@@ -50,7 +50,7 @@
 
 ## Versioning
 
-This fork tracks upstream [`kirodotdev/KiroCrew`](https://github.com/kirodotdev/KiroCrew) — currently base **upstream `main`** (`v0.5.0` + all pushes since, synced 2026-09-06). Every release is tagged **`{upstream}-{n}`** — for example `0.7.0-1.0` means *upstream `0.7.0` + fork revision `1.0`*. The upstream part tells you how up-to-date the sync is, the fork part counts revisions since it. The current release is **`v0.7.0-1.0`**. See [`CHANGELOG.md`](CHANGELOG.md) for what each fork revision adds.
+This fork tracks upstream [`kirodotdev/KiroCrew`](https://github.com/kirodotdev/KiroCrew) — currently base **upstream `main`** (`v0.5.0` + all pushes since, synced 2026-09-06). Every release is tagged **`{upstream}-{n}`** — for example `0.5.0-1.0` means *official kiro `0.5.0` + fork revision `1.0`*. The upstream part tells you how up-to-date the sync is, the fork part counts revisions since it. The current release is **`v0.5.0-1.0`**. See [`CHANGELOG.md`](CHANGELOG.md) for what each fork revision adds.
 
 ## Why this fork? (Custom API Edition)
 
