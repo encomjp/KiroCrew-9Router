@@ -63,6 +63,8 @@ const BUILTIN = {
     iconUrl: '/app-assets/worlds/icon.svg',
     heroImage: '/app-assets/worlds/hero-light.svg',
     heroImageDark: '/app-assets/worlds/hero-dark.svg',
+    useCases: ['raw use case'],
+    configuration: ['raw configuration'],
     ui: { pages: [{ route: '/worlds', label: 'Worlds', icon: 'Gamepad2' }] },
   },
 }
@@ -94,6 +96,16 @@ describe('AppDetailPage — built-in icon/hero resolution', () => {
     await screen.findByTestId('app-icon')
     const hero = document.querySelector('img[src="/app-assets/worlds/hero-light.svg"]')
     expect(hero).not.toBeNull()
+  })
+
+  it('renders localized use-case and configuration guidance from the manifest', async () => {
+    getApp.mockResolvedValue(BUILTIN)
+    renderDetail()
+
+    expect(await screen.findByText('Use cases')).toBeInTheDocument()
+    expect(screen.getByText('Configuration')).toBeInTheDocument()
+    expect(screen.getByText(/second-screen view of live agents/)).toBeInTheDocument()
+    expect(screen.getByText(/no credentials or external service/)).toBeInTheDocument()
   })
 
   it('shows no hero banner when the built-in ships no hero image', async () => {
@@ -147,8 +159,8 @@ const ART_LESS_ROW = {
   origin: 'registry',
 }
 
-const proxied = (path: string, repo = 'https://example.invalid/octocat/some-app') =>
-  `/api/apps/blob?repo=${encodeURIComponent(repo)}&path=${encodeURIComponent(path)}`
+/** The app's own installed art route — no repo identifier, no clone, no network. */
+const local = (path: string, name = 'some-app') => `/apps/${name}/art/${path}`
 
 describe('AppDetailPage — installed external app whose registry row carries no art', () => {
   beforeEach(() => {
@@ -158,7 +170,12 @@ describe('AppDetailPage — installed external app whose registry row carries no
     system.mockResolvedValue({ hostname: '' })
   })
 
-  it('proxies the manifest icon, banner, and screenshot through the blob proxy', async () => {
+  it("serves the manifest icon, banner, and screenshot from the app's own files", async () => {
+    // This is the surface the catalog leaves with nothing: a catalog row carries
+    // `iconRef`/`heroRef` and no screenshot or detail-hero equivalent at all, so
+    // these three fields come off the installed manifest. They used to reach the
+    // blob proxy — a git clone behind an SSRF allowlist warmed by a network
+    // fetch — and now read the files the install itself wrote.
     getApp.mockResolvedValue(EXTERNAL)
     listRegistry.mockResolvedValue({
       apps: [ART_LESS_ROW],
@@ -167,20 +184,27 @@ describe('AppDetailPage — installed external app whose registry row carries no
     renderDetail('some-app')
 
     const icon = await screen.findByTestId('app-icon')
-    expect(icon.getAttribute('data-icon-url')).toBe(proxied('assets/icon.webp'))
-    expect(document.querySelector(`img[src="${proxied('assets/hero-detail.webp')}"]`))
+    expect(icon.getAttribute('data-icon-url')).toBe(local('assets/icon.webp'))
+    expect(document.querySelector(`img[src="${local('assets/hero-detail.webp')}"]`))
       .not.toBeNull()
-    expect(document.querySelector(`img[src="${proxied('assets/screenshots/one.webp')}"]`))
+    expect(document.querySelector(`img[src="${local('assets/screenshots/one.webp')}"]`))
       .not.toBeNull()
+    const srcs = [...document.querySelectorAll('img')].map(i => i.getAttribute('src') || '')
+    expect(srcs.some(s => s.includes('/api/apps/blob'))).toBe(false)
   })
 
-  it('falls back to the recorded install URL when no row and no manifest repo name one', async () => {
-    getApp.mockResolvedValue(EXTERNAL)
+  it('needs no recorded install URL, so art survives an app with no provenance', async () => {
+    // Replaces a case that asserted the opposite: with no row and no manifest
+    // `repo`, the blob URL was built from `sourceUrl`, and without that there was
+    // no URL at all. The app's own name locates the bytes, so neither identifier
+    // is load-bearing for art any more.
+    const { sourceUrl: _unused, ...noProvenance } = EXTERNAL
+    getApp.mockResolvedValue(noProvenance)
     listRegistry.mockResolvedValue({ apps: [], serverPlatform: { os: 'linux', arch: 'x86_64' } })
     renderDetail('some-app')
 
     const icon = await screen.findByTestId('app-icon')
-    expect(icon.getAttribute('data-icon-url')).toBe(proxied('assets/icon.webp'))
+    expect(icon.getAttribute('data-icon-url')).toBe(local('assets/icon.webp'))
   })
 
   it('renders no repo-relative src when no repo can be resolved', async () => {
@@ -254,5 +278,80 @@ describe('AppDetailPage — installed external app whose registry row carries no
     expect(icon.getAttribute('data-icon-url')).toBe('')
     const srcs = [...document.querySelectorAll('img')].map((i) => i.getAttribute('src') || '')
     expect(srcs.some((s) => s.includes('evil.example'))).toBe(false)
+  })
+})
+
+describe('AppDetailPage — malformed registry guidance', () => {
+  beforeEach(() => {
+    getApp.mockReset()
+    listRegistry.mockReset()
+    system.mockReset()
+    getApp.mockResolvedValue(null)
+    system.mockResolvedValue({ hostname: '' })
+  })
+
+  it('does not render empty guidance cards for rejected third-party fields', async () => {
+    listRegistry.mockResolvedValue({
+      apps: [{
+        ...ART_LESS_ROW,
+        installed: false,
+        useCases: 'not an array',
+        configuration: ['valid-looking', null],
+      }],
+      serverPlatform: { os: 'linux', arch: 'x86_64' },
+    })
+    renderDetail('some-app')
+
+    await screen.findByTestId('app-icon')
+    expect(screen.queryByText('Use cases')).toBeNull()
+    expect(screen.queryByText('Configuration')).toBeNull()
+  })
+})
+
+describe('AppDetailPage — version reported for an installed app', () => {
+  beforeEach(() => {
+    getApp.mockReset()
+    listRegistry.mockReset()
+    system.mockReset()
+    system.mockResolvedValue({ hostname: '' })
+  })
+
+  // The registry row is fetched from the network and cached, so it can name an
+  // OLDER version than the one on this machine — a repo still publishing 1.0.0
+  // while the user installed a 1.2.0 clone from a local directory. The header
+  // must report what is installed; letting the row win makes the page state a
+  // version the user does not have.
+  it('reports the installed version, not the version the registry row publishes', async () => {
+    getApp.mockResolvedValue(EXTERNAL)
+    listRegistry.mockResolvedValue({
+      apps: [{ ...ART_LESS_ROW, version: '1.0.0' }],
+      serverPlatform: { os: 'linux', arch: 'x86_64' },
+    })
+    renderDetail('some-app')
+
+    await screen.findByTestId('app-icon')
+    // Rendered as `<author> v<version>` in the detail header.
+    expect(screen.getByText(/v1\.2\.0/)).toBeTruthy()
+    expect(screen.queryByText(/v1\.0\.0/)).toBeNull()
+  })
+
+  // The '0.0.0' floor is what `normalizeRegistryApp` substitutes for a row that
+  // carries no version — the shape a private or unreachable app repo produces,
+  // since the backend sources a row's `version` only from the fetched `app.json`
+  // and the registry index cannot supply it. This page reads an unnormalized row
+  // today, so it is the other two call sites that see the floor; pinning it here
+  // keeps the floor from displacing the installed version if this page is ever
+  // switched onto the normalized shape.
+  it('reports the installed version over a registry row pinned at the 0.0.0 floor', async () => {
+    getApp.mockResolvedValue(EXTERNAL)
+    listRegistry.mockResolvedValue({
+      apps: [{ ...ART_LESS_ROW, version: '0.0.0' }],
+      serverPlatform: { os: 'linux', arch: 'x86_64' },
+    })
+    renderDetail('some-app')
+
+    await screen.findByTestId('app-icon')
+    expect(screen.getByText(/v1\.2\.0/)).toBeTruthy()
+    expect(screen.queryByText(/v0\.0\.0/)).toBeNull()
   })
 })

@@ -18,15 +18,12 @@ with a name but no published serve means.
 
 Three properties are load-bearing.
 
-**This is a LIVE probe, and the existing status endpoint is not.**
-``GET /api/tailnet/status`` deliberately reports the value resolved once at
-startup, because that is what actually went into the fixed origin allowlist.
-This endpoint reports what the machine can do *next*. The two must stay separate:
-a name that resolves now but was absent at startup is exactly the boot race where
-the origin is NOT trusted, and reporting it as ready would be the
-"checked-but-never-ran shown as a clean result" defect. It gets its own step
-(``restart_gateway``) instead. The one-click UI resumes after the replacement
-gateway is ready, while the security boundary itself changes only at startup.
+**This is a LIVE daemon probe, while the existing status endpoint reports the
+live request boundary.**  They must stay separate: a daemon name is not trusted
+merely because it resolves.  The background recovery path first validates and
+adds it to the running Origin/Host set; only then does this endpoint report the
+name as trusted.  Until that happens the existing fail-closed restart step is
+preserved, including for config changes that still require a restart.
 
 **The QR carries a live credential, so it is minted on demand and never cached.**
 The payload is a URL with a session token in its query string. It is not logged,
@@ -52,9 +49,11 @@ from typing import Any, Literal, NamedTuple
 from aiohttp import web
 
 from kiro_crew.config import KiroCrewConfig
+from kiro_crew.config.loader import ConfigReadError, config_path, update_config_locked
 from kiro_crew.dashboard import tailnet, tailnet_serve
 from kiro_crew.dashboard.boot_id import current_boot_id
-from kiro_crew.dashboard.handlers._shared import _is_restricted_session
+from kiro_crew.dashboard.handlers._shared import _caller_bounds, _is_restricted_session
+from kiro_crew.dashboard.handlers.agents import _get_config_lock
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.token_auth import (
     LINK_WINDOW_SECS,
@@ -248,6 +247,12 @@ async def api_tailnet_mobile_status(request: web.Request) -> web.Response:
     probe = live.probe
     return web.json_response(
         {
+            # A per-process marker lets the setup flow prove that a requested
+            # restart reached the replacement gateway. Step text alone is not
+            # sufficient: an already-ready pre-migration process remains
+            # ``ready`` during its response-flush window and could otherwise
+            # mint one last boot-bound QR before exiting.
+            "boot_id": current_boot_id(),
             "step": live.step,
             "host": probe.name,
             "origin": f"https://{probe.name}" if probe.name else "",
@@ -339,7 +344,7 @@ async def _live_state(request: web.Request, port: int) -> _LiveState:
             published = state.published
             serve_detail = state.detail
 
-    startup_host = str(request.app.get("tailnet_host") or "")
+    startup_host = tailnet.running_tailnet_origin(request.app)[0]
     step = _derive_step(
         pinned=pinned,
         probe=probe,
@@ -474,6 +479,221 @@ def _guard(request: web.Request) -> web.Response | None:
     return None
 
 
+def _apply_mobile_setup_config(data: dict, login: str) -> tuple[bool, bool, bool]:
+    """Apply the durable half of one-click mobile setup in place.
+
+    Returns ``(changed, restart_required, persistent)``. The login comes from
+    this machine's daemon status, not from the browser, and is ADDED to an
+    existing allowlist rather than replacing it. That makes the explicit
+    "Set up / Show QR" action sufficient to establish the identity bound a
+    session needs to survive an update without silently removing identities an
+    operator configured by hand.
+
+    ``qr_session_until_restart=false`` is the one advanced opt-out preserved:
+    it deliberately asks for a clock-bounded, non-refreshing session. Every
+    default/ordinary shape is promoted to persistent once identity trust is
+    ready. Trust/origin changes require a gateway restart because middleware
+    snapshots them at boot; changing only the QR session shape does not.
+    """
+    dashboard = data.setdefault("dashboard", {})
+    if not isinstance(dashboard, dict):
+        raise ValueError("config section 'dashboard' is not an object")
+    tailscale = dashboard.setdefault("tailscale", {})
+    if not isinstance(tailscale, dict):
+        raise ValueError("config section 'dashboard.tailscale' is not an object")
+
+    changed = False
+    restart_required = False
+
+    def _set(section: dict, key: str, value: object, *, restart: bool = False) -> None:
+        nonlocal changed, restart_required
+        if section.get(key) == value:
+            return
+        section[key] = value
+        changed = True
+        restart_required = restart_required or restart
+
+    _set(tailscale, "enabled", True, restart=True)
+
+    raw_logins = tailscale.get("allowed_logins", [])
+    if not isinstance(raw_logins, list):
+        raise ValueError("config field 'dashboard.tailscale.allowed_logins' is not a list")
+    allowed_logins = list(raw_logins)
+    if login and not any(
+        isinstance(entry, str) and entry.strip().lower() == login.lower()
+        for entry in allowed_logins
+    ):
+        allowed_logins.append(login)
+        _set(tailscale, "allowed_logins", allowed_logins, restart=True)
+    if login:
+        _set(tailscale, "trust_identity", True, restart=True)
+
+    identity_ready = bool(
+        tailscale.get("trust_identity") is True
+        and any(isinstance(entry, str) and entry.strip() for entry in allowed_logins)
+    )
+    persistent = False
+    if identity_ready and dashboard.get("qr_session_until_restart", True) is not False:
+        _set(dashboard, "qr_session_until_restart", True)
+        _set(dashboard, "qr_session_persist_across_restart", True)
+        persistent = True
+
+    return changed, restart_required, persistent
+
+
+def _effective_mobile_setup(cfg: KiroCrewConfig, login: str) -> tuple[bool, list[str]]:
+    """Validate the merged config that the next gateway boot will consume.
+
+    The writer above intentionally edits ``config.json`` only, while
+    ``config.local.json`` is a user-owned, higher-precedence overlay.  Returning
+    success from the raw base write would therefore be a lie when that overlay
+    disables identity trust or persistence.  The explicit timed-session opt-out
+    remains valid; every other mismatch is returned as a dotted field name so
+    the caller can explain exactly what the overlay must stop overriding.
+    """
+    dashboard = cfg.dashboard
+    tailscale = dashboard.tailscale
+    allowed_logins = tuple(
+        entry for entry in getattr(tailscale, "allowed_logins", ()) if isinstance(entry, str)
+    )
+    conflicts: list[str] = []
+    if getattr(tailscale, "enabled", False) is not True:
+        conflicts.append("dashboard.tailscale.enabled")
+    if getattr(tailscale, "trust_identity", False) is not True:
+        conflicts.append("dashboard.tailscale.trust_identity")
+    if not tailnet.login_allowed(login, allowed_logins):
+        conflicts.append("dashboard.tailscale.allowed_logins")
+
+    timed_opt_out = getattr(dashboard, "qr_session_until_restart", True) is False
+    persistent = False
+    if not timed_opt_out:
+        if getattr(dashboard, "qr_session_persist_across_restart", False) is not True:
+            conflicts.append("dashboard.qr_session_persist_across_restart")
+        else:
+            persistent = not conflicts
+    return persistent, conflicts
+
+
+def _running_tailnet_trust_ready(request: web.Request, login: str) -> bool:
+    """Whether this process can enforce a persistent phone session right now."""
+    trust = request.app.get("tailnet_trust")
+    if not isinstance(trust, tailnet.TailnetTrust):
+        return False
+    return trust.trust_identity and tailnet.login_allowed(login, trust.allowed_logins)
+
+
+async def api_tailnet_mobile_configure(request: web.Request) -> web.Response:
+    """POST /api/tailnet/mobile/configure — persist safe update-proof access.
+
+    This is deliberately a dedicated owner-only mutation instead of four
+    generic config PATCHes. The allowlist value is discovered from the local
+    Tailscale daemon and all related fields land in one locked write, so a
+    crash or concurrent settings save cannot leave ``trust_identity`` enabled
+    with an empty list, or persistence enabled without its identity bound.
+    """
+    refusal = _guard(request)
+    if refusal is not None:
+        await _audit_async(request, "tailnet.mobile.configure", "denied", "restricted-session")
+        return refusal
+
+    pinned = await asyncio.to_thread(
+        tailnet.is_governance_pinned_off, audit_tool="tailnet_mobile_configure"
+    )
+    if pinned:
+        await _audit_async(request, "tailnet.mobile.configure", "denied", "governance-pinned")
+        return web.json_response(
+            {
+                "error": "tailnet access is disabled by your administrator's security policy",
+                "code": "governance_pinned",
+            },
+            status=403,
+        )
+
+    probe = await asyncio.to_thread(tailnet.probe_daemon)
+    if not (probe.reachable and probe.logged_in and probe.name and probe.login):
+        await _audit_async(request, "tailnet.mobile.configure", "denied", "daemon-not-ready")
+        return web.json_response(
+            {
+                "error": (
+                    "Tailscale must be signed in with MagicDNS and a readable local "
+                    "login before persistent phone access can be configured."
+                ),
+                "code": "daemon_not_ready",
+            },
+            status=409,
+        )
+
+    result: dict[str, bool] = {}
+
+    def _mutate(data: dict) -> dict | None:
+        changed, restart_required, persistent = _apply_mobile_setup_config(data, probe.login)
+        result.update(
+            changed=changed,
+            restart_required=restart_required,
+            persistent=persistent,
+        )
+        return data if changed else None
+
+    try:
+        async with _get_config_lock():
+            await asyncio.to_thread(update_config_locked, config_path(), mutate=_mutate)
+    except ConfigReadError:
+        await _audit_async(request, "tailnet.mobile.configure", "error", "config-read-failed")
+        return web.json_response(
+            {"error": "failed to read config file", "code": "config_read_failed"}, status=500
+        )
+    except ValueError as exc:
+        await _audit_async(request, "tailnet.mobile.configure", "error", "config-invalid")
+        return web.json_response({"error": str(exc), "code": "config_invalid"}, status=500)
+    except OSError:
+        await _audit_async(request, "tailnet.mobile.configure", "error", "config-write-failed")
+        return web.json_response(
+            {"error": "failed to write config file", "code": "config_write_failed"}, status=500
+        )
+
+    effective = await asyncio.to_thread(KiroCrewConfig.load)
+    persistent, conflicts = _effective_mobile_setup(effective, probe.login)
+    result["persistent"] = persistent
+    if conflicts:
+        await _audit_async(
+            request,
+            "tailnet.mobile.configure",
+            "denied",
+            "config-local-override",
+        )
+        return web.json_response(
+            {
+                "error": (
+                    "config.json now contains the safe phone-access settings, but "
+                    "config.local.json overrides them; update or remove the listed "
+                    "overrides, then retry so the gateway can load them"
+                ),
+                "code": "config_overlay_conflict",
+                "fields": conflicts,
+            },
+            status=409,
+        )
+
+    if persistent and not _running_tailnet_trust_ready(request, probe.login):
+        # A prior attempt may have written the base file but returned the
+        # overlay conflict above. Once the user removes that overlay, a retry
+        # sees no raw-file change; nevertheless this process still holds the
+        # old startup trust snapshot and must restart before a require_peer
+        # link can work. Comparing the LIVE snapshot keeps that retry honest.
+        result["restart_required"] = True
+
+    await _audit_async(
+        request,
+        "tailnet.mobile.configure",
+        "success",
+        "persistent" if result.get("persistent") else "boot-bound",
+    )
+    # The browser needs only the action it must take next. ``changed`` and
+    # ``persistent`` remain server-side inputs to restart/audit decisions; a
+    # successful 2xx response already carries the success bit.
+    return web.json_response({"restart_required": bool(result.get("restart_required"))})
+
+
 async def api_tailnet_mobile_publish(request: web.Request) -> web.Response:
     """POST /api/tailnet/mobile/publish — put this dashboard on the tailnet.
 
@@ -575,10 +795,14 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     backed routes admit, so a bespoke subject would produce a phone session that
     looks fine and is silently denied those routes.
 
-    Refuses unless the derived step is ``ready``. That is the whole precondition
-    set, read from ``_derive_step`` rather than re-checked here: a QR for a URL
-    nothing answers is a support ticket, not a feature, and a QR issued under an
-    administrator's tailnet pin is a credential the ceiling forbids.
+    Refuses unless the derived step is ``ready``. That is the whole machine-state
+    precondition set, read from ``_derive_step`` rather than re-checked here: a
+    QR for a URL nothing answers is a support ticket, not a feature, and a QR
+    issued under an administrator's tailnet pin is a credential the ceiling
+    forbids. On top of the machine state, the CALLER's own session bounds are
+    enforced via ``_shared._caller_bounds`` (the same helper the mobile-link
+    mint uses): the minted token never out-scopes the session authorizing it,
+    and a caller with no lifetime left to lend is refused.
     """
     refusal = _guard(request)
     if refusal is not None:
@@ -641,9 +865,11 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
             parsed = parse_duration(raw_ttl)
             if parsed:
                 ttl = parsed
-    # Clamped twice on purpose: this endpoint's own ceiling first, then the
-    # global session ceiling, so neither a caller-supplied value nor a future
-    # raise of MAX_QR_TTL_SECS can exceed what token_auth itself allows.
+    # Clamped by this endpoint's own ceiling first, then the global session
+    # ceiling, so neither a caller-supplied value nor a future raise of
+    # MAX_QR_TTL_SECS can exceed what token_auth itself allows. The caller's
+    # own remaining lifetime is applied further down, after the last awaited
+    # step before the mint, so it cannot go stale while this handler waits.
     ttl = min(ttl, MAX_QR_TTL_SECS, MAX_SESSION_TTL_SECS)
 
     state_obj = request.app.get("state")
@@ -670,8 +896,13 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     # lapses. Kept as a supported shape for an operator who wants the credential
     # bounded by a clock regardless of process lifetime.
     #
-    # Mutually exclusive on purpose: carrying both would mean a session that
-    # neither refreshes nor lasts, which is worse than either.
+    # Mutually exclusive as the DEFAULT shapes on purpose: choosing both for an
+    # unbounded caller would mean a session that neither refreshes nor lasts,
+    # which is worse than either. A BOUNDED caller is different — its carried
+    # claims are merged over the configured shape below, and a token carrying
+    # both ``boot`` and ``no_refresh`` is then the honest intersection: the
+    # session ends at whichever bound is hit first, which is exactly what
+    # "never out-scope the caller" requires.
     #
     # The TTL clamp above is untouched under both shapes. Rotation is what
     # extends a boot-bound session, so no ceiling and no security constant moves.
@@ -684,18 +915,140 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
     # that expires on a clock the operator did not ask for, which presents as a
     # phone that randomly signs itself out. The fallback is not unbounded
     # either — a boot-bound session still ends at the next restart.
+    # Read INDEPENDENTLY, each with its own conservative default, rather than as
+    # one all-or-nothing block. Coupling them means a config object missing any
+    # ONE attribute discards the other two — so adding this shape would silently
+    # take the existing opt-out away from anyone whose config predates it, which
+    # is the opposite of "an unreadable override falls back to the default".
+    # Per-field is the faithful version of that rule.
+    _until_restart = True
+    _persist = False
+    _identity_trusted = False
     try:
         _cfg = await asyncio.to_thread(KiroCrewConfig.load)
-        _until_restart = bool(_cfg.dashboard.qr_session_until_restart)
     except Exception:
         logger.debug("tailnet mobile: config unreadable for session shape", exc_info=True)
-        _until_restart = True
-
-    if _until_restart:
-        claims = {"boot": current_boot_id()}
     else:
-        claims = {"no_refresh": "1"}
-    token = generate_token(owner_id or "local-app", ttl_seconds=ttl, extra=claims)
+        _dash = getattr(_cfg, "dashboard", None)
+        _until_restart = bool(getattr(_dash, "qr_session_until_restart", True))
+        _persist = bool(getattr(_dash, "qr_session_persist_across_restart", False))
+        _ts = getattr(_dash, "tailscale", None)
+        _identity_trusted = bool(
+            getattr(_ts, "trust_identity", False) and getattr(_ts, "allowed_logins", None)
+        )
+
+    # THIRD shape - ``persistent``: the refresh chain with NO boot claim, so one
+    # scan survives a gateway restart and is bounded only by the chain's own
+    # 30-day lifetime. Opt-in, because the boot bound it removes is a hard revoke
+    # needing no recorded state, and that default was chosen deliberately.
+    #
+    # GATED on daemon-verified tailnet identity, and the gate is what makes this
+    # offerable at all rather than merely convenient. Behind ``tailscale serve``
+    # every request reaches the gateway from 127.0.0.1 (#1762), so with identity
+    # trust off the pin is ``ip:127.0.0.1`` for every tailnet client and the
+    # cookie is a bearer credential any of them could replay. A session that ends
+    # at the next restart bounds that exposure; one that outlives the process does
+    # not. With ``trust_identity`` plus an allowlist the session pins to a
+    # verified peer instead, and the exposure is bounded by identity rather than
+    # by uptime.
+    #
+    # Both refusals are LOUD. Turning the flag on and silently getting a
+    # boot-bound session is the "checked but never ran, reported as a clean
+    # result" defect: the operator would believe the phone survives restarts and
+    # find out only by being signed out.
+    if _persist and not _until_restart:
+        logger.warning(
+            "dashboard.qr_session_persist_across_restart is on but "
+            "qr_session_until_restart is off, so the timed shape is in force and "
+            "there is no refresh chain to carry across a restart. The phone "
+            "session stays bounded by its TTL; turn qr_session_until_restart on "
+            "to use the persistent shape."
+        )
+        _persist = False
+    if _persist and not _identity_trusted:
+        logger.warning(
+            "dashboard.qr_session_persist_across_restart is on but tailnet "
+            "identity trust is not configured, so the phone session stays bound "
+            "to this gateway process. Behind `tailscale serve` every request "
+            "arrives from 127.0.0.1, so without dashboard.tailscale.trust_identity "
+            "plus a non-empty allowed_logins the session cannot be pinned to a "
+            "verified peer and must not outlive the process."
+        )
+        _persist = False
+
+    if _persist:
+        # No ``boot``, so the chain rather than the process bounds this session,
+        # and no ``no_refresh``, so the chain exists at all. ``require_peer`` is
+        # what keeps that honest: this session's whole security argument is that
+        # it is pinned to a daemon-verified tailnet identity, so the chain must
+        # refuse to rotate whenever that identity cannot be established.
+        #
+        # An address pin is NOT an alternative here, and that is the whole reason
+        # this claim exists rather than reusing the boot-bound rotation path.
+        # Behind ``tailscale serve`` every request reaches the gateway from
+        # 127.0.0.1, so ``ip:127.0.0.1`` is satisfied by every peer on the
+        # tailnet - it would read as a pin in the audit trail while excluding
+        # nobody. Refusing the rotation is the only bound that actually holds.
+        shape: dict[str, str] = {"require_peer": "1"}
+    elif _until_restart:
+        shape = {"boot": current_boot_id()}
+    else:
+        shape = {"no_refresh": "1"}
+    # The calling session's own bounds cap everything minted below — the same
+    # invariant the sibling mobile-link mint enforces, read through the same
+    # shared helper so the two surfaces cannot drift. A deliberately bounded
+    # owner session (``no_refresh``, or a short remaining ``session_exp``) must
+    # not trade itself for a boot-bound, refresh-chained credential on another
+    # device: behind ``tailscale serve`` every request reaches the gateway from
+    # 127.0.0.1, so the token cannot be device-pinned and its own bounds are the
+    # only limit that holds. A caller with no lifetime left to lend is refused
+    # outright — minting against it would hand out a credential that outlives
+    # the session authorizing it.
+    #
+    # Read AFTER every awaited step above (the request body and the config
+    # load), deliberately: the remaining lifetime is a wall-clock snapshot, and
+    # a client that trickles the request body in controls how long this handler
+    # waits — a snapshot taken before those awaits would let a caller in its
+    # last seconds stretch the mint past its own expiry.
+    carried, ttl_ceiling = _caller_bounds(request)
+    if ttl_ceiling <= 0:
+        await _audit_async(request, "tailnet.mobile.qr", "denied", "caller-session-expired")
+        return web.json_response(
+            {
+                "error": (
+                    "This session has no lifetime left to lend, so no sign-in "
+                    "link can be issued. Sign in again, then scan."
+                ),
+                "code": "caller_session_expired",
+            },
+            status=403,
+        )
+    # The caller's remaining lifetime completes the clamp: a short-lived caller
+    # asking for the default cannot exceed what the authorizing session itself
+    # has left.
+    ttl = min(ttl, ttl_ceiling)
+    # The caller's carried bounds win on conflict and are never dropped: a
+    # ``boot`` claim is carried verbatim rather than re-derived (the same rule
+    # the link→session exchange follows), and a ``no_refresh`` caller stamps the
+    # minted credential ``no_refresh`` regardless of the configured shape, so
+    # the phone session never grows a refresh chain its authorizing session did
+    # not have.
+    #
+    # This caps the PERSISTENT shape too, and that is correct rather than a gap:
+    # a credential must not outlive the session that authorized it, so an owner
+    # who is themselves signed in on a boot-bound session hands the phone a
+    # boot-bound session as well, whatever the config says. Reaching the
+    # persistent shape therefore also requires the authorizing session to be
+    # unbounded - which the desktop local-bootstrap mint is, since
+    # ``/api/token/local`` carries neither ``boot`` nor ``no_refresh``.
+    claims = {**shape, **carried}
+    caller_peer_key = claims.pop("peer_key", "")
+    token = generate_token(
+        owner_id or "local-app",
+        ttl_seconds=ttl,
+        peer_key=caller_peer_key,
+        extra=claims,
+    )
     url = f"https://{host}/?token={token}"
     try:
 
@@ -721,8 +1074,10 @@ async def api_tailnet_mobile_qr(request: web.Request) -> web.Response:
             # The window in which the LINK must be opened, which is not the
             # session lifetime and is the thing that surprises people: the token
             # stops being redeemable long before the session it would have
-            # created would have expired.
-            "link_window_secs": LINK_WINDOW_SECS,
+            # created would have expired. generate_token clamps the link-click
+            # ``exp`` to the session TTL, so a short-lived caller's link dies
+            # with the ttl it lent — report the live window, not the constant.
+            "link_window_secs": min(LINK_WINDOW_SECS, ttl),
             "host": host,
         }
     )

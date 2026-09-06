@@ -40,6 +40,13 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/update/auto", handlers.api_update_auto)
     app.router.add_post("/api/update/channel", handlers.api_update_channel)
     app.router.add_post("/api/update/cancel", handlers.api_update_cancel)
+    # In-app wheel update step-up (RFC OQ7): the SPA arms, only the host
+    # approves. Arm/status are ordinary authenticated routes; approve
+    # additionally requires the nonce written to the data home, which a
+    # remote dashboard bearer cannot read.
+    app.router.add_post("/api/update/arm", handlers.api_update_arm)
+    app.router.add_get("/api/update/arm", handlers.api_update_arm_status)
+    app.router.add_post("/api/update/approve", handlers.api_update_approve)
     # Restart with no update. Sibling of /api/update rather than a mode of it:
     # /api/update refuses every layout that is not a git checkout, while a
     # restart is valid everywhere and is how a wheel install picks up code a
@@ -64,9 +71,11 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/telemetry/collection", handlers.api_collection_status)
     app.router.add_get("/api/tailnet/status", handlers.api_tailnet_status)
     # Mobile access: a LIVE probe (the status route above reports the startup
-    # value) plus the two mutations and the QR mint. Registered here rather than
-    # in a tailnet-specific module because these share the system routes' owner.
+    # value) plus setup/publish/withdraw mutations and the QR mint. Registered
+    # here rather than in a tailnet-specific module because these share the
+    # system routes' owner.
     app.router.add_get("/api/tailnet/mobile", handlers.api_tailnet_mobile_status)
+    app.router.add_post("/api/tailnet/mobile/configure", handlers.api_tailnet_mobile_configure)
     app.router.add_post("/api/tailnet/mobile/publish", handlers.api_tailnet_mobile_publish)
     app.router.add_post("/api/tailnet/mobile/unpublish", handlers.api_tailnet_mobile_unpublish)
     app.router.add_post("/api/tailnet/mobile/qr", handlers.api_tailnet_mobile_qr)

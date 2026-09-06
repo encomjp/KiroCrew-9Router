@@ -22,6 +22,8 @@ describe('vitest worker memory configuration', () => {
     expect(Number(workers![1])).toBeGreaterThanOrEqual(1)
     expect(Number(workers![1])).toBeLessThanOrEqual(4)
 
-    expect(config).toMatch(/execArgv:\s*\['--max-old-space-size=3072'\],/)
+    expect(config).toMatch(
+      /execArgv:\s*\['--max-old-space-size=3072',\s*'--no-experimental-webstorage'\],/,
+    )
   })
 })

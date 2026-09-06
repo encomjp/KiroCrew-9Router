@@ -471,7 +471,9 @@ def _dispatch(
             )
         request = built_drag
 
-    # (4) AUTHORIZATION — fail-closed, before any accessibility or capture call.
+    # (4) AUDIT — recorded before any accessibility or capture call, so the record
+    # exists even when the driver then fails. This step returns no decision: the
+    # fail-closed authorization is the keystone primary enable at step (1).
     denial = gate.require_computer_use(
         tool_name,
         session_key=session_key,

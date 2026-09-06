@@ -21,6 +21,7 @@ import {
   type Task,
   type TranscriptResponse,
   type TranscriptSegment,
+  type TranslationLine,
 } from '../api'
 import { useMeetingTranscription } from './useMeetingTranscription'
 
@@ -197,16 +198,23 @@ export function canTransition(from: MeetingStatus, to: MeetingStatus): boolean {
  *
  * `status === 'active'` alone is NOT dispatch readiness. `POST /start` persists
  * `active` up front and then initializes agents with transcript ingress
- * SUSPENDED — every dispatch in that window is rejected with a 409
- * (`no_active_meeting`, see the backend's `get_for_dispatch`). The fast start
- * poll exists to observe `active` early, so without a readiness gate it opened
- * the microphone tens of seconds before ingress: early finals burned through
- * the short dispatch retry schedule (~4.6s) against a ~46s initialization and
- * were PERMANENTLY lost from the notes and tasks.
+ * SUSPENDED for direct fan-out. The fast start poll exists to observe `active`
+ * early, so without a readiness gate it opened the microphone tens of seconds
+ * before ingress: early finals burned through the short dispatch retry schedule
+ * (~4.6s) against a ~46s initialization and were PERMANENTLY lost from the notes
+ * and tasks.
  *
- * `ingressReady` is the server's own admission flag, `accepting_dispatches`,
- * reported on every meta poll — the same holder flag the dispatch endpoint
- * itself checks. Gating on the POLLED value rather than on the start
+ * That gate cost the opening of every meeting instead — the mic simply stayed
+ * shut for those ~46s and the speech was never captured at all (issue #4610).
+ * The server now HOLDS speech through initialization, so there are two states in
+ * which a line lands: fanned out immediately (`accepting_dispatches`) or held and
+ * replayed in order when the agents are ready (`buffering_dispatches`). Capture
+ * must open for BOTH, and a server that reports neither is still the closed case
+ * this gate was written for — stopping, reviewing, expired, or no live session.
+ *
+ * `ingressReady` is that pair of server flags, reported on every meta poll — the
+ * same holder state the dispatch endpoint itself checks. Gating on the POLLED
+ * value rather than on the start
  * mutation's lifecycle makes every client-side inference hole unreachable at
  * once, because the mutation's outcome is not evidence about ingress in either
  * direction: an error settlement can hide a server-side success (the ~46s
@@ -246,6 +254,7 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
   const [partialTranscript, setPartialTranscript] = useState('')
   const [fullMeetingId, setFullMeetingId] = useState('')
   const transcriptFullNoticeRef = useRef('')
+  const [translationOpen, setTranslationOpen] = useState(false)
   const [chatViewAgents, setChatViewAgents] = useState<string[]>([])
   const [selectedPreset, setSelectedPreset] = useState(config?.default_preset ?? '')
   // `useState` captures its initial value ONCE, and `config` arrives from a query —
@@ -298,11 +307,14 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
   const meta: MeetingMeta | undefined = metaQuery.data?.meta
   const status: MeetingStatus = meta?.status ?? 'idle'
   const live = metaQuery.data?.live ?? null
-  // The server's own dispatch-admission flag, straight off the poll. `=== true`
-  // rather than truthy-or-default: a missing `live` (no session installed — a
-  // gateway restart left the meeting `active` on disk with nothing live) means a
-  // dispatch CANNOT land, so unknown must read as not-ready.
-  const ingressReady = live?.accepting_dispatches === true
+  // The server's own dispatch-admission state, straight off the poll. Either flag
+  // means a line sent now LANDS: directly, or held for the agents that are still
+  // initializing (issue #4610). `=== true` rather than truthy-or-default: a
+  // missing `live` (no session installed — a gateway restart left the meeting
+  // `active` on disk with nothing live) means a dispatch CANNOT land, so unknown
+  // must read as not-ready.
+  const ingressReady =
+    live?.accepting_dispatches === true || live?.buffering_dispatches === true
 
   const outputsQuery = useQuery({
     queryKey: [...scope, 'outputs'],
@@ -331,6 +343,77 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
       }
     },
     enabled: initQuery.isSuccess,
+    refetchInterval: status === 'active'
+      ? (config?.poll_interval_active ?? 5000)
+      : status === 'paused' || status === 'reviewing'
+        ? (config?.poll_interval_idle ?? 30_000)
+        : false,
+  })
+
+  // ── live translation ──────────────────────────────────────────────────────
+  //
+  // Polled incrementally: the endpoint takes a `since` cursor and returns only
+  // newer lines, so a long meeting does not resend its whole transcript every few
+  // seconds. Accumulation therefore happens HERE rather than in the response.
+  //
+  // A Map keyed by line number, not an array: `queryFn` appending would otherwise
+  // duplicate every line if it ran twice for one cursor (React Strict Mode's
+  // double-invoke in development does exactly that). Keying by `n` makes the merge
+  // idempotent whatever the caller does.
+  const translationLinesRef = useRef(new Map<number, TranslationLine>())
+  const translationCursorRef = useRef(0)
+  const translationLanguage = config?.translation_language ?? ''
+
+  // Reset when the target language changes: the backend starts a fresh document,
+  // so keeping lines from the previous language would show a mix with no way to
+  // tell which line is in which.
+  const lastTranslationLanguageRef = useRef(translationLanguage)
+  if (lastTranslationLanguageRef.current !== translationLanguage) {
+    lastTranslationLanguageRef.current = translationLanguage
+    translationLinesRef.current = new Map()
+    translationCursorRef.current = 0
+  }
+
+  // The language the SERVER last reported for this meeting's translation
+  // document — distinct from the config value above, which a Settings change
+  // moves immediately while the running session keeps its start-time language.
+  const lastServerLanguageRef = useRef('')
+
+  const translationQuery = useQuery({
+    queryKey: [...scope, 'translations'],
+    queryFn: async () => {
+      let page = await meetingsApi.translations(meetingId, translationCursorRef.current)
+      // A language switch observed from the SERVER resets: the document was
+      // replaced under us and its numbering restarted at zero, so a cursor
+      // advanced against the old document would filter out every initial line
+      // of the new language. Keyed on the last OBSERVED server language (not
+      // the config value): comparing against config would wipe the map on
+      // every poll for as long as the running session and the config disagree.
+      if (page.language !== lastServerLanguageRef.current) {
+        lastServerLanguageRef.current = page.language
+        translationLinesRef.current = new Map()
+        if (translationCursorRef.current !== 0) {
+          translationCursorRef.current = 0
+          page = await meetingsApi.translations(meetingId, 0)
+        }
+      }
+      for (const line of page.lines) translationLinesRef.current.set(line.n, line)
+      translationCursorRef.current = page.next_n
+      return {
+        lines: [...translationLinesRef.current.values()].sort((a, b) => a.n - b.n),
+        pending: page.pending,
+        dropped: page.dropped,
+        language: page.language,
+        languageLabel: page.language_label,
+      }
+    },
+    // Only while the panel is OPEN and a language is configured. Translation is
+    // off by default, and polling for a feature nobody enabled would be pure waste.
+    enabled: initQuery.isSuccess && translationOpen && Boolean(translationLanguage),
+    // Same ladder as the outputs/transcript queries: pausing does not clear the
+    // backend queue, so the worker keeps draining lines while paused/reviewing —
+    // stopping the poll entirely would freeze the panel mid-sentence and never
+    // show the tail.
     refetchInterval: status === 'active'
       ? (config?.poll_interval_active ?? 5000)
       : status === 'paused' || status === 'reviewing'
@@ -651,6 +734,18 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
     chatViewAgents,
     selectedPreset,
     transcription,
+    /** Live translation: `''` language means the feature is off. */
+    translation: {
+      language: translationLanguage,
+      /** Endonym from the server; falls back to the code until the first poll lands. */
+      languageLabel: translationQuery.data?.languageLabel || translationLanguage,
+      open: translationOpen,
+      lines: translationQuery.data?.lines ?? [],
+      pending: translationQuery.data?.pending ?? 0,
+      dropped: translationQuery.data?.dropped ?? 0,
+      loading: translationQuery.isFetching && translationQuery.data === undefined,
+    },
+    setTranslationOpen,
     loading: initQuery.isLoading || metaQuery.isLoading,
     error: (initQuery.error ?? metaQuery.error) as Error | null,
     agentsPaused: Boolean(live?.agents_paused),

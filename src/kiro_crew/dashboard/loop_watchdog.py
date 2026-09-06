@@ -23,16 +23,11 @@ fed by the async heartbeat calling :meth:`LoopStallWatchdog.beat` every tick:
    it fires even when the loop thread is wedged in a syscall *and* the
    GIL-dependent daemon check below would be starved; when it fires it dumps
    *all* thread stacks and then ``_exit()``s the process in one atomic step.
-   Because the process dumps and dies on its own, there is no race with the
-   external Electron liveness probe (the probe is reduced to a backstop), and
-   the mechanism is fully cross-platform and needs no root — unlike an
+   The mechanism is fully cross-platform and needs no root — unlike an
    out-of-process ``py-spy`` capture, which macOS blocks without elevated
-   ``task_for_pid`` privileges.  ``exit_after`` (25s) is kept below the external
-   probe's kill window — that probe trips after ``failure_threshold`` (3)
-   consecutive failed polls at a 10s cadence, i.e. ≳20s — so this in-process
-   path generally wins and the dump is captured.  The two budgets are close
-   (25s vs ≳20s) rather than comfortably separated, so they must be kept in sync
-   if either side is tuned; see :class:`LoopStallWatchdog` for the exact timing.
+   ``task_for_pid`` privileges. Desktop launches use a 25s exit budget near
+   Electron's independent liveness window. Managed services have no Electron
+   probe, use a wider budget, and receive the soft diagnostic dump first.
 
    **Journal visibility:** hard-exit dumps land in the dedicated file only (not
    stderr/journal) because ``faulthandler.dump_traceback_later`` targets a single
@@ -44,8 +39,10 @@ fed by the async heartbeat calling :meth:`LoopStallWatchdog.beat` every tick:
 2. **Soft observability dump (the daemon-thread fallback).**  A separate daemon
    thread compares the last beat against the clock and, once the loop has not
    beaten for ``stall_after`` seconds, logs a marker and dumps all thread stacks
-   *without* exiting, re-arming on recovery.  This is the fallback used when the
-   armed timer is disabled (``exit_after=None``) or could not be armed.
+   *without* exiting, re-arming on recovery. When the hard timer is active this
+   stays on stderr so a recovered stall is not classified as a fatal crash. If
+   the hard timer is disabled or could not be armed, the soft dump also goes to
+   the dedicated file because no later fatal capture can make it discoverable.
 
 The daemon thread keeps running even when the loop thread is blocked in the
 kernel — CPython releases the GIL around blocking syscalls such as ``close()`` /
@@ -73,17 +70,15 @@ logger = logging.getLogger("kiro_crew.dashboard.loop_watchdog")
 
 
 def _default_dump(file: "typing.IO[str] | typing.Any | None" = None) -> None:
-    """Dump every thread's stack to a dedicated file AND stderr.
+    """Dump every thread's stack to a dedicated file and stderr.
 
-    Writes to both the dedicated crash-dump file (for discoverability) and stderr
-    (for journal/terminal visibility) so dumps are never lost.
-
-    *file* can be any object with a ``fileno()`` method (including
-    :class:`~kiro_crew.dashboard.crash_dump_store.DumpFile`).
+    The caller passes ``dump_file`` only when no authoritative hard-exit timer
+    is armed. That keeps soft-only failures discoverable by ``doctor`` while a
+    recoverable pre-exit dump in a managed service remains journal-only and
+    cannot masquerade as a fatal crash at the next clean startup.
     """
     target = file or sys.stderr
     faulthandler.dump_traceback(file=target, all_threads=True)
-    # Also write to stderr if the target is a different file
     if target is not sys.stderr:
         faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
 
@@ -125,39 +120,31 @@ class LoopStallWatchdog:
     Two layers, both fed by :meth:`beat` (called from the async heartbeat):
 
     * the C-level ``faulthandler`` armed timer that dumps **and exits** at
-      ``exit_after`` seconds of silence — authoritative; portable / no-root and
-      it beats the external liveness probe so the dump is never lost to a race;
+      ``exit_after`` seconds of silence — authoritative and portable / no-root;
       and
     * the daemon-thread :meth:`check` that dumps **without** exiting at
       ``stall_after`` seconds — a soft observability fallback.
 
-    With the default config (``exit_after=25`` < ``stall_after=30``) the armed
-    timer ``_exit()``s the process before the soft dump's threshold is reached,
-    so :meth:`check` only actually emits when the armed timer is **disabled or
-    could not be armed** — i.e. ``exit_after=None`` (a dashboard-only process) or
-    an ``arm_later`` failure that degrades to soft-only.  It is a fallback, not a
-    second live layer in the gateway's default configuration.
+    When ``exit_after`` is below ``stall_after`` (the desktop default), the
+    armed timer exits before the soft threshold. When it is above
+    ``stall_after`` (the managed-service default), the soft dump records the
+    transient stall and the hard timer exits only if recovery never arrives.
 
     Args:
         stall_after: Seconds of heartbeat silence before the soft daemon-thread
-            dump fires.  Only reachable when the armed timer is off/failed (see
-            above).  Should comfortably exceed the heartbeat interval (default
-            heartbeat is 5s, so 30s ≈ 6 missed ticks avoids false positives).
+            dump fires. Should comfortably exceed the heartbeat interval
+            (default heartbeat is 5s, so 30s ≈ 6 missed ticks avoids false
+            positives).
         exit_after: Seconds of silence before the authoritative
             ``dump_traceback_later(exit=True)`` fires.  The timer is re-armed
             only on each :meth:`beat`, so the real silence tolerated before
-            ``_exit`` is ``exit_after`` minus up to one heartbeat interval (≈20s
-            at the 5s default heartbeat).  Kept below the external liveness
-            probe's kill window — the probe needs ``failure_threshold`` (3)
-            consecutive failed polls at its poll interval (10s), i.e. ≳20s — so
-            this in-process path generally wins and the faulthandler dump is
-            captured rather than lost to the probe's SIGKILL.  The two budgets
-            are close, so keep them in sync if either side is tuned.  ``None``
-            disables the armed timer (only the soft dump remains).
+            ``_exit`` is ``exit_after`` minus up to one heartbeat interval.
+            ``None`` disables the armed timer (only the soft dump remains).
         poll_interval: How often the daemon thread evaluates liveness.
         now: Monotonic clock, injectable for tests.
-        dump: Soft stack-dump callback, injectable for tests.  Defaults to
-            ``faulthandler.dump_traceback(all_threads=True)``.
+        dump: Soft stack-dump callback, injectable for tests. By default a
+            soft dump is stderr-only while the hard timer is armed, otherwise
+            it is written to both ``dump_file`` and stderr.
         arm_later: Arms the C-level dump-then-exit timer for N seconds,
             injectable for tests so they never arm a real process-killing timer.
             Defaults to :func:`_default_arm_later`.
@@ -200,7 +187,7 @@ class LoopStallWatchdog:
         self._poll_interval = poll_interval
         self._now = now
         self._dump_file = dump_file
-        self._dump = dump or (lambda: _default_dump(dump_file))
+        self._dump = dump
         self._arm_later = arm_later or (lambda t: _default_arm_later(t, dump_file))
         self._cancel_later = cancel_later or _default_cancel_later
         self._enrich_after = enrich_after
@@ -229,8 +216,22 @@ class LoopStallWatchdog:
         if self._later_active and self._exit_after is not None:
             try:
                 self._cancel_later()
+            except Exception:  # pragma: no cover - never let petting crash the loop
+                # Cancellation failed, so the previous timer may still own the
+                # crash file.  Keep the active flag rather than creating a
+                # competing soft sentinel on that uncertain path.
+                self._log.exception(
+                    "loop watchdog failed to cancel dump_traceback_later before re-arm"
+                )
+                return
+            try:
                 self._arm_later(self._exit_after)
             except Exception:  # pragma: no cover - never let petting crash the loop
+                # Cancellation succeeded but no replacement timer exists.  The
+                # soft watchdog must now write the discoverable file as well as
+                # stderr; leaving this true would silently lose both the hard
+                # exit and its crash artifact on the next stall.
+                self._later_active = False
                 self._log.exception(
                     "loop watchdog failed to re-arm dump_traceback_later"
                 )
@@ -278,7 +279,17 @@ class LoopStallWatchdog:
                     silence,
                 )
                 try:
-                    self._dump()
+                    if self._dump is not None:
+                        self._dump()
+                    elif self._later_active:
+                        # A managed service may recover before its wider hard
+                        # deadline. Keep that diagnostic in the journal; the
+                        # armed timer owns the fatal crash-sentinel file.
+                        _default_dump()
+                    else:
+                        # No hard timer can create a discoverable artifact, so
+                        # retain the soft-only dump in the dedicated file too.
+                        _default_dump(self._dump_file)
                 except Exception:  # pragma: no cover - dump must never crash the watchdog
                     self._log.exception("loop watchdog stack dump failed")
                 return True

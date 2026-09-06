@@ -18,6 +18,7 @@ from dataclasses import field as dataclass_field
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew import name_grant
 from kiro_crew.acp.client import AcpError, AcpPromptBusy, advertised_model_ids
 from kiro_crew.acp.types import EVENT_STEER_CONSUMED, TurnUsage
 from kiro_crew.config.loader import KiroCrewConfig
@@ -30,7 +31,13 @@ from kiro_crew.providers.base import (
     LLMEvent,
     LLMProvider,
 )
-from kiro_crew.security import is_denied, is_sensitive_bash_command, is_sensitive_path
+from kiro_crew.security import (
+    is_denied,
+    is_sensitive_bash_command,
+    is_sensitive_path,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel as _sel
 
 _PROMPT_BUSY_RETRIES = 2
@@ -217,6 +224,26 @@ def first_advertised_fallback(advertised: Any, rejected: str | None) -> str | No
 # across a 4-candidate chain).
 FALLBACK_CANDIDATE_ATTEMPTS = 2
 
+
+def fallback_rewound_transient_budget() -> int:
+    """Same-model counter value that grants a fresh fallback candidate its budget.
+
+    The dashboard's interactive ladder does not hold a :class:`FallbackState`
+    between turns — after a swap it rewinds ``slot._transient_5xx_retries`` so
+    the candidate gets exactly :data:`FALLBACK_CANDIDATE_ATTEMPTS` - 1 further
+    passes through the same-model retry branch (the re-queued turn itself is
+    the first attempt) before the next exhaustion advances the chain. Deriving
+    the rewind here keeps the per-candidate budget in ONE place with
+    :meth:`FallbackState.should_retry_active`, the encoding the unattended
+    surfaces use. Clamped at zero so the counter can never go negative:
+    a FALLBACK_CANDIDATE_ATTEMPTS above TRANSIENT_RETRIES + 1 cannot be
+    expressed by this counter encoding at all — it collapses to the full
+    same-model budget (the documented "deliberately not a fresh full budget"
+    stance caps the useful range at TRANSIENT_RETRIES + 1).
+    """
+    return max(0, TRANSIENT_RETRIES - (FALLBACK_CANDIDATE_ATTEMPTS - 1))
+
+
 # Provider attribute carrying the active fallback as ``(primary, candidate)``.
 # Doubles as (a) the sticky-restore marker — the next stream_and_collect call
 # on the same provider probes one ``set_model(primary)`` restore — and (b) the
@@ -225,6 +252,115 @@ FALLBACK_CANDIDATE_ATTEMPTS = 2
 # successful restore, never on turn completion: the swap is sticky for the
 # remainder of the session by design.
 TURN_FALLBACK_ATTR = "_kc_active_fallback"
+
+# Exception attribute carrying the chain-exhaustion story (set by the fallback
+# walks when every candidate also failed). The delivering surface appends it to
+# the terminal error text via :func:`append_fallback_story` so an unattended
+# failure names the whole walk, not just the last candidate's error.
+FALLBACK_STORY_ATTR = "_kc_fallback_story"
+
+# Bound on the story text a consumer will accept. The walked ids originate in
+# ``agent.fallback_model`` config (LLM-reachable via MCP) and the advertised
+# check fails OPEN on an empty list, so an arbitrarily long config string can
+# reach the walk — bound and redact it centrally before it rides any error
+# surface (WS frames, Slack alerts, log lines).
+_FALLBACK_STORY_CAP = 500
+
+
+def fallback_story_of(exc: BaseException) -> str:
+    """The chain-exhaustion story carried on *exc*, redacted+capped, or ``""``.
+
+    Reads :data:`FALLBACK_STORY_ATTR`; anything but a non-empty string is
+    treated as absent (the attribute is best-effort — a frozen exception type
+    may have refused the set, and a hostile ``__getattribute__`` must not
+    break error delivery). Redaction and the :data:`_FALLBACK_STORY_CAP`
+    bound live HERE so every consumer (cron alert, sub-agent error, heartbeat
+    log) gets the same safe text — no per-surface drift. Never raises.
+    """
+    try:
+        story = getattr(exc, FALLBACK_STORY_ATTR, None)
+        if not isinstance(story, str) or not story:
+            return ""
+        story = redact_credentials(redact_exfiltration_urls(story)[0])[0]
+    except Exception:  # noqa: BLE001 — a story must never break error delivery
+        logger.debug("fallback story read/redaction failed", exc_info=True)
+        return ""
+    return story[:_FALLBACK_STORY_CAP]
+
+
+def append_fallback_story(text: str, exc: BaseException, *, budget: int | None = None) -> str:
+    """Append *exc*'s chain-exhaustion story to terminal error *text*.
+
+    THE consumer for :data:`FALLBACK_STORY_ATTR` on unattended surfaces
+    (cron failure alerts, sub-agent ``info.error``, the heartbeat failure
+    log). The interactive dashboard does not use it — it rebuilds a richer
+    story from ``slot._fallback_walked``. No story ⇒ *text* is returned
+    unchanged (capped at *budget* when one is given). The story arrives
+    redacted+capped from :func:`fallback_story_of`. Never raises.
+
+    :param budget: optional total length bound for the composite. The ERROR
+        text is trimmed to leave the story room — the story is the part a
+        verbose backend error must never push out — but keeps a FLOOR of half
+        the budget: an oversized story (config-sourced ids can approach
+        :data:`_FALLBACK_STORY_CAP`, which may equal a caller's cap) must not
+        evict the actual error either, so past the floor it is the story tail
+        that truncates. Degenerate budgets (a handful of characters — no real
+        caller passes one) keep the error head and may lose the story
+        entirely. ``None`` appends unbounded (caller owns the cap); a
+        negative value is normalized to 0 (a negative slice would DROP the
+        bound instead of tightening it).
+    """
+    if budget is not None and budget < 0:
+        budget = 0
+    story = fallback_story_of(exc)
+    if not story:
+        return text if budget is None else text[:budget]
+    if budget is not None:
+        # Reserve " [" + story + "]" out of the budget, but never trim the
+        # error text below half the budget; the final cap then truncates the
+        # story tail instead.
+        text = text[: max(budget // 2, budget - len(story) - 3)]
+    out = f"{text} [{story}]" if text else story
+    return out if budget is None else out[:budget]
+
+
+def annotate_model_fallback(text: str, provider: Any) -> str:
+    """Prepend the throttle-fallback warning to a delivered unattended result.
+
+    Unattended surfaces (cron/heartbeat results, the sub-agent completion
+    event) have no chat card to announce a fallback swap on, so the delivered
+    result text itself carries the warning — the same visibility contract as
+    the interactive notice card. The marker is read from
+    :data:`TURN_FALLBACK_ATTR` (set by the shared fallback walk) and left in
+    place: the swap is sticky for the session, so every run served by the
+    fallback repeats the warning until the restore probe moves the session
+    back. Model ids come from config, which is LLM-reachable via MCP — redact
+    before they reach Slack/dashboard. One body for every surface (was two
+    spellings: ``slack/gateway`` + an inline block in ``subagent``). Never
+    raises: an annotation failure must not turn a successful run into a
+    failed one — the un-annotated *text* is returned instead.
+    """
+    try:
+        fb = getattr(provider, TURN_FALLBACK_ATTR, None)
+        if not fb:
+            return text
+        primary, candidate = fb
+        # Same threat model as _FALLBACK_STORY_CAP: the ids originate in
+        # config (LLM-reachable via MCP), so bound them as well as redacting.
+        safe_primary = redact_credentials(redact_exfiltration_urls(str(primary))[0])[0][
+            :_FALLBACK_STORY_CAP
+        ]
+        safe_candidate = redact_credentials(redact_exfiltration_urls(str(candidate))[0])[0][
+            :_FALLBACK_STORY_CAP
+        ]
+        line = (
+            f"⚠️ Model '{safe_primary}' throttled; this run was served by fallback "
+            f"'{safe_candidate}'."
+        )
+        return f"{line}\n\n{text}" if text else line
+    except Exception:  # noqa: BLE001 — annotation is best-effort visibility
+        logger.debug("fallback annotation failed", exc_info=True)
+        return text
 
 
 def provider_fallback_active(provider: Any) -> bool:
@@ -302,6 +438,37 @@ class FallbackState:
             return None
         self.pos += remaining.index(cand) + 1
         return cand
+
+    def should_retry_active(self) -> bool:
+        """Consume one more attempt on the active candidate, if budget remains.
+
+        THE single home of the per-candidate retry budget/trigger (was three
+        spellings: ``stream_and_collect`` Case 2.75, the sub-agent ladder, and
+        the dashboard's counter rewind — the last derives its counter from the
+        same constant via :func:`fallback_rewound_transient_budget`). ``True``
+        means the caller retries the active candidate once more (the attempt is
+        already recorded); ``False`` means no candidate is active or its
+        :data:`FALLBACK_CANDIDATE_ATTEMPTS` budget is spent — advance the chain
+        via :func:`advance_fallback_candidate`.
+        """
+        if self.active is None or self.attempts >= FALLBACK_CANDIDATE_ATTEMPTS:
+            return False
+        self.attempts += 1
+        return True
+
+    def exhaustion_story(self) -> str | None:
+        """One-line story of a spent chain walk, or ``None`` when none ran.
+
+        ``None`` (nothing was actually walked — e.g. every candidate was
+        skipped as unadvertised) means the error should surface exactly as it
+        did before the fallback feature existed, with no story attached.
+        """
+        if not self.walked:
+            return None
+        return (
+            f"{self.primary or 'the selected model'} throttled; "
+            f"fallbacks {', '.join(self.walked)} also unavailable"
+        )
 
 
 async def advance_fallback_candidate(
@@ -412,7 +579,10 @@ def resolve_substitute_set_model(provider: Any) -> Callable[[str], Awaitable[Non
     ``AcpClient.set_model`` / ``AcpSessionProvider.set_model`` does not fire
     for a served candidate.
     """
-    fn = getattr(provider, "set_model", None)
+    try:
+        fn = getattr(provider, "set_model", None)
+    except Exception:  # pragma: no cover - exotic property getters
+        fn = None
     if callable(fn):
         return fn
     for attr in ("client", "_client"):
@@ -420,7 +590,10 @@ def resolve_substitute_set_model(provider: Any) -> Callable[[str], Awaitable[Non
             inner = getattr(provider, attr, None)
         except Exception:  # pragma: no cover - exotic property getters
             inner = None
-        fn = getattr(inner, "set_model", None) if inner is not None else None
+        try:
+            fn = getattr(inner, "set_model", None) if inner is not None else None
+        except Exception:  # pragma: no cover - exotic property getters
+            fn = None
         if callable(fn):
             return fn
     return None
@@ -471,37 +644,89 @@ def provider_raw_model(provider: Any) -> str:
     return ""
 
 
-async def probe_fallback_restore(provider: Any, *, surface: str = "unattended") -> None:
+async def probe_fallback_restore(
+    provider: Any,
+    *,
+    surface: str = "unattended",
+    state: tuple[Any, Any] | None = None,
+    stale: bool = False,
+    clear: Callable[[], None] | None = None,
+    on_restored: Callable[[], None] | None = None,
+    log_suffix: str = "",
+) -> None:
     """One ``set_model(primary)`` restore probe at the start of a turn.
 
-    No-op unless :data:`TURN_FALLBACK_ATTR` marks an active fallback. The
-    restore only fires while the session is still on the fallback this feature
-    set (a user/session-level model change in between clears the marker without
-    touching the model — never override an explicit later pick). Success clears
-    the marker and logs (recovery is the quiet default: no chat notice);
-    failure keeps the fallback for this turn. Never raises.
+    THE single restore-probe body: the unattended surfaces call it bare (state
+    read from :data:`TURN_FALLBACK_ATTR`), and the dashboard's slot probe wraps
+    it (``chat_runner._probe_fallback_restore_for_slot_locked``) with the
+    slot-held state and hooks below, so the probe/witness/clear sequencing
+    cannot diverge across surfaces. The restore only fires while the session is
+    still on the fallback this feature set (a user/session-level model change
+    in between clears the sticky state without touching the model — never
+    override an explicit later pick). Success clears the state and logs
+    (recovery is the quiet default: no chat notice); failure keeps the fallback
+    for this turn. Never raises.
+
+    :param state: ``(primary, candidate)`` override. Default: read the
+        provider's :data:`TURN_FALLBACK_ATTR` marker (no-op when absent).
+    :param stale: caller-known extra staleness the marker cannot see (the
+        dashboard's explicit-pick generation check) — treated exactly like the
+        session having moved off the fallback.
+    :param clear: replaces the default marker clear (the dashboard drops slot
+        fields AND the marker as one logical record).
+    :param on_restored: hook running after a witnessed restore, before *clear*
+        (the dashboard's slot-model heal).
+    :param log_suffix: appended inside the log parentheses, e.g. ``", slot=k"``.
     """
-    state = getattr(provider, TURN_FALLBACK_ATTR, None)
-    if not state:
-        return
     try:
-        primary, candidate = state
+        # The whole state read is guarded: a hostile marker property, a
+        # raising ``__bool__``/``__str__``, or a malformed tuple must not
+        # break the "never raises" contract — an unreadable state simply
+        # skips the probe.
+        if state is None:
+            marker = getattr(provider, TURN_FALLBACK_ATTR, None)
+            if not marker:
+                return
+            primary, candidate = marker
+        else:
+            primary, candidate = state
+            if not candidate:
+                return
+        # Coerce ONCE; every later comparison uses the plain string. The
+        # marker path deliberately has no empty-candidate early return (a
+        # ``(primary, "")`` marker still probes and clears — pre-existing
+        # semantics), while the state path mirrors the slot probe's
+        # no-active-fallback no-op.
+        candidate = "" if candidate is None else str(candidate)
+        primary_missing = not primary
     except Exception:
+        logger.debug("fallback restore: unreadable fallback state; skipping probe", exc_info=True)
         return
+
+    def _default_clear() -> None:
+        try:
+            setattr(provider, TURN_FALLBACK_ATTR, None)
+        except Exception:
+            pass
+
+    def _run_hook(fn: Callable[[], None], what: str) -> None:
+        # Caller-supplied hooks must not break the never-raises contract: a
+        # failing heal/clear aborts the TURN it runs at the start of, which is
+        # far worse than the stale state it was tidying.
+        try:
+            fn()
+        except Exception:
+            logger.debug("fallback restore %s hook failed", what, exc_info=True)
+
+    _clear = clear if clear is not None else _default_clear
     current = provider_active_model(provider)
-    if current and candidate and current.strip().lower() != str(candidate).strip().lower():
+    if current and candidate and current.strip().lower() != candidate.strip().lower():
         # The session moved off our fallback by other means (explicit pick,
-        # session reset). The marker is stale — drop it, restore nothing.
-        try:
-            setattr(provider, TURN_FALLBACK_ATTR, None)
-        except Exception:
-            pass
+        # session reset). The sticky state is stale — drop it, restore nothing.
+        _run_hook(_clear, "clear")
         return
-    if not primary:
-        try:
-            setattr(provider, TURN_FALLBACK_ATTR, None)
-        except Exception:
-            pass
+    if stale or primary_missing:
+        _run_hook(_clear, "clear")
         return
     set_model_fn = resolve_substitute_set_model(provider)
     if set_model_fn is None:
@@ -510,11 +735,12 @@ async def probe_fallback_restore(provider: Any, *, surface: str = "unattended") 
         await set_model_fn(primary)
     except Exception as exc:
         logger.info(
-            "model fallback: primary %s still unavailable (%s); staying on %s " "(surface=%s)",
+            "model fallback: primary %s still unavailable (%s); staying on %s " "(surface=%s%s)",
             primary,
             exc,
             candidate,
             surface,
+            log_suffix,
         )
         return
     # Witness the restore before clearing: a non-raising set_model(primary)
@@ -524,24 +750,31 @@ async def probe_fallback_restore(provider: Any, *, surface: str = "unattended") 
     # backfill pin the temporary fallback permanently. Keep the marker and
     # retry at the next turn start instead.
     _raw = provider_raw_model(provider)
-    if _raw and candidate and _raw.strip().lower() == str(candidate).strip().lower():
+    if _raw and candidate and _raw.strip().lower() == candidate.strip().lower():
         logger.info(
             "model fallback: restore to %s was a silent no-op (still on %s); "
-            "keeping fallback (surface=%s)",
+            "keeping fallback (surface=%s%s)",
             primary,
             candidate,
             surface,
+            log_suffix,
         )
         return
-    try:
-        setattr(provider, TURN_FALLBACK_ATTR, None)
-    except Exception:
-        pass
+    if on_restored is not None:
+        # A failed heal does not block the clear: the two writes are one
+        # logical record, a half-cleared record is worse than a missed heal,
+        # and the stale-state paths above never heal either — retaining the
+        # record would not buy a retry of the heal. The dashboard's actual
+        # hooks are plain attribute writes that realistically cannot raise;
+        # this guard is for the "never raises" contract, not an expected path.
+        _run_hook(on_restored, "on_restored")
+    _run_hook(_clear, "clear")
     logger.warning(
-        "model fallback: restored %s -> %s (reason=primary-recovered, surface=%s)",
+        "model fallback: restored %s -> %s (reason=primary-recovered, surface=%s%s)",
         candidate,
         primary,
         surface,
+        log_suffix,
     )
 
 
@@ -849,7 +1082,11 @@ async def run_bg_oneliner(
                 from kiro_crew.dashboard.handlers.usage import persist_token_record_async
 
                 usage = provider_last_turn_usage(session, since=stats_before)
-                if usage.credits or usage.input_tokens or usage.output_tokens:
+                # One shared predicate across every persist gate: a claude-seam
+                # turn recovered through the live-stats path can bill cost or
+                # cache tokens with zero credits AND zero fresh token counts;
+                # a gate testing only the kiro dimensions silently drops it.
+                if usage_has_billing(usage):
                     await persist_token_record_async(
                         sel_session_key,
                         # The model the session SERVED, never the one requested: a
@@ -903,10 +1140,46 @@ def _attempt_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> TurnUsage:
     if since is not _NO_PRIOR_STATS and stats is since:
         return TurnUsage()
     try:
+        # Prefer the stats object's own converter: it is the single source of
+        # truth for stats -> TurnUsage and carries every billing dimension the
+        # turn filled (claude seam: token counts + cache fields + cost_usd; kiro:
+        # credits). Duck-typed so the doubles in tests (and any stats holder
+        # predating the converter) fall through to the credits-only constructor,
+        # which is byte-identical for the kiro seam. The converter's failure is
+        # contained so a faulty to_turn_usage degrades to the credits read
+        # rather than silently zeroing a turn that previously billed.
+        to_usage = getattr(stats, "to_turn_usage", None)
+        if callable(to_usage):
+            try:
+                usage = to_usage()
+            except Exception:
+                logger.debug("to_turn_usage failed; falling back to credits", exc_info=True)
+                usage = None
+            if isinstance(usage, TurnUsage):
+                return usage
         return TurnUsage(credits=float(getattr(stats, "credits", 0.0) or 0.0))
     except Exception:
         logger.debug("attempt usage read failed", exc_info=True)
     return TurnUsage()
+
+
+def usage_has_billing(usage: TurnUsage) -> bool:
+    """True when *usage* carries any billing dimension worth a row.
+
+    The single predicate behind every persist gate. Three hand-maintained
+    copies of ``credits or input_tokens or output_tokens`` is how the claude
+    seam's ``cost_usd`` (and a cost-free cache-only turn) got dropped in the
+    first place (#6758); a gate that reads this cannot drift from its siblings
+    when the next billing dimension is added.
+    """
+    return bool(
+        usage.credits
+        or usage.cost_usd
+        or usage.input_tokens
+        or usage.output_tokens
+        or usage.cache_creation_tokens
+        or usage.cache_read_tokens
+    )
 
 
 def _sum_usage(left: TurnUsage, right: TurnUsage) -> TurnUsage:
@@ -918,6 +1191,12 @@ def _sum_usage(left: TurnUsage, right: TurnUsage) -> TurnUsage:
             + int(getattr(right, "input_tokens", 0) or 0),
             output_tokens=int(getattr(left, "output_tokens", 0) or 0)
             + int(getattr(right, "output_tokens", 0) or 0),
+            cache_creation_tokens=int(getattr(left, "cache_creation_tokens", 0) or 0)
+            + int(getattr(right, "cache_creation_tokens", 0) or 0),
+            cache_read_tokens=int(getattr(left, "cache_read_tokens", 0) or 0)
+            + int(getattr(right, "cache_read_tokens", 0) or 0),
+            cost_usd=float(getattr(left, "cost_usd", 0.0) or 0.0)
+            + float(getattr(right, "cost_usd", 0.0) or 0.0),
         )
     except Exception:
         logger.debug("usage sum failed", exc_info=True)
@@ -954,8 +1233,10 @@ def provider_last_turn_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> 
     next caller preserving that pairing. A fresh turn installs fresh stats, so a
     stale total simply fails the identity check and the live read takes over.
 
-    On the ACP backend the only non-zero per-turn billing signal is ``credits``;
-    the token fields stay 0, matching the real usage record. Providers that expose
+    On the kiro (acp) seam the only non-zero per-turn billing signal is
+    ``credits``; on the claude seam the token counts, cache fields, and
+    ``cost_usd`` are filled instead. Whichever dimensions the turn's stats
+    carried come through :meth:`to_turn_usage` intact. Providers that expose
     no stats (non-ACP backends, test doubles) yield an empty ``TurnUsage``
     (credits=0). Never raises.
     """
@@ -1122,8 +1403,10 @@ async def background_turn(
 
                 # A turn that never reached the provider bills nothing and has no
                 # row to write; the same guard the chat path applies keeps
-                # acquire-time failures from landing as zero-credit noise.
-                if usage.credits or usage.input_tokens or usage.output_tokens:
+                # acquire-time failures from landing as zero-credit noise. The
+                # shared predicate covers the claude seam's cost and cache
+                # dimensions alongside the kiro credits/token signals.
+                if usage_has_billing(usage):
                     await persist_token_record_async(
                         BACKGROUND_KEY,
                         "",
@@ -1452,12 +1735,9 @@ async def stream_and_collect(
                 and acp_error_is_transient(exc)
                 and transient_attempts >= _TRANSIENT_RETRIES
             ):
-                if (
-                    _fb_state.active is not None
-                    and _fb_state.attempts < FALLBACK_CANDIDATE_ATTEMPTS
-                ):
-                    # Final attempt on the current candidate.
-                    _fb_state.attempts += 1
+                if _fb_state.should_retry_active():
+                    # Final attempt on the current candidate — the shared
+                    # budget body already recorded it.
                     delay = transient_retry_delay(1)
                     logger.warning(
                         "model fallback: candidate %s still failing (attempt %d/%d), "
@@ -1481,21 +1761,18 @@ async def stream_and_collect(
                     await asyncio.sleep(transient_retry_delay(1))
                     retrying = True
                     continue
-                if _fb_state.walked:
+                _story = _fb_state.exhaustion_story()
+                if _story:
                     # Chain exhausted: surface the ORIGINAL error class with the
                     # chain's story attached for the delivering surface, and
                     # keep the incident greppable.
-                    _story = (
-                        f"{_fb_state.primary or 'the selected model'} throttled; "
-                        f"fallbacks {', '.join(_fb_state.walked)} also unavailable"
-                    )
                     logger.warning(
                         "model fallback: chain exhausted (%s); surfacing original error: %s",
                         _story,
                         exc,
                     )
                     try:
-                        exc._kc_fallback_story = _story  # type: ignore[attr-defined]
+                        setattr(exc, FALLBACK_STORY_ATTR, _story)
                     except Exception:
                         pass
                 # Fall through to Case 2.5 / Case 3.
@@ -1795,9 +2072,41 @@ async def _resolve_permission(
             )
             return False
         if tool_result.action == TOOL_AUTO_APPROVE:
-            await provider.approve_tool(event.request_id)
-            _log("auto_approved", metadata={"reason": "hook_auto_approve"})
-            return True
+            # The hook granted this by NAME (its `auto_approve_tools` globs, or
+            # the read-only allowlist). Verify it UNCONDITIONALLY: this helper
+            # serves unattended callers (cron / autonudge / heartbeat / Meetings
+            # transcript turns), some of which pass no approver, and the shell
+            # resolves the command's program names again through a PATH that can
+            # lead with agent-writable directories. A refusal DOWNGRADES to the
+            # caller's normal path — the interactive approver when one is
+            # present, else deny-by-default (reject) below — never a
+            # silent auto-approve of a shadowed name on an unwatched turn.
+            _ng_refusal = await name_grant.refusal_for_event(event)
+            if _ng_refusal is None:
+                await provider.approve_tool(event.request_id)
+                _log("auto_approved", metadata={"reason": "hook_auto_approve"})
+                return True
+            logger.warning(
+                "declining a hook auto-approve: %s; the request falls through "
+                "to this caller's approval path",
+                _ng_refusal.log_text,
+            )
+            name_grant.log_decline(
+                source="",
+                session_key=session_key,
+                agent=agent,
+                event=event,
+                refusal=_ng_refusal,
+                tier="hook_auto_approve",
+                sel_factory=sel,
+            )
+            # No interactive approver on this caller: the hook grant was the
+            # only positive authorization and it was withheld, so fall through
+            # to deny-by-default rather than the caller-less auto-approve below.
+            if on_tool_approval is None:
+                await provider.reject_tool(event.request_id)
+                _log("rejected", metadata={"reason": "name_grant_headless_reject"})
+                return False
 
     # Interactive approval if callback provided
     if on_tool_approval:

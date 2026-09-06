@@ -19,7 +19,8 @@ from typing import Any
 import pytest
 
 from kiro_crew.apps.builtins.auto_improvement.backend import ledger_admin as la
-from kiro_crew.apps.builtins.auto_improvement.backend import store
+from kiro_crew.apps.builtins.auto_improvement.backend import routes, store
+from kiro_crew.apps.builtins.auto_improvement.spine import ledger as spine_ledger
 
 REAL_PR = "https://github.com/o/r/pull/7"
 
@@ -148,8 +149,6 @@ class TestForget:
         so an event carrying an unexpected key is DROPPED, the fingerprint never
         enters the index as purged, and the locus stays deduped. The purge would look
         like it worked and change nothing."""
-        from kiro_crew.apps.builtins.auto_improvement.spine import ledger as spine_ledger
-
         _write_ledger(data_home, [_row("f1", "failed_gate")])
         assert spine_ledger.Ledger(store.ledger_path()).known("f1") is True
 
@@ -161,8 +160,6 @@ class TestForget:
     def test_status_purged_matches_the_spine_constant(self) -> None:
         """The literal here mirrors the spine's constant to avoid importing the whole
         engine on a request path. Pin them together so the mirror cannot drift."""
-        from kiro_crew.apps.builtins.auto_improvement.spine import ledger as spine_ledger
-
         assert la.STATUS_PURGED == spine_ledger.STATUS_PURGED
 
     def test_unknown_fingerprint_is_refused(self, data_home: Path) -> None:
@@ -577,9 +574,6 @@ class TestManualDraftRowSurvivesReload:
     """
 
     def test_filed_marker_enters_the_dedup_index(self, data_home: Path) -> None:
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes
-        from kiro_crew.apps.builtins.auto_improvement.spine import ledger as spine_ledger
-
         # A prior soft-terminal row, as after an automatic draft failed (no gh/network).
         _write_ledger(data_home, [_row("f9", "error")])
         routes.ledger_admin_record("f9", "https://github.com/o/r/pull/7")
@@ -594,12 +588,212 @@ class TestManualDraftRowSurvivesReload:
     def test_row_is_loadable_even_with_no_prior_row(self, data_home: Path) -> None:
         """``kind``/``target`` are required, so they must be present unconditionally —
         not only on the path where a prior row supplied them."""
-        from kiro_crew.apps.builtins.auto_improvement.backend import routes
-        from kiro_crew.apps.builtins.auto_improvement.spine import ledger as spine_ledger
-
         store.ledger_path().parent.mkdir(parents=True, exist_ok=True)
         routes.ledger_admin_record("f10", "https://github.com/o/r/pull/8")
 
         reloaded = spine_ledger.Ledger(store.ledger_path())
         assert "f10" in reloaded._seen
         assert reloaded._seen["f10"].cr.endswith("/8")
+
+
+class TestManualFiledWriteSharesTheForgetLockDomain:
+    """The manual-draft ``filed`` write must serialize against ``forget`` under the
+    SAME ``_LEDGER_LOCK`` that ``forget`` / ``purge`` hold — not a different lock domain.
+
+    The regression this pins: a finding sits ``filed`` with a ``QUEUED:<fp>`` placeholder
+    (queued, no real pull request yet). A ``forget`` reads that placeholder and decides it
+    is safe to clear (``is_real_pr_reference`` is False), then appends ``purged``.
+    Concurrently the manual draft opens a real pull request and records a ``filed`` row
+    carrying its URL. When the two writes live in DIFFERENT lock domains they interleave
+    as ``filed(real PR)`` THEN ``purged`` — the later ``purged`` wins last-write-wins, so
+    ``known()`` reports the locus unknown, the findings list drops the row, and the next
+    discovery cycle drafts a SECOND pull request for a change already up for review.
+
+    Unifying both under ``_LEDGER_LOCK`` makes each caller's read→decide→append atomic:
+    ``forget`` runs either entirely before the filed write (then the filed write
+    supersedes the purge with the real PR) or entirely after it (then, seeing the real
+    PR, ``forget`` REFUSES with ``has_pull_request``). Both serialized outcomes leave the
+    real pull request as the current state; the interleaved one does not.
+
+    Determinism without sleeps: the ``forget`` thread is paused at its DECISION point
+    (right after it reads the ledger and before it appends ``purged``) and there released
+    the filed writer. If the writes share one lock, the filed writer is parked on
+    ``_LEDGER_LOCK`` — which ``forget`` still holds — so it cannot append until ``forget``
+    finishes and releases; the shared lock, not the test, orders them. If they do NOT
+    share the lock (the bug), the filed writer runs to completion inside ``forget``'s
+    critical section and lands its ``filed`` row BEFORE ``forget``'s ``purged`` — the
+    interleaving the invariant below rejects. A timeout bounds the pause so a fixed build
+    (where the writer is correctly blocked) never hangs.
+    """
+
+    def test_forget_and_manual_filed_write_do_not_interleave(
+        self, data_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A queued-but-not-yet-drafted finding: filed, reference is a QUEUED placeholder.
+        _write_ledger(data_home, [_row("fp1", "filed", cr="QUEUED:fp1")])
+
+        forget_decided = threading.Event()  # forget has read+decided, is about to append
+        filed_may_start = threading.Event()  # release the filed writer
+        filed_done = threading.Event()  # the filed writer's record() has returned
+
+        # Hook forget's decision point: `_purged_event` is built inside forget AFTER the
+        # read and BEFORE the append, while `_LEDGER_LOCK` is held. Releasing the filed
+        # writer here means it must contend for the lock against a holder that has already
+        # decided — exactly the window the bug exploited.
+        original_purged_event = la._purged_event
+
+        def _hooked_purged_event(prior: dict[str, Any], note: str) -> dict[str, Any]:
+            forget_decided.set()
+            filed_may_start.set()
+            # Wait for the filed writer to fully COMPLETE its record. On the BUGGY build it
+            # is not under this lock, so it runs to completion here and `filed_done` is set
+            # → forget then appends `purged` AFTER the real filed row (the interleaving).
+            # On the FIXED build it is blocked on the shared `_LEDGER_LOCK` that forget
+            # still holds, so `filed_done` never sets within the timeout, forget proceeds
+            # and releases the lock, and the filed row lands cleanly afterwards — no hang.
+            filed_done.wait(timeout=1.0)
+            return original_purged_event(prior, note)
+
+        monkeypatch.setattr(la, "_purged_event", _hooked_purged_event)
+
+        results: dict[str, Any] = {}
+
+        def _forget() -> None:
+            results["forget"] = la.forget("fp1")
+
+        def _filed() -> None:
+            filed_may_start.wait(timeout=5.0)
+            # Drive the PUBLIC route entry point, not the helper directly: it is what the
+            # dashboard's manual-draft path calls, and reverting the production fix returns
+            # it to a lock-free append — which is exactly what must turn this test red.
+            routes.ledger_admin_record("fp1", REAL_PR)
+            results["filed"] = True
+            filed_done.set()
+
+        threads = [threading.Thread(target=_forget), threading.Thread(target=_filed)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+        assert not any(t.is_alive() for t in threads), "a writer deadlocked"
+        assert forget_decided.is_set(), "forget never reached its decision point"
+
+        # THE INVARIANT: the current state of fp1 must reflect the real pull request. A
+        # `purged` row sitting on top of the real `filed(REAL_PR)` row is the exact bug —
+        # it hides a live PR and re-opens the locus for duplicate drafting.
+        latest = {r["fp"]: r for r in la.latest_records()}["fp1"]
+        statuses = [r.get("status") for r in _events(data_home)]
+        assert latest["status"] == "filed", f"the manual filed PR was hidden; tail = {statuses}"
+        assert la.pr_reference(latest) == REAL_PR
+
+        # The dedup index agrees: the locus stays known, so no second PR is drafted.
+        reloaded = spine_ledger.Ledger(store.ledger_path())
+        assert reloaded.known("fp1") is True
+
+        # If forget ran AFTER the real PR was recorded, it must have REFUSED rather than
+        # purged — a forget that clears a locus with a live PR is itself the defect.
+        if results["forget"].get("ok"):
+            assert results["filed"] is True  # forget ran first; the filed write superseded
+            assert "purged" in statuses
+        else:
+            assert results["forget"]["reason"] == "has_pull_request"
+
+    def test_record_filed_is_a_public_shared_helper(self, data_home: Path) -> None:
+        """The manual filed write is a named ``ledger_admin`` helper, not a hand-rolled
+        append in the route — so it shares the module's lock and prior-row handling."""
+        _write_ledger(data_home, [_row("fp2", "seen")])
+        assert la.record_filed("fp2", REAL_PR) is True
+        latest = {r["fp"]: r for r in la.latest_records()}["fp2"]
+        assert latest["status"] == "filed"
+        assert la.pr_reference(latest) == REAL_PR
+        # kind/target carried from the prior row so the timeline row stays identifiable
+        # AND the spine dataclass load does not drop it.
+        reloaded = spine_ledger.Ledger(store.ledger_path())
+        assert "fp2" in reloaded._seen
+        assert reloaded._seen["fp2"].kind == "bug"
+        assert reloaded._seen["fp2"].target == "src/x.py::f"
+
+    def test_forget_cannot_hide_the_loops_own_in_run_filed_write(
+        self, data_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`forget`/`purge` must serialize against the LOOP'S OWN filing writer too —
+        ``spine.ledger.Ledger.record`` — not only the operator's manual write.
+
+        The loop files a finding by constructing a ``spine.ledger.Ledger`` on the same
+        ``store.ledger_path()`` and calling ``record()`` on a run worker thread (via
+        ``spine.pr_pipeline``). Before the shared lock, ``Ledger.record`` appended under the
+        instance's OWN ``self._lock`` — a third lock domain — so an operator ``forget``
+        concurrent with the loop filing that locus could still land ``filed(real PR)`` then
+        ``purged`` and re-open the locus for a duplicate PR. Both now hold
+        ``spine.ledger_lock.LEDGER_WRITE_LOCK``, so the sequences serialize.
+
+        Deterministic, no sleeps: ``forget`` is paused at its decision point (hooking
+        ``_purged_event``, built under the lock) and there releases the spine writer. If the
+        two share the lock, the spine ``record()`` is parked on ``LEDGER_WRITE_LOCK`` that
+        ``forget`` still holds and cannot append until ``forget`` finishes — the shared lock,
+        not the test, orders them (``spine_done`` times out, ``forget`` proceeds, no hang). If
+        they did NOT share it (the pre-fix third domain), ``record()`` runs to completion
+        inside ``forget``'s critical section and lands ``filed(real PR)`` before ``purged`` —
+        the interleaving the invariant rejects.
+        """
+        _write_ledger(data_home, [_row("fp3", "filed", cr="QUEUED:fp3")])
+
+        forget_decided = threading.Event()
+        spine_may_start = threading.Event()
+        spine_done = threading.Event()
+
+        original_purged_event = la._purged_event
+
+        def _hooked_purged_event(prior: dict[str, Any], note: str) -> dict[str, Any]:
+            forget_decided.set()
+            spine_may_start.set()
+            spine_done.wait(timeout=1.0)
+            return original_purged_event(prior, note)
+
+        monkeypatch.setattr(la, "_purged_event", _hooked_purged_event)
+
+        results: dict[str, Any] = {}
+
+        def _forget() -> None:
+            results["forget"] = la.forget("fp3")
+
+        def _loop_file() -> None:
+            spine_may_start.wait(timeout=5.0)
+            # The loop's own filing path: a Ledger on the SAME file, record() on a worker
+            # thread — exactly what spine.pr_pipeline does when it files a finding.
+            ledger = spine_ledger.Ledger(store.ledger_path())
+            ledger.record(
+                spine_ledger.LedgerEntry(
+                    fp="fp3",
+                    kind="bug",
+                    target="src/x.py::f",
+                    status=spine_ledger.STATUS_FILED,
+                    cr=REAL_PR,
+                )
+            )
+            spine_done.set()
+
+        threads = [threading.Thread(target=_forget), threading.Thread(target=_loop_file)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10.0)
+        assert not any(t.is_alive() for t in threads), "a writer deadlocked"
+        assert forget_decided.is_set(), "forget never reached its decision point"
+
+        latest = {r["fp"]: r for r in la.latest_records()}["fp3"]
+        statuses = [r.get("status") for r in _events(data_home)]
+        assert latest["status"] == "filed", f"the loop's filed PR was hidden; tail = {statuses}"
+        assert la.pr_reference(latest) == REAL_PR
+        reloaded = spine_ledger.Ledger(store.ledger_path())
+        assert reloaded.known("fp3") is True
+
+        if results["forget"].get("ok"):
+            assert "purged" in statuses  # forget ran first; the loop's record superseded it
+        else:
+            assert results["forget"]["reason"] == "has_pull_request"
+
+    def test_manual_and_spine_writers_share_one_lock_object(self) -> None:
+        """The unified fix is one lock OBJECT across both layers — pin identity so a future
+        refactor cannot silently re-split the domains back apart."""
+        assert la._LEDGER_LOCK is spine_ledger.LEDGER_WRITE_LOCK

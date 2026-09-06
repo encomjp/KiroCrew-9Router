@@ -73,6 +73,8 @@ jobs:
       - name: Checkout manifest verifier contract
         if: env.HAS_PUBLISH_ROLE && env.HAS_MANIFEST_KEY
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Download wheel artifact
         if: env.HAS_PUBLISH_ROLE && env.HAS_MANIFEST_KEY
@@ -94,11 +96,13 @@ jobs:
       - name: Locate wheel and compute checksum
         id: wheel
         if: env.HAS_PUBLISH_ROLE && env.HAS_MANIFEST_KEY
+        env:
+          WHEEL_ARTIFACT: ${{ inputs.wheel_artifact }}
         run: |
           set -euo pipefail
           mapfile -t WHEELS < <(find cli-dist -type f -name '*.whl' -print)
           if [ "${#WHEELS[@]}" -ne 1 ]; then
-            echo "::error::Expected exactly one .whl in artifact '${{ inputs.wheel_artifact }}'; found ${#WHEELS[@]}"
+            echo "::error::Expected exactly one .whl in artifact '${WHEEL_ARTIFACT}'; found ${#WHEELS[@]}"
             exit 1
           fi
           WHEEL="${WHEELS[0]}"
@@ -173,11 +177,26 @@ jobs:
           # source commit instead.
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$GITHUB_SHA")
           PUB_DATE=$(date -u -d "@${SOURCE_DATE_EPOCH}" +%Y-%m-%dT%H:%M:%SZ)
+          # The forced-update floor, declared in packaging/MIN_VERSION (comments
+          # and blank lines ignored; at most one value line). Empty means no
+          # floor and the signed payload omits the field entirely, keeping the
+          # manifest byte-identical to the pre-floor format. More than one value
+          # line is a merge artifact and must fail the publish, not pick a line.
+          MIN_VERSION=$(grep -v '^[[:space:]]*#' packaging/MIN_VERSION | grep -v '^[[:space:]]*$' || true)
+          if [ "$(printf '%s\n' "$MIN_VERSION" | grep -c .)" -gt 1 ]; then
+            echo "::error::packaging/MIN_VERSION carries more than one value line."
+            exit 1
+          fi
+          # Trim ONLY leading/trailing whitespace. Internal whitespace must
+          # SURVIVE to the validator so a malformed declaration like '0. 6.0'
+          # fails the publish loudly instead of being silently folded into a
+          # well-formed floor nobody declared.
+          MIN_VERSION=$(printf '%s' "$MIN_VERSION" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
           python3 packaging/signing/cli-manifest.py payload \
             --channel "$CHANNEL" --version "$WHEEL_VERSION" \
             --wheel-url "${CDN_BASE}/cli/${CHANNEL}/${WHEEL_VERSION}/${WHEEL_NAME}" \
             --sha256 "$SHA256" --python-requires "$PYREQ" \
-            --pub-date "$PUB_DATE" \
+            --pub-date "$PUB_DATE" --min-version "$MIN_VERSION" \
             --public-key "$PUBLIC_KEY" --output "$PAYLOAD"
           python3 packaging/signing/cli-manifest.py kms-sign \
             --payload "$PAYLOAD" --key-arn "$KEY_ARN" \
@@ -246,10 +265,51 @@ jobs:
           put_immutable "${PREFIX}/SHA256SUMS" "${SUMS_DIR}/SHA256SUMS"
           put_immutable "${PREFIX}/cli-manifest.json" "$MANIFEST_PATH"
 
-          # Signature fields are additive to the legacy channel/version/
-          # wheel_url/sha256 schema, so old clients remain parse-compatible.
-          aws s3 cp "$MANIFEST_PATH" "s3://${BUCKET}/feed/${CHANNEL}/latest-cli.json" \
-            --content-type application/json --cache-control no-cache
+          # Feed monotonicity guard: the channel feed is a mutable
+          # last-writer-wins pointer, and a hotfix cut on an OLD release
+          # line (0.4.1 while the channel serves 0.5.0) must publish its
+          # versioned assets WITHOUT dragging every client on the channel
+          # backward into a downgrade offer. Two signals: the live feed
+          # via the public CDN (the publish role is Put-only on feed/*,
+          # so no S3 read-back; the CDN copy can be up to max-age stale)
+          # and the repo's tags via ls-remote (pushed before any run
+          # starts, closing the staleness window). Any strictly-newer
+          # candidate holds the pointer; equality advances so a re-run
+          # of the current release stays idempotent.
+          FEED_KEY="feed/${CHANNEL}/latest-cli.json"
+          # Fail CLOSED on transport errors: only confirmed absence (404, or
+          # 403 -- S3-backed CloudFront answers 403 for a missing key) reads
+          # as "no feed yet". Treating an outage as absence would advance on
+          # degraded evidence -- the exact rollback this guard prevents.
+          FEED_HTTP=$(curl -sS --retry 3 --retry-delay 2 \
+            -o /tmp/current-feed.json -w '%{http_code}' "${CDN_BASE}/${FEED_KEY}") \
+            || { echo "::error::channel feed fetch failed (transport)"; exit 1; }
+          case "$FEED_HTTP" in
+            200) ;;
+            403|404) : > /tmp/current-feed.json ;;
+            *) echo "::error::channel feed fetch returned HTTP ${FEED_HTTP}"; exit 1 ;;
+          esac
+          # awk does the ^{} peel-ref filtering (awk always exits 0 on empty
+          # input, unlike grep -v); an ls-remote failure aborts via pipefail.
+          git ls-remote --tags origin 'refs/tags/v*' \
+            | awk -F/ '$NF !~ /\^\{\}$/ {print $NF}' > /tmp/repo-tags.txt
+          VERDICT=$(python3 scripts/check_feed_advance.py \
+            --new "${WHEEL_VERSION}" --channel "${CHANNEL}" \
+            --current-file /tmp/current-feed.json \
+            --tags-file /tmp/repo-tags.txt --self "${GITHUB_REF_NAME}" || true)
+          if [ "$VERDICT" = "advance" ]; then
+            # Signature fields are additive to the legacy channel/version/
+            # wheel_url/sha256 schema, so old clients remain parse-compatible.
+            aws s3 cp "$MANIFEST_PATH" "s3://${BUCKET}/${FEED_KEY}" \
+              --content-type application/json --cache-control no-cache
+            FEED_NOTE="\`${FEED_KEY}\`"
+          elif [ "$VERDICT" = "hold" ]; then
+            echo "::notice::${FEED_KEY} already serves a newer version; pointer NOT moved (hotfix on an old line). Versioned assets are published."
+            FEED_NOTE="not moved (channel already serves a newer version)"
+          else
+            echo "::error::feed guard returned neither advance nor hold (got: '${VERDICT}')"
+            exit 1
+          fi
 
           {
             echo "## CLI Published (${CHANNEL})"
@@ -257,7 +317,7 @@ jobs:
             echo "- Version: \`${WHEEL_VERSION}\`"
             echo "- Signed manifest: \`${PREFIX}/cli-manifest.json\`"
             echo "- Key: \`${MANIFEST_KEY_ID}\`"
-            echo "- Feed: \`feed/${CHANNEL}/latest-cli.json\`"
+            echo "- Feed: ${FEED_NOTE}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Publish PEP 503 simple index

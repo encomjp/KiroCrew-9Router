@@ -586,20 +586,36 @@ class AcpSessionProvider(LLMProvider):
         Raises :class:`AcpModelUnavailable` so the caller surfaces it as a user
         error instead of recovering with a session reset — a reset here would
         destroy the live conversation and still land on a different model.
+
+        A refusal is never issued on the session-init snapshot alone. That
+        snapshot is one answer, captured at one instant, and a lookup racing a
+        token refresh can answer with the default tier — freezing a
+        false "not entitled" verdict into the session for its whole life. So a
+        would-be refusal first revalidates against a fresh backend probe
+        (:meth:`AcpSessionHandle.refresh_available_models`) and only stands if
+        the fresh answer ALSO lacks the model. A failed probe keeps the stale
+        verdict (fail-safe: no evidence, no entitlement granted).
         """
         advertised = advertised_model_ids(self._handle.available_models)
         if model_is_unusable(model_id, advertised):
-            # PERMANENT guard: a model the active backend does not advertise
-            # must never reach the wire — whatever leaked it (a persisted slot
-            # from a previous provider, a stale picker value, a resumed chat).
-            # Fall back to 'auto' (the backend's own advertised default) so a
-            # new session runs instead of erroring. Only raise when 'auto'
-            # itself is unusable (a genuinely broken entitlement).
-            if "auto" in advertised:
-                model_id = "auto"
-                await self._guarded(self._handle.set_model("auto"))
-                return
-            raise AcpModelUnavailable(model_id, advertised)
+            # Upstream: revalidate against a fresh backend probe before the
+            # refusal stands. Fork delta: PERMANENT guard — a model the active
+            # backend does not advertise must never reach the wire (whatever
+            # leaked it: a persisted slot from a previous provider, a stale
+            # picker value, a resumed chat). Fall back to 'auto' (the backend's
+            # own advertised default) so a new session runs instead of erroring.
+            # Only raise when 'auto' itself is unusable (a genuinely broken
+            # entitlement).
+            fresh = advertised_model_ids(
+                await self._guarded(self._handle.refresh_available_models())
+            )
+            effective = fresh or advertised
+            if model_is_unusable(model_id, effective):
+                if "auto" in effective:
+                    model_id = "auto"
+                    await self._guarded(self._handle.set_model("auto"))
+                    return
+                raise AcpModelUnavailable(model_id, effective)
         await self._guarded(self._handle.set_model(model_id))
 
     async def set_mode(self, agent_name: str) -> None:

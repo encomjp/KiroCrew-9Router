@@ -165,7 +165,10 @@ describe('/side while a turn is running', () => {
     fireEvent.change(input, { target: { value: 'plain steer text' } })
     await armRunning(store)
     fireEvent.keyDown(input, { key: 'Enter' })
-    await waitFor(() => expect(mockSteerChat).toHaveBeenCalledWith('plain steer text', SLOT))
+    // The third argument is the client-minted send-correlation id the steer
+    // path stamps on its optimistic bubble (#6075) — pin its shape, not its
+    // random value.
+    await waitFor(() => expect(mockSteerChat).toHaveBeenCalledWith('plain steer text', SLOT, expect.stringMatching(/^s-/)))
     expect(mockSendChat).not.toHaveBeenCalled()
   })
 

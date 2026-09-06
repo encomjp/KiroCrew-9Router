@@ -26,6 +26,7 @@ from concurrent import futures
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 import pytest
 from meetings_helpers import (  # noqa: F401
@@ -239,13 +240,36 @@ class TestParseDt:
         # 09:00 PST (UTC-8 in January) == 17:00 UTC.
         assert parsed == datetime(2026, 1, 15, 17, 0, tzinfo=timezone.utc)
 
-    def test_an_unknown_tzid_degrades_to_utc_rather_than_dropping(self):
+    def test_a_windows_zone_name_is_mapped_to_iana(self):
+        """Exchange/Outlook stamp Windows/CLDR names, not IANA keys.
+
+        `TZID=Romance Standard Time` is Europe/Paris; without the mapping the
+        wall-clock time was read as UTC (a whole-timezone shift). 16:00 Paris in
+        August (UTC+2) == 14:00 UTC.
+        """
+        parsed = cal._parse_dt("20260827T160000", ";TZID=Romance Standard Time")
+        assert parsed == datetime(2026, 8, 27, 14, 0, tzinfo=timezone.utc)
+
+    def test_a_windows_zone_name_honours_dst_at_the_event_date(self):
+        """Mapped zone uses the IANA rules for THAT date, not a fixed offset.
+
+        Pacific Standard Time -> America/Los_Angeles. 09:00 in January is PST
+        (UTC-8) == 17:00 UTC; the same clock time in August would be UTC-7.
+        """
+        parsed = cal._parse_dt("20260115T090000", ";TZID=Pacific Standard Time")
+        assert parsed == datetime(2026, 1, 15, 17, 0, tzinfo=timezone.utc)
+
+    def test_a_quoted_windows_zone_name_is_mapped(self):
+        parsed = cal._parse_dt("20260827T160000", ';TZID="Romance Standard Time"')
+        assert parsed == datetime(2026, 8, 27, 14, 0, tzinfo=timezone.utc)
+
+    def test_an_unmappable_tzid_degrades_to_utc_rather_than_dropping(self):
         """A visible meeting at a possibly-wrong hour beats a missing one.
 
-        Some exporters emit a Windows zone name or a custom VTIMEZONE id, neither
-        of which is an IANA key.
+        A custom VTIMEZONE id that is neither an IANA key nor a known Windows
+        name still degrades to reading the wall-clock time as UTC.
         """
-        parsed = cal._parse_dt("20260803T090000", ";TZID=Pacific Standard Time")
+        parsed = cal._parse_dt("20260803T090000", ";TZID=Custom Made-Up Zone 42")
         assert parsed == datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc)
 
     def test_a_floating_time_is_read_as_utc(self):
@@ -262,6 +286,56 @@ class TestParseDt:
     def test_a_malformed_value_is_none(self):
         assert cal._parse_dt("not-a-date", "") is None
         assert cal._parse_dt("", "") is None
+
+    def test_a_zone_beyond_the_original_subset_is_mapped(self):
+        """The table is the FULL CLDR 001 mapping, not a hand-picked subset.
+
+        `FLE Standard Time` (Europe/Kyiv) was absent from the original 28-entry
+        table, so an Exchange export from that zone silently kept the
+        whole-offset bug the PR exists to fix. 12:00 Kyiv in January (UTC+2)
+        == 10:00 UTC.
+        """
+        parsed = cal._parse_dt("20260115T120000", ";TZID=FLE Standard Time")
+        assert parsed == datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+
+    def test_another_previously_missing_zone_is_mapped(self):
+        """`GTB Standard Time` -> Europe/Bucharest. 12:00 in August (UTC+3) == 09:00 UTC."""
+        parsed = cal._parse_dt("20260827T120000", ";TZID=GTB Standard Time")
+        assert parsed == datetime(2026, 8, 27, 9, 0, tzinfo=timezone.utc)
+
+
+class TestWindowsToIanaTable:
+    """Shape invariants of the full CLDR ``windowsZones`` 001-territory table."""
+
+    def test_every_value_resolves_under_zoneinfo(self):
+        """A row whose value ZoneInfo cannot load is dead weight — the second
+        lookup in `_tzid_of` would raise and degrade to UTC exactly as if the
+        row were absent, silently re-opening the whole-offset bug for that zone.
+        """
+        unresolvable = []
+        for win, iana in cal._WINDOWS_TO_IANA.items():
+            try:
+                ZoneInfo(iana)
+            except Exception:  # noqa: BLE001 - any failure means a dead row
+                unresolvable.append((win, iana))
+        assert unresolvable == []
+
+    def test_every_key_is_lowercase_and_stripped(self):
+        """`_tzid_of` looks up ``name.lower()`` on an already-stripped name, so
+        a key with uppercase letters or edge whitespace is unreachable.
+        """
+        bad = [
+            k
+            for k in cal._WINDOWS_TO_IANA
+            if k != k.lower() or k != k.strip()
+        ]
+        assert bad == []
+
+    def test_the_table_carries_the_full_cldr_001_set(self):
+        """CLDR ``windowsZones`` maps 139 Windows ids for territory 001; a
+        shrinking table means someone re-introduced the hand-picked-subset gap.
+        """
+        assert len(cal._WINDOWS_TO_IANA) >= 139
 
 
 class TestEventId:

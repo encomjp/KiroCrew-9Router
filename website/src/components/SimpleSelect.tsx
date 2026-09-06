@@ -83,10 +83,10 @@ export default function SimpleSelect({ options, optionLabels, value, onChange, a
         id={id}
         aria-label={ariaLabel}
         disabled={disabled}
-        // On the Radix path `style` lands on the wrapper div; here it lands on the
-        // control itself, which is where a native form control expects it. No
-        // caller passes `style` today, so the two never diverge in practice.
-        style={style}
+        // `style` lands on the WRAPPER on both paths. It is layout intent (a flex
+        // basis, a min-width), and on this path the `<select>` is `w-full` inside
+        // the wrapper — a flex rule placed on it is simply inert.
+        wrapperStyle={style}
         className={className}
         value={toRadix(value)}
         onChange={e => {

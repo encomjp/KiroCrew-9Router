@@ -17,6 +17,7 @@ Per-thread JSONL files at `~/.kiro/crew/sessions/{safe_key}.jsonl`. First line i
 - `agent_usage()` — returns `{agent_name: (session_count, last_used_mtime)}`; built on `list_sessions()` so it inherits canonical-session dedup + symlink-skip (counts per logical conversation). Used by `GET /api/agents` to order the roster most-used-first, degrading to config order on failure.
 - `search_sessions(query, limit=50)` — case-insensitive substring content search over the newest `_SEARCH_SCAN_WINDOW` session JSONL files; the ONE ranking shared by the dashboard history filter, the `search_chat_history` MCP tool, and Discord session resume. The query is parsed by `parse_search_query` into needles: non-CJK terms are required substrings (AND over the document); a spaceless-script run (Han ideographs + kana; NOT Hangul, since modern Korean is space-separated) gates on its individual characters (required, down-weighted) plus an adjacency floor — at least one of the run's character bigrams must hit somewhere, so a spaceless multi-word CJK query matches documents containing the words apart (each word is a bigram hit) while scatter-only character noise is excluded, and adjacency dominates the ranking; the floor is waived when the query's bigram set exceeds its cap (a partial set cannot prove no-adjacency-anywhere, so truncation only ever loosens). Occurrence counts are weighted per needle, length-normalized, title-boosted, phrase-bonused, then multiplied by a bounded recency boost (×2.5 for a session modified now, decaying toward ×1 with a 30-day half-weight — never a penalty; sized so a year-old double mention loses to today's single mention while a decisively better old match still wins), and capped to `limit` results. Exposed via `GET /api/sessions/search?q=<q>&limit=<n>` (min 2 chars); used by the dashboard history filter to find sessions by content (CR ids, error messages, file paths) rather than title alone. Returns the same meta dicts as `list_sessions()`, so each search hit likewise carries `folder_id` (when present), letting the sidebar group results by folder. Snippet builders (`_content_snippet`, mcp_core's `_extract_history_snippet`) derive their needles from the same parse via `snippet_needles` (phrase first, then whole terms/bigrams, lone CJK characters last) so match and excerpt cannot drift apart. The fold/snippet memos backing the search are keyed by the sanitized `path.stem` (from `list_sessions`' meta dicts) while writers invalidate under the logical session key; `_invalidate_cache`'s identity-wide pops are what connect the two spellings, so a housekeeping rewrite that restores the file's mtime still drops the memo and search stops matching text the transcript no longer contains.
 - `needles_match_text(needles, folded_text)` — the single-string form of `search_sessions`' match gate (required needles as substrings + the CJK adjacency floor), for callers filtering one text field; Discord session resume's zero-hit title fallback uses it so title matching cannot grow a second spelling of tokenization.
+- `read_file_change_messages(key)` — a lightweight Artifacts projection that streams one transcript as bytes, skips lines without the serialized `"file_changes"` key before JSON parsing, and retains only `ts` plus `meta.file_changes` in its own bounded, file-stamped cache. It never warms `_msg_cache`, so scanning the session-document firehose cannot retain the full parsed transcript corpus.
 - Forge references (pull requests, merge requests, issues) are a query dimension of their own, because one item has several written spellings and a transcript carries whichever one its author used. A term naming an item — `#4411`, `PR #4411`, `pr 4411`, `pull request 4411`, `pr4411`, `pull/4411`, a full PR/MR URL, `owner/repo#4411` — becomes ONE required needle carrying every spelling of that item (`SearchNeedle.alts`, counted by the shared `count_needle`), so any spelling finds every spelling. The words that introduce the number are dropped from the gate: they are not part of the reference, and requiring the literal "pr" would disqualify a transcript that names the item only by URL. Spellings are `digit_bounded` on both sides, so `#4411` matches neither `#44110` nor the run id `1544110293`. The TYPED sigil decides the family, never a word before it: `mr#12` is read as `#12`, because letting the word win produced a reference none of whose spellings was the string the user typed. Coverage of every accepted shape is pinned by a property test that drives each one against a transcript quoting it verbatim, rather than by inspection of the spelling list. GitHub's pull/issue sequence is shared (`#4411` ≡ `/pull/4411` ≡ `/issues/4411`) while GitLab numbers merge requests separately, so `!12` and `#12` stay distinct families and never match each other; bare `merge` is not a GitLab word (GitLab is `MR 12` / `merge request 12` / `!12`). Plain digits remain one of the spellings exactly when the QUERY typed no sigil (`issue 42`, `PR 4411`, `pr4411`): such a query previously gated on the digits, so dropping them would HIDE the transcript that says "we hit issue 42 in prod", and keeping them makes the recall of the literal AND it replaces hold with ONE intended exception — a session whose only claim to the old match was the digits sitting inside a longer number, which is what the boundary exists to exclude. The LEFT edge of that boundary applies only to a spelling that starts with a digit: for a delimited spelling the character before it says nothing about the number's length, and demanding a non-digit there would refuse `#4411` inside `owner/repo2#4411` — a repo whose name ends in a digit, matched against the very reference the query named. Only a lead-in run that actually NAMES a type turns a following number into a reference: `pr 4411`, `issue 42`, `pull request 4411` and `merge request 12` (the two-word GitLab form) do; `requests 12` and `merge 1234` do NOT and stay literal terms, since dropping such a word from the gate would trade a real term for every session mentioning that number. A query that DID type a sigil never gated on bare digits, so it keeps them out and stays precise (a standalone "12" is ordinary prose). A BARE number with no naming word is not a reference at all: it keeps its plain substring needle — numeric content search (ports, error codes, run ids) is unchanged — and gains the spellings as scoring-only needles at `_FORGE_REF_WEIGHT`, so the session that references the pull request outranks one that merely contains those digits. Those ranking needles are NOT adjacency evidence (`SearchNeedle.adjacency`, which only CJK bigrams set), or they would arm the adjacency floor and turn a ranking hint into a hidden gate. Two limitations are accepted rather than special-cased, both needing a query nobody writes and both only widening the result set: a chain-only word wedged between the type word and the number (`issue merge 42`) is swallowed, and because the gate is keyed by term text a query repeating a suffix word as its own term (`pull the pull request 12`) loses that term. Closing either means keying the gate by token position instead of by text. Expansions per query are capped at `_SEARCH_MAX_FORGE_REFS`, each costing one scan per spelling per scanned session (up to eight for a named reference, up to thirteen for a bare number's both-families ranking needle); a token past the cap degrades to a plain needle.
 - `_read_messages` — mtime-guarded message cache with the same double-checked, miss-only locking `_folded_content` uses for this identical race. A warm hit is served lock-free; only a MISS takes the session's in-process writer lock (`_file_lock`) and re-checks mtime + cache under it, so a cache fill cannot publish a pre-rewrite parse after an mtime-restoring rewrite (`_restore_mtime`) invalidated the cache. ON the event loop the lock is acquired non-blockingly and a busy lock falls back to an unlocked fill, so an on-loop read never stalls behind a writer holding the RLock across its cross-process flock wait (`_FLOCK_ACQUIRE_TIMEOUT_S`). An unlocked fill publishes through two witnesses, one per writer class: a per-key invalidation **generation** covering local writers (`_invalidate_cache` bumps the counter BEFORE dropping entries; the fill snapshots it before its stat and publishes only while it is unmoved, re-checked after the store), and a cross-process **flock-hold witness** covering external processes (`_flock_hold_witness`: publish only while this process provably held the sidecar flock for the whole fill window — an external writer's invalidation bumps a table in its own process, invisible here, so the flock is what excludes it; the witness carries a release epoch so a broken-and-reacquired hold never passes as continuous). A fill that races no rewrite is kept instead of re-parsed on the next read; one that cannot prove its window clean is discarded. Every published entry also records the generation it was stored under, and a warm HIT requires both the mtime and the generation to match: `_invalidate_cache`'s pops reach only its own instance's caches, so the process-wide bump is what unhits an entry when the rewrite was performed through a different `ConversationLog` instance. The generation guards `_msg_cache` specifically — the derived `_meta_cache`/`_recent_cache`/`_folded_cache`/`_snippet_cache` memos keep mtime-plus-instance-local-pop guards, so the cross-instance preserved-mtime case is a knowingly accepted residual gap for those (they back bounded views and search memos, not the authoritative transcript) — and lives in a process-wide class-level table keyed by `(transcript dir, sanitized filename stem)` — the same scope as the per-path lock table, because the writer forcing a reader onto the unlocked fill may be a different `ConversationLog` instance — with the legacy/canonical Slack spellings closed over bidirectionally (`_cache_key_identities`), because one session is reachable under both its logical key and its sanitized `path.stem` spelling and the writer and reader do not always use the same one.
 - `delete_session(key)` — permanently removes a session JSONL file
@@ -146,6 +147,16 @@ no longer destroy older turns.
   into the frozen prefix (`_disk_older_count += …`) only for messages actually
   persisted (`min(excess, _disk_window_len)`); an unpersisted overflow is logged
   rather than silently counted as on-disk.
+- **`slot._disk_older_durable_count`**: the durable-only position base — how
+  many non-transient rows (`state._TRANSIENT_ROLES`) have left the window off
+  the front. Maintained at every site that sets or advances
+  `_disk_older_count` (restore/resume/rehydrate/channel rebuild recompute it
+  from disk; the trim path advances it by the durable rows in the WHOLE
+  evicted slice, unpersisted overflow included — it is a position base with no
+  disk contract, so an uncounted lost row would silently shift every later
+  position). It exists for absolute message positions
+  (`session_control.read_messages`), never for save-model arithmetic — the
+  save's frozen-prefix contract stays on `_disk_older_count`.
 - **Single-file only**: the save touches `_path(history_key)` and never reads or
   writes sibling files. `tab_id` is 1:1 with a file (fork creates a fresh slot
   with its own file), so chaining is untouched and legacy no-tab_id sessions are
@@ -182,6 +193,78 @@ no longer destroy older turns.
   patiently to a bounded deadline. The same discipline applies to every other
   session-JSONL writer: `clear_closed` (resume un-flags `closed` under `_locked`,
   offloaded via `asyncio.to_thread`) and all `history.py` mutators hold `_locked`.
+- **Delete-won guard**: `delete_session` unlinks the session file under the
+  same `_locked` and leaves no tombstone, and the patient off-loop acquire
+  means a save can legitimately sit waiting while a permanent delete runs to
+  completion ahead of it. Inside the lock, before any `mkdir`/`atomic_write`,
+  the save therefore aborts cleanly (no write, no error — the flush loop
+  clears `_dirty`) when the file is gone AND the slot has OBSERVED its session
+  on disk. The observation witness is `_disk_meta_created_at` — recorded
+  exactly at the hydrate sites and at each committed save, nowhere else — and
+  it is the SOLE gate: the window counters take no part in either direction,
+  because fork/transfer set `_resumed_count` optimistically after a
+  best-effort first save (a transient first-write failure must not read as a
+  deletion and eat the retry), and a restored zero-message session has
+  all-zero counters while its delete must still win against the save of its
+  first message. A delete that already
+  reported success is not silently undone. Only `FileNotFoundError` from
+  `stat` counts as the delete witness; any other failure (permissions, device
+  not ready) propagates and leaves the retry armed. A file that EXISTS can
+  also be delete-won: `delete_session` leaves no tombstone, so a foreign
+  append landing after the delete creates a fresh file — the save tells the
+  incarnations apart by the metadata `created_at` (the file's identity, which
+  a save always carries forward and which therefore never changes for a
+  continuously-existing file) against `_disk_meta_created_at`, the identity
+  the slot last observed at restore or at its own save; a known-vs-known
+  mismatch aborts rather than merging the deleted window into the new
+  transcript, while a readable-but-absent `created_at` (legacy meta) fails
+  open. The metadata is read through `get_metadata_status`, and an UNREADABLE
+  line fails CLOSED: the save raises (leaving `_dirty` armed for the flush
+  retry) and `session_was_deleted` returns True (the copy is refused,
+  retryably) — a transient read failure must not blank the identity
+  comparison and let deleted content overwrite a replacement session. A brand-new slot's first
+  save has none of that evidence and creates the file normally. The abort
+  returns `False` (every other completion returns `True`), and
+  `save_slot_off_loop` forwards it — for BOTH `best_effort` modes the skip
+  raises nothing, so a clean return no longer proves a committed write.
+  Callers that republish the slot's content elsewhere check it: the fork
+  aborts with 409 and the transfer export refuses the bundle, because a copy
+  made from the surviving in-memory window would resurrect the destroyed
+  conversation under a fresh key whose own save carries no delete evidence.
+  Because the periodic 5s flush can hit the guard FIRST and clear `_dirty` —
+  after which fork/transfer skip their dirty-gated flush arms and never see
+  the `False` — both also call `session_was_deleted(state, slot)` directly at
+  their copy choke points: the same evidence + stat-ENOENT witness, answered
+  independently of flush ordering (lock-free, safe because a permanent delete
+  never un-happens). Being lock-free also means the delete can land INSIDE the
+  probe, between its stat and its metadata read, and `get_metadata_status`
+  reports a vanished file as a genuine `({}, True)` -- so an empty `created_at`
+  is re-stated before it is trusted, which is what tells "legacy metadata"
+  (fails open) from "deleted a moment ago" (refuses). The save's guard needs no
+  equivalent: it reads the metadata and stats the path inside `_locked`, the
+  lock `delete_session` unlinks under, so no delete can interleave between its
+  two reads.
+  A single pre-copy probe is not enough, because writing the copy is itself an
+  await that does not serialise against the source's delete: the transfer
+  re-probes after bundle assembly, and the fork re-probes after its DESTINATION
+  save, both before the copy is acknowledged. The boundary a handler owns is
+  ACKNOWLEDGMENT — a delete committing before it wins, and the fork therefore
+  removes the destination transcript it had already written (`delete_session`
+  on the destination key, off-loop) and pops the never-broadcast slot before
+  answering 409; a delete committing after the copy is acknowledged is out of
+  scope and the copy survives its source, the way a repo fork outlives what it
+  came from. Rolling the destination back cannot harm the source (different
+  key, different lock), so the fail-closed probe costs at worst a retryable
+  409. If that removal itself fails the copy stays on disk and is logged at
+  ERROR — the one case that still needs a human.
+  Archival callers (close/cleanup) ignore it — the delete already disposed of
+  what they were archiving. Residuals: a slot that never observed its session
+  on disk (fresh slot adopting an existing key whose file is deleted while it
+  waits) still recreates — the writer-recreates case `delete_session`'s
+  docstring already accepts; and for a slot the delete's cleanup cannot pop
+  (e.g. a cron-linked tab whose slot key matches none of the spellings the
+  cleanup probes), the abort latches — every later save of new activity is
+  skipped, which is why the skip logs at WARNING with the slot key.
 - **Turn persistence is offloaded through ONE choke point**
   (`save_conversation_turn_off_loop`, `llm_helpers.py`): `save_conversation_turn`
   makes TWO `append` calls, so an on-loop caller pays ~24 ms of loop time per turn

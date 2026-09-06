@@ -49,6 +49,19 @@ and of macOS signing/notarization.
   SubjectPublicKeyInfo DER bytes.
 - Signed fields: `algorithm`, `channel`, `key_id`, `pub_date`,
   `python_requires`, `schema`, `sha256`, `version`, and `wheel_url`.
+- Optional signed field: `min_version` — the forced-update floor for a
+  breaking release, declared in `packaging/MIN_VERSION` at publish time. Must
+  be a bare release (`0.6.0`, no prerelease suffix) and must not exceed the
+  manifest's own `version`; both are enforced by
+  `packaging/signing/cli-manifest.py` before signing. The installer verifies
+  its format but does not act on it (it always installs the signed version);
+  running gateways read it from the channel feed and mark the update
+  REQUIRED when their own version sits below the floor — but only after
+  `platform/feed_trust.py` verifies the manifest signature against the same
+  pinned key, because the floor coerces the dashboard UI and an unverified
+  one must degrade to the ordinary dismissible prompt. Absent means no
+  floor, and the canonical payload omits the key entirely so no-floor
+  manifests stay byte-identical to the pre-floor format.
 - Signature field: base64 RSA signature over sorted, compact UTF-8 JSON of all
   signed fields; `signature` itself is excluded.
 - Channel source: `feed/<channel>/latest-cli.json`. Pinned-version source:
@@ -134,6 +147,7 @@ choice blob makes the usage line unreadable.
 | `kirocrew gateway` | Start the Kiro Crew server (dashboard + messaging channels) |
 | `kirocrew gateway --slack-only` | Start without dashboard or SSH tunnel instructions |
 | `kirocrew gateway --no-crons` | Start without cron scheduler (use when another instance handles crons) |
+| `kirocrew gateway --no-tunnel` | Never publish a tunnel: refuses to start or provision one for the life of the process, whatever `tunnel.enabled` says. SCOPED TO TUNNELS — it does not change where the dashboard binds, so a config that widens `dashboard.url` off loopback still does, with token auth as the control there; do not read `publish_disabled()` as "no published surface of any kind". Reach the instance on the loopback port it binds (`ssh -L` from another host). A Dev Fleet pod boots with this whenever its own checkout declares the flag — the pod's argv is built by the control plane but executed by the target worktree's gateway, so `pod.runtime.target_supports_flag` probes that checkout first and DROPS the flag when it is absent (passing it would make argparse exit 2, which the unit's `Restart=on-failure`/`RestartSec=5` turns into a 5s restart loop). Such a checkout keeps the tunnel behaviour it had before this flag existed and is not given the guarantee — see `security.md` for why no config-side substitute is applied. |
 | `kirocrew setup` | Install agent config, save project dir, configure credentials |
 | `kirocrew setup --agent-only` | Only install agent config (skip credentials) |
 | `kirocrew setup --slack` | Run the guided Slack credential + slash-command setup (opt-in) |
@@ -507,11 +521,216 @@ All write paths emit SEL audit events (`config_get`, `config_set`, `config_set_f
 - Exit: `exit`, `quit`, `/exit`, `/quit`, `:q`, Ctrl+D
 - Streaming output printed as chunks arrive
 
+### Tool permission requests
+
+A backend that routes tool decisions over ACP holds the turn open until it gets
+an answer, so the stream consumer must respond — an ignored request is not a
+missed prompt, it is a turn that never ends.
+
+Answering one is an **authorization decision**, so the CLI is a security
+surface, not just a prompt. Every request runs the same ladder, in this order:
+
+```
+permission_request
+  → HookManager.on_tool_call        (sensitive paths, denied commands, ceiling ∩ profile)
+      deny → SEL "denied" → reject_tool → stderr notice          [not overridable]
+  → may this invocation ask?        (command mode AND both streams a TTY)
+      no   → SEL "denied" → reject_tool → stderr notice
+  → prompt the human
+      exactly "a" → SEL "allowed" → approve_tool(always=False)
+      anything else → SEL "denied" → reject_tool
+```
+
+The gate is fed the event's non-model-authored fields (`tool_kind`,
+`raw_tool_params`, `shell_command`, `is_shell`, `mcp_server_name`, `tool_name`),
+not just `title`: for a shell tool the title may be an LLM-authored
+description, so a dangerous command behind a benign label is exactly what
+keying on the title alone lets through. The CLI identifies itself as
+`session_key="cli_chat"` (SEL source `cli`) with the resolved agent, which is
+what lets the gate resolve `ceiling ∩ profile` rather than the ceiling alone.
+No second copy of the sensitive-path or denied-command rules lives in the CLI.
+
+The hook result is used as a **deny ceiling only**: `TOOL_DENY` rejects, and
+both `TOOL_ALLOW` and `TOOL_AUTO_APPROVE` still ask the human. This consumer
+answers permission requests; it does not carry the dashboard's trust and
+auto-approval semantics, and honouring `TOOL_AUTO_APPROVE` here would add a
+second execution path with no human confirmation. Asking more often than the
+dashboard is the safe direction.
+
+| Mode | stdin+stdout TTY | Behaviour |
+|---|---|---|
+| interactive REPL | yes | Prompt. Exactly `a` allows once; anything else denies. |
+| interactive REPL | no | Deny automatically, notice on stderr, stdin untouched. |
+| `-m` single message | either | Deny automatically, notice on stderr, stdin untouched. |
+
+Both conditions are required, and neither implies the other. `-m` is documented
+as `Single message (non-interactive)`, so a terminal does not license a prompt
+there — a script wrapped in a pty would otherwise block on a question nobody is
+watching for. And a prompt nobody can see is a hang, not consent, so the REPL
+still needs a real terminal on both ends. The mode is passed explicitly rather
+than inferred from a TTY check, because only the caller knows which mode runs.
+
+A shell call shows the command it is asking about:
+
+```
+Permission required: Run a helpful script
+Command: git status --short
+   [a] allow once  [d] deny (default):
+```
+
+`title` is LLM-authored prose, so approving on it alone is consent to a
+description rather than to what runs — the same reason the gate keys on
+`shell_command`. The command is redacted with the two `security` helpers,
+collapsed to one line, and capped with an explicit `... [truncated]`. Local
+paths are deliberately **not** redacted here: this is the operator's own
+terminal, and seeing the real path is part of the consent.
+
+**A call that names a file discloses that file.** A trusted tool identity says
+WHICH tool runs, not what it runs against, so `fs_write` under a benign title is
+consent to a verb:
+
+```
+Permission required: Tidy up the notes
+Tool: fs_write
+Path: /home/tester/thesis.md
+   [a] allow once  [d] deny (default):
+```
+
+The path is read from the request's own `raw_tool_params`, under the same
+`path` / `file_path` / `filePath` spellings `hooks._SEARCH_DENY_ARG_KEYS`
+accepts. Sharing the spellings is the point: the gate already denies a
+*sensitive* path or a write-protected config path read from those keys, so what
+is left for a human to judge is exactly the ordinary valuable file no rule
+speaks for — and a prompt reading a different field than the gate inspects would
+let the two disagree about what the target is. Rendered like the command
+(sanitised, one line, capped), and shown for any call that carries a path rather
+than only an `edit`-kind one, because the kind is agent-influenced and
+disclosure can only inform the decision.
+
+Absence of a path is **not** a refusal. Most builtin calls legitimately act on no
+file — a memory write, a tag creation — so denying whenever a path cannot be
+found would refuse them all to close a gap that exists only for tools which name
+one. A non-string value is treated as absent rather than raised on: raising would
+leave the request unanswered, which is the hang this path exists to end.
+
+Beyond the command and the path, the whole tool input is still **not** shown —
+this is the question, not a detail panel.
+
+**Terminal controls are neutralised on this surface.** Every untrusted string
+the permission UI prints — the title, the command, and a gate reason — goes
+through `_for_consent`, which redacts as above and then replaces ESC, the C0 set
+(`U+0000`–`U+001F`), DEL (`U+007F`), and the C1 set (`U+0080`–`U+009F`) with
+spaces before collapsing whitespace, so the result is always a single line. Lone
+UTF-16 surrogate code points (`U+D800`–`U+DFFF`) are removed by the same boundary:
+they are not Unicode scalar values, so even a strict UTF-8 stream cannot encode
+them. The result is then round-tripped through the destination stream's codec
+with `backslashreplace`. UTF-8 terminals retain ordinary Unicode; a strict cp1252
+or other legacy Windows stream sees inert ASCII escapes for characters it cannot
+represent. This is an authorization surface: OSC 52 writes the clipboard, and
+CSI can move the cursor and erase what is drawn, so a model-authored title could
+otherwise repaint the question a human is answering and hide what is being approved.
+Scope is the permission prompt only — ordinary streamed model output is printed
+raw by `_send_and_print` and is unchanged, which is a surface-wide rendering
+question rather than part of answering a permission request.
+
+**An authorization-boundary failure is itself a refusal.** If the shared gate
+raises, the CLI records `gate_failed` best-effort and rejects the request. If TTY
+detection, prompt rendering, or prompt reading raises, it records `prompt_failed`
+best-effort and rejects. The transport response is sent before any explanatory
+notice, so a closed or unencodable output stream cannot leave the backend waiting.
+This does not change cancellation: Ctrl-C still aborts the session and provider
+teardown owns the pending request, because waiting on a possibly wedged rejection
+transport would swallow the cancellation.
+
+**The audit write never runs on the event loop.** `sel()` opens the audit log
+and replays it to recover the running HMAC chain, so the first permission of a
+fresh chat pays a filesystem cost inside the call — an unbounded one on slow or
+corrupt storage. The decision coroutine shares its loop with the ACP reader and
+stderr-drain tasks, exactly as the gate call does, so the audit is awaited
+through `asyncio.to_thread` for the same reason: a blocking write here would
+stop draining the backend and freeze the turn the audit is about. The one
+exception is the cancellation teardown, which keeps the synchronous call because
+awaiting anything there would swallow the `CancelledError` being delivered.
+
+**There is no "always allow".** A persistent approval asks the backend to stop
+sending permission requests for matching calls, and a request that is never sent
+is a call this ladder never runs and never audits. The dashboard offers it
+because its tool pipeline re-gates every call; this consumer does not.
+
+The answer is matched **exactly**, not by first letter: a prefix match reads
+`abort` as an allow. Blank line, EOF, and any unrecognised word all deny.
+
+Denial is **not** an error: the request is answered, the turn runs to completion,
+and the exit code is unchanged. Only the existing transport failures
+(`AcpTimeoutError`, `AcpError`) exit non-zero.
+
+Every decision is written to the SEL log **before** the matching
+`approve_tool`/`reject_tool`, so a transport failure cannot erase a decision
+already made:
+
+| decision | `outcome` | `error` |
+|---|---|---|
+| gate denied | `denied` | `hook_deny` |
+| gate raised before a verdict | `denied` | `gate_failed` |
+| execute-kind request has no verified command | `denied` | `unverified_shell` |
+| nobody to ask | `denied` | `noninteractive` |
+| prompt availability/render/read failed | `denied` | `prompt_failed` |
+| user allowed | `allowed` | — |
+| user allowed but the critical audit failed | `denied` | `audit_unwritable` |
+| user denied / blank / EOF / unrecognised | `denied` | `user_denied` |
+| session cancelled with the question open | `denied` | `session_aborted` |
+
+`error` is a stable machine code, never the gate's reason: a reason names the
+path or command that triggered it, and an audit record must not restate the
+thing it protects (`log_tool_invocation` does not redact for its callers). The
+audited `tool_name` is the canonical `_meta.kiro` identity when the backend
+supplies one, falling back to a redacted `title` — an audit trail keyed on prose
+the model wrote can be steered by the model being audited.
+
+Responses go through `provider.approve_tool()` / `provider.reject_tool()`. The
+CLI never reads the advertised `options`: those ids are backend-specific and the
+ACP layer owns the mapping.
+
+#### stdin ownership
+
+The prompt is read on an owned daemon thread through a private duplicate of the
+stdin descriptor, not on the event loop and not through `sys.stdin`. The turn is
+parked inside an active stream — the ACP runtime holds a reader task on the
+backend's stdout and a drain task on its stderr — so a read on the loop thread
+would stop draining those pipes until the human answers.
+
+**A cancelled prompt ends the session.** A blocking terminal read cannot be
+retracted: cancelling the await frees the coroutine, not the thread, and that
+reader stays parked and takes the next line the user types. So cancellation
+marks stdin poisoned and propagates; `_require_usable_stdin` then refuses at
+every later entry point — a second permission prompt and the REPL's own `you>`
+alike — rather than racing the abandoned reader for keystrokes. There is no
+input broker and no recovery path: the abandoned reader can only outlive the
+session, never compete with a live prompt.
+
+Teardown **must not await the backend.** The request in flight is left
+unanswered and audited as `session_aborted`, because answering it means awaiting
+a transport: `CancelledError` has already been raised once and nothing
+re-delivers it, so a wedged `reject_tool` would leave the Ctrl-C that asked for
+the teardown unable to land. The provider is shut down with the session, so the
+unanswered request dies with it. `StdinPoisonedError` carries the same rule.
+
+That last sentence is a guarantee, not an expectation: `provider.start()` hands
+back a live backend process, so `_chat` runs the whole message/REPL lifecycle
+under `try` and calls `provider.shutdown()` from `finally`. A normal return, an
+exception, and a cancellation raised through a permission prompt all tear the
+backend down; without it a Ctrl-C at the prompt would exit leaving the backend
+running with nothing owning it. Cleanup never swallows the cancellation — a
+failing `shutdown()` is logged rather than raised, because replacing the
+exception already propagating would discard the very `CancelledError` the
+teardown exists to clean up after — and `gc.collect()` is nested inside its own
+`finally` so a raising shutdown cannot skip it.
+
 ### Context Tracking
 
 After each message, checks `provider.context_usage_pct()`:
 - `>= autocompact_pct` (default 70%): compact → shutdown → restart provider, reset counter
-- `>= autocompact_pct - CONTEXT_WARN_MARGIN_PCT` (50% on the default): warning printed to stderr. Relative, not absolute: the compact arm is tested first, so an absolute warn level at or above the threshold would be unreachable
+- `>= autocompact_pct - CONTEXT_WARN_MARGIN_PCT`: warning printed to stderr. Relative, not absolute: the compact arm is tested first, so an absolute warn level at or above the threshold would be unreachable
 
 CLI compaction is blocking (single-user, acceptable).
 
@@ -616,12 +835,13 @@ Each step checks if the tool is already installed and skips if present.
 6. **Global mcp.json**: kirocrew MCP servers present with valid binary paths — auto-fixes stale paths
 7. **Python environment**: checks Python 3.9+ availability and dependency installation
 8. **Vector memory (in-process embeddings)**: vendored llama-cpp-python runtime importable, embedding model file present (downloads in background on gateway start; when absent, a light HTTPS-reachability probe of the resolved model URL runs); embeddings are always-on (`embeddings:  ✅ always-on`). On platforms with no vendored native libs (`_platform_libs_dirname()` returns None, e.g. darwin/x86_64 — Intel Macs or a Rosetta interpreter), the runtime line reports `⏹ unsupported platform … — memory uses keyword search` and is NOT counted as an issue (designed degradation per `embeddings.py`); only a load failure on a supported platform flags `embedding runtime`. When that failure is an INCOMPLETE shipped payload, doctor additionally names the absent files (`Missing native libs for <platform>: …`, from `embeddings.verify_vendored_libs()`) and says it is a packaging defect rather than an unsupported platform — the two are indistinguishable in ctypes' own `Shared library with base name 'llama' not found`, which reads as an architecture problem and misdirects diagnosis. When `LLAMA_CPP_LIB_PATH` is set, doctor reports THAT directory as the thing to check instead (mirroring the loader's exemption): the libs load from there, so blaming the bundled tree would send the operator to reinstall a package they are deliberately not loading from. A `faiss:` line reports whether the optional FAISS accelerator is importable — never an issue on any platform (episodic recall falls back to the stdlib cosine scan); when absent it suggests `pip install faiss-cpu`
-9. **Speech-to-Text (optional)**: whisper + ffmpeg presence when STT is enabled. On Windows these are reported as non-fatal `⚠️` notes (neither is a Kiro Crew dependency there, and STT ships enabled-by-default) so a healthy first install exits 0 and the guide's `kirocrew doctor && kirocrew gateway` chain proceeds; on macOS/Linux a missing binary still flags an issue. Fix hints are OS-aware (`brew` / `winget` / Linux)
+9. **Speech-to-Text (optional)**: recognizer, selected model and audio-decoder presence when STT is enabled. Supported desktop releases bundle and build-gate the recognizer plus the pinned `imageio-ffmpeg` executable; a missing decoder there is a corrupt payload whose remedy is reinstalling Kiro Crew, never Homebrew/Winget/Apt. Source installs use `kirocrew[voice]` for the recognizer and a fixed system FFmpeg path for compressed audio. Windows preserves its non-fatal `⚠️` marker for an optional-extra gap so enabled-by-default STT cannot block gateway startup; on macOS/Linux a missing active runtime still flags an issue.
 10. Slack credentials (optional)
 11. **Discord (optional)**: the channel's enabled flag, whether a bot token is present (never any part of its value), the three allow-lists, the privileged Message Content intent, the live connection, and the install URL. Blocking issues are enabled-without-a-token, an empty `discord.allowed_user_ids` (the transport fails closed, so every message is denied while it is empty), a thread or channel allow-list with Message Content OFF, and a reachable gateway whose Discord connection recorded a `connect_error`. The intent state comes from `discord/intent_probe.py`: one read-only `GET /oauth2/applications/@me` that decodes Discord's application-flags bitfield as a tri-state per intent PAIR (`enabled` / `limited` / `disabled`, since a limited grant still delivers the data) and degrades to `unknown` on any failure rather than aborting the report. Granted-but-unused Server Members / Presence intents are hardening notes, never issues. The install URL comes from `discord/install_url.py`, the OAuth-authorize analogue of Slack's app manifest: named permission bits OR'd to `309237711936` for a thread-capable install (the number [`discord-integration.md`](../../../src/kiro_crew/docs/discord-integration.md) publishes), and none at all for the recommended DM-only install
 12. **WhatsApp (optional)**: printed whether or not the channel is enabled, because a channel that is invisible in the preflight is the failure this section exists to catch. When enabled it reports the optional `neonize` extra, checked with `find_spec` and never imported (importing it loads a ~19 MB ctypes CDLL plus protobuf descriptors, and a health check must not initialize the subsystem it inspects, nor construct a client), and whether the linked-device session store exists at `<data home>/whatsapp/session.db`, resolved from the same expression the channel opens it with so the two can never describe different files. A missing extra IS an issue: the channel is enabled, cannot start, and the fix is one offline `pip install`. An absent store is a `⚠️` note and never an issue, because pairing is a QR scan served BY the running gateway, so failing here would break the documented `kirocrew doctor && kirocrew gateway` chain at the one moment the operator has to start the gateway to make progress. Group membership is not knowable offline, so the section reports the configured count and the gateway logs the unmatched JIDs on connect
 13. kiro-cli connectivity
 14. Gateway running status
+15. **Cron job health**: names cron jobs that auto-paused after repeated failures (`Fix: kirocrew cron resume <id>`) and jobs whose last run errored while still scheduled (`Fix: kirocrew cron trigger <id>`), with an aggregate count each and the named list capped at 5 plus a `+N more` tail. Read-only — doctor never resumes or triggers a job, because an auto-pause after `_AUTO_PAUSE_THRESHOLD` consecutive failures is usually load-bearing and lifting it silently would hide the problem the run is meant to find. The scan is `cron.unhealthy_jobs_from_disk()`, which reads `crons.json` directly rather than via the gateway API: the dashboard's per-job `err` badge and the gateway's hourly failure re-alert both run inside the gateway, so neither can report a wedged one, and that out-of-process property is the point of this check. A job the user paused explicitly is never reported (only `auto_paused` is a health signal, and both flags can be set at once since pausing an auto-paused job preserves `auto_paused`). Silent on a healthy store and on a fresh install with no `crons.json`. A store that EXISTS but yields no readable job list — unparseable, non-UTF-8, wrong shape, or holding no usable record — is reported instead, because the scheduler can load nothing from it and every job has stopped; reporting that as a clean bill of health would reproduce the silence this check exists to break. No corruption aborts the run
 
 ## Update Command
 

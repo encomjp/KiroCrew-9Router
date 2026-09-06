@@ -18,6 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from skill_script_helpers import load_skill_script
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -54,16 +55,109 @@ def _toml_available():
 def test_generic_fallback_on_empty_repo(tmp_path):
     prof = resolve_profile.resolve(str(tmp_path))
     assert prof["source"] == "generic"
+    assert prof["setup"] == []
     assert prof["gates"] == []
     assert prof["reviewers"] == []
     assert prof["readiness"] == {"status_context": None, "defer_label": None}
     assert prof["single_commit"] is False
 
 
+def test_profile_is_loaded_from_base_ref_not_worktree(tmp_path):
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    profile = tmp_path / ".prepare-pr.toml"
+    profile.write_text("[project]\nsingle_commit = true\n")
+    subprocess.run(["git", "add", ".prepare-pr.toml"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    profile.write_text("[project]\nsingle_commit = false\n")
+
+    resolved = resolve_profile.resolve(str(tmp_path), base_ref="HEAD")
+
+    assert resolved["source"] == "config"
+    assert resolved["single_commit"] is True
+
+
+def test_branch_only_profile_is_ignored_when_base_has_none(tmp_path):
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    (tmp_path / ".prepare-pr.toml").write_text("[project]\nsingle_commit = true\n")
+
+    resolved = resolve_profile.resolve(str(tmp_path), base_ref="HEAD")
+
+    assert resolved["source"] == "generic"
+    assert resolved["single_commit"] is False
+
+
+def test_branch_deleting_a_review_workflow_cannot_drop_the_lane(tmp_path):
+    """Auto-detection is pinned to the base ref too: deleting a review workflow
+    in the checkout must not remove that reviewer from the resolved profile."""
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "codex-review.yml").write_text("name: review\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    (wf / "codex-review.yml").unlink()
+
+    resolved = resolve_profile.resolve(str(tmp_path), base_ref="HEAD")
+
+    assert resolved["source"] == "auto-detect"
+    assert [r["name"] for r in resolved["reviewers"]] == ["codex-review"]
+    assert resolved["reviewers"][0]["contract"] == ".github/workflows/codex-review.yml"
+
+
+def test_unresolvable_base_ref_is_a_hard_error(tmp_path):
+    """A base ref that names nothing must fail loudly, never silently hand
+    resolution back to the branch checkout."""
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("base\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+
+    with pytest.raises(RuntimeError, match="cannot resolve base ref"):
+        resolve_profile.resolve(str(tmp_path), base_ref="no-such-ref")
+
+
+def test_cli_without_base_ref_pins_to_the_remote_default_branch(tmp_path):
+    """The documented no-argument invocation must not read reviewer authority
+    from the branch checkout when a remote base exists to pin to."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=upstream, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=upstream, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=upstream, check=True)
+    (upstream / ".prepare-pr.toml").write_text("[project]\nsingle_commit = true\n")
+    subprocess.run(["git", "add", ".prepare-pr.toml"], cwd=upstream, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=upstream, check=True)
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(clone)], check=True)
+    (clone / ".prepare-pr.toml").write_text("[project]\nsingle_commit = false\n")
+
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS_DIR / "resolve_profile.py"), str(clone)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=True,
+    )
+
+    assert json.loads(proc.stdout)["single_commit"] is True
+
+
 def test_autodetect_python_stack(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
     prof = resolve_profile.resolve(str(tmp_path))
     assert prof["source"] == "auto-detect"
+    assert prof["setup"] == []
     assert "python -m pytest -q" in prof["gates"]
 
 
@@ -103,6 +197,8 @@ def test_kirocrew_markers_load_bundled_profile(tmp_path):
     assert prof["source"] == "kirocrew"
     assert prof["single_commit"] is True
     assert prof["base_branch"] == "main"
+    assert prof["setup"] == ["(cd website && npx playwright install chromium)"]
+    assert all("playwright install" not in gate for gate in prof["gates"])
     assert prof["readiness"]["status_context"] == "PR Readiness"
     models = {r["name"]: r["model"] for r in prof["reviewers"]}
     assert models["gpt"] == "gpt-5.6-sol"
@@ -182,14 +278,16 @@ def test_charter_budgets_match_the_ci_workflows():
         f"({opus_blocking} BLOCKING / {opus_advisory} advisory)"
     )
 
-    gpt_workflow = (
-        REPO_ROOT / ".github" / "workflows" / "codex-review.yml"
+    # The GPT lane's budget lives with the contract that applies it -- the
+    # shared review-core prompt (#5852) -- not in the workflow that splices it.
+    gpt_contract = (
+        REPO_ROOT / ".github" / "review-prompts" / "gpt-review-core.md"
     ).read_text(encoding="utf-8")
-    assert "BUDGET: report ALL findings that genuinely meet WHAT BLOCKS" in gpt_workflow, (
-        "codex-review.yml's BUDGET is expected to be report-ALL; if a numeric "
+    assert "BUDGET: report ALL findings that genuinely meet WHAT BLOCKS" in gpt_contract, (
+        "gpt-review-core.md's BUDGET is expected to be report-ALL; if a numeric "
         "cap returned, restore the numeric charter assertions here"
     )
-    assert re.search(r"BUDGET: at most \d+ BLOCKING", gpt_workflow) is None
+    assert re.search(r"BUDGET: at most \d+ BLOCKING", gpt_contract) is None
     assert "report-ALL" in skill, (
         "the gpt charter's budget no longer matches codex-review.yml "
         "(expected the report-ALL wording)"
@@ -214,25 +312,25 @@ def _ci_workflow_run_text() -> str:
     )
 
 
-def test_every_floor_gate_names_a_real_target():
-    """A gate naming a script that does not exist fails for the wrong reason.
+def test_every_floor_command_names_a_real_target():
+    """A floor command naming a missing script fails for the wrong reason.
 
     The floor is data, so nothing type-checks it: a renamed script or npm
     script turns a gate into a command-not-found, which reads as a defect in
     the branch under review rather than as rot in the floor.
     """
     data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
-    gates = "\n".join(data["gates"])
+    commands = "\n".join(data["setup"] + data["gates"])
 
-    for rel in sorted(set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", gates))):
-        assert (REPO_ROOT / rel).is_file(), f"gate references missing script {rel}"
+    for rel in sorted(set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", commands))):
+        assert (REPO_ROOT / rel).is_file(), f"floor references missing script {rel}"
 
-    npm_scripts = set(re.findall(r"\bnpm(?: --prefix \S+)? run ([a-z0-9:-]+)", gates))
+    npm_scripts = set(re.findall(r"\bnpm(?: --prefix \S+)? run ([a-z0-9:-]+)", commands))
     declared = json.loads(
         (REPO_ROOT / "website" / "package.json").read_text(encoding="utf-8")
     )["scripts"]
     for name in sorted(npm_scripts):
-        assert name in declared, f"gate references undeclared npm script {name!r}"
+        assert name in declared, f"floor references undeclared npm script {name!r}"
 
 
 def test_ci_blocking_scans_are_covered_by_the_floor():
@@ -248,7 +346,10 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     """
     run_text = _ci_workflow_run_text()
     data = json.loads((PROFILES_DIR / "kirocrew.json").read_text(encoding="utf-8"))
-    gates = "\n".join(data["gates"])
+    # Only repeatable verdict-producing gates satisfy the CI floor. A command
+    # filed under setup runs once per worktree, so counting it here would let a
+    # future blocking CI check disappear from later prepare-pr passes.
+    floor = "\n".join(data["gates"])
 
     exempt_scripts = {
         # Chooses WHICH tests to run for the changed surface; not itself a gate.
@@ -270,17 +371,17 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     }
 
     invoked = set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", run_text))
-    missing = sorted(s for s in invoked - exempt_scripts if s not in gates)
+    missing = sorted(s for s in invoked - exempt_scripts if s not in floor)
     assert not missing, (
-        "ci.yml runs these scripts but the prepare-pr gate floor does not: "
+        "ci.yml runs these scripts but the prepare-pr floor does not: "
         f"{missing}. Add them to profiles/kirocrew.json gates[] in their "
         "CI-exact form, or exempt them here with a reason."
     )
 
     npm_invoked = set(re.findall(r"\bnpm run ([a-z0-9:-]+)", run_text))
-    npm_missing = sorted(n for n in npm_invoked if f"run {n}" not in gates)
+    npm_missing = sorted(n for n in npm_invoked if f"run {n}" not in floor)
     assert not npm_missing, (
-        f"ci.yml runs these npm scripts but the gate floor does not: {npm_missing}"
+        f"ci.yml runs these npm scripts but the floor does not: {npm_missing}"
     )
 
     # A blocking step can also be a bare binary -- `cfn-lint`, `mypy`, `flake8`
@@ -291,7 +392,7 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
         # Environment setup, not gates.
         "pip": "installs the pinned lint tool",
         "uv": "resolves/installs dependencies",
-        "sudo": "privileged provisioning -- belongs in setup, never in a gate",
+        "sudo": "privileged provisioning -- belongs in manual host setup",
         # Wrappers whose payload is already covered by another assertion.
         "bash": "an interpreter prefix -- the payload is the .sh path, covered by "
                 "the script scan above",
@@ -313,10 +414,10 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     }
     tools = set(re.findall(r"(?m)^\s*run: ([a-z][a-z0-9_-]+) ", run_text))
     tool_missing = sorted(
-        t for t in tools - set(exempt_tools) if not re.search(rf"\b{re.escape(t)}\b", gates)
+        t for t in tools - set(exempt_tools) if not re.search(rf"\b{re.escape(t)}\b", floor)
     )
     assert not tool_missing, (
-        f"ci.yml runs these tools but the gate floor does not: {tool_missing}. "
+        f"ci.yml runs these tools but the floor does not: {tool_missing}. "
         "Add each to profiles/kirocrew.json gates[] in its CI-exact form, or "
         "add it to exempt_tools here with the reason it is not a local gate."
     )
@@ -536,6 +637,7 @@ def test_gate_rationale_reference_exists_and_is_pointed_at():
 def test_bundled_kirocrew_profile_is_valid_json():
     data = json.loads((PROFILES_DIR / "kirocrew.json").read_text())
     assert data["name"] == "kirocrew"
+    assert isinstance(data["setup"], list)
     # Every reviewer must carry a served model id (no bare gpt-5.6).
     for r in data["reviewers"]:
         assert r["model"] and r["model"] != "gpt-5.6"
@@ -547,6 +649,8 @@ def test_toml_config_path(tmp_path):
         "[project]\n"
         'base_branch = "trunk"\n'
         "single_commit = true\n\n"
+        "[setup]\n"
+        'commands = ["make bootstrap"]\n\n'
         "[gates]\n"
         'commands = ["make check"]\n\n'
         "[review]\n"
@@ -561,6 +665,7 @@ def test_toml_config_path(tmp_path):
         prof = resolve_profile.resolve(str(tmp_path))
         assert prof["source"] == "config"
         assert prof["base_branch"] == "trunk"
+        assert prof["setup"] == ["make bootstrap"]
         assert prof["gates"] == ["make check"]
         assert prof["rule_files"] == ["AGENTS.md"]
         assert prof["reviewers"][0]["model"] == "gpt-5.6-sol"
@@ -584,14 +689,21 @@ def test_partial_toml_config_fills_gates_from_autodetect(tmp_path):
     prof = resolve_profile.resolve(str(tmp_path))
     assert prof["source"] == "config"
     assert prof["base_branch"] == "trunk"
+    assert prof["setup"] == []
     assert "python -m pytest -q" in prof["gates"]  # filled from auto-detect
 
 
 def test_normalize_defaults_fill_missing_keys():
     prof = resolve_profile.normalize({}, "generic")
-    for key in ("source", "base_branch", "single_commit", "gates",
+    for key in ("source", "base_branch", "single_commit", "setup", "gates",
                 "rule_files", "reviewers", "readiness"):
         assert key in prof
+
+
+def test_legacy_profile_without_setup_stays_compatible():
+    prof = resolve_profile.normalize({"gates": ["make check"]}, "config")
+    assert prof["setup"] == []
+    assert prof["gates"] == ["make check"]
 
 
 def test_single_commit_string_false_is_not_truthy():
@@ -608,6 +720,70 @@ def test_symlinked_config_is_refused(tmp_path):
     prof = resolve_profile.resolve(str(tmp_path))
     # A symlinked config is refused -> resolution does not take the "config" path.
     assert prof["source"] != "config"
+
+
+# --------------------------------------------------------------------------
+# TreeReader interface parity
+# --------------------------------------------------------------------------
+def test_tree_reader_worktree_and_pinned_parity(tmp_path):
+    """#6236: WorktreeReader and PinnedTreeReader share the TreeReader contract."""
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'parity'\n")
+    (tmp_path / "package.json").write_text('{"scripts": {"build": "npm run build"}}')
+    wf = tmp_path / ".github" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "test-review.yml").write_text("name: test\n")
+    (wf / "other.yaml").write_text("name: other\n")
+
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+
+    wt_reader = resolve_profile.WorktreeReader(str(tmp_path))
+    pinned_reader = resolve_profile.PinnedTreeReader(str(tmp_path), "HEAD")
+
+    # has()
+    assert wt_reader.has("pyproject.toml") is True
+    assert pinned_reader.has("pyproject.toml") is True
+    assert wt_reader.has("missing.txt") is False
+    assert pinned_reader.has("missing.txt") is False
+
+    # read()
+    assert wt_reader.read("package.json") == '{"scripts": {"build": "npm run build"}}'
+    assert pinned_reader.read("package.json") == '{"scripts": {"build": "npm run build"}}'
+    assert wt_reader.read("missing.txt") is None
+    assert pinned_reader.read("missing.txt") is None
+
+    # ls()
+    assert wt_reader.ls(".github/workflows") == [
+        ".github/workflows/other.yaml",
+        ".github/workflows/test-review.yml",
+    ]
+    assert pinned_reader.ls(".github/workflows") == [
+        ".github/workflows/other.yaml",
+        ".github/workflows/test-review.yml",
+    ]
+    assert wt_reader.ls(".nonexistent") == []
+    assert pinned_reader.ls(".nonexistent") == []
+
+    # Detection functions take reader directly
+    assert resolve_profile.detect_gates(wt_reader) == ["python -m pytest -q", "npm run build"]
+    assert resolve_profile.detect_gates(pinned_reader) == ["python -m pytest -q", "npm run build"]
+    assert resolve_profile.detect_kirocrew(wt_reader) is False
+    assert resolve_profile.detect_kirocrew(pinned_reader) is False
+
+    reviewers = resolve_profile.detect_reviewers(wt_reader)
+    assert len(reviewers) == 1
+    assert reviewers[0]["name"] == "test-review"
+
+
+def test_unreadable_prepare_pr_toml_raises(tmp_path):
+    """A present but unreadable/malformed .prepare-pr.toml raises, never silently ignored."""
+    (tmp_path / ".prepare-pr.toml").write_bytes(b"\xff\xfe\x00\x00malformed")
+    with pytest.raises(Exception):
+        resolve_profile.resolve(str(tmp_path))
 
 
 # --------------------------------------------------------------------------

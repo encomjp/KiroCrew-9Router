@@ -153,11 +153,12 @@ for (const arg of process.argv.slice(2)) {
  * reference keys that do not exist, to assert the missing-key fallback behaviour
  * (`pseudoBracket.test.tsx` builds fixture keys, `navLabels.test.tsx` composes
  * `settings.tabs.${k}.${field}`). Failing on those would make the gate punish the
- * tests that exist to prove the failure mode. They are still parsed, and still
- * reported under `--report`, so the exclusion is visible rather than assumed.
+ * tests that exist to prove the failure mode. A normal gate run skips them before
+ * filesystem metadata or source parsing; `--report` still parses and reports them,
+ * so the exclusion stays visible without making every CI gate scan the test corpus.
  */
 const DECLARATION_FILE = 'i18n/t.ts'
-const isTestFile = (rel) => /\.test\.tsx?$/.test(rel) || rel.startsWith('test/')
+const isTestFile = (rel) => /\.test\.tsx?$/.test(rel) || rel === 'test' || rel.startsWith('test/')
 
 /**
  * Property names whose string-literal value IS a catalog key.
@@ -240,6 +241,11 @@ function walk(dir, out = []) {
   for (const entry of fs.readdirSync(dir)) {
     if (entry === 'node_modules' || entry === 'locales') continue
     const full = path.join(dir, entry)
+    const rel = path.relative(SRC, full).split(path.sep).join('/')
+    // Test references never affect the default verdict or its production-only
+    // coverage count. Skip their filesystem and AST work from the blocking gate;
+    // `--report` deliberately keeps the wider diagnostic scan.
+    if (!REPORT && isTestFile(rel)) continue
     if (fs.statSync(full).isDirectory()) walk(full, out)
     else if (/\.tsx?$/.test(entry)) out.push(full)
   }

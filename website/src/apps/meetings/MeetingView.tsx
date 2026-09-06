@@ -6,9 +6,11 @@ import { AnimatePresence, motion } from 'framer-motion'
 import {
   AlertTriangle,
   ArrowLeft,
+  Languages,
   ListChecks,
   Mic,
   MicOff,
+  MoreHorizontal,
   Play,
   RefreshCw,
   Square,
@@ -16,6 +18,13 @@ import {
 
 import { i18nT } from '../../i18n/t'
 import { Badge, Btn, EmptyState, SendBtn, Skeleton } from '../../components/ui'
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from '../../components/ui/dropdown-menu'
 import type { MeetingsConfig } from './api'
 import AgentPanel from './components/AgentPanel'
 import AgentPillBar from './components/AgentPillBar'
@@ -23,6 +32,7 @@ import BroadcastBar from './components/BroadcastBar'
 import MeetingWorkspace from './components/MeetingWorkspace'
 import TaskSidebar from './components/TaskSidebar'
 import TranscriptPanel from './components/TranscriptPanel'
+import TranslationSidebar from './components/TranslationSidebar'
 import TaskReviewView from './TaskReviewView'
 import { useMeetingSession } from './hooks/useMeetingSession'
 
@@ -68,6 +78,7 @@ export default function MeetingView({
     syncing,
     actions,
     pending,
+    translation,
   } = session
 
   if (loading) return <Skeleton className="h-40 m-6" />
@@ -176,32 +187,72 @@ export default function MeetingView({
                 {i18nT('apps.meetings.meeting.unpause')}
               </Btn>
             )}
-            {(status === 'active' || status === 'paused') && (
-              <Btn
-                danger
-                onClick={actions.review}
-                aria-label={i18nT('apps.meetings.meeting.endAndReview')}
-              >
-                <Square className="lucide-inline" />
-                {i18nT('apps.meetings.meeting.endAndReview')}
-              </Btn>
-            )}
-            <Btn
-              onClick={session.refresh}
-              disabled={syncing}
-              aria-label={i18nT('apps.meetings.meeting.refresh')}
-              title={i18nT('apps.meetings.meeting.refresh')}
-            >
-              <RefreshCw className={`lucide-inline ${syncing ? 'animate-spin' : ''}`} />
-            </Btn>
-            <Btn
-              onClick={() => setSidebarOpen(open => !open)}
-              aria-label={i18nT('apps.meetings.meeting.toggleTasks')}
-              title={i18nT('apps.meetings.meeting.toggleTasks')}
-            >
-              <ListChecks className="lucide-inline" />
-              {tasks.length > 0 && <span>{tasks.length}</span>}
-            </Btn>
+            {/* Everything past the one primary status action lives in an overflow
+                menu: five sibling buttons breached the two-per-row cap and wrapped
+                under width pressure. The trigger counts as one control, and the
+                menu items keep full text labels the icon-only buttons never had.
+                Following components/CronRowActions.tsx and issue-radar's
+                DetailOverflowMenu rather than inventing a second overflow shape —
+                including moving a significant action (End and review, like the
+                issue pane's Close) into the menu, where its full label survives. */}
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Btn
+                  className="!px-1.5"
+                  aria-label={i18nT('apps.meetings.meeting.moreActions')}
+                  title={i18nT('apps.meetings.meeting.moreActions')}
+                >
+                  <MoreHorizontal size={14} />
+                </Btn>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="min-w-[200px]">
+                {(status === 'active' || status === 'paused') && (
+                  <>
+                    <DropdownMenuItem onSelect={actions.review}>
+                      <Square size={13} className="shrink-0 text-danger" />
+                      <span>{i18nT('apps.meetings.meeting.endAndReview')}</span>
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                  </>
+                )}
+                <DropdownMenuItem disabled={syncing} onSelect={session.refresh}>
+                  <RefreshCw
+                    size={13}
+                    className={`shrink-0 text-muted ${syncing ? 'animate-spin' : ''}`}
+                  />
+                  <span>{i18nT('apps.meetings.meeting.refresh')}</span>
+                </DropdownMenuItem>
+                {/* Offered only when a target language is configured: with translation
+                    off (the default) the item would open a panel that can never fill.
+                    Settings is where it gets turned on. */}
+                {translation.language && (
+                  <DropdownMenuItem
+                    onSelect={() => {
+                      // One side panel at a time: stacked below `lg` the two
+                      // panels' 260px height floors together exceed a short
+                      // viewport and squeeze the transcript out entirely.
+                      setSidebarOpen(false)
+                      session.setTranslationOpen(open => !open)
+                    }}
+                  >
+                    <Languages size={13} className="shrink-0 text-muted" />
+                    <span>{i18nT('apps.meetings.meeting.toggleTranslation')}</span>
+                  </DropdownMenuItem>
+                )}
+                <DropdownMenuItem
+                  onSelect={() => {
+                    session.setTranslationOpen(false)
+                    setSidebarOpen(open => !open)
+                  }}
+                >
+                  <ListChecks size={13} className="shrink-0 text-muted" />
+                  <span>
+                    {i18nT('apps.meetings.meeting.toggleTasks')}
+                    {tasks.length > 0 ? ` (${tasks.length})` : ''}
+                  </span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         </div>
 
@@ -281,6 +332,17 @@ export default function MeetingView({
           />
         )}
       </div>
+
+      {translation.open && translation.language && (
+        <TranslationSidebar
+          lines={translation.lines}
+          languageLabel={translation.languageLabel}
+          pending={translation.pending}
+          dropped={translation.dropped}
+          loading={translation.loading}
+          onClose={() => session.setTranslationOpen(false)}
+        />
+      )}
 
       {sidebarOpen && (
         <TaskSidebar

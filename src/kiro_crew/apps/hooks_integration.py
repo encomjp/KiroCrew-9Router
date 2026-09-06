@@ -22,7 +22,7 @@ from kiro_crew.apps.bridges import (
     disarm_app_crons_for_execution,
     register_app_crons_with_service,
 )
-from kiro_crew.apps.context import build_app_context
+from kiro_crew.apps.context import AppContext, build_app_context
 from kiro_crew.apps.cron_sdk import CronSDK
 from kiro_crew.apps.execution import (
     app_execution_denied,
@@ -31,7 +31,7 @@ from kiro_crew.apps.execution import (
 from kiro_crew.apps.lifecycle import LifecycleDispatcher
 from kiro_crew.apps.manager import app_dir, list_apps
 from kiro_crew.apps.route_registry import RouteRegistry
-from kiro_crew.cron import CronStoreBusy
+from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -39,6 +39,40 @@ logger = logging.getLogger(__name__)
 # Module-level singletons (initialized at gateway startup)
 _route_registry: RouteRegistry | None = None
 _lifecycle_dispatcher: LifecycleDispatcher | None = None
+
+# Last hook-wiring health per app, for apps whose hooks did NOT come up clean.
+# ``AppHealthStatus`` lives on the AppContext, which both wiring paths drop as
+# soon as they finish, so the reason a hook failed had no reader on the startup
+# path -- an app that failed to load was indistinguishable from one that was
+# never installed. Published here so ``GET /api/apps`` can report it under the
+# same ``hooks.health_status`` spelling the enable response already uses.
+_hook_health: dict[str, dict[str, Any]] = {}
+
+
+def _publish_hook_health(app_name: str, ctx: AppContext) -> dict[str, Any] | None:
+    """Record (or clear) one app's hook-wiring health and return the snapshot.
+
+    Both wiring paths funnel through here so they cannot drift: whatever
+    ``register_app_routes`` and the lifecycle dispatcher marked on the context is
+    what an operator reads back. A healthy wire-up clears any earlier entry, so a
+    fixed app stops reporting a stale failure after a re-enable.
+    """
+    if ctx.health.status == "healthy":
+        _hook_health.pop(app_name, None)
+        return None
+    snapshot = ctx.health.to_dict()
+    _hook_health[app_name] = snapshot
+    return snapshot
+
+
+def clear_hook_health(app_name: str) -> None:
+    """Forget an app's recorded hook health (disable / teardown)."""
+    _hook_health.pop(app_name, None)
+
+
+def get_all_hook_health() -> dict[str, dict[str, Any]]:
+    """Return every recorded non-healthy hook-wiring snapshot, by app name."""
+    return {name: dict(snapshot) for name, snapshot in _hook_health.items()}
 
 
 def init_hooks_system(
@@ -74,6 +108,21 @@ def get_route_registry() -> RouteRegistry | None:
 def get_lifecycle_dispatcher() -> LifecycleDispatcher | None:
     """Get the global LifecycleDispatcher instance."""
     return _lifecycle_dispatcher
+
+
+async def stop_retained_startup_hooks(
+    app_name: str, *, bounded: bool
+) -> bool:
+    """Wait for retained startup execution, failing closed on ownership errors."""
+    if _lifecycle_dispatcher is None:
+        return True
+    try:
+        return await _lifecycle_dispatcher.stop_detached_startup_hooks(
+            app_name, bounded=bounded
+        )
+    except Exception:  # noqa: BLE001 - destructive lifecycle work must fail closed
+        logger.exception("Could not verify detached startup-hook cleanup for %s", app_name)
+        return False
 
 
 def _app_hook_root(app_name: str) -> Path:
@@ -191,12 +240,15 @@ async def on_app_enable(
     # Invoke on_startup hook if declared
     startup_hook = hooks.get("on_startup", "")
     if startup_hook and _lifecycle_dispatcher:
-        success = await _lifecycle_dispatcher._invoke(app_name, startup_hook, ctx)
+        success = await _lifecycle_dispatcher._invoke(
+            app_name, startup_hook, ctx, phase="startup"
+        )
         result["hooks_startup"] = "ok" if success else "failed"
 
     # Report health status
-    if ctx.health.status != "healthy":
-        result["health_status"] = ctx.health.to_dict()
+    health_snapshot = _publish_hook_health(app_name, ctx)
+    if health_snapshot:
+        result["health_status"] = health_snapshot
 
     sel().log_api_access(
         caller="gateway",
@@ -207,8 +259,24 @@ async def on_app_enable(
     return result
 
 
+async def stop_app_startup_hooks(
+    app_name: str, *, bounded: bool = False
+) -> bool:
+    """Prove retained startup ownership clear before teardown mutates state."""
+    if not _lifecycle_dispatcher:
+        return True
+    return await _lifecycle_dispatcher.stop_detached_startup_hooks(
+        app_name, bounded=bounded
+    )
+
+
 async def on_app_disable(
-    app_name: str, app_info: dict[str, Any], *, run_app_hooks: bool = True
+    app_name: str,
+    app_info: dict[str, Any],
+    *,
+    run_app_hooks: bool = True,
+    bounded_startup_cleanup: bool = False,
+    startup_stopped: bool | None = None,
 ) -> dict[str, Any]:
     """Called before an app is disabled — deregister routes and invoke shutdown hook.
 
@@ -217,13 +285,34 @@ async def on_app_disable(
     caller passes it when there is no reason to believe the app is running: its
     shutdown hook is third-party code, and *starting* that code as part of
     withdrawing its permission to run would turn the security operation into an
-    execution vector. Nothing that STOPS something is ever skipped by this flag —
-    see the split in ``apps/teardown.py``.
+    execution vector. Nothing that STOPS something is ever skipped by this flag.
+
+    ``bounded_startup_cleanup`` distinguishes trust withdrawal from ordinary
+    disable. Ordinary disable waits until an owned detached startup task exits;
+    trust withdrawal stays bounded and reports residual execution as a hard
+    failure so the grant remains in place for a retry. Shared teardown passes a
+    pre-established ``startup_stopped`` result so this function cannot repeat the
+    ownership wait after other teardown work has begun.
     """
     result: dict[str, Any] = {}
     manifest = app_info.get("manifest", {})
     backend = manifest.get("backend", {})
     hooks = backend.get("hooks", {})
+
+    # A startup hook may have been detached after its readiness deadline. It is
+    # still third-party code with a live AppContext, so disable/revocation must
+    # stop it even if the current manifest no longer declares hooks. A resistant
+    # task becomes a hard teardown failure; callers keep trust in place rather
+    # than falsely claiming all app code stopped.
+    if startup_stopped is None:
+        startup_stopped = await stop_app_startup_hooks(
+            app_name, bounded=bounded_startup_cleanup
+        )
+    if not startup_stopped:
+        result["startup_cleanup"] = (
+            "failed: detached startup hook is still running; teardown not started"
+        )
+        return result
 
     if hooks:
         sel().log_api_access(
@@ -233,19 +322,26 @@ async def on_app_disable(
             resources=app_name,
         )
 
-    # Invoke on_shutdown hook if declared
+    # Invoke on_shutdown only after retained startup ownership is proven clear.
+    # Trust withdrawal must stay bounded and must never overlap partially
+    # initialized startup state with an unbounded third-party shutdown hook.
     shutdown_hook = hooks.get("on_shutdown", "")
-    if shutdown_hook and _lifecycle_dispatcher and run_app_hooks:
+    if shutdown_hook and _lifecycle_dispatcher and run_app_hooks and startup_stopped:
         success = await _lifecycle_dispatcher._invoke(
             app_name,
             shutdown_hook,
             _lifecycle_dispatcher._build_context(app_info),
+            phase="shutdown",
         )
         result["hooks_shutdown"] = "ok" if success else "failed"
 
     # Deregister routes
     if _route_registry:
         _route_registry.deregister_app_routes(app_name)
+
+    # A disabled app has no live hooks, so a recorded failure would linger as a
+    # stale claim about an app that is no longer wired up at all.
+    clear_hook_health(app_name)
 
     # Clean up cron jobs owned by this app
     permissions = manifest.get("permissions", {})
@@ -265,6 +361,27 @@ async def on_app_disable(
                 removed = await sdk.remove_all_async()
                 if removed:
                     result["cron_cleanup"] = f"removed {removed} job(s)"
+            except CronStoreUnreadable as exc:
+                # Sibling class of CronStoreBusy, so it escaped the arm below
+                # entirely and would CRASH the disable — the outcome the comment
+                # above forbids. Reported rather than retried: an unreadable store
+                # does not heal on its own.
+                logger.warning(
+                    "App %s: cron cleanup could not complete on disable — "
+                    "store unreadable: %s",
+                    app_name,
+                    exc,
+                )
+                result["cron_cleanup"] = (
+                    "failed: cron store unreadable — jobs may still be enabled"
+                )
+                sel().log_api_access(
+                    caller="gateway",
+                    operation="app_crons_deregister",
+                    outcome="failed",
+                    resources=app_name,
+                    error=str(exc),
+                )
             except CronStoreBusy as exc:
                 logger.warning(
                     "App %s: cron cleanup could not complete on disable — " "store busy: %s",
@@ -370,9 +487,20 @@ async def on_gateway_startup(
         # Invoke on_startup hook (if declared)
         startup_hook = hooks.get("on_startup", "")
         if startup_hook and _lifecycle_dispatcher:
-            success = await _lifecycle_dispatcher._invoke(name, startup_hook, ctx)
+            success = await _lifecycle_dispatcher._invoke(
+                name, startup_hook, ctx, phase="startup"
+            )
             if success:
                 logger.info("Startup hook invoked for: %s", name)
+
+        # Same publication as on_app_enable: the reason a hook failed must outlive
+        # the context, or boot is the one path where it is collected and dropped.
+        # No log line here on purpose: every site that marks the context degraded
+        # already logs at ERROR itself (route_registry.py:142,151,159 and
+        # lifecycle.py:352,396, plus the cancelled site via
+        # _mark_cancelled_startup_residual at lifecycle.py:66), so an aggregate
+        # would only re-log them, and only ever for this one caller.
+        _publish_hook_health(name, ctx)
 
 
 async def on_gateway_shutdown() -> None:
@@ -383,13 +511,7 @@ async def on_gateway_shutdown() -> None:
     # list_apps() walks the apps dir (two file reads per app) — off the loop.
     installed = await asyncio.to_thread(list_apps)
     enabled = [a for a in installed if a.get("enabled")]
-    apps_with_hooks = [
-        a
-        for a in enabled
-        if a.get("manifest", {}).get("backend", {}).get("hooks", {}).get("on_shutdown")
-    ]
-
-    if apps_with_hooks:
-        invoked = await _lifecycle_dispatcher.dispatch_shutdown(apps_with_hooks)
+    if enabled:
+        invoked = await _lifecycle_dispatcher.dispatch_shutdown(enabled)
         if invoked:
             logger.info("Shutdown hooks invoked for: %s", ", ".join(invoked))

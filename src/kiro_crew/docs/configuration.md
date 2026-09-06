@@ -30,12 +30,10 @@ OS-level sandbox (a user namespace on Linux, `sandbox-exec` on macOS).
 
 | Value | Behavior |
 |-------|----------|
-| `off` (default) | Defer isolation to kiro-cli's own internal agent sandbox |
-| `auto` | Add Kiro Crew's OS-level sandbox on top |
+| `auto` (default) | Add the Kiro Crew OS-level sandbox; on macOS it defers to the kiro-cli internal sandbox when that is enabled |
+| `off` | Skip the Kiro Crew OS-level sandbox |
 
-The two layers are mutually exclusive on macOS, because a nested seatbelt
-sandbox fails with `EPERM`. That is why the default is `off`: kiro-cli already
-isolates the agent, and stacking a second sandbox would break it.
+The two layers are mutually exclusive on macOS because a nested seatbelt sandbox fails with `EPERM`. The default is `auto`: it uses the Kiro Crew sandbox where available and defers to the kiro-cli internal sandbox on macOS when that sandbox is enabled.
 
 Set via `kirocrew config set agent.sandbox auto`.
 
@@ -82,19 +80,19 @@ use KAS's `_kiro/session/list` (which returns the full `sessions[]` to search by
 id); that is deferred to the session-lifecycle work, not the display path.
 
 
-**KAS gets its token from kiro-cli.** Kiro Crew launches KAS with
-`--auth=acp-callback`, so KAS keeps no credential of its own: whenever it needs
-an access token it calls back over ACP (`_kiro/auth/getAccessToken`) and Kiro
-Crew answers by shelling out to `kiro-cli chat _ get-kas-token`, which
-resolves-and-refreshes the token. The refresh token never leaves kiro-cli's own
-store, and this process only ever holds a short-lived access token in transit —
-never cached, never logged. This works on any machine where `kiro-cli login` has
-succeeded; a machine that is not signed in gets an auth error on the first
-prompt (the session still starts cleanly). Sign in with kiro-cli before
-switching.
+**KAS is served by kiro-cli's own ACP relay.** Kiro Crew spawns
+`kiro-cli acp --agent-engine v3 --auth-method cli` and speaks ordinary ACP to it;
+the relay forwards frames to KAS in both directions. Two consequences worth
+knowing:
 
-It also needs a KAS bundle already extracted on the machine by kiro-cli; set
-`KIROCREW_KAS_NODE` / `KIROCREW_KAS_SCRIPT` to point elsewhere.
+- **Credentials stay in kiro-cli.** `--auth-method cli` makes the relay resolve
+  access tokens from kiro-cli's own store, so Kiro Crew never handles a KAS
+  token. This works on any machine where `kiro-cli login` has succeeded; sign in
+  with kiro-cli before switching.
+- **No KAS assets to locate.** Kiro Crew does not read kiro-cli's extracted KAS
+  bundle or its Node runtime, so there is nothing to point at and no override to
+  set. What it does need is a kiro-cli new enough to offer `--agent-engine v3`;
+  `kirocrew doctor` reports that when `agent.acp_backend` is `kas`.
 
 An unrecognized value logs a warning and falls back to the default backend, so a
 typo costs you a line in the log rather than a gateway that will not start.
@@ -111,7 +109,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
     "approval_mode": "auto",
     "model": "auto",
     "reasoning_effort": "",
-    "sandbox": "off",
+    "sandbox": "auto",
     "bot_name": "",
     "conductor_skill": false,
     "max_channels": 1,
@@ -185,10 +183,15 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `agent.approval_mode` | `"auto"` or `"interactive"` | `"auto"` |
 | `agent.model` | Default LLM model for new sessions. `"auto"` defers to the agent config, then to Kiro's own default. Editable from Settings → Chat → Model; a per-session model picker overrides it for that session only | `"auto"` |
 | `agent.reasoning_effort` | Default reasoning effort on models that support it. One of `""`, `low`, `medium`, `high`, `xhigh`, `max`; `""` defers to the provider/model default. A per-session override wins | `""` |
-| `agent.sandbox` | `"off"` (defer to kiro-cli) or `"auto"` (add Kiro Crew's OS-level sandbox) | `"off"` |
+| `agent.sandbox` | `"auto"` (use Kiro Crew OS-level sandbox, or defer to the kiro-cli internal sandbox on macOS) or `"off"` (skip the Kiro Crew sandbox) | `"auto"` |
 | `agent.streaming` | Stream response text as it is generated | `true` |
 | `agent.bot_name` | Custom name the bot identifies as | `""` |
 | `agent.conductor_skill` | Enable agent delegation conductor | `false` |
+| `agent.session_sharing` | Reuse a shared ACP runtime for subagents on the kiro-cli backend; alternate ACP backends ignore it | `true` |
+| `agent.tool_search` | On the kiro-cli backend, defer MCP tool definitions when either threshold below is exceeded; alternate ACP backends ignore it | `true` |
+| `agent.tool_search_min_pct` | Tool-definition context threshold as a percentage; `0` with the token threshold also `0` always defers | `5` |
+| `agent.tool_search_min_tokens` | Tool-definition token threshold; `0` with the percentage threshold also `0` always defers | `50000` |
+| `agent.fallback_model` | Model used after the active model exhausts its transient-retry budget. `"auto"` defers to availability-aware routing; `""` disables fallback | `"auto"` |
 | `agent.max_channels` | Max concurrent agent channels (1-5) | `1` |
 | `agent.max_channel_agents` | Max agents per channel (1-10) | `3` |
 | `agent.log_level` | Persistent log level for the `kiro_crew` logger, applied at startup. The `--verbose` CLI flag overrides it | `"WARNING"` |
@@ -205,10 +208,12 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | Key | Description | Default |
 |-----|-------------|---------|
 | `session.timeout_secs` | Idle session timeout in seconds (0 disables the idle sweep) | `3600` (60 min) |
+| `session.empty_response_auto_continue` | After two consecutive empty model responses, send one transcript-visible `continue` nudge per user message | `true` |
 | `session.autocompact_pct` | Context usage percentage at which auto-compaction triggers (5-90). Lower compacts sooner and keeps per-turn cost down; higher retains more conversation before rewriting it. Applies to new installs: an existing `config.json` keeps its stored value | `70.0` |
 | `session.pool_size` | Number of pre-spawned kiro-cli processes kept ready for instant session start. 0 disables | `0` |
 | `session.pool_agent` | Agent for warm-pool processes. Empty uses `agent.default_agent` | `""` |
 | `session.pool_ttl_secs` | Max age in seconds for pooled processes, discarded at claim time. 0 disables | `1800` |
+| `session.eager_spawn` | Create a chat session when its slot is created, switched, or retargeted instead of waiting for the first message | `true` |
 | `session.archive_retention_days` | Days to keep compacted/rotated session archives before auto-cleanup. `-1` disables cleanup | `30` |
 | `session.watchdog_rss_max_mb` | Recycle a session when its process tree resident memory exceeds this many MiB. 0 disables. A session with a turn in flight is never recycled | `0` |
 
@@ -222,6 +227,7 @@ Set via `kirocrew config set agent.acp_backend kas`.
 | `dashboard.qr_session_until_restart` | Keep a phone signed in for as long as the gateway process runs. Ordinary idling no longer signs it out; a gateway restart does, and so does going 30 days untouched (the refresh credential's lifetime, renewed on each visit). Turn off for a timed session that expires on a clock whether or not the gateway is still running. | `true` |
 | `dashboard.merge_queued_messages` | Concatenate follow-up messages while the agent is busy | `false` |
 | `dashboard.mcp_probe_timeout_secs` | Seconds to wait for an MCP server handshake during a probe (5-120) | `15` |
+| `dashboard.link_previews` | Fetch and render HTTP(S) link metadata in assistant messages. Off by default because each linked site receives a request from this machine | `false` |
 
 ### Slack
 
@@ -243,14 +249,76 @@ from the dashboard — see each channel's doc for keys and credentials.
 
 ### Speech-to-text
 
+Speech-to-text is on by default and runs on your machine. Dictate into the
+dashboard composer, and voice notes that arrive over a messaging channel are
+transcribed the same way.
+
 | Key | Description | Default |
 |-----|-------------|---------|
-| `stt.enabled` | Enable voice-memo transcription | `true` |
-| `stt.provider` | `"whisper"` (local), `"mlx"` (local, Apple silicon), `"parakeet"` (local, Apple silicon, NVIDIA Parakeet), `"apple"` (local, macOS 26+), or `"transcribe"` (AWS, needs the `voice` extra) | `"whisper"` |
-| `stt.parakeet_model` | Hugging Face repo for the parakeet-mlx model (parakeet provider only) | `"mlx-community/parakeet-tdt-0.6b-v3"` |
-| `stt.streaming` | Stream partial transcripts live into the dashboard input. Transcribe provider only | `false` |
-| `stt.transcribe_region` | AWS region for the Transcribe API (transcribe provider only) | `"us-east-1"` |
+| `stt.enabled` | Turn spoken input into text you can send | `true` |
+| `stt.provider` | `"local"` (this machine, no account), `"apple"` (the on-device recognizer built into macOS 26 and later), or `"transcribe"` (AWS Transcribe, which bills your AWS account) | `"local"` |
+| `stt.model` | Which speech model the local provider downloads and runs: `tiny`, `base`, `small`, or `large-v3-turbo`. Bigger is more accurate and a longer first-time download | `"base"` |
 | `stt.language_code` | Language for speech recognition, e.g. `en-US`, `fr-FR` | `"en-US"` |
+| `stt.streaming` | Show words in the message box while you are still speaking rather than only once you stop. Every provider supports it; turning it off spends less CPU on `local` and fewer API calls on `transcribe` | `true` |
+| `stt.silence_ms` | How long a pause must last before what you said is treated as a finished phrase. Raise it if you are being cut off mid-sentence, lower it if the text lags behind you. A value outside 200-5000 ms is clamped into that range, because a shorter pause than that falls between two ordinary words | `700` |
+| `stt.partial_interval_ms` | How often the live transcript is refreshed while you speak. Lower feels more immediate and costs a little more CPU per second of speech; higher is steadier to read. A value outside 100-5000 ms is clamped into that range | `400` |
+| `stt.idle_evict_secs` | How long the local model stays in memory after your last recording. It holds roughly 150 MB at the default model and reloads in a fraction of a second, so lower this on a machine short of memory. `0` releases it as soon as you stop speaking | `600` |
+| `stt.endpointing` | While dictating, judge each finished phrase with a fast background model and send the message once it reads as a complete request, without you pressing anything. Needs `streaming` | `false` |
+| `stt.dictation_panel` | Show the animated dictation panel while recording instead of the thin status bar. Ignored when the browser lacks WebGL2 or the OS asks for reduced motion, both of which fall back to the bar | `true` |
+| `stt.timeout_secs` | Ceiling on transcribing one whole file: the audio decode, and each model load or recognition inside it | `300` |
+| `stt.transcribe_region` | AWS region for the Transcribe API (`transcribe` provider only) | `"us-east-1"` |
+| `stt.transcribe_profile` | AWS profile for the Transcribe API. Empty uses the default credential chain (`transcribe` provider only) | `""` |
+
+#### The local provider downloads one model, once
+
+Recognition needs weights, and they are too large to ship inside the package, so
+the first time you dictate Kiro Crew fetches the model named by `stt.model` and
+every session after that loads it from disk. `base` is 148 MB. The others are
+78 MB (`tiny`), 488 MB (`small`) and 1.6 GB (`large-v3-turbo`). The dashboard says
+a download has started before it begins and reports its progress, because a silent
+transfer of that size is indistinguishable from a hang.
+
+Every download is verified against a pinned sha256 digest and is only moved into
+place once the digest matches, so a tampered mirror, a truncated transfer or a
+captive-portal login page cannot become your speech model. Weights live under
+`models/whisper/` in the data home. Deleting one just costs you the download
+again.
+
+Desktop users install nothing else by hand: the app already carries the
+recognizer, decoder, and AWS client. In a source environment the recognizer and
+AWS client arrive with the optional `voice` extra
+(`pip install "kirocrew[voice]"`):
+
+- **Intel Macs have no prebuilt recognizer.** Every other platform Kiro Crew
+  supports (Apple silicon macOS, glibc and musl Linux on x86_64 and arm64, and
+  Windows) installs a ready-built wheel. On an Intel Mac `pip` falls back to
+  building from source, which needs a C++ toolchain and CMake. Settings reports
+  that as its own state rather than as a missing extra, because the two need
+  different fixes.
+
+  If you would rather not build it, `pip install "kirocrew[voice-aws]"` installs
+  only the AWS Transcribe client. `pip` resolves an extra all-or-nothing, so on a
+  platform without the recognizer wheel the full `voice` extra installs *nothing* —
+  including the Transcribe client, which has no such limitation. This is the way to
+  get the paid provider on a host that cannot build the free one.
+- Compressed audio still passes through ffmpeg internally: a voice note arrives
+  as ogg/Opus and a browser recording as webm. Desktop releases bundle and verify
+  a pinned decoder, so there is no separate FFmpeg installation step. Source
+  environments use a system FFmpeg from the fixed platform paths instead of an
+  executable inside an agent-writable project venv.
+
+#### Retired providers
+
+The `whisper`, `mlx`, `parakeet` and `faster` providers are gone. Each of them
+needed a runtime you had to install yourself (a `whisper` command on `PATH`, or an
+`mlx-whisper` / `parakeet-mlx` / `faster-whisper` package), which is exactly the
+work `local` removes while recognizing the same speech. On Apple silicon the GPU
+acceleration that `mlx` existed for is already in the bundled recognizer.
+
+A config that still names one keeps working: it is read as `local`, and the
+gateway log says which value it replaced. The settings those providers used
+(`whisper_path`, `mlx_model`, `parakeet_model`, `device`) are ignored if they are
+still present, so there is nothing you have to remove by hand.
 
 ### Paid AWS services need an explicit confirmation
 
@@ -282,8 +350,8 @@ permission to spend. The authenticated dashboard is the only writer — there is
 deliberately no CLI verb, because a terminal command that records a grant on
 request is a grant an automated caller can take.
 
-Both local defaults (`piper` for TTS, `whisper` for STT) need no AWS account and
-no confirmation.
+Both local defaults (`piper` for TTS, `local` for STT) need no AWS account and no
+confirmation.
 
 ### Memory and embeddings
 
@@ -295,10 +363,12 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 |-----|-------------|---------|
 | `memory.embedding_provider` | Vector embedding backend. `"llama_cpp"` is the only accepted value; any other value in an existing config (including a legacy `"ollama"` or `"none"`) is coerced to it on load | `"llama_cpp"` |
 | `memory.embedding_dim` | Output width of the embedding model in use. Must match a custom model's real width, or the load is refused | `1024` |
+| `memory.embedding_threads` | CPU threads llama.cpp may use per embedding call; clamped to the machine core count | `4` |
 | `memory.embed_model_url` | Override HTTPS URL for the embedding-model GGUF download (mirrored or airgapped hosts). Empty uses the public Kiro Crew CDN. `KIROCREW_EMBED_MODEL_URL` wins over both. Downloads are sha256-verified regardless of source | `""` |
 | `memory.embed_model_path` | Absolute path to a local GGUF to run **instead of** the bundled Qwen3-Embedding-0.6B. When set, the default model is never downloaded, so a custom model survives a default-model version change. Set `embedding_dim` to the model's output width. Changing the model changes the vector space, so stored embeddings are regenerated in the background. A configured-but-unreadable path fails closed (keyword search still works) rather than silently reverting to the default and re-embedding your corpus. Editable from the dashboard (Memory → Embedding Model). `KIROCREW_EMBED_MODEL_PATH` wins over this | `""` |
 | `memory.embed_model_id` | Stable identifier for a custom model's vector space. Defaults to `custom:<filename>:<size>`, which cannot distinguish two different models of identical byte size, so set it explicitly if you swap between such models | `""` |
 | `memory.semantic_confidence_threshold` | Minimum similarity score for a semantic search result | `0.8` |
+| `memory.episodic_dedup_threshold` | Similarity threshold for deduplicating episodic memories | `0.88` |
 | `memory.episodic_max_results` | Max episodic memories injected per session | `8` |
 | `memory.episodic_max_count` | Max total episodic memories stored | `10000` |
 | `memory.decay_rates` | Per-tag episodic recency decay rates, per day (score factor `exp(-rate * days_old)`). Keys are memory tags (case-insensitive); the reserved `default` key replaces the built-in `0.03` for memories matching no configured tag. A memory carrying several configured tags uses the slowest (smallest) rate, so a broad tag can never age out a long-retention one. `0` never ages out of retrieval ranking; `1` falls out of retrieval within about a day. Ranking only: `episodic_max_count` cap eviction (lowest importance, then oldest) still applies regardless of decay rate. Values are clamped to `0..10`; non-numeric values are ignored with a logged warning. Example: `{"legal_precedents": 0.0, "trading_data": 1.0}` | `{}` |
@@ -312,17 +382,33 @@ them, so there is no enable switch here: only knobs for *which* model runs.
 | `skills.max_triggered` | Maximum skills loaded per message (>=0) | `0` |
 | `skills.lazy_load` | Inject only a usage-ranked top-K of on-demand skills at session start and leave the long tail discoverable via search, so a large skills set cannot crowd out memory and lessons | `false` |
 
+### MCP Gateway
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `mcp_gateway.enabled` | Share one MCP backend process between sessions with identical server configuration. Opt-in; when false each session owns its backend | `false` |
+
+### Session summaries
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `session_summary.enabled` | Generate intent-level summaries for the chat side panel after turns. This consumes model tokens; unchanged sessions are served from cache | `false` |
+
 ### Knowledge Library
 
 | Key | Description | Default |
 |-----|-------------|---------|
 | `knowledge.auto_ingest_artifacts` | Auto-ingest content-bearing local artifacts into the Knowledge Library as a searchable "Artifacts" source, kept in sync and removed when the artifact is deleted (see [Knowledge Library](knowledge-library-how-it-works.md)). Opt-in: enabling it backfills the artifacts you already have | `false` |
 | `knowledge.auto_ingest_artifact_kinds` | Artifact kinds eligible for auto-ingest. `widget` is excluded as UI rather than a document; `svg` is excluded because the file reader has no support for it | `["markdown", "text", "html", "json"]` |
+| `knowledge.max_ingest_file_mb` | Per-file Knowledge Library ingestion size cap; oversized files are skipped. `0` disables the cap | `100.0` |
 | `knowledge.auto_add_documents` | Let the agent add documents it reads while working to the Knowledge Library (one aggregate "Auto-added" source). The agent fetches the content with its own tools under your approval; Kiro Crew fetches nothing, so `doc_ingest_hosts` does not apply. Renamed from `auto_ingest_doc_links`, which is still accepted on read | `false` |
 | `knowledge.auto_register_project_docs` | Register the documents of each project you work in as a Knowledge source automatically. Documents only (`.md`/`.pdf`/`.docx`/`.org` above a size floor, excluding agent instructions, generated files and repository boilerplate) — never source code. Opt-in: once on it applies to every project you open, with no per-project confirmation | `false` |
 | `knowledge.auto_ingest_chunk_budget` | Chunks an automatically-registered source may ingest per watcher sweep. Each chunk is one LLM extraction call, so this bounds the cost; newest documents land first and the rest follow on later sweeps. 0 removes the bound | `150` |
 | `knowledge.folder_ingest_chunk_budget` | Chunks a folder you add by hand may ingest per watcher sweep, including the first scan started by confirming the source. Nothing is skipped — newest files land first and the rest continue on later sweeps — so this paces spend rather than limiting what is ingested. Higher than the auto-ingest budget because you asked for the folder explicitly. 0 removes the bound; a per-source `chunk_budget` property overrides it for one folder | `300` |
 | `knowledge.dedup_every_n_sweeps` | Run a full duplicate-collapsing pass every Nth watcher sweep (the per-write gate only catches byte-identical documents). 0 disables | `12` |
+| `knowledge.extraction_pool_size` | Concurrent LLM workers for document extraction; requires restart | `3` |
+| `knowledge.embed_rate_limit` | Maximum embedding generations per minute across all sources. `0` removes the bound | `120` |
+| `knowledge.sweep_chunk_budget` | Maximum chunks ingested across all sources in one watcher sweep. `0` removes the bound | `500` |
 | `knowledge.auto_discover_folder` | Watch for a documents folder inside the active workspace and register it as a Knowledge source automatically, so files dropped there become searchable without adding the source by hand. The folder is never created for you, and deleting or pausing the auto-added source persists so it does not reappear on the next sweep. Off by default because ingestion spends LLM extraction on every supported file | `false` |
 | `knowledge.auto_discover_dirname` | Folder name inside the workspace that auto-discovery looks for. A single path segment: separators and traversal are rejected so the source cannot be redirected outside the workspace. Avoid `knowledge`, which is where the Library's own store lives and always exists | `"knowledge-docs"` |
 

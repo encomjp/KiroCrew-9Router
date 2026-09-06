@@ -676,3 +676,173 @@ class TestDispatchThreadsGovernanceIdentity:
             names = {kw.arg for kw in call.keywords}
             assert "app" in names, "on_tool_call is invoked without `app`, so no profile resolves"
             assert "session_key" in names and "agent" in names
+
+
+class TestTheInitWindowHoldIsBounded:
+    """Unit-level arithmetic for the #4610 hold, without the HTTP surface."""
+
+    @staticmethod
+    def _session() -> sess.MeetingSession:
+        return sess.MeetingSession(
+            meeting_id="standup",
+            sessions=None,
+            config={"meeting_agents": []},
+        )
+
+    def test_it_accepts_up_to_the_cap_without_dropping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(k, "MAX_INIT_BUFFER_LINES", 3)
+        session = self._session()
+        assert [session.buffer_during_init(f"line {i}") for i in range(3)] == [
+            True,
+            True,
+            True,
+        ]
+        assert session.init_dropped == 0
+        assert len(session.init_buffer) == 3
+
+    def test_the_line_past_the_cap_displaces_the_oldest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(k, "MAX_INIT_BUFFER_LINES", 3)
+        session = self._session()
+        for index in range(4):
+            accepted = session.buffer_during_init(f"line {index}")
+        # The fourth reports the displacement so the caller can log it.
+        assert accepted is False
+        assert [line for line, _ in session.init_buffer] == ["line 1", "line 2", "line 3"]
+        assert session.init_dropped == 1
+
+    def test_a_lowered_cap_sheds_the_whole_excess_at_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The trim is by ARITHMETIC, not one entry per call.
+
+        A `pop(0)` per append would leave the buffer permanently over a cap that
+        shrank — the bound has to hold for the buffer it is applied to, not only
+        for the line that triggered it.
+        """
+        monkeypatch.setattr(k, "MAX_INIT_BUFFER_LINES", 5)
+        session = self._session()
+        for index in range(5):
+            session.buffer_during_init(f"line {index}")
+        monkeypatch.setattr(k, "MAX_INIT_BUFFER_LINES", 2)
+        assert session.buffer_during_init("newest") is False
+        assert [line for line, _ in session.init_buffer] == ["line 4", "newest"]
+        assert session.init_dropped == 4
+
+    def test_the_drain_empties_the_hold_and_resets_the_tally(self) -> None:
+        session = self._session()
+        assert session.buffer_during_init("first") is True
+        assert session.buffer_during_init("second") is True
+        delivered, dropped = session.drain_init_buffer()
+        assert (delivered, dropped) == (2, 0)
+        assert session.init_buffer == []
+        assert session.init_dropped == 0
+        # The always-on task extractor received them in order.
+        assert session.agents[k.TASK_EXTRACTOR_ID].queue == ["first", "second"]
+
+    def test_noise_is_filtered_at_arrival_and_never_occupies_a_slot(self) -> None:
+        """A held line takes the same path in; the hold changes WHEN, not WHAT.
+
+        Filtering at arrival is what makes the cap honest — filler that would be
+        discarded anyway must not be counted against the bound in the meantime.
+        """
+        session = self._session()
+        assert session.buffer_during_init("uh") is True
+        assert session.init_buffer == []  # consumed no slot at all
+        session.buffer_during_init("real content here")
+        assert [line for line, _ in session.init_buffer] == ["real content here"]
+
+        delivered, dropped = session.drain_init_buffer()
+        assert (delivered, dropped) == (1, 0)
+        assert session.agents[k.TASK_EXTRACTOR_ID].queue == ["real content here"]
+
+    def test_each_line_keeps_the_recipients_it_had_when_spoken(self) -> None:
+        """A mute landing mid-hold does not reach backwards."""
+        session = self._session()
+        session.agents["late-joiner"] = session._make_queue("late-joiner", "")
+        session.buffer_during_init("everyone hears this")
+        session.muted_agents.add("late-joiner")
+        session.buffer_during_init("only the extractor hears this")
+
+        delivered, dropped = session.drain_init_buffer()
+        assert (delivered, dropped) == (2, 0)
+        assert session.agents["late-joiner"].queue == ["everyone hears this"]
+        assert session.agents[k.TASK_EXTRACTOR_ID].queue == [
+            "everyone hears this",
+            "only the extractor hears this",
+        ]
+
+    def test_an_agent_removed_mid_hold_is_skipped_not_resurrected(self) -> None:
+        """A recorded name whose queue is gone must not be re-created at drain.
+
+        Names are stored rather than queue objects precisely so a disabled agent
+        cannot be fed into a queue nothing flushes.
+        """
+        session = self._session()
+        session.agents["doomed"] = session._make_queue("doomed", "")
+        session.buffer_during_init("spoken while it existed")
+        del session.agents["doomed"]
+
+        delivered, dropped = session.drain_init_buffer()
+        # Still counts as delivered — the extractor received it.
+        assert (delivered, dropped) == (1, 0)
+        assert "doomed" not in session.agents
+        assert session.agents[k.TASK_EXTRACTOR_ID].queue == ["spoken while it existed"]
+
+    def test_a_line_addressed_to_nobody_is_not_counted_as_delivered(self) -> None:
+        """Every recipient muted at arrival means the line reached no one."""
+        session = self._session()
+        session.muted_agents.add(k.TASK_EXTRACTOR_ID)
+        session.buffer_during_init("into the void")
+        delivered, dropped = session.drain_init_buffer()
+        assert (delivered, dropped) == (0, 0)
+        assert session.agents[k.TASK_EXTRACTOR_ID].queue == []
+
+    def test_the_marker_reaches_an_agent_muted_after_its_lines_were_dropped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The marker follows the LOSS, not the drain-time mute set.
+
+        Addressing it to whoever is unmuted at drain omitted exactly the agent the
+        marker is for: one that lost an opening line to the cap and was muted before
+        the drain still receives its surviving pre-mute lines, so without the notice
+        its output begins mid-conversation with nothing to show a turn was lost.
+        """
+        monkeypatch.setattr(k, "MAX_INIT_BUFFER_LINES", 1)
+        session = self._session()
+        session.agents["muted-later"] = session._make_queue("muted-later", "")
+        # Cap of 1: the first line is dropped by the second, and both were
+        # addressed to `muted-later` while it was still listening.
+        session.buffer_during_init("dropped opening")
+        session.buffer_during_init("surviving line")
+        assert session.init_dropped == 1
+        assert "muted-later" in session.init_dropped_recipients
+
+        session.muted_agents.add("muted-later")
+        delivered, dropped = session.drain_init_buffer()
+        assert (delivered, dropped) == (1, 1)
+
+        marker = k.SYSTEM_INIT_BUFFER_OVERFLOW.format(count=1, limit=1)
+        # It gets the surviving line AND the notice that one is missing.
+        assert session.agents["muted-later"].queue == [marker, "surviving line"]
+        # The tally is consumed by the drain.
+        assert session.init_dropped_recipients == set()
+
+    def test_no_marker_reaches_an_agent_that_lost_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An agent muted while the dropped lines were spoken has no gap to announce."""
+        monkeypatch.setattr(k, "MAX_INIT_BUFFER_LINES", 1)
+        session = self._session()
+        session.agents["late-joiner"] = session._make_queue("late-joiner", "")
+        session.muted_agents.add("late-joiner")
+        session.buffer_during_init("dropped while muted")
+        session.buffer_during_init("also while muted")
+        session.muted_agents.discard("late-joiner")
+
+        delivered, dropped = session.drain_init_buffer()
+        assert dropped == 1
+        assert session.agents["late-joiner"].queue == []

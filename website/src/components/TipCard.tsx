@@ -9,7 +9,7 @@ import MarkdownRenderer from './MarkdownRenderer'
 
 import { i18nT } from '../i18n/t'
 // The Feature Tips toggle lives in Settings → Chat.
-export const TIPS_SETTINGS_PATH = '/settings?tab=chat'
+export const TIPS_SETTINGS_PATH = '/settings/chat'
 
 // Tip docs live in the repo at src/kiro_crew/docs/ (same base the Security and
 // Discord settings panels link to).

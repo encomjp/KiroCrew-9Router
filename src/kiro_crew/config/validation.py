@@ -151,18 +151,45 @@ def _actual_type_name(value: object) -> str:
     return type(value).__name__
 
 
+#: Exact dot-paths whose malformed values must SURVIVE advisory validation.
+#:
+#: ``_apply_field_default`` repairs a violating value by removing it so the
+#: loader falls back to defaults. Whether that repair is safe depends on the
+#: DIRECTION of the field's default:
+#:
+#: * ``publish`` (the section) and ``publish.allowed_destinations``: the
+#:   default is **open** (no restriction), so repairing a malformed narrowing
+#:   silently widens it to allow-all with no denial and no audit record
+#:   (#4057). The loader's recording coercion (``_coerced_section``) and the
+#:   gate's fail-closed checks are the honest handlers — but they can only run
+#:   if validation leaves the evidence in place. Keeping the value also keeps
+#:   security behaviour identical whether or not ``jsonschema`` is installed
+#:   (validation is a no-op without it), which is the split that let this gap
+#:   ship unnoticed.
+#:
+#: * Every OTHER publish field stays repairable, deliberately. For a field
+#:   whose default is **restrictive** the repair is the safe direction, and
+#:   preserving the malformed value can itself widen: a dict-shaped
+#:   ``publish.relocate_roots`` of ``{"/etc": false}`` iterates as its keys in
+#:   the loader's comprehension and would inject ``/etc`` as an allowed
+#:   relocate root, where the repaired default ``[]`` means home-only.
+#:
+#: Exact-match only: this is a per-path judgment, not a subtree rule.
+_FAIL_CLOSED_PATHS = frozenset({"publish", "publish.allowed_destinations"})
+
+
 def _apply_field_default(data: dict, dot_path: str) -> bool:
     """Remove the invalid value at *dot_path* so the loader falls back to defaults.
 
-    Recurses to arbitrary depth, walking dict keys and numeric array indices
-    (``items``). Dynamic dict keys (``additionalProperties``) are walked as
-    ordinary dict lookups. Warns when an intermediate is not an object/array
-    and strips by key presence (pop if present) so callers log honestly: a
-    kept value must not be reported as "using default". H7: validation never
-    widens the agent's effective ceiling by destroying loader-tolerated data;
-    depth is no longer capped.
+    Recurses to arbitrary depth (fork H7: validation never widens the
+    agent's effective ceiling by destroying loader-tolerated data — the
+    upstream one-level cap is lifted), walking dict keys and numeric array
+    indices. Values at a fail-closed path (see :data:`_FAIL_CLOSED_PATHS`)
+    are never removed: repairing them to their open defaults silently
+    widens a security narrowing (#4057). Callers use the return value to
+    log honestly: a kept value must not be reported as "using default".
     """
-    if not dot_path:
+    if dot_path in _FAIL_CLOSED_PATHS or not dot_path:
         return False
     parts = dot_path.split(".")
     cur: object = data
@@ -416,7 +443,11 @@ def validate_config_data(data: dict) -> dict:
     # circular import: schema.py imports KiroCrewConfig from config.loader, which
     # re-exports this module — importing schema at module level here would close
     # a config.loader -> validation -> schema -> loader cycle at import time.
-    from kiro_crew.config.loader import CONFIG_RESERVED_TOP_KEYS
+    from kiro_crew.config.loader import (
+        CONFIG_RESERVED_TOP_KEYS,
+        _validated_stt_model,
+        _validated_stt_provider,
+    )
     from kiro_crew.config.schema import JSON_SCHEMA, SCHEMA_REGISTRY
 
     # 1. Detect unrecognized top-level keys. The schema registry models only the
@@ -453,6 +484,22 @@ def validate_config_data(data: dict) -> dict:
     agent = data.get("agent")
     if isinstance(agent, dict) and isinstance(agent.get("log_level"), str):
         agent["log_level"] = agent["log_level"].upper()
+
+    # 3a. Resolve the STT provider and model through the loader's own degradation
+    # rules before the enum check can discard them. Both fields accept values that
+    # are deliberately absent from their enum (a retired provider, and a model name
+    # the catalog maps onto a current entry), and the loader answers each with a
+    # specific warning and a specific replacement. An enum violation instead
+    # deletes the key, so the parse site would fall back to the plain default and
+    # the operator would be told only that a value was rejected. Normalizing here
+    # makes the resolved value and the log identical whether or not ``jsonschema``
+    # is installed, which is the whole point: this function is a no-op without it.
+    stt = data.get("stt")
+    if isinstance(stt, dict):
+        if "provider" in stt:
+            stt["provider"] = _validated_stt_provider(stt["provider"])
+        if "model" in stt:
+            stt["model"] = _validated_stt_model(stt["model"])
 
     # 4. Preserve numeric values written by older config writers.
     _coerce_legacy_numeric_values(data, JSON_SCHEMA)

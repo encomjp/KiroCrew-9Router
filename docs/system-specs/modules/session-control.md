@@ -19,11 +19,22 @@ unreachable in production because the caller's `X-Internal-Secret` is ignored.
 | `session_stop` | `POST /api/session-control/stop` | Stop another session's in-flight turn |
 | `session_read_message` | `GET /api/session-control/read` | Read another session's transcript tail + liveness |
 
-**Nothing here writes into another session's conversation.** Reading returns a
-transcript tail, stopping cancels a turn the way the Stop button does, and
-creating opens an empty session the person types the first message into. Every
-verb is authorized at the moment it acts, so there is no delivery that can be
-delayed past its own authorization.
+**One verb here writes into another session's conversation: `session_send`.**
+Reading returns a transcript tail, stopping cancels a turn the way the Stop button
+does, creating opens an empty session, and sending delivers a message that the
+target runs as its next turn. Delivery is the sharpest verb and is bounded
+accordingly: the body is redacted through `sanitize_outbound` before it is
+persisted, it is prefixed with a `[sent by session <caller> via session_send]`
+envelope so the target's transcript can never render it as something the person
+typed, and channel agents are blocked from it outright.
+
+**Delivery has two authorization moments, and only the first is enforced today.**
+An idle target runs the prompt immediately, under the authorization that admitted
+it. A busy target QUEUES it, and the generic drain re-runs no check — so a target
+that gains a channel mirror between enqueue and drain broadcasts the delivered
+text. That window is accepted, not overlooked: it is not specific to this module
+(a human-typed message into a busy session drains through the same ungated path),
+so it is fixed once at the drain rather than per caller. Tracked as issue #5911.
 
 `session_create` earns its place on its own, not as the front half of a delivery
 design: an agent that has just worked out that a job needs its own session can
@@ -135,12 +146,15 @@ shape:
 window. A slot retains only its most recent messages in memory and credits each
 trimmed row to a frozen-prefix counter, so a length-derived cursor would freeze
 at the retention cap — and a poller on a long session would silently stop seeing
-replies, on exactly the sessions that need it most. A `since` read on a session
-whose rows have aged out is refused with `cursor_unavailable` (409) rather than
-fast-forwarded onto newer rows as if they were the ones asked for: the position
-is no longer exact, so answering it would be a guess dressed as an answer. The
-caller falls back to a tail read, which is why `next_since` is omitted in that
-case — its absence IS the signal that cursors are not available.
+replies, on exactly the sessions that need it most. Positions are based on the
+**durable-only** frozen-prefix counter (`_disk_older_durable_count`), which
+counts only trimmed rows a durable read returns — never the all-rows
+`_disk_older_count`, which also counts transient rows and would shift every
+position as soon as one was trimmed. A trimmed session therefore keeps an exact
+cursor: `next_since` is returned as usual. The one trim-related refusal left is
+a `since` **below** the trimmed prefix (409 `cursor_unavailable`): those rows
+exist only on disk now, and starting the read at the window instead would
+silently skip everything in between. The caller falls back to a tail read.
 
 `running` is what makes the loop terminable: `running: false` with an empty
 window means the target finished and went idle, which is different from "nothing
@@ -187,12 +201,12 @@ infer a grant from silence.
 
 ## What is deliberately not here
 
-- **No message delivery.** No verb writes into another session's conversation.
-  Delivering a message to a peer has two authorization moments — acceptance and
-  the drain that can be minutes later — and the target's agent, workspace and
-  channel binding can all change in between. That is a different design from the
-  three verbs here, which are each authorized at the moment they act, so it is
-  scoped to its own change rather than carried along.
+- **No delivery to a target outside the addressable set.** `session_send` writes
+  into another session's conversation, but only one the same `authorize_target`
+  guard admits: a channel-linked, channel-mirrored, crew-mode, incognito,
+  app-scoped, unattended or cross-workspace target is refused, so the verb cannot
+  reach a conversation other people are party to. The residual is the queued arm's
+  second authorization moment, recorded above and tracked as #5911.
 - **No cross-workspace or cross-machine reach.** The boundary is one gateway's
   live sessions in one workspace.
 - **No waking closed sessions.** See above.

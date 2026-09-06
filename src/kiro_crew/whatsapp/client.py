@@ -273,8 +273,8 @@ class WhatsAppClient:
         # after the restriction failed would pair the device and leave that
         # credential readable by any other local principal, which is exactly the
         # case a warning nobody reads does not cover.
-        # Off the loop: on Windows these resolve a SID and shell out to `icacls`,
-        # which is a subprocess on the one event loop that also carries every other
+        # Off the loop: these are blocking filesystem calls (the Windows DACL is
+        # applied in-process), and the one event loop also carries every other
         # channel and the liveness heartbeat. Still awaited rather than
         # fire-and-forget, because pairing must not begin until the credential's
         # directory is actually locked down.
@@ -799,4 +799,13 @@ class WhatsAppClient:
 
         norm = normalize_jid(jid_str)
         user, _, server = norm.partition("@")
-        return JID(User=user, Server=server or USER_SERVER)
+        # The JID proto marks RawAgent/Device/Integrator as required, so a
+        # two-field JID raises EncodeError at neonize's FFI boundary and every
+        # outbound call fails. Mirror neonize.utils.jid.build_jid: zero them.
+        return JID(
+            User=user,
+            RawAgent=0,
+            Device=0,
+            Integrator=0,
+            Server=server or USER_SERVER,
+        )

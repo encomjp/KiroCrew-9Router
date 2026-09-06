@@ -436,15 +436,13 @@ class TestTheSharedKiroPathRatchet:
         # longer matches the thing it protects -- weakening the guard to satisfy an
         # isolation ratchet, which is backwards.
         ("kiro_crew/security.py", "_EXTRACT_INTO_TRUST_ROOT_RE"): "security anchor: must name the REAL home",
-        # Also not redirectable: the home-anchoring IS the security property. These name
-        # OTHER products' credential stores (kiro-cli, amazon-q), and the module's own
-        # comment records that an entry either equals the home-anchored path inside
-        # `_SENSITIVE_HOME_DIRS`' fence or falls outside it and must not be trusted --
-        # so a redirected value would manufacture a forgeable "trusted" path. They are
-        # only ever READ, and `test_kiro_usage_api.py` stubs the tuples per test, which
-        # is the right seam: stub the READER, never move the anchor.
-        ("kiro_crew/dashboard/handlers/kiro_usage_api.py", "_CLI_SQLITE_DBS"): "security anchor: must name the REAL home",
-        ("kiro_crew/dashboard/handlers/kiro_usage_api.py", "_OTHER_SQLITE_DBS"): "security anchor: must name the REAL home",
+        # The kiro-cli/amazon-q sqlite tuples that used to sit here as direct
+        # ``Path.home()`` bindings are now PROJECTIONS over the canonical table in
+        # ``kiro_crew/identity_stores.py`` (``sqlite_dbs(...)`` resolves the home
+        # inside the call), so they no longer match this tripwire's import-time
+        # shape and need no exclusion. Their anchor rule ("must name the REAL
+        # home"; stub the READER, never move the anchor) is carried forward by
+        # ``test_identity_stores.py::TestUsageTuplesAnchorTheRealHome``.
         # An ALLOW-LIST root, so the same rule applies from the other direction: the
         # file browser's first permitted root is the operator's real home BY DESIGN,
         # since that is the directory the user is entitled to browse. Redirecting it
@@ -761,40 +759,68 @@ class TestTheWorkingDirectoryIsRestored:
         )
 
 
-_DYNAMIC_CREDENTIAL_ORDER: dict[str, bool] = {}
+# ── driving the floor's own between-test restores ─────────────────────────
 
 
-@pytest.mark.xdist_group(name="dynamic_credential_env_floor")
+def _autouse_floor_generator(name: str):
+    """The plain generator function behind one of the rootdir conftest's autouse fixtures.
+
+    The floor tests below drive one setup -> teardown cycle of the REAL fixture code,
+    which is what lets a SINGLE test observe the restore the floor performs between
+    tests. An injector/observer pair cannot do that reliably: pytest-split partitions
+    the collected suite into shard groups BEFORE xdist runs, so it can place the two
+    halves in different CI shards regardless of any ``xdist_group`` mark, and an
+    observer whose meaning depends on which test ran before it is unprovable in a
+    sharded run.
+
+    Asserts the attribute still IS an autouse fixture on the way through: the floor's
+    guarantee is that it fires around every test, and a fixture demoted to a plain
+    helper (or one whose ``autouse`` was dropped) would still pass a direct drive.
+    """
+    definition = getattr(_root, name)
+    marker = getattr(definition, "_fixture_function_marker", None) or getattr(
+        definition, "_pytestfixturefunction", None
+    )
+    assert marker is not None and marker.autouse, (
+        f"conftest.{name} is not an autouse fixture, so the floor it implements is unarmed"
+    )
+    return getattr(definition, "__wrapped__", definition)
+
+
 class TestDynamicCredentialEnvironmentIsRestored:
     """A dynamic per-host Jira token must not leak to the next test.
 
-    ``load_credentials`` propagates ``JIRA_TOKEN_<HEX>`` keys even though they
-    are not members of the fixed ``_CREDENTIAL_KEYS`` tuple. Keep these tests
-    adjacent on one worker so the second observes the first test's teardown.
+    ``load_credentials`` propagates ``JIRA_TOKEN_<HEX>`` keys even though they are
+    not members of the fixed ``_CREDENTIAL_KEYS`` tuple, so the floor's restore has
+    to recognise the dynamic shape too — a snapshot bounded to the fixed keys would
+    pass over it. The restore under test is ``conftest._no_credential_env_residue``'s
+    own teardown, driven directly (see ``_autouse_floor_generator``).
     """
 
-    def test_a_test_can_inject_a_dynamic_jira_token(self) -> None:
-        os.environ["JIRA_TOKEN_AABBCC"] = "token-from-previous-test"
-        _DYNAMIC_CREDENTIAL_ORDER["injected"] = True
+    def test_this_test_starts_without_the_dynamic_token(self) -> None:
+        """Which is only true if no earlier test on this worker leaked one."""
+        assert "JIRA_TOKEN_AABBCC" not in os.environ
 
-    def test_the_next_test_does_not_inherit_the_dynamic_token(self) -> None:
-        assert _DYNAMIC_CREDENTIAL_ORDER.get("injected"), (
-            "the injecting test did not run on this worker, so this assertion "
-            "would prove nothing"
-        )
+    def test_an_injected_dynamic_token_is_removed_by_the_floors_own_teardown(self) -> None:
+        """One full cycle of the real fixture: snapshot while absent, inject, restore.
+
+        A failure part-way cannot leak the token past this test: the live autouse
+        instance of the same fixture wraps this test too, and its snapshot predates
+        the injection.
+        """
+        cycle = _autouse_floor_generator("_no_credential_env_residue")()
+        next(cycle)  # the floor's setup: snapshot, taken while the token is absent
+
+        os.environ["JIRA_TOKEN_AABBCC"] = "token-from-this-test"
+
+        with pytest.raises(StopIteration):
+            next(cycle)  # the floor's teardown: the restore under test
         assert "JIRA_TOKEN_AABBCC" not in os.environ
 
 
 # ── the logging record factory ─────────────────────────────────────────────
 
 
-#: Written by one test and asserted by the next, for the same reason as ``_CWD_ORDER``:
-#: the restore this pins runs during teardown, so no finalizer of the leaking test can
-#: observe it -- the rootdir floor is the OUTER fixture and finalizes after them all.
-_FACTORY_ORDER: dict[str, object] = {}
-
-
-@pytest.mark.xdist_group(name="log_record_factory_floor")
 class TestTheLogRecordFactoryIsRestored:
     """``logging.setLogRecordFactory`` is ONE process-global slot, per worker.
 
@@ -804,33 +830,147 @@ class TestTheLogRecordFactoryIsRestored:
     different process and the pollution is invisible until an unsharded release run.
     ``conftest._restore_log_record_factory`` is what removes the class; without a test,
     an edit to it reverts silently and the failures reappear in files that have nothing
-    to do with the cause.
-
-    Grouped with ``xdist_group`` so the leaker and the observer stay on ONE worker:
-    ``--dist loadgroup`` honours that, and without it the two are distributed
-    independently and the observation passes vacuously.
+    to do with the cause. Its teardown is driven directly (see
+    ``_autouse_floor_generator``), so the proof needs no adjacent observer test.
     """
 
     def test_this_test_starts_with_the_stdlib_factory(self) -> None:
         """Which is only true if no earlier test on this worker left a wrapper installed."""
         assert logging.getLogRecordFactory() is logging.LogRecord
 
-    def test_a_leaked_wrapper_does_not_reach_the_next_test(self) -> None:
-        """Installs one and deliberately does NOT remove it -- the floor's job, not ours."""
+    def test_a_leaked_wrapper_is_removed_by_the_floors_own_teardown(self) -> None:
+        """One full cycle of the real fixture: snapshot, install and leave installed, restore.
+
+        The install is exactly the leak the floor absorbs in the wild — a test driving
+        the real ``cli.main()`` reaches ``_setup_cli_logging``, which installs this
+        wrapper and never removes it. A failure part-way cannot leak the wrapper past
+        this test: the live autouse instance of the same fixture wraps this test too,
+        and its snapshot predates the install.
+        """
+        cycle = _autouse_floor_generator("_restore_log_record_factory")()
+        next(cycle)  # the floor's setup: snapshot, taken while the stdlib factory holds
+
         install_log_redaction([])
-        _FACTORY_ORDER["installed"] = logging.getLogRecordFactory()
         assert logging.getLogRecordFactory() is not logging.LogRecord
 
-    def test_the_next_test_sees_the_slot_restored(self) -> None:
-        """Reads what the previous test recorded. Ordered by definition order in the file."""
-        assert _FACTORY_ORDER.get("installed") is not None, (
-            "the installing test did not run on this worker, so this assertion proves "
-            "nothing -- the xdist_group mark on the class is what keeps them together"
-        )
+        with pytest.raises(StopIteration):
+            next(cycle)  # the floor's teardown: the restore under test
         assert logging.getLogRecordFactory() is logging.LogRecord, (
             f"the record factory is still {logging.getLogRecordFactory()!r} -- a wrapper "
-            "left installed by an earlier test now rewrites every record on this worker"
+            "left installed by a test would rewrite every later record on its worker"
         )
+
+    def test_the_restore_target_is_what_the_test_inherited_not_the_stdlib(self) -> None:
+        """The floor restores the INHERITED factory, so a higher-scoped installer survives.
+
+        Pinned because it is the documented reason the floor is a fixture rather than a
+        ``pytest_runtest_setup`` hookimpl: a class- or module-scoped fixture that installs
+        a factory for its whole scope must not have it torn out after the first test.
+        """
+        sentinel_calls: list[str] = []
+
+        def sentinel(*args: object, **kwargs: object) -> logging.LogRecord:
+            sentinel_calls.append("made")
+            return logging.LogRecord(*args, **kwargs)  # type: ignore[arg-type]
+
+        before = logging.getLogRecordFactory()
+        logging.setLogRecordFactory(sentinel)
+        try:
+            cycle = _autouse_floor_generator("_restore_log_record_factory")()
+            next(cycle)  # snapshot taken while the sentinel is installed
+            install_log_redaction([])
+            with pytest.raises(StopIteration):
+                next(cycle)
+            assert logging.getLogRecordFactory() is sentinel, (
+                "the floor restored past the factory this cycle inherited, so a "
+                "higher-scoped installer would be torn out after its first test"
+            )
+        finally:
+            logging.setLogRecordFactory(before)
+
+
+# ── logger levels ──────────────────────────────────────────────────────────
+
+
+class TestLoggerLevelsAreRestored:
+    """A logger's level is PROCESS-GLOBAL, per worker, and HIERARCHICAL.
+
+    Together those are what make this leak class so hard to attribute. ``Logger.debug``
+    gates on the EFFECTIVE level, so an explicit level left on ``kiro_crew`` decides what
+    every ``kiro_crew.*`` logger in the worker may emit, and it outranks the root level
+    ``caplog.at_level()`` sets -- the victim gets ``caplog.text == ""``, nothing at all
+    rather than the wrong text, from a test that passes alone. The suite reaches this
+    through ``cli._setup_cli_logging``, which pins ``kiro_crew`` at WARNING, and which
+    test modules across the suite run for real by driving ``cli.main()`` in process.
+
+    ``conftest._restore_logger_levels`` is what removes the class; without a test, an edit
+    to it reverts silently and the failures reappear in files that have nothing to do with
+    the cause. Its teardown is driven directly (see ``_autouse_floor_generator``), so the
+    proof needs no adjacent observer test.
+    """
+
+    def test_this_test_starts_with_an_unconfigured_kiro_crew_logger(self) -> None:
+        """Which is only true if no earlier test on this worker left a level on it."""
+        assert logging.getLogger("kiro_crew").level == logging.NOTSET
+
+    def test_a_leaked_level_is_removed_by_the_floors_own_teardown(self) -> None:
+        """One full cycle of the real fixture: snapshot, pin a level and leave it, restore.
+
+        The pin is exactly the leak the floor absorbs in the wild — ``_setup_cli_logging``
+        sets ``kiro_crew`` to WARNING once per process and never undoes it. A failure
+        part-way cannot leak the level past this test: the live autouse instance of the
+        same fixture wraps this test too, and its snapshot predates the pin.
+        """
+        cycle = _autouse_floor_generator("_restore_logger_levels")()
+        next(cycle)  # the floor's setup: snapshot, taken while the level is NOTSET
+
+        logging.getLogger("kiro_crew").setLevel(logging.WARNING)
+        assert logging.getLogger("kiro_crew").level == logging.WARNING
+
+        with pytest.raises(StopIteration):
+            next(cycle)  # the floor's teardown: the restore under test
+        level = logging.getLogger("kiro_crew").level
+        assert level == logging.NOTSET, (
+            f"kiro_crew is still pinned at {logging.getLevelName(level)} -- every "
+            "kiro_crew.* record below that level would be dropped before it reaches "
+            "the root handler caplog captures through"
+        )
+
+    def test_a_logger_created_during_the_test_is_restored_to_pristine(self) -> None:
+        """The gap a plain snapshot cannot see: a logger that did not exist at setup.
+
+        The floor restores a name missing from its "before" snapshot to the pristine
+        ``(NOTSET, enabled)`` state rather than passing over it, and this is the only
+        place that behaviour is exercised with a genuinely fresh name.
+        """
+        name = "kiro_crew._floor_probe_6351"
+        assert name not in logging.Logger.manager.loggerDict
+
+        cycle = _autouse_floor_generator("_restore_logger_levels")()
+        next(cycle)  # snapshot taken while the logger does not exist
+
+        probe = logging.getLogger(name)
+        probe.setLevel(logging.CRITICAL)
+        probe.disabled = True
+
+        with pytest.raises(StopIteration):
+            next(cycle)
+        assert probe.level == logging.NOTSET and probe.disabled is False, (
+            "a logger created mid-test kept its configuration -- the floor's "
+            "missing-from-snapshot branch no longer restores to pristine"
+        )
+
+    def test_a_debug_record_from_a_kiro_crew_logger_still_reaches_caplog(self, caplog) -> None:
+        """The capability the level restore exists to protect, asserted directly.
+
+        The level assertion above pins the mechanism; this pins the OUTCOME, in the exact
+        shape the victim test uses -- ``at_level`` on the root logger, a ``debug`` call on
+        a ``kiro_crew.*`` child -- so a future floor that restores something subtly
+        different still has to keep this working.
+        """
+        with caplog.at_level("DEBUG"):
+            logging.getLogger("kiro_crew.slack.gateway").debug("floor canary")
+        assert "floor canary" in caplog.text
 
 
 # ── the worker budget ─────────────────────────────────────────────────────

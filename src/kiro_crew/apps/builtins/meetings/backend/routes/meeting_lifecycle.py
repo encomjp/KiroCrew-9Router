@@ -24,6 +24,7 @@ from aiohttp import web
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain import session as sess
+from kiro_crew.apps.builtins.meetings.backend.domain import translate
 from kiro_crew.apps.builtins.meetings.backend.routes import tasks as task_routes
 from kiro_crew.apps.builtins.meetings.backend.routes._common import (
     ACTIVE,
@@ -142,17 +143,21 @@ async def handle_get_meeting(request: web.Request) -> web.Response:
     live_payload = None
     if live is not None:
         live_payload = live.status()
-        # Whether a dispatch sent NOW would be admitted, from the same holder flag
-        # ``get_for_dispatch`` reads. The status is persisted ``active`` before
-        # ``init_agents`` runs, so status alone overstates readiness for the whole
-        # initialization window (~tens of seconds) while every dispatch 409s. The
-        # frontend polls this endpoint to decide when to open the microphone, and
-        # this field is the only per-poll answer to "would speech land?" — the
-        # start response alone cannot be, because it can be lost in transit while
-        # the server side succeeded. Plain attribute read on the single-threaded
-        # loop, same as the ``ACTIVE.get`` above; the value is a snapshot and may
-        # change by the next poll, which is exactly what a poll is for.
+        # Whether a dispatch sent NOW would be fanned out DIRECTLY, from the same
+        # holder flag ``get_for_dispatch`` reads. The status is persisted ``active``
+        # before ``init_agents`` runs, so status alone overstates readiness for the
+        # whole initialization window (~tens of seconds). Plain attribute read on
+        # the single-threaded loop, same as the ``ACTIVE.get`` above; the value is a
+        # snapshot and may change by the next poll, which is exactly what a poll is
+        # for.
         live_payload["accepting_dispatches"] = ACTIVE.accepting_dispatches
+        # And whether it would be HELD rather than refused (issue #4610). The
+        # frontend polls this endpoint to decide when to open the microphone, and
+        # "would speech land?" is now these two ORed: during initialization the
+        # answer is yes-by-holding. Reported separately rather than folded into the
+        # flag above, because that one is also the gate ``get_for_dispatch`` reads —
+        # making it true here would send lines to agents that are not ready.
+        live_payload["buffering_dispatches"] = ACTIVE.buffering_dispatches
     return web.json_response(
         {
             "meta": meta,
@@ -304,6 +309,9 @@ async def handle_start_meeting(request: web.Request) -> web.Response:
             hooks=hooks_of(request),
             agents_enabled=agents_enabled,
             config=config,
+            # Threaded through for the translation worker's writes, which are the
+            # only ones a live session makes on its own rather than via a handler.
+            root=root,
         )
         session.muted_agents = set(muted)
         # Drain the OUTGOING session before this one replaces it. `set()` cancels the
@@ -320,9 +328,16 @@ async def handle_start_meeting(request: web.Request) -> web.Response:
         outgoing = await ACTIVE.drain_and_clear()
         async with DISPATCH_LOCK:
             ACTIVE.set(session)
-            # Agent initialization may await several model turns. Keep ingress
-            # closed until every enabled agent knows its output contract.
-            ACTIVE.suspend_dispatches(session)
+            # Agent initialization may await several model turns. Keep DIRECT
+            # fan-out closed until every enabled agent knows its output contract —
+            # but HOLD what is said meanwhile instead of refusing it.
+            #
+            # Refusing was measured at ~46s of a real meeting (issue #4610): the
+            # speaker opens with the agenda, every line 409s, and the notes and
+            # tasks begin partway through the first topic with nothing to show a
+            # turn was lost. The hold is bounded and drains in arrival order right
+            # after `init_agents` returns, below.
+            ACTIVE.suspend_dispatches(session, buffer_speech=True)
 
         # A replacement of a DIFFERENT meeting is a teardown of that meeting, so its
         # metadata needs the same terminal status every other teardown writes.
@@ -370,6 +385,30 @@ async def handle_start_meeting(request: web.Request) -> web.Response:
             await sess.broadcast_system(session, k.SYSTEM_MEETING_RESTARTED)
         async with DISPATCH_LOCK:
             ACTIVE.resume_dispatches(session)
+            # Drain under the SAME acquisition that reopened ingress. A live
+            # dispatch needs this lock too, so nothing spoken after the reopen can
+            # overtake speech that was held while it was shut — releasing between
+            # the two would let the meeting's opening land after its second topic.
+            buffered, dropped = session.drain_init_buffer()
+        if buffered or dropped:
+            logger.info(
+                "meetings: %r delivered %d line(s) held during agent init, %d dropped",
+                meeting_id,
+                buffered,
+                dropped,
+            )
+        if dropped:
+            # Off the lock (this is disk IO) but still inside START_LOCK. Recorded
+            # so the human transcript states the loss too: the agents were told by
+            # `drain_init_buffer`, and a gap only one reader can see is the silent
+            # truncation the bound exists to avoid.
+            await asyncio.to_thread(
+                store.append_transcript,
+                meeting_id,
+                k.SYSTEM_INIT_BUFFER_OVERFLOW.format(count=dropped, limit=k.MAX_INIT_BUFFER_LINES),
+                k.TRANSCRIPT_SOURCE_SYSTEM,
+                root,
+            )
 
     audit("meetings.start", meeting_id, outcome="ok")
     return web.json_response(
@@ -528,6 +567,48 @@ async def handle_get_outputs(request: web.Request) -> web.Response:
     root = data_root(request)
     outputs, tasks = await asyncio.to_thread(_collect_outputs, meeting_id, root)
     return web.json_response({"outputs": outputs, "tasks": tasks})
+
+
+def _read_translations_since(meeting_id: str, since: int, root: Any) -> dict[str, Any]:
+    """Translated lines with ``n >= since``, plus the cursor to ask for next. BLOCKING."""
+    doc = store.read_translations(meeting_id, root)
+    lines = [
+        line
+        for line in doc.get("lines", [])
+        if isinstance(line, dict) and int(line.get("n", -1)) >= since
+    ]
+    language = str(doc.get("language", "") or "")
+    return {
+        "language": language,
+        # Resolved here rather than in the frontend: the accepted languages and
+        # their endonyms are published by the backend (see GET /config), so a
+        # second copy in the client would be the thing that drifts.
+        "language_label": translate.language_label(language) if language else "",
+        "lines": lines,
+        "next_n": int(doc.get("next_n", 0)),
+    }
+
+
+async def handle_get_translations(request: web.Request) -> web.Response:
+    """Live-translation lines for a meeting, newer than a client cursor.
+
+    A cursor rather than the whole document: a long meeting accumulates hundreds
+    of lines and the panel polls while it is open, so resending everything each
+    time would grow linearly for no benefit. ``next_n`` is what the client sends
+    back as ``since``.
+
+    Separate from ``…/outputs`` on purpose. Outputs is polled for every meeting;
+    this is polled only while the panel is open, and translation is off by default.
+    """
+    meeting_id = _meeting_id(request)
+    root = data_root(request)
+    since = query_int(request, "since", default=0, low=0, high=10_000_000)
+    payload = await asyncio.to_thread(_read_translations_since, meeting_id, since, root)
+    live = ACTIVE.get(meeting_id)
+    queue = live.translations if live is not None else None
+    payload["pending"] = queue.pending if queue is not None else 0
+    payload["dropped"] = queue.dropped if queue is not None else 0
+    return web.json_response(payload)
 
 
 def _apply_attachments(

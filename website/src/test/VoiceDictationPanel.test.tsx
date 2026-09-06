@@ -118,3 +118,118 @@ describe('useDictationPanelUsable', () => {
     expect(seen[0]).toBe(false)
   })
 })
+
+describe('word revision tracking', () => {
+  it('climbs stability for surviving words and flashes the one revised in place', () => {
+    const { rerender } = render(
+      <VoiceDictationPanel sampleRef={sampleRef} value="fix the wold" partial="fix the wold" streaming />,
+    )
+    rerender(
+      <VoiceDictationPanel sampleRef={sampleRef} value="fix the world" partial="fix the world" streaming />,
+    )
+    const words = screen.getAllByTestId('dictation-word')
+    expect(words.map(w => w.textContent)).toEqual(['fix', 'the', 'world'])
+    // Survivors of two consecutive hypotheses ramp toward solid…
+    expect(words[0].getAttribute('data-stability')).toBe('1')
+    expect(words[1].getAttribute('data-stability')).toBe('1')
+    // …while "wold" → "world" is a revision: reset to dim, generation bump = flash.
+    expect(words[2].getAttribute('data-stability')).toBe('0')
+    expect(words[2].getAttribute('data-generation')).toBe('1')
+  })
+
+  it('does not flash words appended past the previous hypothesis (dictation, not revision)', () => {
+    const { rerender } = render(
+      <VoiceDictationPanel sampleRef={sampleRef} value="fix the" partial="fix the" streaming />,
+    )
+    rerender(
+      <VoiceDictationPanel sampleRef={sampleRef} value="fix the build" partial="fix the build" streaming />,
+    )
+    const words = screen.getAllByTestId('dictation-word')
+    expect(words.map(w => w.textContent)).toEqual(['fix', 'the', 'build'])
+    expect(words[2].getAttribute('data-generation')).toBe('0')
+    expect(words[2].getAttribute('data-stability')).toBe('0')
+  })
+
+  it('confines an insertion to the inserted word — the unchanged tail keeps its stability', () => {
+    const { rerender } = render(
+      <VoiceDictationPanel sampleRef={sampleRef} value="fix the build" partial="fix the build" streaming />,
+    )
+    rerender(
+      <VoiceDictationPanel sampleRef={sampleRef} value="fix in the build" partial="fix in the build" streaming />,
+    )
+    const words = screen.getAllByTestId('dictation-word')
+    expect(words.map(w => w.textContent)).toEqual(['fix', 'in', 'the', 'build'])
+    // "fix" survived; "in" was inserted (flashes); "the"/"build" re-anchor and
+    // KEEP their earned stability instead of reading as revised.
+    expect(words[0].getAttribute('data-stability')).toBe('1')
+    expect(words[1].getAttribute('data-generation')).toBe('1')
+    expect(words[1].getAttribute('data-stability')).toBe('0')
+    expect(words[2].getAttribute('data-stability')).toBe('1')
+    expect(words[3].getAttribute('data-stability')).toBe('1')
+  })
+
+  it('keeps the surviving words\u2019 DOM nodes across an insertion (no remount, no spurious flash)', () => {
+    const { rerender } = render(
+      <VoiceDictationPanel sampleRef={sampleRef} value="fix the build" partial="fix the build" streaming />,
+    )
+    const beforeNodes = screen.getAllByTestId('dictation-word')
+    rerender(
+      <VoiceDictationPanel sampleRef={sampleRef} value="fix in the build" partial="fix in the build" streaming />,
+    )
+    const after = screen.getAllByTestId('dictation-word')
+    // "the" and "build" re-anchored as the SAME words: identical DOM nodes,
+    // so React never remounted them and their flash cannot restart.
+    expect(after[2]).toBe(beforeNodes[1])
+    expect(after[3]).toBe(beforeNodes[2])
+    // The inserted word is a new node.
+    expect(beforeNodes).not.toContain(after[1])
+  })
+
+  it('flashes a replacement even when the new text duplicates a later word (a b c \u2192 a c c)', () => {
+    const { rerender } = render(
+      <VoiceDictationPanel sampleRef={sampleRef} value="a b c" partial="a b c" streaming />,
+    )
+    rerender(<VoiceDictationPanel sampleRef={sampleRef} value="a c c" partial="a c c" streaming />)
+    const words = screen.getAllByTestId('dictation-word')
+    expect(words.map(w => w.textContent)).toEqual(['a', 'c', 'c'])
+    // "b" \u2192 "c" is an in-place revision and must flash; anchoring to the old
+    // "c" would have read it as deletion-plus-append and never flashed.
+    expect(words[1].getAttribute('data-generation')).toBe('1')
+    expect(words[1].getAttribute('data-stability')).toBe('0')
+    // The original trailing "c" survived.
+    expect(words[2].getAttribute('data-stability')).toBe('1')
+  })
+
+  it('resets tracking when a phrase commits, instead of diffing across unrelated phrases', () => {
+    const { rerender } = render(
+      <VoiceDictationPanel sampleRef={sampleRef} value="hello world" partial="hello world" streaming />,
+    )
+    rerender(
+      <VoiceDictationPanel
+        sampleRef={sampleRef}
+        value="hello world. next phrase"
+        partial=" next phrase"
+        streaming
+      />,
+    )
+    const words = screen.getAllByTestId('dictation-word')
+    expect(words.map(w => w.textContent)).toEqual(['next', 'phrase'])
+    for (const w of words) {
+      expect(w.getAttribute('data-stability')).toBe('0')
+      expect(w.getAttribute('data-generation')).toBe('0')
+    }
+  })
+
+  it('preserves exact transcript text (whitespace included) through the word spans', () => {
+    render(
+      <VoiceDictationPanel
+        sampleRef={sampleRef}
+        value="summarize the fix  and   tell me"
+        partial="  and   tell me"
+      />,
+    )
+    const t = screen.getByTestId('voice-dictation-transcript')
+    expect(t.textContent).toBe('summarize the fix  and   tell me')
+    expect(t.querySelector('.text-muted')?.textContent).toBe('  and   tell me')
+  })
+})

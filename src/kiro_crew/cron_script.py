@@ -654,6 +654,9 @@ def run_script_sandboxed(
         "import sys\n"
         "sys.path[:] = [p for p in sys.path if p not in ('', sys.path[0])]\n"
         "import json, os, types\n"
+        "from kiro_crew.config.loader import KiroCrewConfig\n"
+        "from kiro_crew.platform.bootstrap import boot_platform\n"
+        "boot_platform(KiroCrewConfig.load())\n"
         "from kiro_crew.cron_script import ScriptContext, Skip, Done, Report\n"
         f"sys.path.insert(0, os.path.dirname({file_path_str!r}))\n"
         f"mod = types.ModuleType('_cron_script')\n"
@@ -693,13 +696,13 @@ def run_script_sandboxed(
             # Tighten the DACL BEFORE writing the secret bytes so the file is
             # never on disk under the parent-inherited %TEMP% DACL on Windows.
             # On POSIX mkstemp already births the file 0600 so ordering is a
-            # no-op; on Windows mkstemp cannot set an owner-only DACL, and the
-            # icacls subprocess restrict_to_owner spawns is a measurable window
+            # no-op; on Windows mkstemp cannot set an owner-only DACL, so the
+            # interval between create and lockdown is a real window
             # if we wrote first. Matches the fail-loud convention of the other
             # internal-secret writers (token_secret, refresh_tokens, snapshot,
             # server._write_secret_file, token_auth) — chmod_safe swallows
             # OSError and would hide a lockdown failure. Both calls stay inside
-            # the outer try so an icacls failure still hits the finally that
+            # the outer try so a lockdown failure still hits the finally that
             # unlinks the secret + launcher (otherwise the fd leaks and temp
             # files persist).
             platform_compat.restrict_to_owner(secret_path)

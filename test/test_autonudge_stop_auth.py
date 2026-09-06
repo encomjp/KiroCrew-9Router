@@ -230,7 +230,7 @@ def test_autonudge_stop_short_circuits_for_non_nudgeable_session(monkeypatch):
 class _FakeLoop:
     def __init__(
         self, loop_id, *, cycle_count=0, max_cycles=0, active=True, created_ts=0.0,
-        max_runtime_secs=0, stopped_reason="",
+        max_runtime_secs=0, stopped_reason="", slot_key="",
     ):
         self.id = loop_id
         self.cycle_count = cycle_count
@@ -239,13 +239,15 @@ class _FakeLoop:
         self.created_ts = created_ts
         self.max_runtime_secs = max_runtime_secs
         self.stopped_reason = stopped_reason
+        self.slot_key = slot_key
 
 
 class _FakeSvc:
     """Minimal AutoNudge service double for session-directive mutations."""
 
-    def __init__(self, loop=None):
+    def __init__(self, loop=None, *, all_loops=None):
         self._loop = loop
+        self._all = list(all_loops) if all_loops is not None else ([loop] if loop else [])
         self.get_by_slot_keys: list[str] = []
         self.removed: list[str] = []
         self.updated: list[tuple[str, dict]] = []
@@ -253,6 +255,9 @@ class _FakeSvc:
     def get_by_slot(self, key):
         self.get_by_slot_keys.append(key)
         return self._loop
+
+    def list_all(self):
+        return list(self._all)
 
     async def remove(self, loop_id):
         self.removed.append(loop_id)
@@ -725,3 +730,91 @@ def test_applier_autonudge_stop_no_loop_is_a_clean_noop(monkeypatch):
     assert "nothing to stop" in result.lower()
     assert svc.removed == []
     assert svc.updated == []
+
+
+def test_applier_autonudge_stop_reports_a_binding_miss_instead_of_success(monkeypatch):
+    """A loop active on ANOTHER slot is a lookup miss, not an idempotent success.
+
+    ``get_by_slot`` resolves only the calling session's binding, so a loop armed
+    against a different slot key is unreachable here. The result must say
+    nothing was stopped and name this session's own binding — and it must not
+    remove or pause the loop it could not resolve.
+    """
+    elsewhere = _FakeLoop("loop-elsewhere", slot_key="chat-99-1700009999")
+    svc = _FakeSvc(None, all_loops=[elsewhere])
+    _install_svc(monkeypatch, svc)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(), _fake_slot(), _SESSION, "autonudge_stop", {"reason": "done"}
+        )
+    )
+    assert "nothing to stop" not in result.lower()
+    assert "NOTHING WAS STOPPED" in result
+    assert binding_key_for(_SESSION) in result
+    assert "1 auto-nudge loop(s) are running on other sessions" in result
+    assert svc.removed == []
+    assert svc.updated == []
+
+
+def test_applier_autonudge_stop_miss_names_no_other_session_identifier(monkeypatch):
+    """OWNERSHIP: the miss diagnostic reports a COUNT, never an id or slot key.
+
+    The stop tool exposes no loop-id parameter so a session cannot target
+    another session's loop; a message naming other sessions' loops would hand a
+    model the identifiers that schema withholds. Cross-session enumeration
+    belongs to the token-authed dashboard API, not to a tool result.
+    """
+    # Slot keys deliberately disjoint from the CALLER's own binding: the message
+    # prints that legitimately, so an overlapping fixture would fail on the
+    # caller's own identity rather than on a leak.
+    loops = [_FakeLoop(f"loop-{n}", slot_key=f"chat-9{n}-1700009999") for n in range(4)]
+    svc = _FakeSvc(None, all_loops=loops)
+    _install_svc(monkeypatch, svc)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(), _fake_slot(), _SESSION, "autonudge_stop", {"reason": "done"}
+        )
+    )
+    assert "4 auto-nudge loop(s) are running on other sessions" in result
+    for lp in loops:
+        assert lp.id not in result
+        assert lp.slot_key not in result
+    # No dead-end remedy: the message must not advertise a route whose path it
+    # does not print, and a loop's sentinel path can legitimately be empty.
+    assert "stop_sentinel_path" not in result
+    assert svc.removed == []
+
+
+def test_applier_autonudge_stop_ignores_inactive_loops_in_the_miss_diagnostic(monkeypatch):
+    """A deactivated loop fires no nudges, so it is not evidence of a miss.
+
+    Only active loops make the difference between "nothing exists" and "the
+    lookup failed"; a paused or tombstoned loop keeps the plain no-loop answer.
+    """
+    svc = _FakeSvc(None, all_loops=[_FakeLoop("loop-dead", active=False, slot_key="chat-99-1")])
+    _install_svc(monkeypatch, svc)
+    result = asyncio.run(
+        apply_session_directive(
+            _fake_state(), _fake_slot(), _SESSION, "autonudge_stop", {"reason": "done"}
+        )
+    )
+    assert "nothing to stop" in result.lower()
+    assert "loop-dead" not in result
+    assert svc.removed == []
+    assert svc.updated == []
+
+
+def test_autonudge_stop_directive_does_not_read_as_confirmation(default_install):
+    """The tool's OWN return is the only text the model receives in-turn.
+
+    The consumer applies the effect after the model already has this string, and
+    the applier's outcome lands on the transcript rather than rewriting the
+    model's tool result — so this wording must not let a caller conclude a loop
+    was found or stopped. The measured failure it guards is a loop that called
+    stop repeatedly, read a success-shaped reply each time, and never checked.
+    """
+    result = _call_tool_inner("autonudge_stop", {"reason": "done"})
+    assert session_directive.decode(result, "autonudge_stop") == {"reason": "done"}
+    assert "REQUESTED" in result
+    assert "not confirmation" in result.lower()
+    assert "nothing was stopped" in result.lower()

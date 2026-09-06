@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from aiohttp import web
 
 from kiro_crew.connections import get_provider
+from kiro_crew.connections.ownership import remove_provider_entry
 from kiro_crew.connections.registry import Provider
 from kiro_crew.dashboard.handlers.mcp import _is_valid_mcp_name
 from kiro_crew.sel import sel
@@ -157,6 +160,11 @@ def _approval_superseded(error: str, code: str) -> web.Response:
 
 async def api_mcp_oauth_relay(request: web.Request) -> web.Response:
     """POST /api/mcp/oauth/relay — deliver a failed browser redirect locally."""
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "mcp_oauth_relay")
+    if owner_denied is not None:
+        return owner_denied
     try:
         body = await request.json()
     except Exception:
@@ -268,9 +276,11 @@ async def _mint_request(
 ) -> tuple[dict, Provider] | web.Response:
     """The JSON body and its registry provider, or the error response to return.
 
-    Registry membership is the bound on what a caller can make the gateway spawn: a
-    mint starts a kiro-cli process, so the slug has to resolve to a provider we ship
-    rather than to arbitrary caller-supplied text.
+    Registry membership is the bound on what a caller can make the gateway act on:
+    a mint starts a kiro-cli process and a disconnect deletes stored grant
+    artifacts, so the slug has to resolve to a provider we ship rather than to
+    arbitrary caller-supplied text. Shared by every provider-scoped endpoint so
+    that bound is enforced in one place.
     """
     try:
         body = await request.json()
@@ -291,6 +301,11 @@ async def api_connections_mint(request: web.Request) -> web.Response:
     Returns as soon as the mint is scheduled. The URL is not ready yet: the
     caller polls :func:`api_connections_mint_state` for it.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_mint")
+    if owner_denied is not None:
+        return owner_denied
     parsed = await _mint_request(request)
     if isinstance(parsed, web.Response):
         return parsed
@@ -323,7 +338,8 @@ async def api_connections_mint(request: web.Request) -> web.Response:
 
     # Off the loop: only the append is queued to SEL's writer thread. The FIRST
     # sel() of a process CONSTRUCTS the log -- trust-dir creation, key validation,
-    # and on Windows an icacls subprocess -- and this handler runs BEFORE the audit
+    # and on Windows the owner-only DACL on the key file -- and this handler runs
+    # BEFORE the audit
     # middleware's own call (that one logs the response), so on a fresh gateway
     # whose first state-changing request is a Connect click it would land here and
     # stall every other request. Same reasoning as server._audit_denied.
@@ -385,7 +401,14 @@ async def api_connections_status(request: web.Request) -> web.Response:
     # for grant presence -- test_the_handlers_package_does_not_import_the_mint_engine
     # keeps that engine off the boot path.
     from kiro_crew.connections.status import _STATUS_SCHEMA_VERSION, collect_connection_statuses
+    from kiro_crew.connections.warm import expire_dead_mints
 
+    # Withdraw shared rows whose minting process is gone BEFORE the statuses are
+    # read, so a card cannot be served an approval URL nothing can redeem. Keyed on
+    # the fact rather than a cause, which is what covers a process that went away by
+    # a route no expiry path anticipated; cheap enough to run per request because
+    # liveness is a returncode read, not I/O.
+    await expire_dead_mints()
     statuses = await collect_connection_statuses()
     return web.json_response({"schema_version": _STATUS_SCHEMA_VERSION, "connections": statuses})
 
@@ -401,6 +424,11 @@ async def api_connections_cancel(request: web.Request) -> web.Response:
     keeps the working connection. Idempotent -- cancelling a provider with no
     live mint answers ``dropped=false``.
     """
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
+
+    owner_denied = await require_owner_dashboard_request(request, "connections_cancel")
+    if owner_denied is not None:
+        return owner_denied
     parsed = await _mint_request(request)
     if isinstance(parsed, web.Response):
         return parsed
@@ -421,7 +449,7 @@ async def api_connections_cancel(request: web.Request) -> web.Response:
     dropped = await cancel_mint(slug, token)
 
     # Off the loop: the FIRST sel() of a process constructs the log (trust-dir
-    # creation, key validation, on Windows an icacls subprocess). Same reasoning
+    # creation, key validation, on Windows the owner-only DACL). Same reasoning
     # as api_connections_mint above.
     await asyncio.to_thread(
         lambda: sel().log_api_access(
@@ -433,3 +461,128 @@ async def api_connections_cancel(request: web.Request) -> web.Response:
         )
     )
     return web.json_response({"ok": True, "slug": slug, "dropped": dropped})
+
+
+def _open_project_dirs(state: Any) -> tuple[Path, ...]:
+    """Every project directory an open chat slot is bound to.
+
+    The UNION over the slot registry, deliberately WIDER than
+    :func:`_shared.active_project_dir`: that resolver fails closed to ``None``
+    when two slots name different projects, which is right for a settings page
+    that must write somewhere defensible and exactly wrong here, where ``None``
+    would read as "no project agent specs exist" -- the reading that deletes a
+    live grant. A census needs every directory that could hold a sharer, and its
+    own answer is already the resolver's superset.
+
+    Pure in-memory reads (``_ChatSlot.project``, with ``project_dir`` accepted for
+    slot-like objects that expose that name), so this is safe on the event loop;
+    the directory scans it feeds happen on a worker thread.
+
+    RESIDUAL: a project with no open chat slot is not enumerated, so its specs
+    stay invisible. Slot state is what the dashboard actually knows about the
+    checkouts kiro-cli runs in; widening to ``recent_projects.json`` would scan
+    directories the user may have moved on from.
+    """
+    from kiro_crew.dashboard.handlers._shared import _slot_project
+
+    found: dict[str, Path] = {}
+    for slot in list((getattr(state, "_slots", None) or {}).values()):
+        project = _slot_project(slot)
+        if project is not None:
+            found.setdefault(str(project), project)
+    return tuple(found.values())
+
+
+async def api_connections_disconnect(request: web.Request) -> web.Response:
+    """POST /api/connections/disconnect — undo a connection on this machine.
+
+    Body: ``{"slug": "<registry provider>"}``. Three local things: any in-flight
+    mint is torn down, then -- in ONE locked transaction -- the MCP entry is
+    removed from the scopes that configure this provider and the runtime's stored
+    grant artifacts are unlinked.
+
+    Deleting the artifacts is the whole point of this endpoint. Removing the config
+    entry alone left a usable refresh token on disk, so a later reconnect resumed
+    the old grant silently instead of asking for consent -- while the card had
+    already told the user this machine's connection was gone.
+
+    What it deliberately does NOT do is revoke at the provider. Nothing here can;
+    only the provider can. So the response never claims the upstream grant is dead,
+    and the card keeps sending the user to the provider's revoke page as well.
+
+    ``grantRemoved`` and ``grantSurviving`` are separate answers on purpose: the
+    artifacts are a pair, and "the token went" is not the same fact as "the grant is
+    gone". The caller is told which one happened instead of inferring it from a
+    delete loop's own optimism, and the audit outcome is ``partial`` when anything
+    survived. ``grantCensusIncomplete`` says WHY a grant was kept when no sharer is
+    named: a source the ownership decision needed could not be read.
+    """
+    # Owner-only, BEFORE any parse or destructive act: this endpoint deletes
+    # machine-global config and OAuth artifacts, the same server-side boundary
+    # every mutating agents route enforces. Non-owner dashboard subjects are
+    # real (presigned links), and the token middleware only authenticates.
+    # Function-local import: same boot-path reason as the mint handlers below.
+    from kiro_crew.dashboard.handlers.agents import _require_owner
+
+    denied = await _require_owner(request, "connections.disconnect")
+    if denied is not None:
+        return denied
+
+    parsed = await _mint_request(request)
+    if isinstance(parsed, web.Response):
+        return parsed
+    _body, provider = parsed
+    slug = str(provider["slug"])
+    mcp_url = str(provider["mcp_url"])
+
+    # Function-local, same boot-path reason as the mint handlers.
+    from kiro_crew.connections.mint import cancel_mint
+    from kiro_crew.mcp_grant import surviving_grant_artifacts
+
+    # A pending mint for this provider is now moot, and leaving it live would let
+    # a grant arrive moments after the user asked for the connection to be gone.
+    await cancel_mint(slug, None)
+    # Read from slot state BEFORE the transaction and handed in, so the census and
+    # the purge judge one snapshot of which checkouts are open rather than two.
+    scope = await remove_provider_entry(slug, mcp_url, _open_project_dirs(request.app.get("state")))
+    removed = scope.grant_removed
+    # Asked rather than inferred from ``removed``: a survivor is what decides
+    # whether this Disconnect actually held. Read outside the lock on purpose --
+    # it changes nothing, and an entry appearing now does not make a pair that is
+    # already gone come back.
+    surviving = []
+    for grant_url in scope.attempted_urls:
+        for label in await asyncio.to_thread(surviving_grant_artifacts, grant_url):
+            if label not in surviving:
+                surviving.append(label)
+
+    # Off the loop: the FIRST sel() of a process constructs the log. Same
+    # reasoning as api_connections_cancel above.
+    await asyncio.to_thread(
+        lambda: sel().log_api_access(
+            caller="dashboard",
+            operation="connections_disconnect",
+            # No `or grant_shared_with` escape any more: only ATTEMPTED pairs are
+            # re-stat'd, so a survivor is always a failed unlink rather than a
+            # deliberate keep that had to be excused.
+            outcome="partial" if surviving else "ok",
+            source="dashboard",
+            resources=(
+                f"provider:{slug} artifacts_removed={len(removed)} "
+                f"surviving={len(surviving)} entry_removed={scope.entry_removed} "
+                f"grant_shared={len(scope.grant_shared_with)} "
+                f"census_incomplete={scope.census_incomplete}"
+            ),
+        )
+    )
+    return web.json_response(
+        {
+            "ok": True,
+            "grantRemoved": bool(removed),
+            "grantSurviving": surviving,
+            "entryRemoved": scope.entry_removed,
+            "grantSharedWith": list(scope.grant_shared_with),
+            "grantCensusIncomplete": scope.census_incomplete,
+            "grantCensusUnreadable": list(scope.census_unreadable),
+        }
+    )

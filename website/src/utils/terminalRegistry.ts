@@ -138,6 +138,9 @@ const MAX_RETRIES = 10
 const BASE_DELAY_MS = 1000
 const MAX_DELAY_MS = 30_000
 
+/** Coarse connection state a session's terminal view can render. */
+export type TerminalConnStatus = 'connected' | 'reconnecting' | 'disconnected'
+
 interface Conn {
   term: Terminal
   fit: FitAddon
@@ -146,11 +149,157 @@ interface Conn {
   disposed: boolean
   retries: number
   reconnectTimer?: ReturnType<typeof setTimeout>
+  status: TerminalConnStatus
+  /**
+   * Set when the user clicked "Reconnect" and cleared the moment the socket
+   * next resolves (connected) or the redial chain gives up (disconnected). It
+   * scopes the "Reconnecting…" banner to a user-initiated attempt: ordinary
+   * automatic redials (transient tab-hide/visibility blips) leave it false and
+   * stay bannerless, preserving the deliberate anti-flicker behaviour.
+   */
+  manualRetry: boolean
 }
 const conns = new Map<string, Conn>()
 
+/* ── Per-session connection status, published to the terminal view ──
+ * The status lives on the Conn but is surfaced through its own listener set so
+ * a view can subscribe with useSyncExternalStore without reaching into the
+ * connection manager. 'disconnected' is the terminal state after the retry
+ * ceiling is hit; 'reconnecting' covers both the automatic backoff chain and a
+ * socket that has not opened yet. */
+const statusListeners = new Map<string, Set<() => void>>()
+
+function notifyStatus(sessionId: string) {
+  const ls = statusListeners.get(sessionId)
+  if (ls) for (const cb of ls) cb()
+}
+
+function setConnStatus(sessionId: string, c: Conn, status: TerminalConnStatus) {
+  // A resolved outcome ends any user-initiated attempt: 'connected' means the
+  // redial succeeded, 'disconnected' means the chain gave up — both return the
+  // banner to its non-manual presentation.
+  const clearManual = (status === 'connected' || status === 'disconnected') && c.manualRetry
+  if (clearManual) c.manualRetry = false
+  if (c.status === status) {
+    // Status unchanged but the manual flag flipped off: still publish so the
+    // "Reconnecting…" banner can retire.
+    if (clearManual) notifyStatus(sessionId)
+    return
+  }
+  c.status = status
+  notifyStatus(sessionId)
+}
+
+/**
+ * Mark a session as being under a user-initiated reconnect and publish it, so
+ * the view can distinguish a manual retry (banner stays, as "Reconnecting…")
+ * from an automatic redial (bannerless). Idempotent notify-wise.
+ */
+function setManualRetry(sessionId: string, c: Conn) {
+  if (c.manualRetry) return
+  c.manualRetry = true
+  notifyStatus(sessionId)
+}
+
+/** Imperative read of whether a session's reconnect was user-initiated. */
+function manualRetryActive(sessionId: string): boolean {
+  return conns.get(sessionId)?.manualRetry ?? false
+}
+
+/**
+ * React hook: whether this session's current reconnect attempt was started by
+ * the user clicking "Reconnect". Drives the "Reconnecting…" banner, which is
+ * deliberately NOT shown for ordinary automatic redials.
+ */
+export function useTerminalManualRetry(sessionId: string): boolean {
+  return useSyncExternalStore(
+    (cb) => {
+      let s = statusListeners.get(sessionId)
+      if (!s) { s = new Set(); statusListeners.set(sessionId, s) }
+      s.add(cb)
+      return () => { s?.delete(cb) }
+    },
+    () => manualRetryActive(sessionId),
+    () => false,
+  )
+}
+
+/** React hook: a session's live connection status. Undefined until a
+ *  connection is managed for the session. */
+export function useTerminalConnStatus(sessionId: string): TerminalConnStatus | undefined {
+  return useSyncExternalStore(
+    (cb) => {
+      let s = statusListeners.get(sessionId)
+      if (!s) { s = new Set(); statusListeners.set(sessionId, s) }
+      s.add(cb)
+      return () => { s?.delete(cb) }
+    },
+    () => conns.get(sessionId)?.status,
+    () => undefined,
+  )
+}
+
+/**
+ * Re-arm and immediately redial a session's connection: clears the retry
+ * ceiling and any pending backoff timer, then dials at once. Used by the
+ * manual "Reconnect" button and by the network/visibility revive listeners.
+ * No-op for a disposed, unmanaged, or already-live (OPEN/CONNECTING) socket.
+ *
+ * `manual` marks a user-initiated retry so the view keeps the banner visible
+ * as "Reconnecting…"; the automatic revive listeners pass false so transient
+ * redials stay bannerless.
+ */
+export function retryTerminalConnection(sessionId: string, manual = true): void {
+  const c = conns.get(sessionId)
+  if (!c || c.disposed) return
+  if (manual) setManualRetry(sessionId, c)
+  const rs = c.ws?.readyState
+  if (rs === WebSocket.OPEN || rs === WebSocket.CONNECTING) return
+  if (rs === WebSocket.CLOSING) {
+    // The socket's own onclose is imminent and will schedule a redial. Dialing
+    // here too would race it into two competing PTY attachments (each reset()
+    // + scrollback replay corrupting the display). Reset the budget so that
+    // onclose redials promptly even if the chain was exhausted, and let it own
+    // the dial.
+    c.retries = 0
+    return
+  }
+  c.retries = 0
+  clearTimeout(c.reconnectTimer)
+  c.reconnectTimer = undefined
+  connect(sessionId, c)
+}
+
+/**
+ * Revive every managed session whose socket is not currently OPEN/CONNECTING.
+ * Registered once at module load against the events that signal a stalled
+ * backoff chain can make progress again: the tab regaining network ('online')
+ * and a backgrounded tab returning to the foreground ('visibilitychange' →
+ * visible), where mobile browsers freeze setTimeout so the backoff chain can
+ * silently stall or exhaust while hidden.
+ */
+function reviveAllConnections() {
+  for (const [sessionId] of conns) retryTerminalConnection(sessionId, false)
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', reviveAllConnections)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') reviveAllConnections()
+  })
+}
+
 function connect(sessionId: string, c: Conn) {
-  if (c.disposed || c.retries >= MAX_RETRIES) return
+  if (c.disposed) return
+  if (c.retries >= MAX_RETRIES) {
+    // Backoff exhausted: no further dial will happen until a revive event
+    // (online / tab foreground) or a manual Reconnect re-arms it. This is the
+    // one place dialing truly stops, so it owns the terminal 'disconnected'
+    // state — an earlier onclose still has a redial pending.
+    setConnStatus(sessionId, c, 'disconnected')
+    return
+  }
+  setConnStatus(sessionId, c, 'reconnecting')
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
   const qs = c.cwd ? `?cwd=${encodeURIComponent(c.cwd)}` : ''
   const ws = new WebSocket(`${proto}//${location.host}/api/ws/terminal/${sessionId}${qs}`)
@@ -159,6 +308,7 @@ function connect(sessionId: string, c: Conn) {
 
   ws.onopen = () => {
     c.retries = 0
+    setConnStatus(sessionId, c, 'connected')
     // Server replays this session's scrollback on (re)connect; reset first so
     // the cached term's retained screen doesn't stack under the replay.
     c.term.reset()
@@ -191,8 +341,16 @@ function connect(sessionId: string, c: Conn) {
     unregisterTerminalWs(sessionId)
     if (c.disposed) return
     const attempt = c.retries++
-    if (attempt >= MAX_RETRIES) return
+    if (attempt >= MAX_RETRIES) {
+      // Already past the ceiling (a straggler close after dialing stopped):
+      // reflect the terminal state without scheduling another dial.
+      setConnStatus(sessionId, c, 'disconnected')
+      return
+    }
+    setConnStatus(sessionId, c, 'reconnecting')
     const delay = Math.min(BASE_DELAY_MS * 2 ** attempt, MAX_DELAY_MS)
+    // The scheduled connect() flips to 'disconnected' itself once retries has
+    // reached the ceiling, so exhaustion is surfaced even on the last redial.
     c.reconnectTimer = setTimeout(() => connect(sessionId, c), delay + delay * 0.2 * Math.random())
   }
 
@@ -208,7 +366,7 @@ export function ensureTerminalConnection(
   sessionId: string, term: Terminal, fit: FitAddon, cwd?: string | null,
 ): void {
   if (conns.has(sessionId)) return
-  const c: Conn = { term, fit, cwd, ws: null, disposed: false, retries: 0 }
+  const c: Conn = { term, fit, cwd, ws: null, disposed: false, retries: 0, status: 'reconnecting', manualRetry: false }
   conns.set(sessionId, c)
   // Wire terminal I/O once (the term is cached for the session's lifetime;
   // its listeners are cleaned up by term.dispose() in destroyTerm).
@@ -233,6 +391,7 @@ export function disposeTerminalConnection(sessionId: string): void {
   titles.delete(sessionId)
   titleListeners.delete(sessionId)
   cwds.delete(sessionId)
+  statusListeners.delete(sessionId)
   // Drop any pending onTerminalReady callbacks. They're normally drained by
   // registerTerminalWs when the socket opens; if the tab is closed before the
   // WS ever connects, they'd otherwise leak in readyListeners indefinitely.

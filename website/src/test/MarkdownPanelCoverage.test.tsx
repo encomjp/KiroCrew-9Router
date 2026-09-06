@@ -534,7 +534,7 @@ describe('MarkdownPanel — save and cancel', () => {
     const onSave = vi.fn(async () => {})
     mountDirty({ onSave })
     // Cmd+S is gated on `editing` — the shortcut belongs to the edit surface.
-    fireEvent.click(screen.getByText('View Source'))
+    fireEvent.click(screen.getByText('Edit'))
     fireEvent.keyDown(document, { key: 's', metaKey: true })
     await waitFor(() => expect(onSave).toHaveBeenCalledOnce())
   })
@@ -545,7 +545,7 @@ describe('MarkdownPanel — save and cancel', () => {
     // save would persist the very draft the user is about to discard.
     const onSave = vi.fn(async () => {})
     mountDirty({ onSave })
-    fireEvent.click(screen.getByText('View Source'))
+    fireEvent.click(screen.getByText('Edit'))
     fireEvent.keyDown(document, { key: 'Escape' })
     await screen.findByRole('dialog')
     fireEvent.keyDown(document, { key: 's', metaKey: true })
@@ -598,6 +598,46 @@ describe('MarkdownPanel — diff chrome', () => {
     // …and offers the way back out.
     fireEvent.click(screen.getByText('Show full file'))
     await waitFor(() => expect(screen.queryByText('No changes in this file')).toBeNull())
+  })
+
+  it('reports the missing baseline for a file outside any git repository', async () => {
+    // status not_git means there IS no baseline: the whole-file-added diff the
+    // empty `original` would produce is a claim about a baseline that does not
+    // exist, so the panel must say so instead of rendering it (#6640).
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: '', original: '', status: 'not_git' } as never)
+    mountPanel({ content: 'standalone text\n', initialDiffMode: undefined })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    fireEvent.click(screen.getAllByLabelText('Toggle diff view')[0])
+    expect(await screen.findByText("This file isn't in a git repository, so there is no baseline to diff against")).toBeInTheDocument()
+    expect(screen.queryByTestId('pierre-diff')).toBeNull()
+    // The escape hatch back to the full file is the same as the zero-diff one.
+    fireEvent.click(screen.getByText('Show full file'))
+    await waitFor(() => expect(screen.queryByText(/no baseline to diff against/)).toBeNull())
+  })
+
+  it('keeps the all-added diff for an untracked file inside a repo', async () => {
+    // untracked is the case where all-added IS the true answer — the repo is
+    // the baseline and the file is new to it. Only not_git loses its diff.
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: '+new file content', original: '', status: 'untracked' } as never)
+    mountPanel({ content: 'new file content\n', initialDiffMode: undefined })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    fireEvent.click(screen.getAllByLabelText('Toggle diff view')[0])
+    const surface = await screen.findByTestId('pierre-diff')
+    expect(surface).toHaveAttribute('data-old', '')
+    expect(surface).toHaveAttribute('data-new', 'new file content\n')
+    expect(screen.queryByText(/no baseline to diff against/)).toBeNull()
+  })
+
+  it('surfaces a git failure instead of presenting it as a clean file', async () => {
+    // status error is a failed `git diff`, which the backend keeps distinct
+    // from clean so a failure is never read as "no changes".
+    vi.mocked(api.fileDiff).mockResolvedValue({ diff: '', original: 'same\n', status: 'error' } as never)
+    mountPanel({ content: 'same\n', initialDiffMode: undefined })
+    await waitFor(() => expect(api.fileDiff).toHaveBeenCalled())
+    fireEvent.click(screen.getAllByLabelText('Toggle diff view')[0])
+    expect(await screen.findByText("Couldn't compute the diff — git failed for this file")).toBeInTheDocument()
+    expect(screen.queryByTestId('pierre-diff')).toBeNull()
+    expect(screen.queryByText('No changes in this file')).toBeNull()
   })
 
   it('offers split/unified as a menu row only once a diff is on screen', async () => {
@@ -731,7 +771,7 @@ describe('MarkdownPanel — fullscreen overlay', () => {
 
   it('carries the editing toolbar into the overlay', async () => {
     mountPanel({ content: 'edited body', savedBaseline: 'disk body' })
-    fireEvent.click(screen.getByText('View Source'))
+    fireEvent.click(screen.getByText('Edit'))
     openPanelMenu()
     fireEvent.click(screen.getByText('Full screen'))
     const dialog = await screen.findByRole('dialog')
@@ -817,7 +857,7 @@ describe('MarkdownPanel — preview find', () => {
 
   it('hands Cmd+F back to the editor when the panel leaves preview', async () => {
     mountPanel({ content: 'alpha beta\n' })
-    fireEvent.click(screen.getByText('View Source'))
+    fireEvent.click(screen.getByText('Edit'))
     fireEvent.keyDown(document, { key: 'f', metaKey: true })
     await waitFor(() => expect(screen.queryByLabelText('Find in document')).toBeNull())
   })
@@ -875,7 +915,7 @@ describe('MarkdownPanel — inline comment highlights', () => {
     seedDraft('beta')
     mountPanel({ filePath: FILE, content: BODY, onSubmitComments: vi.fn() })
     await waitFor(() => expect(highlightRegistry.has('mc-comment')).toBe(true))
-    fireEvent.click(screen.getByText('View Source'))
+    fireEvent.click(screen.getByText('Edit'))
     await waitFor(() => expect(highlightRegistry.has('mc-comment')).toBe(false))
   })
 
@@ -1152,16 +1192,16 @@ describe('MarkdownPanel — view options', () => {
 
   it('returns to the preview from source mode via the same toggle', () => {
     mountPanel()
-    fireEvent.click(screen.getByText('View Source'))
-    expect(screen.getByText('View Preview')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('View Preview'))
-    expect(screen.getByText('View Source')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Edit'))
+    expect(screen.getByText('Preview')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Preview'))
+    expect(screen.getByText('Edit')).toBeInTheDocument()
   })
 
   it('hides the source/preview toggle for a file whose only renderer is a viewer', async () => {
     mountPanel({ filePath: '/tmp/diagram.png', content: 'iVBORw0KGgo=' })
     await waitFor(() => expect(document.querySelector('img')).not.toBeNull())
-    expect(screen.queryByText('View Source')).toBeNull()
+    expect(screen.queryByText('Edit')).toBeNull()
     expect(screen.queryByLabelText('Toggle diff view')).toBeNull()
   })
 
@@ -1170,8 +1210,8 @@ describe('MarkdownPanel — view options', () => {
     // they open in the Pierre editor and the mode toggle is hidden.
     mountPanel({ filePath: '/tmp/mod.py', content: 'a = 1\n' })
     expect(await screen.findByTestId('pierre-editor')).toBeInTheDocument()
-    expect(screen.queryByText('View Source')).toBeNull()
-    expect(screen.queryByText('View Preview')).toBeNull()
+    expect(screen.queryByText('Edit')).toBeNull()
+    expect(screen.queryByText('Preview')).toBeNull()
   })
 })
 

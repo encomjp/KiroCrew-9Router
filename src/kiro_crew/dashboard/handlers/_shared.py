@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import fnmatch
+import importlib.util
 import json
 import logging
 import os
+import shlex
+import sys
+import sysconfig
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 import aiohttp
 from aiohttp import web
 
+from kiro_crew import platform_compat
 from kiro_crew.agent_discovery import (
     SKILL_URI_PREFIX,
     expand_skill_uri,
@@ -20,6 +26,11 @@ from kiro_crew.agent_discovery import (
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.dashboard.state import VALID_MEMORY_MODES, DashboardState
+from kiro_crew.dashboard.token_auth import (
+    MAX_SESSION_TTL_SECS,
+    _b64url_decode,
+    required_peer_key_unverified,
+)
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.messaging.privacy_mode import hydrate as _hydrate_conv_flags
 from kiro_crew.messaging.privacy_mode import is_incognito as is_thread_incognito
@@ -182,8 +193,9 @@ def _admits(surface: str, resource: str, probe: "Callable[[], bool]") -> bool:
     rather than silently gaining unaudited egress.
 
     SYNCHRONOUS BY DESIGN, and callers on the event loop must run it in a worker
-    thread. SEL initialization can shell out (``icacls`` on a fresh Windows
-    gateway), so calling this inline from a coroutine would stall every request.
+    thread. SEL initialization does blocking filesystem work (trust-dir creation,
+    key validation, and on Windows an owner-only DACL), so calling this inline
+    from a coroutine would stall every request.
     """
     from kiro_crew.platform.context import safe_context_call
 
@@ -1498,6 +1510,78 @@ def _read_session_key(request: "Any") -> str:
     return request.headers.get("X-Session-Key", "").strip()
 
 
+def _caller_bounds(request: web.Request) -> tuple[dict[str, str], int]:
+    """Read the caller's own session bounds from the token that authenticated it.
+
+    Shared by every handler that mints a NEW credential on the authority of an
+    existing dashboard session (the mobile login link and the tailnet QR mint),
+    so the two mint surfaces cannot drift apart on the invariant: the minted
+    credential must never out-scope the session authorizing it.
+
+    Returns ``(carried_claims, ttl_ceiling_seconds)``. ``ttl_ceiling`` is ``0``
+    when the caller has no lifetime left to lend, which the handler refuses
+    rather than minting against. Claims are carried, never re-derived: ``boot``
+    copied verbatim (same rule as the link→session exchange in ``token_auth``),
+    ``no_refresh`` copied so the recipient session never grows a refresh chain,
+    and the remaining ``session_exp`` becomes the TTL ceiling so a short-lived
+    caller cannot mint a longer-lived credential. ``require_peer`` and its
+    signed ``peer_key`` move as one inseparable device bound. Fail-closed on an
+    unreadable payload: a caller whose bounds cannot be established gets a
+    bounded (no-refresh, default-TTL-capped) link rather than an unbounded one.
+
+    **Read the credential the middleware VALIDATED, not a re-extracted one.**
+    Only that credential has a verified signature; the other one was never
+    checked. ``token_auth`` publishes it as ``request["auth_token"]`` for
+    exactly this reason: its own extraction prefers ``?token=`` but falls back
+    to the session cookie when the query token is invalid, so re-deriving with
+    a fixed query-then-cookie order could pick the credential that was NOT
+    validated — letting a request that authenticated with a bounded cookie have
+    its bounds read from an unverified, attacker-settable query token, dropping
+    ``no_refresh`` and raising the TTL ceiling to the full maximum, which is
+    precisely the ceiling-escape this function exists to prevent. When no
+    credential was published (a surface that authenticated by another means),
+    the mint is bounded fail-closed the same way an unreadable payload is.
+
+    **A non-positive remaining lifetime is never rounded up.** Clamping it to a
+    floor of one second would let a caller whose own session has just run out
+    mint a link that outlives it, and the exchange the recipient performs starts
+    a fresh window — so repeating the mint would walk the expiry forward
+    indefinitely from a session that should already be dead. Report ``0`` and
+    let the caller be refused.
+    """
+    published = request.get("auth_token", "")
+    token = published if isinstance(published, str) else ""
+    carried: dict[str, str] = {}
+    ttl_ceiling = MAX_SESSION_TTL_SECS
+    if not token:
+        # Authenticated without a readable token (unexpected on this surface):
+        # fail closed by bounding the mint rather than trusting it.
+        return {"no_refresh": "1"}, ttl_ceiling
+    try:
+        data = json.loads(_b64url_decode(token.split(".", 1)[0]))
+        boot = str(data.get("boot", ""))
+        if boot:
+            carried["boot"] = boot
+        if str(data.get("no_refresh", "")) == "1":
+            carried["no_refresh"] = "1"
+        if str(data.get("require_peer", "")) == "1":
+            carried["require_peer"] = "1"
+            # Middleware refuses a claimless require_peer cookie, so the
+            # fallback is unreachable on a real authenticated request. Keep it
+            # fail-closed for direct test doubles or future alternate auth:
+            # an impossible key mints an unusable child instead of widening it.
+            carried["peer_key"] = required_peer_key_unverified(token) or "unverified"
+        session_exp = float(data.get("session_exp", 0.0))
+        if session_exp:
+            remaining = int(session_exp - time.time())
+            if remaining <= 0:
+                return carried, 0
+            ttl_ceiling = min(ttl_ceiling, remaining)
+    except Exception:
+        return {"no_refresh": "1"}, ttl_ceiling
+    return carried, ttl_ceiling
+
+
 def _is_restricted_session(state: DashboardState, request: "Any") -> bool:
     """Check if request comes from an ephemeral (incognito) or temporary (guest) session.
 
@@ -1746,6 +1830,83 @@ def _read_memory_mode(path: "Path") -> str | None:
     return normalized
 
 
+async def require_owner_dashboard_request(
+    request: web.Request, operation: str
+) -> web.Response | None:
+    """Owner gate shared across dashboard handler modules.
+
+    Returns ``None`` when the caller IS the dashboard owner, allowing the
+    request to proceed.  Otherwise audits the denial via SEL (off-thread so a
+    first-process SEL construction cannot stall the event loop), checks for
+    a stale pre-owner bootstrap subject (relabelling the denial to a 401), and
+    falls back to a 403 with the standard ``owner_only`` code.
+
+    Imports ``is_owner_dashboard_request`` and ``stale_owner_session_response``
+    inside the function body to avoid a circular import: ``source_providers``
+    imports chat-state helpers that reach back into sibling handler modules.
+    """
+    import asyncio
+
+    from kiro_crew.dashboard.handlers.source_providers import (
+        is_owner_dashboard_request,
+    )
+
+    if is_owner_dashboard_request(request):
+        return None
+
+    # Off the loop: the FIRST sel() of a process CONSTRUCTS the log (trust-dir
+    # creation, key validation — blocking file IO), so on a fresh gateway whose
+    # first mutating request is non-owner this would stall every other request.
+    caller = str(request.get("user") or "unknown")
+    try:
+        from kiro_crew.sel import sel as _sel
+
+        await asyncio.to_thread(
+            lambda: _sel().log_api_access(
+                caller=caller,
+                operation=operation,
+                outcome="denied",
+                source="dashboard",
+                resources="non_owner_block",
+            )
+        )
+    except Exception:  # pragma: no cover - audit must never change the outcome
+        logger.debug("SEL audit for non-owner %s failed", operation, exc_info=True)
+
+    # Deny decision made above; only the response label changes for a signed
+    # pre-owner bootstrap subject (see stale_owner_session_response).
+    return _owner_denial_response(request)
+
+
+def _owner_denial_response(
+    request: web.Request,
+    error_message: str = "owner authorization required",
+    error_code: str = "owner_only",
+) -> web.Response:
+    """Stale-session relabel + 403 denial -- the tail of every owner gate.
+
+    Synchronous: ``stale_owner_session_response`` is a pure predicate over
+    request attributes, so no I/O is involved.  Domain-specific wrappers that
+    perform their own SEL/audit logging before reaching the denial response can
+    call this directly instead of going through the full async
+    ``require_owner_dashboard_request`` helper.
+
+    Imports ``stale_owner_session_response`` inside the function body to avoid
+    a circular import (same reason as the async helper above).
+    """
+    from kiro_crew.dashboard.handlers.source_providers import (
+        stale_owner_session_response,
+    )
+
+    stale = stale_owner_session_response(request)
+    if stale is not None:
+        return stale
+    return web.json_response(
+        {"error": error_message, "code": error_code},
+        status=403,
+    )
+
+
 def _probe_persisted_session(slot_name: str) -> tuple[bool, str | None]:
     """``(file_exists, memory_mode_or_None)`` for *slot_name*.
 
@@ -1768,3 +1929,75 @@ def _probe_persisted_session(slot_name: str) -> tuple[bool, str | None]:
     if len(matches) > 1:
         return True, None
     return True, _read_memory_mode(matches[0])
+
+
+# ── Optional-extra install advice ──
+# Two handler modules need these: `core` for the [voice] extra behind
+# Speech-to-Text, and `messaging` for the per-channel SDK extras ([feishu] ->
+# lark-oapi, [teams] -> PyJWT, [whatsapp] -> neonize). They live here rather than
+# in either one so neither handler module has to import the other.
+
+
+def _pip_install_channel_available() -> bool:
+    """True when ``<gateway python> -m pip install`` can plausibly succeed.
+
+    Three environments make that command a guaranteed dead end, and surfacing
+    it there recreates the press-and-nothing-changes failure this surface
+    exists to avoid:
+
+    - the desktop app's bundled interpreter (see
+      :func:`platform_compat.is_bundled_interpreter`): pip may exist, but a
+      pip install writes into the code-signed bundle — breaking launches and
+      updates — and is discarded on every app update;
+    - an interpreter without the ``pip`` module (uv tool installs, some
+      pipx layouts);
+    - a PEP 668 externally-managed interpreter (distro/brew pythons), where
+      pip refuses to install. Checked only outside a venv: inside one, pip
+      works and deliberately ignores the marker, so a venv returns True.
+
+    Touches the filesystem (``find_spec``, then the marker file), so call it
+    from a worker thread on an async path.
+    """
+    if platform_compat.is_bundled_interpreter():
+        return False
+    if importlib.util.find_spec("pip") is None:
+        return False
+    # PEP 668 applies to the environment pip would install into. Inside a venv
+    # pip deliberately ignores the marker, and `sysconfig.get_path("stdlib")`
+    # resolves to the BASE interpreter's directory — where distro/brew pythons
+    # place it — so checking it from a venv would misfire on the recommended
+    # install layout (venv on a Debian/Ubuntu/Homebrew python).
+    if sys.prefix != sys.base_prefix:
+        return True
+    return not (Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED").exists()
+
+
+def pip_extra_install_command(extra: str) -> str:
+    r"""The command that installs ``kirocrew[extra]`` into THIS gateway's python.
+
+    The interpreter is spelled out rather than left as a bare ``pip`` because
+    "which python" is the failure this string exists to prevent: a gateway run
+    from one venv while the user installs into another leaves the feature
+    missing, and nothing in the UI says the install landed somewhere else. The
+    extra is imported by the gateway process itself, so a system python or a
+    ``--user`` install is not importable here.
+
+    On Windows the user's shell is unknowable here (they may paste this into
+    PowerShell OR cmd), so the form must be SILENT-CORRUPTION-FREE in both, and
+    PowerShell is the harder shell: a double-quoted string still expands
+    ``$name`` and honours backtick escapes, and so does a bare unquoted token —
+    both are legal path characters, so either form silently rewrites an
+    interpreter under e.g. ``C:\tools\$python\...`` into a path that does not
+    exist. Single quotes are PowerShell's LITERAL form (no expansion, no
+    escapes, spaces included), with ``&`` invoking the quoted path, so the
+    interpreter reaches pip byte-for-byte — including the all-users
+    ``C:\Program Files\...`` layout an unquoted form cannot express. cmd performs
+    no ``$`` or backtick processing at all and rejects the leading ``&`` loudly
+    ("... was unexpected"), so a cmd user gets a clear error to re-quote for,
+    never a corrupted install. A literal single quote in the path is escaped by
+    doubling, PowerShell's own rule.
+    """
+    if os.name == "nt":
+        exe = sys.executable.replace("'", "''")
+        return f"& '{exe}' -m pip install kirocrew[{extra}]"
+    return f"{shlex.quote(sys.executable)} -m pip install 'kirocrew[{extra}]'"

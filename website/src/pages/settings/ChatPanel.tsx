@@ -65,8 +65,8 @@ const SOFT_STOP_DEFAULT = 10.0
 type CompletionKeepMode = 'head' | 'tail' | 'both'
 const COMPLETION_KEEP_OPTIONS: CompletionKeepMode[] = ['head', 'tail', 'both']
 
-type VerbosityLevel = 'default' | 'concise' | 'ultra'
-const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra']
+type VerbosityLevel = 'default' | 'concise' | 'ultra' | 'answer_only'
+const VERBOSITY_OPTIONS: VerbosityLevel[] = ['default', 'concise', 'ultra', 'answer_only']
 
 /**
  * Narrow a persisted `dashboard.verbosity` to a level this Select can render.
@@ -97,10 +97,108 @@ const COMPLETION_KEEP_CHARS_MIN = 0
 const COMPLETION_KEEP_CHARS_MAX = 512000
 const COMPLETION_KEEP_CHARS_DEFAULT = 3000
 
+/** Shape of the kirocrewConfig query payload this panel reads and patches. */
+type KirocrewConfigShape = {
+  session?: { autocompact_pct?: number }
+  session_summary?: { enabled?: boolean }
+  agent?: {
+    provider?: string
+    provider_base_url?: string
+    provider_api_key?: string
+    provider_api_format?: string
+    model_whitelist?: string[]
+    model?: string
+    role_models?: { background?: string; subagent?: string }
+    role_efforts?: { background?: string; subagent?: string }
+    reasoning_effort?: string
+    soft_stop_budget_secs?: number
+    completion_keep?: CompletionKeepMode
+    completion_keep_chars?: number
+    fallback_model?: string
+  }
+  dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string; prevent_sleep?: boolean }
+}
+
+/**
+ * Return a copy of `cfg` with the dot-separated `path` set to `value`,
+ * shallow-cloning only the objects along the path. Used on a config PATCH's
+ * success to write the ACCEPTED value into the query cache at that one path,
+ * so a transiently failed settle-time refetch cannot leave the display on a
+ * pre-PATCH value the server no longer holds.
+ */
+function setConfigValue(cfg: KirocrewConfigShape, path: string, value: unknown): KirocrewConfigShape {
+  const keys = path.split('.')
+  const next: Record<string, unknown> = { ...cfg }
+  let cursor = next
+  for (let i = 0; i < keys.length - 1; i++) {
+    const child = cursor[keys[i]]
+    cursor[keys[i]] = typeof child === 'object' && child !== null ? { ...(child as Record<string, unknown>) } : {}
+    cursor = cursor[keys[i]] as Record<string, unknown>
+  }
+  cursor[keys[keys.length - 1]] = value
+  return next as KirocrewConfigShape
+}
+
 export function ChatPanel() {
   const qc = useQueryClient()
   const [chatCfg, setChatCfg] = useState<ChatConfig>(loadChatConfig)
-  const [saveError, setSaveError] = useState('')
+  const [saveError, rawSetSaveError] = useState('')
+  // The failure banner is one shared slot written by every save on this panel,
+  // so a pick may only auto-clear a failure that came from the SAME picker —
+  // its own config path. Clearing more than that (another picker's failure,
+  // or a non-picker save's) would dismiss an unresolved error and leave the
+  // user believing that setting persisted. The ref records which config path
+  // produced the current banner; null = not a picker failure.
+  const saveErrorPathRef = useRef<string | null>(null)
+  const setSaveError = (msg: string) => {
+    saveErrorPathRef.current = null
+    rawSetSaveError(msg)
+  }
+  const setPickerSaveError = (path: string, msg: string) => {
+    saveErrorPathRef.current = path
+    rawSetSaveError(msg)
+  }
+
+  // ── Optimistic pending values for the model/effort pickers ──
+  // Each picker renders `pending ?? server`, so a pick shows in the trigger
+  // immediately instead of after the PATCH → invalidate → refetch round-trip.
+  // The overlay is keyed by config path, so concurrent picks on different
+  // pickers cannot touch each other's display: a failed mutation only stops
+  // masking its OWN path, and a settle-time refetch lands in the query cache
+  // UNDER every still-pending overlay rather than clobbering it.
+  //
+  // Ownership is a monotonic token, not the picked value: `setPending`
+  // returns the token from `onMutate` (react-query hands it back to
+  // `onSettled` as the mutation context), and only the entry's own token may
+  // clear it. Guarding on the value instead would let pick A → pick B →
+  // pick A on one picker have A₁'s settle clear the entry A₃ owns, flashing
+  // the stale cache value while A₃ is still in flight.
+  const pendingSeqRef = useRef(0)
+  // Latest token per path, readable synchronously from mutation callbacks
+  // (state would be a stale closure there): lets a superseded mutation's
+  // late failure recognise it no longer owns the path's display.
+  const latestTokenRef = useRef<Record<string, number>>({})
+  const [pendingCfg, setPendingCfg] = useState<Record<string, { value: string; token: number } | undefined>>({})
+  const setPending = (path: string, value: string): number => {
+    const token = ++pendingSeqRef.current
+    latestTokenRef.current[path] = token
+    setPendingCfg(prev => ({ ...prev, [path]: { value, token } }))
+    // A fresh attempt supersedes a stale failure banner from THIS picker:
+    // without this the trigger would show the new pick while its own last
+    // pick's error still hangs above it in the same frame. Failures from any
+    // other source — another picker included — stay up: this pick says
+    // nothing about whether that other setting saved.
+    if (saveErrorPathRef.current === path) setSaveError('')
+    return token
+  }
+  const clearPending = (path: string, token: unknown) =>
+    setPendingCfg(prev => {
+      // A newer pick on the same path owns the display now; leave it alone.
+      if (prev[path]?.token !== token) return prev
+      const next = { ...prev }
+      delete next[path]
+      return next
+    })
 
   // ── Dashboard config (server-side) ──
   const dashQ = useQuery<DashboardConfig>({
@@ -151,30 +249,70 @@ export function ChatPanel() {
   })
 
   // ── KiroCrew config (server-side) ──
-  const mcQ = useQuery<{
-    session?: { autocompact_pct?: number }
-    session_summary?: { enabled?: boolean }
-    agent?: {
-      provider?: string
-      provider_base_url?: string
-      provider_api_key?: string
-      provider_api_format?: string
-      model_whitelist?: string[]
-      model?: string
-      role_models?: { background?: string; subagent?: string }
-      role_efforts?: { background?: string; subagent?: string }
-      reasoning_effort?: string
-      soft_stop_budget_secs?: number
-      completion_keep?: CompletionKeepMode
-      completion_keep_chars?: number
-      fallback_model?: string
-    }
-    dashboard?: { user_role?: string; user_role_other?: string; user_technical_level?: string; prevent_sleep?: boolean }
-  }>({
+  const mcQ = useQuery<KirocrewConfigShape>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
   })
   const mcCfg = mcQ.data
+
+  /**
+   * Mutation options for a config PATCH with an OPTIMISTIC display: the seven
+   * Model-section selectors render `pending ?? server`, so a pick shows
+   * immediately instead of waiting for the PATCH + refetch round-trip.
+   *
+   * The pending entry is per config PATH, never a whole-config snapshot:
+   * snapshotting the whole object would capture another picker's in-flight
+   * optimistic value and restore it on this mutation's failure, transiently
+   * reverting a pick the user never undid. With the overlay, an error only
+   * stops masking this mutation's own path.
+   *
+   * On success the ACCEPTED value is first written into the cache at this
+   * path only, so a transiently failed settle-time refetch (which
+   * invalidateQueries swallows) cannot leave the display on a pre-PATCH
+   * value the server no longer holds. `onSuccess` then RETURNS the
+   * invalidateQueries promise — react-query awaits it before `onSettled` —
+   * so by the time the pending entry clears, a completed refetch has already
+   * replaced that write with the server's authoritative answer (which may
+   * differ from the pick when the backend normalises it). The refetch cannot
+   * clobber a DIFFERENT picker's in-flight pick, because that picker's
+   * overlay still masks the cache until its own settle. On error the cache
+   * was never written, but the refetch still runs: a PATCH can fail after
+   * persisting (5xx after apply, proxy timeout), and only the server can say
+   * which value survived. `''` is a meaningful value here ("model default" /
+   * fallback "disabled"), hence `??` over truthiness everywhere the overlay
+   * is read.
+   *
+   * The failure banner is token-guarded: a pick that has been superseded by
+   * a newer pick on the same path reports nothing when it eventually fails —
+   * the newer pick owns the display, and a stale "failed to save" beside a
+   * value that did persist is exactly the co-render this fix removes.
+   */
+  const optimisticConfigOpts = (path: string, errMsg: (err: unknown) => string) => ({
+    mutationFn: (v: string) => api.patchConfig(path, v),
+    onMutate: (v: string) => setPending(path, v),
+    onSuccess: (_data: unknown, v: string, token: unknown) => {
+      // Only the path's LATEST pick may write its accepted value: with A→B
+      // in flight on one picker and B settling first, A's later settle would
+      // otherwise overwrite B in the cache, and a failed refetch would leave
+      // stale A displayed while the server holds B.
+      if (latestTokenRef.current[path] === token) {
+        const cur = qc.getQueryData<KirocrewConfigShape>(['kirocrewConfig'])
+        if (cur) qc.setQueryData(['kirocrewConfig'], setConfigValue(cur, path, v))
+      }
+      return qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+    },
+    onError: (err: unknown, _v: string, token: unknown) => {
+      // Stop masking immediately (token-guarded and idempotent with the
+      // onSettled clear) so no intermediate frame shows the failed pick
+      // beside its own failure banner.
+      clearPending(path, token)
+      if (latestTokenRef.current[path] === token) setPickerSaveError(path, errMsg(err))
+    },
+    onSettled: (_data: unknown, err: unknown, _v: string, token: unknown) => {
+      clearPending(path, token)
+      if (err) qc.invalidateQueries({ queryKey: ['kirocrewConfig'] })
+    },
+  })
 
   // ── User profile (About You) ──
   // Same slugs as onboarding step 2 (OnboardingFlow.tsx), validated by the
@@ -253,19 +391,23 @@ export function ChatPanel() {
   // "auto" (default) = backend availability-aware routing, concrete id =
   // tried first with "auto" as the final fallthrough.
   const fallbackModel = mcCfg?.agent?.fallback_model ?? 'auto'
-  const fallbackMut = useMutation({
-    mutationFn: (v: string) => api.patchConfig('agent.fallback_model', v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-    onError: (err: unknown) => {
+  const shownFallbackModel = pendingCfg['agent.fallback_model']?.value ?? fallbackModel
+  const fallbackMut = useMutation(
+    optimisticConfigOpts('agent.fallback_model', (err: unknown) => {
       // Surface the backend's actual deny reason (e.g. an unentitled id)
       // next to the generic failure line.
       const reason = err instanceof Error && err.message ? `: ${err.message}` : ''
-      setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_fallback_model') + reason)
-    },
-  })
-  const fallbackModelOptions = (current: string): string[] => {
+      return i18nT('pages.settings.chatPanel.failed_to_save_fallback_model') + reason
+    })
+  )
+  const fallbackModelOptions = (shown: string, server: string): string[] => {
     const opts = ['', 'auto', ...availableModels.map(m => m.name).filter(m => m !== 'auto')]
-    if (current && !opts.includes(current)) opts.splice(2, 0, current)
+    // Keep both the shown and the persisted id selectable while they differ:
+    // an in-flight pick must not drop the server's unadvertised id from the
+    // list, or the user could not switch back to it during that window.
+    for (const kept of [server, shown]) {
+      if (kept && !opts.includes(kept)) opts.splice(2, 0, kept)
+    }
     return opts
   }
   const fallbackModelLabels = (opts: string[]): string[] =>
@@ -380,17 +522,21 @@ export function ChatPanel() {
   // '' in config means "unset" and resolves the same way 'auto' does, so both
   // render as the 'auto' option rather than as a missing selection.
   const defaultModel = mcCfg?.agent?.model || 'auto'
+  const shownDefaultModel = pendingCfg['agent.model']?.value ?? defaultModel
   const modelOptions = availableModels.map(m => m.name)
   // A model the live backend no longer advertises must still be selectable,
   // otherwise the select would silently jump to another entry and a stray
-  // change event would overwrite the user's stored choice.
-  if (!modelOptions.includes(defaultModel)) modelOptions.unshift(defaultModel)
+  // change event would overwrite the user's stored choice. Both the SHOWN and
+  // the persisted value are kept: while a pick is in flight the server's
+  // unadvertised id must not vanish from the list, or the user could not
+  // change back to it during that window.
+  for (const kept of [defaultModel, shownDefaultModel]) {
+    if (!modelOptions.includes(kept)) modelOptions.unshift(kept)
+  }
 
-  const defaultModelMut = useMutation({
-    mutationFn: (v: string) => api.patchConfig('agent.model', v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_default_model')),
-  })
+  const defaultModelMut = useMutation(
+    optimisticConfigOpts('agent.model', () => i18nT('pages.settings.chatPanel.failed_to_save_default_model'))
+  )
 
   // ── Provider (agent backend + router URL/key) ──
   // The section edits a DRAFT that only becomes config on Save: the backend
@@ -518,15 +664,18 @@ export function ChatPanel() {
   }
 
   const defaultEffort = mcCfg?.agent?.reasoning_effort ?? ''
+  const shownDefaultEffort = pendingCfg['agent.reasoning_effort']?.value ?? defaultEffort
   // Effort is only meaningful on reasoning-capable models. Rather than hide the
   // row (which would make the setting look absent), keep it visible and
-  // disabled with an explanatory hint.
-  const effortSupported = modelSupportsEffort(defaultModel)
-  const defaultEffortMut = useMutation({
-    mutationFn: (v: string) => api.patchConfig('agent.reasoning_effort', v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_default_reasoning_effort')),
-  })
+  // disabled with an explanatory hint. Gated on the SHOWN model so the row's
+  // enabled state tracks the trigger the user is looking at, not a value the
+  // refetch has yet to replace.
+  const effortSupported = modelSupportsEffort(shownDefaultModel)
+  const defaultEffortMut = useMutation(
+    optimisticConfigOpts('agent.reasoning_effort', () =>
+      i18nT('pages.settings.chatPanel.failed_to_save_default_reasoning_effort')
+    )
+  )
 
   // ── Per-role model defaults (agent.role_models) ──
   // Same picker as the chat default above, but NOT the same precedence:
@@ -537,25 +686,32 @@ export function ChatPanel() {
   // these rows label it differently from the chat row's Default (auto).
   const backgroundModel = mcCfg?.agent?.role_models?.background || 'auto'
   const subagentModel = mcCfg?.agent?.role_models?.subagent || 'auto'
+  const shownBackgroundModel = pendingCfg['agent.role_models.background']?.value ?? backgroundModel
+  const shownSubagentModel = pendingCfg['agent.role_models.subagent']?.value ?? subagentModel
   // A pinned model the live backend no longer advertises must stay selectable
-  // (same reasoning as the chat-default picker), so prepend it when missing.
-  const roleModelOptions = (current: string): string[] => {
+  // (same reasoning as the chat-default picker), so prepend what is missing —
+  // both the shown value and the persisted one, so neither vanishes while a
+  // pick is in flight.
+  const roleModelOptions = (shown: string, server: string): string[] => {
     const opts = availableModels.map(m => m.name)
-    if (!opts.includes(current)) opts.unshift(current)
+    for (const kept of [server, shown]) {
+      if (!opts.includes(kept)) opts.unshift(kept)
+    }
     return opts
   }
   const roleModelLabels = (opts: string[]): string[] =>
     opts.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.role_model_auto') : m))
-  const backgroundModelMut = useMutation({
-    mutationFn: (v: string) => api.patchConfig('agent.role_models.background', v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_model')),
-  })
-  const subagentModelMut = useMutation({
-    mutationFn: (v: string) => api.patchConfig('agent.role_models.subagent', v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_model')),
-  })
+  // One array per row, shared by `options` and `optionLabels`: SettingsSelect
+  // pairs a label to a value by INDEX, so both props must read the same list.
+  const backgroundModelOpts = roleModelOptions(shownBackgroundModel, backgroundModel)
+  const subagentModelOpts = roleModelOptions(shownSubagentModel, subagentModel)
+  const fallbackOpts = fallbackModelOptions(shownFallbackModel, fallbackModel)
+  const backgroundModelMut = useMutation(
+    optimisticConfigOpts('agent.role_models.background', () => i18nT('pages.settings.chatPanel.failed_to_save_role_model'))
+  )
+  const subagentModelMut = useMutation(
+    optimisticConfigOpts('agent.role_models.subagent', () => i18nT('pages.settings.chatPanel.failed_to_save_role_model'))
+  )
 
   // Per-role reasoning effort, paired with each role's model. Empty inherits the
   // the MODEL's own default: `RoleModels.resolve_effort` does not fall back to
@@ -569,19 +725,17 @@ export function ChatPanel() {
   // rather than folded into this copy fix.
   const backgroundEffort = mcCfg?.agent?.role_efforts?.background ?? ''
   const subagentEffort = mcCfg?.agent?.role_efforts?.subagent ?? ''
-  const bgEffortSupported = modelSupportsEffort(backgroundModel !== 'auto' ? backgroundModel : defaultModel)
-  const subEffortSupported = modelSupportsEffort(subagentModel !== 'auto' ? subagentModel : defaultModel)
+  const shownBackgroundEffort = pendingCfg['agent.role_efforts.background']?.value ?? backgroundEffort
+  const shownSubagentEffort = pendingCfg['agent.role_efforts.subagent']?.value ?? subagentEffort
+  const bgEffortSupported = modelSupportsEffort(shownBackgroundModel !== 'auto' ? shownBackgroundModel : shownDefaultModel)
+  const subEffortSupported = modelSupportsEffort(shownSubagentModel !== 'auto' ? shownSubagentModel : shownDefaultModel)
   const effortLabels = EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.settings.chatPanel.model_default') : effortLabel(l)))
-  const backgroundEffortMut = useMutation({
-    mutationFn: (v: string) => api.patchConfig('agent.role_efforts.background', v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_effort')),
-  })
-  const subagentEffortMut = useMutation({
-    mutationFn: (v: string) => api.patchConfig('agent.role_efforts.subagent', v),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-    onError: () => setSaveError(i18nT('pages.settings.chatPanel.failed_to_save_role_effort')),
-  })
+  const backgroundEffortMut = useMutation(
+    optimisticConfigOpts('agent.role_efforts.background', () => i18nT('pages.settings.chatPanel.failed_to_save_role_effort'))
+  )
+  const subagentEffortMut = useMutation(
+    optimisticConfigOpts('agent.role_efforts.subagent', () => i18nT('pages.settings.chatPanel.failed_to_save_role_effort'))
+  )
 
   // ── Local chat config (localStorage) ──
   const setChat = useCallback(<K extends keyof ChatConfig>(k: K, v: ChatConfig[K]) => {
@@ -727,7 +881,7 @@ export function ChatPanel() {
             label={i18nT('pages.settings.chatPanel.default_model')}
             description={i18nT('pages.settings.chatPanel.which_model_new_sessions_start_with_pick_a_model')}
             hint={i18nT('pages.settings.chatPanel.default_defers_to_your_agent_config_and_then_to')}
-            value={defaultModel}
+            value={shownDefaultModel}
             options={modelOptions}
             optionLabels={modelOptions.map(m => (m === 'auto' ? i18nT('pages.settings.chatPanel.default_auto') : m))}
             onChange={v => defaultModelMut.mutate(v)}
@@ -741,7 +895,7 @@ export function ChatPanel() {
                 ? i18nT('pages.settings.chatPanel.model_default_applies_no_override_the_model_pick')
                 : i18nT('pages.settings.chatPanel.effort_needs_reasoning_model')
             }
-            value={defaultEffort}
+            value={shownDefaultEffort}
             options={[...EFFORT_LEVELS]}
             optionLabels={effortLabels}
             onChange={v => defaultEffortMut.mutate(v)}
@@ -755,16 +909,16 @@ export function ChatPanel() {
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.background_model')}
             hint={i18nT('pages.settings.chatPanel.role_model_auto_hint')}
-            value={backgroundModel}
-            options={roleModelOptions(backgroundModel)}
-            optionLabels={roleModelLabels(roleModelOptions(backgroundModel))}
+            value={shownBackgroundModel}
+            options={backgroundModelOpts}
+            optionLabels={roleModelLabels(backgroundModelOpts)}
             onChange={v => backgroundModelMut.mutate(v)}
             disabled={!mcQ.isSuccess}
           />
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.background_effort')}
             hint={i18nT('pages.settings.chatPanel.role_effort_hint')}
-            value={backgroundEffort}
+            value={shownBackgroundEffort}
             options={[...EFFORT_LEVELS]}
             optionLabels={effortLabels}
             onChange={v => backgroundEffortMut.mutate(v)}
@@ -778,16 +932,16 @@ export function ChatPanel() {
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.subagent_model')}
             hint={i18nT('pages.settings.chatPanel.role_model_auto_hint')}
-            value={subagentModel}
-            options={roleModelOptions(subagentModel)}
-            optionLabels={roleModelLabels(roleModelOptions(subagentModel))}
+            value={shownSubagentModel}
+            options={subagentModelOpts}
+            optionLabels={roleModelLabels(subagentModelOpts)}
             onChange={v => subagentModelMut.mutate(v)}
             disabled={!mcQ.isSuccess}
           />
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.subagent_effort')}
             hint={i18nT('pages.settings.chatPanel.role_effort_hint')}
-            value={subagentEffort}
+            value={shownSubagentEffort}
             options={[...EFFORT_LEVELS]}
             optionLabels={effortLabels}
             onChange={v => subagentEffortMut.mutate(v)}
@@ -801,9 +955,9 @@ export function ChatPanel() {
           <SettingsSelect
             label={i18nT('pages.settings.chatPanel.fallback_model')}
             hint={i18nT('pages.settings.chatPanel.fallback_auto_hint')}
-            value={fallbackModel}
-            options={fallbackModelOptions(fallbackModel)}
-            optionLabels={fallbackModelLabels(fallbackModelOptions(fallbackModel))}
+            value={shownFallbackModel}
+            options={fallbackOpts}
+            optionLabels={fallbackModelLabels(fallbackOpts)}
             onChange={v => fallbackMut.mutate(v)}
             disabled={!mcQ.isSuccess}
             configKey="agent.fallback_model"
@@ -911,7 +1065,7 @@ export function ChatPanel() {
           <SettingsSelect label={i18nT('pages.settings.chatPanel.widget_density')} description={i18nT('pages.settings.chatPanel.how_aggressively_the_agent_uses_inline_widgets_f')} value={dashCfg.widget_density ?? 'more'} options={['more', 'less']} optionLabels={[i18nT('pages.settings.chatPanel.more_encourage_widgets'), i18nT('pages.settings.chatPanel.less_only_when_needed')]} onChange={v => setDash({ widget_density: v as 'more' | 'less' })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.mcp_apps_in_side_panel')} description={i18nT('pages.settings.chatPanel.render_interactive_mcp_apps_in_the_right_side_pa')} checked={dashCfg.mcp_app_panel} onChange={v => setDash({ mcp_app_panel: v })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.auto_open_git_panel')} description={i18nT('pages.settings.chatPanel.expand_the_side_panel_to_the_git_tab_each_time_yo')} checked={dashCfg.auto_open_git_panel} onChange={v => setDash({ auto_open_git_panel: v })} disabled={dashDisabled} />
-          <SettingsSelect label={i18nT('pages.settings.chatPanel.response_verbosity')} description={i18nT('pages.settings.chatPanel.how_terse_the_agent_s_prose_is_ultra_concise_cap')} value={asVerbosity(dashCfg.verbosity)} options={VERBOSITY_OPTIONS} optionLabels={[i18nT('pages.settings.chatPanel.default_normal_length'), i18nT('pages.settings.chatPanel.concise_trim_filler'), i18nT('pages.settings.chatPanel.ultra_concise_3_sentences')]} onChange={v => setDash({ verbosity: v as VerbosityLevel })} disabled={dashDisabled} />
+          <SettingsSelect label={i18nT('pages.settings.chatPanel.response_verbosity')} description={i18nT('pages.settings.chatPanel.how_terse_the_agent_s_prose_is_ultra_concise_cap')} value={asVerbosity(dashCfg.verbosity)} options={VERBOSITY_OPTIONS} optionLabels={[i18nT('pages.settings.chatPanel.default_normal_length'), i18nT('pages.settings.chatPanel.concise_trim_filler'), i18nT('pages.settings.chatPanel.ultra_concise_3_sentences'), i18nT('pages.settings.chatPanel.answer_only_details_on_request')]} onChange={v => setDash({ verbosity: v as VerbosityLevel })} disabled={dashDisabled} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_context_percentage')} description={i18nT('pages.settings.chatPanel.display_usage_percentage_next_to_the_context_pro')} checked={chatCfg.showContextPct} onChange={v => setChat('showContextPct', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.show_token_usage')} description={i18nT('pages.settings.chatPanel.display_used_and_total_tokens_next_to_the_contex')} checked={chatCfg.showContextTokens} onChange={v => setChat('showContextTokens', v)} />
           <SettingsToggle label={i18nT('pages.settings.chatPanel.feature_tips')} description={tipsConfigOff ? i18nT('pages.settings.chatPanel.disabled_by_instance_config_tips_enabled_false') : i18nT('pages.settings.chatPanel.show_occasional_feature_discovery_tips_above_the')} checked={!!tipsQ.data && tipsQ.data.enabled_config && !tipsQ.data.opted_out} onChange={v => tipsMut.mutate(v)} disabled={tipsConfigOff || tipsQ.isLoading || tipsQ.isError} />

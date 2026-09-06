@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter } from 'react-router-dom'
 import type { PullRequestSource } from '../types'
 
 const mockApi = vi.hoisted(() => ({
@@ -72,14 +73,18 @@ const SAGE_PAYLOADS: Record<string, unknown> = {
 // publishing, so a case that is not about identity has to look identified.
 function openReviewedPr(draftDelivered = true, expectedReviewId = '4242') {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  // MemoryRouter because the owner-not-configured refusal renders a settings
+  // <Link>, which needs a Router ancestor even in tests that never hit it.
   return render(
-    <QueryClientProvider client={client}>
-      <DraftReviewActions
-        url={PR_URL}
-        draftDelivered={draftDelivered}
-        expectedReviewId={expectedReviewId}
-      />
-    </QueryClientProvider>,
+    <MemoryRouter>
+      <QueryClientProvider client={client}>
+        <DraftReviewActions
+          url={PR_URL}
+          draftDelivered={draftDelivered}
+          expectedReviewId={expectedReviewId}
+        />
+      </QueryClientProvider>
+    </MemoryRouter>,
   )
 }
 
@@ -309,6 +314,23 @@ it('surfaces a rejected publish instead of claiming success', async () => {
   fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
   expect(await screen.findByText(/no longer pending/)).toBeTruthy()
   expect(screen.getByRole('button', { name: 'Approve' })).toBeTruthy()
+})
+
+it('explains what to configure when publishing is refused for a missing owner', async () => {
+  // A standalone local install: the draft reads fine, so the buttons render
+  // live, and the backend refuses the mutation with the coded 403. The refusal
+  // must name the remedy and link the settings pane, not dead-end on
+  // "forbidden".
+  mockApi.submitPullRequestReview.mockRejectedValue(Object.assign(
+    new Error('forbidden'),
+    { body: JSON.stringify({ error: 'forbidden', code: 'owner_not_configured' }) },
+  ))
+  openReviewedPr()
+  fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
+  fireEvent.click(await screen.findByRole('button', { name: 'Approve' }))
+  expect(await screen.findByText(/Set .Owner Slack member ID. in Settings/)).toBeTruthy()
+  const link = screen.getByRole('link', { name: /Slack settings/i })
+  expect(link.getAttribute('href')).toBe('/settings/channels/slack')
 })
 
 it('reads the draft for the pull request it was given, and only that one', () => {

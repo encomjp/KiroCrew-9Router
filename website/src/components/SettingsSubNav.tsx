@@ -2,7 +2,7 @@ import React, { useEffect } from 'react'
 import { useSearchParams, useLocation, useNavigate } from 'react-router-dom'
 import { ChevronRight } from 'lucide-react'
 import { NavBackBar } from './NavBackBar'
-import { SUBNAV_PARAM, SUBNAV_LEGACY_PARAMS, deleteSubSelection, COARSE_TOUCH_TARGET, SUBNAV_PUSH_STATE } from './subNavParams'
+import { SUBNAV_PARAM, SUBNAV_LEGACY_PARAMS, deleteSubSelection, COARSE_TOUCH_TARGET, SUBNAV_PUSH_STATE, toPathSegment, parsePathSegments } from './subNavParams'
 import { useContainerWidth } from '../hooks/useContainerWidth'
 import { useIsMobile } from '../hooks/useIsMobile'
 
@@ -15,6 +15,12 @@ export interface SubNavItem<K extends string = string> {
   key: K
   /** Already-localized row label. */
   label: string
+  /** The label is a PRODUCT NAME, not localizable copy (a channel: "WeCom",
+   *  "Feishu", "Microsoft Teams"). Marks it opaque to the i18n render scan,
+   *  which would otherwise read the Latin text in the pseudolocale pass as a
+   *  string that escaped the catalog. Off by default: for every other SubNav
+   *  host the label IS translated copy and must stay measured. */
+  labelOpaque?: boolean
   /** Leading glyph: a lucide icon (rail) or a brand logo (card). */
   icon?: React.ReactNode
   /** Already-localized group header; adjacent items sharing a group render
@@ -51,12 +57,23 @@ interface SettingsSubNavProps<K extends string> {
    *  above the component would sit above the back bar and displace the
    *  one-position back control the mobile stack promises. */
   banner?: React.ReactNode
+  /** Path-navigation seam. When set (e.g. "/settings"), the selection is
+   *  URL-PATH-backed instead of query-backed: the sub key is read from path
+   *  segment[1] under basePath (`${basePath}/<tab>/<sub>`) and selection
+   *  writes navigate to that shape — push with the SUBNAV_PUSH_STATE marker
+   *  on narrow drill-in, pop via navigate(-1) when the marker is present,
+   *  replace otherwise (wide rail clicks, self-heals, cold deep links).
+   *  Segments deeper than segment[1] are reserved and render as if absent.
+   *  When ABSENT, the historical ?sub= + legacy-alias behavior is unchanged,
+   *  so non-migrated consumers are unaffected. */
+  basePath?: string
 }
 
 /** Second-level navigation inside one Settings tab: a responsive list-detail
  *  container. Wide content area = persistent rail + detail side by side;
  *  narrow = the rail alone, drilling into a full-width detail view with a
- *  back button. Selection is URL-backed (?sub=<key>) so deep links survive
+ *  back button. Selection is URL-backed (?sub=<key>, or the second path
+ *  segment under `basePath` for path-navigation hosts) so deep links survive
  *  reloads and the command palette / SettingsSearch can mount the right pane
  *  BEFORE the highlight hook queries the DOM. */
 export function SettingsSubNav<K extends string>({
@@ -66,6 +83,7 @@ export function SettingsSubNav<K extends string>({
   listLabel,
   backLabel,
   banner,
+  basePath,
 }: SettingsSubNavProps<K>) {
   const [params, setParams] = useSearchParams()
   const location = useLocation()
@@ -76,24 +94,75 @@ export function SettingsSubNav<K extends string>({
   // the narrow layout on desktop.
   const twoPane = width === null || width >= TWO_PANE_MIN_WIDTH
 
+  // Path mode: segments under basePath are [tab, sub, ...deeper-reserved].
+  // Deeper segments are ignored on read and truncated on write — reserved for
+  // future levels, rendering today as if absent.
+  // Truthy, matching SidePanelLayout's `basePath ?` predicate exactly — the
+  // two halves of the seam must never disagree on which URL model is live.
+  const pathMode = !!basePath
+  const pathSegments = React.useMemo(
+    () => (basePath ? parsePathSegments(basePath, location.pathname) : []),
+    [basePath, location.pathname],
+  )
+  // `|| null`: an empty tab segment (double slash) is positional filler, and
+  // treating it as a tab would let select() mint `${basePath}//<key>`.
+  const tabSegment = pathMode ? pathSegments[0] || null : null
+  // The write-side form: null when there is no tab segment OR the segment is
+  // one toPathSegment refuses (dot-only) — either way nothing may be minted
+  // under it, so every path write below guards on this, not on tabSegment.
+  const tabSeg = tabSegment != null ? toPathSegment(tabSegment) : null
+
   // Canonical param wins; legacy aliases are read-only fallbacks so a stale
   // legacy value can never override an explicit ?sub=. The alias list is the
   // shared SUBNAV_LEGACY_PARAMS constant, not a per-host prop: values are
   // validated against `items` below and the hosts' key sets are disjoint, so
   // per-host scoping bought nothing while spelling the list twice.
-  const raw = params.get(SUBNAV_PARAM) ?? SUBNAV_LEGACY_PARAMS.map(p => params.get(p)).find(v => v != null) ?? null
+  // Path mode reads the path first, then falls back to the legacy selection
+  // params for the frame(s) before SettingsPage's translation effect rewrites
+  // the URL — the effect is passive, so a legacy deep link
+  // (`?tab=channels&channel=slack`) would otherwise render the bare list for
+  // one visible frame. Read-side aliases, write-side canonical: same contract
+  // as the query model below.
+  const legacySub =
+    params.get(SUBNAV_PARAM) ?? SUBNAV_LEGACY_PARAMS.map(p => params.get(p)).find(v => v != null) ?? null
+  const raw = pathMode
+    ? pathSegments[1] || legacySub
+    : legacySub
   const selectedKey = items.some(i => i.key === raw) ? (raw as K) : null
   // Wide mode always shows a detail pane; default to the first item.
   const effectiveKey = selectedKey ?? (twoPane ? items[0]?.key ?? null : null)
 
-  // Self-heal an invalid selection value (?sub=garbage, or a legacy alias
-  // whose key set belongs to a different host). SidePanelLayout yields its
-  // chrome on param PRESENCE while the back bar here renders only for a
-  // VALID key — leaving the bogus param in place would strand a mobile pane
-  // with no navigation affordance at all. Replace, not push: a healed URL is
-  // a correction, not a level.
+  // Mint the path-mode navigation target: `${basePath}/<tab>` (list) or
+  // `${basePath}/<tab>/<sub>` (pane). The query string rides along minus any
+  // leftover selection params — the path is the selection now, and a stale
+  // ?sub=/alias would make SidePanelLayout's legacy level test disagree with
+  // the path (exactly the two-back-bars ambiguity the canonical write kills).
+  const pathTarget = (key: K | null) => {
+    const search = new URLSearchParams(location.search)
+    deleteSubSelection(search)
+    const qs = search.toString()
+    // Callers guard on tabSeg (the encoded form), so `?? ''` here is
+    // unreachable; item keys are code-defined and re-encoded so a key can
+    // never mint extra depth.
+    const keySeg = key != null ? toPathSegment(key) : null
+    return {
+      pathname: keySeg != null ? `${basePath}/${tabSeg ?? ''}/${keySeg}` : `${basePath}/${tabSeg ?? ''}`,
+      search: qs ? `?${qs}` : '',
+    }
+  }
+
+  // Self-heal an invalid selection value (?sub=garbage, /settings/channels/
+  // garbage, or a legacy alias whose key set belongs to a different host).
+  // SidePanelLayout yields its chrome on selection PRESENCE while the back bar
+  // here renders only for a VALID key — leaving the bogus selection in place
+  // would strand a mobile pane with no navigation affordance at all. Replace,
+  // not push: a healed URL is a correction, not a level.
   useEffect(() => {
     if (raw != null && selectedKey == null) {
+      if (pathMode) {
+        if (tabSeg != null) navigate(pathTarget(null), { replace: true })
+        return
+      }
       setParams(prev => {
         const next = new URLSearchParams(prev)
         deleteSubSelection(next)
@@ -111,6 +180,22 @@ export function SettingsSubNav<K extends string>({
       navigate(-1)
       return
     }
+    // Narrow-mode drill-in is a PUSH so the platform back gesture pops one
+    // level, matching the iOS stack; the wide-mode rail click stays replace —
+    // a selector should not mint history entries. Identical in both URL
+    // models: only the write target differs (path segment vs query param).
+    const writeOpts = {
+      replace: twoPane || key == null,
+      state: !twoPane && key != null ? { [SUBNAV_PUSH_STATE]: true } : undefined,
+    }
+    if (pathMode) {
+      // The tab segment is owned by the level above (SettingsPage / the
+      // SidePanelLayout seam). Until it has been canonicalized into the URL
+      // there is no valid `${basePath}/<tab>/<sub>` shape to write.
+      if (tabSeg == null) return
+      navigate(pathTarget(key), writeOpts)
+      return
+    }
     setParams(prev => {
       const next = new URLSearchParams(prev)
       if (key) next.set(SUBNAV_PARAM, key)
@@ -119,13 +204,7 @@ export function SettingsSubNav<K extends string>({
       // the NEXT read ambiguous once ?sub= is later removed (back to list).
       for (const p of SUBNAV_LEGACY_PARAMS) next.delete(p)
       return next
-      // Narrow-mode drill-in is a PUSH so the platform back gesture pops one
-      // level, matching the iOS stack; the wide-mode rail click stays replace —
-      // a selector should not mint history entries.
-    }, {
-      replace: twoPane || key == null,
-      state: !twoPane && key != null ? { [SUBNAV_PUSH_STATE]: true } : undefined,
-    })
+    }, writeOpts)
   }
 
   // Canonicalize the wide-mode implicit selection into the URL. Without this,
@@ -134,10 +213,12 @@ export function SettingsSubNav<K extends string>({
   // list. Gated on a REAL measurement (width !== null): the pre-measurement
   // paint optimistically renders wide, but writing before the ResizeObserver
   // reports would make a fresh narrow visit open a pane instead of the list.
+  // tabSegment is a dep so a path-mode mount that predates the tab's own
+  // canonicalization (select() no-ops without a tab) retries once it lands.
   useEffect(() => {
     if (width !== null && twoPane && !selectedKey && items.length > 0) select(items[0].key)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [width, twoPane, selectedKey])
+  }, [width, twoPane, selectedKey, tabSegment])
 
   // Adjacent items sharing a `group` render under one header (order in
   // `items` drives everything; entries of a group must stay adjacent).
@@ -184,7 +265,12 @@ export function SettingsSubNav<K extends string>({
           {/* Wraps to two lines rather than truncating: verbose locales inflate
               the longest labels past any fixed rail width. `title` covers the
               pathological case. */}
-          <span className="block text-[13px] font-medium line-clamp-2">{item.label}</span>
+          <span
+            className="block text-[13px] font-medium line-clamp-2"
+            data-i18n-opaque={item.labelOpaque ? '' : undefined}
+          >
+            {item.label}
+          </span>
           {item.summary}
         </span>
         {!twoPane && <ChevronRight size={14} className="text-muted shrink-0" />}

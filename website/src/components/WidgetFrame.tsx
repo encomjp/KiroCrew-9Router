@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'react'
-import { widgetHeightKey, getWidgetHeight, setWidgetHeight, estimateWidgetHeight } from '../utils/widgetHeights'
+import { widgetHeightKey, getWidgetHeight, setWidgetHeight, estimateWidgetHeight, clampFrameHeight } from '../utils/widgetHeights'
 import { Maximize2, Minimize2, ExternalLink, Download, Star, RotateCw } from 'lucide-react'
-import { IconButton, IconButtonGroup } from './ui'
+import { Btn, IconButton, IconButtonGroup } from './ui'
 import { useTheme } from '../hooks/useTheme'
 import { sanitizeCssValue } from '../lib/cssSanitize'
 import { THEME_VAR_NAMES, buildSrcdoc } from '../lib/widgetSrcdoc'
@@ -13,7 +13,6 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { i18nT } from '../i18n/t'
 import { useSandboxDoc } from '../hooks/useSandboxDoc'
 import { useNearViewport } from '../hooks/useNearViewport'
-const MIN_HEIGHT = 80
 
 // Upper bound on the text a single widget action may pre-fill into the
 // composer. A malicious LLM-emitted <script> can postMessage
@@ -195,7 +194,7 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   // width, so it takes the default key space; a caller measuring at a different
   // width takes its own.
   const key = useMemo(() => widgetHeightKey(html), [html])
-  const [height, setHeight] = useState(() => getWidgetHeight(key) ?? estimateWidgetHeight())
+  const [height, setHeight] = useState(() => clampFrameHeight(getWidgetHeight(key) ?? estimateWidgetHeight()))
   // Mirror of `height` so the message handler (wired once per `key`) can
   // compare against the live value, plus a timer used to defer shrinks.
   const heightRef = useRef(height)
@@ -227,25 +226,30 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
   // See hooks/useSandboxDoc.ts: the frame loads a gateway-served document
   // rather than a `blob:` URL, and the previous document survives both an
   // in-flight and a failed re-mint.
-  const { url: blobUrl, failed: mintFailed, retry: retryMint } = useSandboxDoc(
+  const { url: blobUrl, failed: mintFailed, pending: mintPending, retry: retryMint } = useSandboxDoc(
     visible ? srcdoc : null,
   )
   // Fade the iframe in once its document loads, so the reveal is a soft fade
   // instead of an abrupt blink-then-appear. Reset to false whenever a new blob
   // is built (first reveal, theme change, content rebuild) so each fresh render
   // fades in too.
+  // Gated on the FIRST load only, and deliberately never reset when the document
+  // is rebuilt. Re-hiding on every new srcdoc leaves the frame blank until the
+  // next `load` fires; with the document now minted over the network (rather than
+  // a local blob:) that gap is a real round trip, long enough on a phone reaching
+  // the gateway through a tunnel to read as the widget vanishing after it had
+  // already rendered — and permanent if a further rebuild lands first. Same
+  // reasoning as ArtifactBody's `everLoaded`; keep the two in step.
   const [iframeLoaded, setIframeLoaded] = useState(false)
-
-  useEffect(() => {
-    if (!visible || !srcdoc) return
-    setIframeLoaded(false)
-  }, [srcdoc, visible])
 
   useEffect(() => {
     const handler = (e: MessageEvent) => {
       if (!iframeRef.current || e.source !== iframeRef.current.contentWindow) return
       if (e.data?.type === 'mc-widget-height' && typeof e.data.height === 'number') {
-        const h = Math.max(e.data.height, MIN_HEIGHT)
+        // Bounded at both ends by the shared clamp. Chat frames have always been
+        // self-sizing off this same report with no bound at all, so a
+        // viewport-coupled document could grow one without limit here.
+        const h = clampFrameHeight(e.data.height)
         // No-op when the clamped height is unchanged. An animated widget can
         // post the same height every frame; without this guard each report
         // re-ran applyHeight → persistHeightCache (synchronous localStorage
@@ -562,14 +566,15 @@ export default function WidgetFrame({ html, title = 'Widget', slug, messageTs, w
 
       {mintFailed && <div className="px-3 py-2 flex items-center gap-3 text-text">
         <span>{i18nT('components.widgetFrame.could_not_render')}</span>
-        <button
-          type="button"
-          className="btn btn-sm"
+        {/* Btn, not a raw `btn btn-sm` button: that class has no CSS behind it,
+            so the recovery control rendered as bare text. */}
+        <Btn
+          disabled={mintPending}
           onClick={retryMint}
         >
           <RotateCw className="lucide-inline" />
           {i18nT('components.widgetFrame.retry')}
-        </button>
+        </Btn>
       </div>}
 
       {/* While the document URL is in flight the row must keep the height the

@@ -22,7 +22,7 @@ Each entry records:
 | `source` | Interface: `slack`, `dashboard`, `cli`, `cron`, `subagent`, `taskrunner`, `mcp`, `background`, `acp` (ACP-transport events, e.g. `tool_interrupted`), `token_auth` / `refresh_tokens` (dashboard auth), `host` (the `_host` sentinel — an in-process host action like app activation / workspace admission), `unknown` (empty/unrecognized session key, which must NOT be mis-tagged `slack`). This is a closed interface vocabulary — component attribution does not extend it; see `caller` below |
 | `operation` | Tool name or `METHOD /api/path` |
 | `tool_kind` | Tool category (`execute_bash`, `fs_write`, `mcp_core`, `mcp_cron`, etc.) |
-| `outcome` | `invoked`, `auto_approved`, `approved`, `rejected`, `denied`, `completed`, `failed`, `clamped`, `degraded` (a governance chokepoint failed OPEN), `one_shot_completed` (a one-shot cron consumed by its own completion — an automated removal, not an operator delete) |
+| `outcome` | `invoked`, `auto_approved`, `auto_approve_declined` (a name-based auto-approve was withheld by the name-grant check and the request took the surface's normal path — see `name_grant.log_decline`), `approved`, `rejected`, `denied`, `completed`, `failed`, `clamped`, `degraded` (a governance chokepoint failed OPEN), `one_shot_completed` (a one-shot cron consumed by its own completion — an automated removal, not an operator delete) |
 | `resources` | Affected resources summary (redacted, then truncated to 500 chars — see `metadata`) |
 | `downstream_service` | MCP server name if applicable (`kirocrew-core`, `kirocrew-cron`, `internal-mcp`) |
 | `request_id` | ACP permission request ID |
@@ -95,7 +95,7 @@ Default 365 days. Pruned daily by heartbeat service (`_PRUNE_TICKS`).
 | Background tasks | Permission requests via `_resolve_permission()` | `llm_helpers.py` |
 | MCP core tools | `spawn_run`, `learn_add`, `task_run` calls and outcomes | `mcp_core.py` |
 | MCP cron tools | `cron_add`, `cron_remove`, etc. calls and outcomes | `mcp_cron.py` |
-| Dashboard API | All POST/PUT/DELETE operations via middleware, plus allowed and denied project-skill trust and app-slot authorization decisions | `dashboard/server.py`, `dashboard/handlers/prompts.py` |
+| Dashboard API | All POST/PUT/DELETE operations via middleware, plus allowed and denied project-skill trust, app-slot, and saved-workflow authorization decisions | `dashboard/server.py`, `dashboard/handlers/prompts.py`, `dashboard/handlers/workflows.py` |
 | ACP worker-pool audit | Per-`tool_call` `auto_approved` `tool_invocation` (`source=subagent`), bounded by `_SEL_AUDIT_TIMEOUT_SECONDS` (5.0s) and offloaded off the event loop so a wedged SEL backend never gates dispatch. Two emitters: the knowledge LLMPool via `AcpClient._maybe_audit_tool_call` (gated on the `audit_source` ctor param, offloaded to `subprocess_executor()`); and **code-review-sage's ReviewPool**, which migrated to the shared `AcpRuntime` (no `audit_source`) and re-emits the same per-tool record itself | `acp/client.py`, `apps/builtins/code_review_sage/sage_lib/review_pool.py` |
 | Token auth | `internal_auth`, `app_scope_check`, `dashboard_sessions_revoked`, `refresh_token_initial_mint`, `nonce_evicted` (`source=token_auth`) | `dashboard/token_auth.py` |
 | Refresh tokens | `refresh_token_use`, `refresh_token_logout`, `access_cookie_revoked` (`source=refresh_tokens`) | `dashboard/handlers/auth_refresh.py` |
@@ -117,8 +117,44 @@ kirocrew security verify            # Verify HMAC chain integrity
 
 ## Thread Safety
 
-Singleton pattern. The chain state (`_last_hash`) and the file append are
-guarded by `threading.Lock`, held only inside the writer thread (and the
-synchronous fallback / `prune`), never by enqueuing callers. Enqueue is
-lock-free via the thread-safe `queue.Queue`. Safe for concurrent access from the
-asyncio event loop + MCP server stdio processes.
+Singleton pattern. Two locks guard the chain, and they are always taken in this
+order: the cross-process **chain lock** first, then the in-process
+`threading.Lock`.
+
+`threading.Lock` guards the chain state (`_last_hash`) and the file append inside
+one interpreter, held only by the writer thread (and the synchronous fallback /
+`prune`), never by enqueuing callers. Enqueue is lock-free via the thread-safe
+`queue.Queue`.
+
+A `threading.Lock` cannot order the gateway against the MCP server stdio
+processes, which are separate processes sharing one log file — each holds its own
+singleton with its own cached chain tip, so two of them chaining off the same
+`prev_hash` fork the HMAC chain permanently. Cross-process ordering therefore
+comes from an advisory lock on a sidecar file, `trust/security_events.lock`. The
+sidecar lives in the trust subdirectory (owner-only, inside the sensitive-path
+floor) so the audited agent cannot unlink or hold it out from under the writers;
+a linked or hard-linked sidecar is refused rather than followed. When the trust
+directory could not be created at init and the HMAC key fell back to its legacy
+location beside the log, the lock is taken on the legacy key file itself — the
+one sibling of the log the deny list has protected all along — rather than
+failing every append on a mkdir that cannot succeed.
+
+The chain lock is taken **before** `threading.Lock`. The reverse order would let
+a cross-process wait stall the event loop indirectly: a writer thread holding the
+thread lock while it waits leaves a loop-side critical audit blocking on that
+lock, which has no bound of its own.
+
+On the event-loop thread neither potentially-slow step may wait:
+
+- **Acquire** — a SINGLE nonblocking `try_acquire_lock` attempt, then a
+  fail-closed refusal. No retry and no sleep: a poll spin would sleep the
+  gateway's event loop, stalling every session it serves, so contention is
+  refused here and absorbed off-loop (the background writer and `prune` in an
+  executor take the blocking lock).
+- **Chain-tip read** — capped at a single tail chunk. A healthy log yields the
+  tip from one read; only an already-corrupt multi-kilobyte tail would walk
+  further, and exhausting the cap raises rather than returning a genesis tip.
+
+Both refusals surface as `OSError`, which the append path turns into a rollback
+plus warning, or into a propagated error for a `critical=True` audit — the
+audit-or-deny contract. Off the loop, both steps are unbounded and recover fully.

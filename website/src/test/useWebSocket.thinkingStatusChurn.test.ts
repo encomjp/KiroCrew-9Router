@@ -137,7 +137,7 @@ describe('useWebSocket chat_thinking status-detail churn', () => {
     expect(store.getState().chat.slotStatusDetail).toBe(mapAfterFirst)
   })
 
-  it('still accumulates the reasoning text on every frame', () => {
+  it('still accumulates the reasoning text once the frame flush lands', async () => {
     const store = storeOnSlot1()
     const { ws } = mount(store)
 
@@ -146,6 +146,9 @@ describe('useWebSocket chat_thinking status-detail churn', () => {
       ws.simulateMessage(thinking('beta '))
       ws.simulateMessage(thinking('gamma'))
     })
+
+    // Thinking text is frame-buffered (see flushChunks); wait one frame for it.
+    await act(async () => { await new Promise(r => requestAnimationFrame(() => r(undefined))) })
 
     const think = store.getState().chat.messages.find(m => m.role === 'thinking')
     expect(think).toBeDefined()

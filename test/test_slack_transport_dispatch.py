@@ -1195,3 +1195,62 @@ class TestTransportAutoTitle:
             )
         )
         assert calls == {"success": 1, "failure": 0}
+
+
+class TestTransportTrustedBotErrorSuppression:
+    """Echo-loop guard parity with native handle_message (issue #6638).
+
+    A failed turn on a trusted-bot message must NOT post the transport error
+    reply: in a mutual-mesh setup the reply is itself a bot-authored event the
+    peer admits, so replying opens an unbounded error-reply ping-pong.
+    """
+
+    def _run_failing_turn(self, monkeypatch, *, from_trusted_bot: bool):
+        monkeypatch.setattr(transport_dispatch, "_get_default_agent", lambda: "")
+        monkeypatch.setattr(transport_dispatch, "_hydrate_thread_overrides", lambda *a, **k: None)
+        monkeypatch.setattr(transport_dispatch, "_hydrate_conv_flags", lambda *a, **k: None)
+        monkeypatch.setattr(transport_dispatch, "_thread_agents", {})
+
+        # Deterministic failure inside the outer try: renderer construction
+        # raises before any session work.
+        def _boom(*a, **k):
+            raise RuntimeError("forced turn failure")
+
+        monkeypatch.setattr(transport_dispatch, "SlackRenderer", _boom)
+
+        slack = RecordingSlackClient()
+        provider = ScriptedProvider([])
+        sessions = _CapturingSessions(provider)
+        asyncio.run(
+            transport_dispatch.handle_message_transport(
+                slack=slack,
+                sessions=sessions,
+                channel="C1",
+                text="hello",
+                thread_ts=None,
+                msg_ts=_MSG_TS,
+                user_id="B_TRUSTED" if from_trusted_bot else "U_OWNER",
+                context_builder=None,
+                conversation_log=None,
+                from_trusted_bot=from_trusted_bot,
+            )
+        )
+        errors = [
+            kw["text"]
+            for method, kw in slack.transcript
+            if method == "post_message" and "Something went wrong" in kw.get("text", "")
+        ]
+        status_clears = [kw for method, kw in slack.transcript if method == "set_thread_status"]
+        return errors, status_clears
+
+    def test_error_reply_suppressed_for_trusted_bot(self, monkeypatch):
+        errors, status_clears = self._run_failing_turn(monkeypatch, from_trusted_bot=True)
+        assert errors == []
+        # The thread status must still be cleared: suppression covers only the
+        # error MESSAGE, or a stale "working" status pins to the thread forever.
+        assert any(kw.get("status") == "" for kw in status_clears)
+
+    def test_error_reply_posted_for_human_sender(self, monkeypatch):
+        errors, status_clears = self._run_failing_turn(monkeypatch, from_trusted_bot=False)
+        assert len(errors) == 1
+        assert any(kw.get("status") == "" for kw in status_clears)

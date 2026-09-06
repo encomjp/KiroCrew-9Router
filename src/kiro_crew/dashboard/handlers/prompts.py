@@ -11,6 +11,7 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.agent_discovery import agent_skill_globs
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
 from kiro_crew.dashboard.state import DashboardState
@@ -311,6 +312,24 @@ async def api_skills(request: web.Request) -> web.Response:
     whose ``resources`` would load the skill via a ``skill://`` URI. Empty
     list means no agent loads it via the kiro-cli native loader (it may
     still be loaded via KiroCrew text-injection or an external MCP server).
+
+    ``?agent=<name>`` scopes the listing to that agent's own ``skill://``
+    mapping (matching the same globs the prompt-injection path resolves via
+    :func:`agent_skill_globs`) — filtered to skills in that agent's
+    ``loaded_by_agents``. An agent with no explicit skill:// resources of its
+    own (``agent_skill_globs`` returns ``[]``) keeps the unfiltered, legacy
+    all-or-nothing listing: an agent that never customized its skill set
+    must not lose access to skills a customized agent's presence would
+    otherwise imply are opt-in.
+
+    When the agent filter is actually applied (agent given AND its globs are
+    non-empty), the response is the envelope
+    ``{"skills": [...], "agent_scoped": true, "agent": <name>}`` instead of
+    the bare array. The flag is required wiring, not decoration: a filtered
+    list — especially an EMPTY one — is byte-identical to the legacy
+    unfiltered array, so without it the client cannot tell "no skills are
+    mapped to this agent" apart from "no skills exist at all". Every
+    unscoped path keeps the bare-array shape unchanged.
     """
     state: DashboardState = request.app["state"]
     session_key = _read_session_key(request)
@@ -351,6 +370,14 @@ async def api_skills(request: web.Request) -> web.Response:
         package_skills,
         project_dir,
     )
+    agent = request.query.get("agent") or None
+    if agent:
+        globs = await asyncio.get_running_loop().run_in_executor(
+            discovery_executor(), agent_skill_globs, agent
+        )
+        if globs:
+            result = [s for s in result if agent in (s.get("loaded_by_agents") or [])]
+            return web.json_response({"skills": result, "agent_scoped": True, "agent": agent})
     return web.json_response(result)
 
 

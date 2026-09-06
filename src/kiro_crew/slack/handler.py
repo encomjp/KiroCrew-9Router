@@ -34,8 +34,13 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from kiro_crew.dashboard.state import DashboardState
 
+from kiro_crew import name_grant
 from kiro_crew.acp.client import AcpError, AcpProcessDied, AcpPromptBusy, AcpTimeoutError
-from kiro_crew.acp.types import STOP_REASON_CANCELLED, STOP_REASON_END_TURN
+from kiro_crew.acp.types import (
+    STOP_REASON_CANCELLED,
+    STOP_REASON_COMPACTION_FAILED,
+    STOP_REASON_END_TURN,
+)
 from kiro_crew.agent_discovery import project_agent_files, project_agent_name
 from kiro_crew.config.loader import (
     ACTIVATION_REVIEW,
@@ -2528,12 +2533,29 @@ async def maybe_route_linked_thread(
     if not _linked_slot.running:
         from kiro_crew.dashboard.chat import _run_chat
 
-        _chat_task = asyncio.create_task(_run_chat(_dashboard_state, _linked_slot, text))  # type: ignore[arg-type]
+        _chat_task = asyncio.create_task(
+            _run_chat(
+                _dashboard_state,  # type: ignore[arg-type]
+                _linked_slot,
+                text,
+                _directive_user_origin=True,
+            )
+        )
         _linked_slot.task = _chat_task
         _dashboard_state._background_tasks.add(_chat_task)  # type: ignore[attr-defined]
         _chat_task.add_done_callback(_dashboard_state._background_tasks.discard)  # type: ignore[attr-defined]
     else:
-        _linked_slot.queue_append(text)
+        # circular import: session_control pulls in dashboard modules at module level.
+        from kiro_crew.dashboard.session_control import containment_meta
+
+        # Stamp the admission-time containment (#5911). A linked slot records
+        # linked=True here, so its own channel's queued messages keep draining;
+        # only a constraint that appears AFTER this enqueue drops the entry.
+        _linked_slot.queue_append(
+            text,
+            meta=containment_meta(_dashboard_state, _linked_slot),  # type: ignore[arg-type]
+            directive_user_origin=True,
+        )
     _dashboard_state.push_slots_update()  # type: ignore[attr-defined]
     sel().log_tool_invocation(
         session_key=session_key,
@@ -3453,18 +3475,42 @@ async def handle_message(
                         is_shell=event.is_shell,
                     )
                     if tool_result.action == TOOL_AUTO_APPROVE:
-                        await client.approve_tool(event.request_id)
-                        Stats().inc_tool_auto_approved()
-                        sel().log_tool_invocation(
-                            session_key=session_key,
-                            source="slack",
-                            tool_name=event.title,
-                            tool_kind=event.tool_kind,
-                            outcome="auto_approved",
-                            request_id=event.request_id,
-                            metadata={"reason": "hook_auto_approve"},
+                        # The hook granted this by NAME (its `auto_approve_tools`
+                        # globs, or the read-only allowlist). Honour it only
+                        # while each program name in the command still resolves
+                        # to the program it appears to name; a shadowed,
+                        # agent-tree or unidentified resolution DOWNGRADES to
+                        # the remaining rungs below (spawn hook, approval mode,
+                        # trust/YOLO, the interactive buttons) — never a hard
+                        # block.
+                        _ng_refusal = await name_grant.refusal_for_event(event)
+                        if _ng_refusal is None:
+                            await client.approve_tool(event.request_id)
+                            Stats().inc_tool_auto_approved()
+                            sel().log_tool_invocation(
+                                session_key=session_key,
+                                source="slack",
+                                tool_name=event.title,
+                                tool_kind=event.tool_kind,
+                                outcome="auto_approved",
+                                request_id=event.request_id,
+                                metadata={"reason": "hook_auto_approve"},
+                            )
+                            continue
+                        logger.warning(
+                            "declining a hook auto-approve: %s; the request "
+                            "falls through to the Slack handler's normal "
+                            "approval ladder",
+                            _ng_refusal.log_text,
                         )
-                        continue
+                        name_grant.log_decline(
+                            source="slack",
+                            session_key=session_key,
+                            event=event,
+                            refusal=_ng_refusal,
+                            tier="hook_auto_approve",
+                            sel_factory=sel,
+                        )
                     if tool_result.action == TOOL_DENY:
                         await client.reject_tool(event.request_id)
                         Stats().inc_tool_denial()
@@ -3594,6 +3640,9 @@ async def handle_message(
                     _stop_reason
                     and _stop_reason != STOP_REASON_END_TURN
                     and _stop_reason != STOP_REASON_CANCELLED
+                    # Expected terminal state after a failed auto-compaction;
+                    # handled below with a session reset, so not "unexpected".
+                    and _stop_reason != STOP_REASON_COMPACTION_FAILED
                 ):
                     logger.warning(
                         "Unexpected stop_reason %r for %s — treating as normal completion",
@@ -3613,8 +3662,26 @@ async def handle_message(
             # the payload shape and model reflection cannot drift across surfaces.
             record_interaction_event(client, session_key, "slack")
 
-        # Check context usage — fires background compaction at configured threshold, never blocks
-        sessions.check_context_usage(session_key, client)
+        if _stop_reason == STOP_REASON_COMPACTION_FAILED:
+            # The completion was synthetic — the backend abandoned the turn
+            # after a failed auto-compaction and never sent end_turn, so it
+            # still counts the prompt as in progress. Reset now (mirrors the
+            # dashboard runner's needs_session_reset) or the NEXT message
+            # collides with "prompt already in progress" and burns the busy
+            # recovery path. No re-queue: the compaction notice already told
+            # the user. The context-usage probe is skipped — compaction just
+            # failed and the session was torn down.
+            try:
+                await sessions.reset(session_key)
+            except Exception:
+                logger.debug(
+                    "Failed to reset session %s after compaction failure",
+                    session_key,
+                    exc_info=True,
+                )
+        else:
+            # Check context usage — fires background compaction at configured threshold, never blocks
+            sessions.check_context_usage(session_key, client)
 
     except AcpTimeoutError as e:
         _had_error = True

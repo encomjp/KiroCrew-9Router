@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import platform
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -196,6 +199,102 @@ class TestScriptHookStore:
         assert retrieved.name == "persist-test"
 
 
+class TestCappedScriptHookOutput:
+    @pytest.mark.asyncio
+    async def test_reader_keeps_only_the_cap_but_drains_to_eof(self):
+        from kiro_crew.hooks import _read_capped_stream
+
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"abcdefgh")
+        reader.feed_eof()
+
+        retained, truncated = await _read_capped_stream(reader, 5)
+
+        assert retained == b"abcde"
+        assert truncated is True
+        assert await reader.read() == b""
+
+    def test_decode_marks_a_multibyte_boundary(self):
+        from kiro_crew.hooks import _HOOK_TRUNCATION_MARKER, _decode_capped
+
+        raw = ("€" * 2).encode("utf-8")[:4]
+        decoded = _decode_capped(raw, truncated=True)
+
+        assert decoded.startswith("€")
+        assert "\ufffd" in decoded
+        assert decoded.endswith(_HOOK_TRUNCATION_MARKER)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_observes_both_reader_tasks(self):
+        from kiro_crew.hooks import _communicate_capped
+
+        class BlockingReader:
+            def __init__(self):
+                self.entered = asyncio.Event()
+                self.cancelled = asyncio.Event()
+
+            async def read(self, _size):
+                self.entered.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    raise
+
+        stdout = BlockingReader()
+        stderr = BlockingReader()
+        proc = SimpleNamespace(
+            stdin=None,
+            stdout=stdout,
+            stderr=stderr,
+            wait=AsyncMock(),
+        )
+        task = asyncio.create_task(_communicate_capped(proc, b"", 32))
+        await asyncio.gather(stdout.entered.wait(), stderr.entered.wait())
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert stdout.cancelled.is_set()
+        assert stderr.cancelled.is_set()
+        proc.wait.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_real_hook_caps_and_marks_both_streams(self, tmp_path, monkeypatch):
+        from kiro_crew.hooks import _HOOK_STREAM_CAP_BYTES, _HOOK_TRUNCATION_MARKER
+
+        # This test exercises real pipe draining, not host sandbox discovery.
+        # Keep the subprocess real while making its isolation wrappers stable
+        # across Linux, namespace-sandbox, and Windows CI environments.
+        monkeypatch.setattr("kiro_crew.sandbox.wrap_argv", lambda argv, **k: (list(argv), None))
+        monkeypatch.setattr("kiro_crew.sandbox.cgroup_scope_argv", lambda argv: list(argv))
+
+        command = _script_command(
+            tmp_path / "large_output.py",
+            "import sys\n" "sys.stdout.write('o' * 70000)\n" "sys.stderr.write('e' * 70000)\n",
+        )
+        hook = ScriptHook(
+            id="large-output",
+            name="large-output",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command=command,
+            timeout=30,
+        )
+
+        result = await run_script_hook(hook, "ctx")
+
+        assert result.exit_code == 0
+        assert result.stdout.endswith(_HOOK_TRUNCATION_MARKER)
+        assert result.stderr.endswith(_HOOK_TRUNCATION_MARKER)
+        assert len(result.stdout.encode("utf-8")) <= (
+            _HOOK_STREAM_CAP_BYTES + len(_HOOK_TRUNCATION_MARKER.encode("utf-8"))
+        )
+        assert len(result.stderr.encode("utf-8")) <= (
+            _HOOK_STREAM_CAP_BYTES + len(_HOOK_TRUNCATION_MARKER.encode("utf-8"))
+        )
+
+
 class TestRunScriptHook:
     """Test run_script_hook execution."""
 
@@ -305,6 +404,133 @@ class TestRunScriptHook:
         )
         result = await run_script_hook(hook, "test-context")
         assert HOOK_EVENT_USER_PROMPT_SUBMIT in result.stdout
+
+    def test_subprocess_env_excludes_gateway_credentials(self, monkeypatch):
+        from kiro_crew.hooks import _hook_subprocess_env
+
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        proxy_secret = "http://svc:pa55word@proxy.example.com"
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", secret)
+        monkeypatch.setenv("HTTPS_PROXY", proxy_secret)
+        monkeypatch.setenv("http_proxy", proxy_secret)
+        monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+        monkeypatch.setenv("KIROCREW_HOME", "/custom/data/home")
+        hook = ScriptHook(
+            id="env-safe",
+            name="env-safe",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command="echo ok",
+        )
+
+        env = _hook_subprocess_env(hook, "prompt text")
+
+        assert env["PATH"] == os.environ["PATH"]
+        assert "AWS_ACCESS_KEY_ID" not in env
+        assert "HTTPS_PROXY" not in env
+        assert "http_proxy" not in env
+        # The data-home override must survive so a hook invoking the kirocrew
+        # CLI resolves the gateway's home, not the default (it is a path, not a
+        # credential).
+        assert env["KIROCREW_HOME"] == "/custom/data/home"
+        assert env["KIROCREW_HOOK_EVENT"] == HOOK_EVENT_USER_PROMPT_SUBMIT
+        assert env["KIROCREW_HOOK_CONTEXT"] == "prompt text"
+
+    @pytest.mark.skipif(_IS_WINDOWS, reason="systemd user-bus wrapping is POSIX-only")
+    @pytest.mark.asyncio
+    async def test_subprocess_routes_allowlist_through_safe_spawn_funnel(self, monkeypatch):
+        """The wrapper gets bus locators without widening the hook base env."""
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        bus_address = "unix:path=/run/user/4242/bus"
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", secret)
+        seen: dict[str, object] = {}
+
+        def safe_spawn(argv, *, env):
+            seen["base_env"] = dict(env)
+            wrapper_env = dict(env)
+            wrapper_env["DBUS_SESSION_BUS_ADDRESS"] = bus_address
+            return list(argv), wrapper_env, None
+
+        proc = MagicMock()
+        # Main's capped-output path (#5442) drains proc.stdout/proc.stderr via
+        # _read_capped_stream(reader.read(n)) rather than proc.communicate, and
+        # feeds proc.stdin then awaits proc.wait(). Model those so the funnel's
+        # env assertions below run against a process that completes cleanly.
+
+        async def _read(_n: int, _chunks=[b"ok\n"]):
+            return _chunks.pop(0) if _chunks else b""
+
+        proc.stdout.read = AsyncMock(side_effect=_read)
+        proc.stderr.read = AsyncMock(return_value=b"")
+        proc.stdin.write = MagicMock()
+        proc.stdin.drain = AsyncMock()
+        proc.stdin.close = MagicMock()
+        proc.wait = AsyncMock(return_value=0)
+        proc.returncode = 0
+        monkeypatch.setattr("kiro_crew.sandbox.sandboxed_spawn_argv", safe_spawn)
+        create = AsyncMock(return_value=proc)
+        monkeypatch.setattr("kiro_crew.sandbox.create_subprocess_limited", create)
+
+        hook = ScriptHook(
+            id="safe-funnel",
+            name="safe-funnel",
+            event=HOOK_EVENT_PRE_TOOL_USE,
+            command="echo ok",
+        )
+        result = await run_script_hook(hook, "tool context")
+
+        assert result.exit_code == 0
+        base_env = seen["base_env"]
+        assert isinstance(base_env, dict)
+        assert "AWS_ACCESS_KEY_ID" not in base_env
+        assert "DBUS_SESSION_BUS_ADDRESS" not in base_env
+        assert create.await_args.kwargs["env"]["DBUS_SESSION_BUS_ADDRESS"] == bus_address
+
+    @pytest.mark.asyncio
+    async def test_stdout_and_stderr_are_redacted_before_return(self, tmp_path):
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        command = _script_command(
+            tmp_path / "leaky_hook.py",
+            "import sys\n"
+            f"print({secret!r})\n"
+            f"sys.stderr.write({secret!r} + '\\n')\n"
+            "raise SystemExit(1)\n",
+        )
+        hook = ScriptHook(
+            id="redacted-streams",
+            name="redacted-streams",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command=command,
+            timeout=30,
+        )
+
+        result = await run_script_hook(hook, "ctx")
+
+        assert secret not in result.stdout
+        assert secret not in result.stderr
+        assert secret not in hook.last_error
+        assert "redacted" in result.stdout.lower()
+        assert "redacted" in result.stderr.lower()
+
+    @pytest.mark.asyncio
+    async def test_exception_text_is_redacted_before_return_or_persistence(self):
+        secret = "AKIAIOSFODNN7EXAMPLE"
+        hook = ScriptHook(
+            id="redacted-exception",
+            name="redacted-exception",
+            event=HOOK_EVENT_USER_PROMPT_SUBMIT,
+            command="echo unreachable",
+            timeout=30,
+        )
+
+        with patch(
+            "kiro_crew.sandbox.wrap_argv",
+            side_effect=RuntimeError(f"spawn failed for {secret}"),
+        ):
+            result = await run_script_hook(hook, "ctx")
+
+        assert secret not in result.error
+        assert secret not in hook.last_error
+        assert "redacted" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_hook_updates_metadata(self):
@@ -560,7 +786,12 @@ class TestRunScriptHookSpawnForm:
             assert seen.get("shell_cmd") == command
             assert "argv" not in seen
         else:
-            assert seen["argv"] == ["/bin/sh", "-c", command]
+            spawned = seen["argv"]
+            assert isinstance(spawned, list)
+            # Security layers may prepend sandbox, cgroup, resource-limit, or
+            # env-unset wrappers. The shell tuple at the tail is the stable
+            # contract, and its command must remain byte-for-byte unchanged.
+            assert spawned[-3:] == ["/bin/sh", "-c", command]
 
     @pytest.mark.asyncio
     async def test_a_wrapping_sandbox_wins_over_the_shell_spawn(self, monkeypatch):
@@ -575,8 +806,8 @@ class TestRunScriptHookSpawnForm:
             "kiro_crew.sandbox.wrap_argv", lambda argv, **k: (["sandbox-exec", *argv], None)
         )
         # cgroup_scope_argv runs AFTER wrap_argv and prepends its own launcher on
-        # a cgroup-v2 host, which would displace "sandbox-exec" from argv[0]. Pin
-        # it to a no-op so the assertion names the wrapper this test installed.
+        # a cgroup-v2 host. Pin it to a no-op so only the shared env-unset shim
+        # may precede the wrapper this test installed.
         monkeypatch.setattr("kiro_crew.sandbox.cgroup_scope_argv", lambda argv: list(argv))
         seen: dict[str, object] = {}
 
@@ -592,8 +823,8 @@ class TestRunScriptHookSpawnForm:
             seen["argv"] = list(argv)
             return fake_proc
 
-        # Capture at create_subprocess_limited so its RLIMIT shim cannot displace
-        # "sandbox-exec" from argv[0] (see the sibling test above).
+        # Capture at create_subprocess_limited so its RLIMIT shim cannot alter
+        # the argv built by the shared spawn funnel (see the sibling test above).
         monkeypatch.setattr("kiro_crew.sandbox.create_subprocess_limited", fake_exec)
         monkeypatch.setattr("asyncio.create_subprocess_shell", fake_shell)
         monkeypatch.setattr("asyncio.create_subprocess_exec", fake_exec)
@@ -601,7 +832,13 @@ class TestRunScriptHookSpawnForm:
         await run_script_hook(self._hook("echo hi"), "ctx")
 
         assert "shell_cmd" not in seen, "a wrapped argv must not be discarded for a shell spawn"
-        assert seen["argv"][0] == "sandbox-exec"
+        spawned = seen["argv"]
+        assert isinstance(spawned, list)
+        shell_start = len(spawned) - 3
+        assert spawned[-3:] == (
+            ["cmd", "/c", "echo hi"] if _IS_WINDOWS else ["/bin/sh", "-c", "echo hi"]
+        )
+        assert spawned.index("sandbox-exec") < shell_start
 
 
 class TestLastError:

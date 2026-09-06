@@ -31,6 +31,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
+from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY
 from kiro_crew.messaging.driver import DirectiveConsumer, TurnDriver
@@ -627,8 +628,32 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             auto_approve_tool=build_auto_approve(ctx_builder),
             tool_gate=build_tool_gate(ctx_builder, session_key=session_key, agent=turn.agent),
             directive_consumer=turn.directive_consumer,
+            audit_session_key=session_key,
+            audit_agent=turn.agent or "kirocrew",
         )
         accumulated = await driver.run(full_message)
+
+        # Defensive lookup, like every other attribute read on this seam: the
+        # driver is resolved through the module attribute, so a caller (or a
+        # test) may supply a stand-in that predates this field. A missing
+        # reason means "no synthetic completion", never an AttributeError
+        # thrown at a real inbound message after the turn already ran.
+        if getattr(driver, "last_stop_reason", "") == STOP_REASON_COMPACTION_FAILED:
+            # Synthetic completion: the backend abandoned the turn after a
+            # failed auto-compaction and never sent end_turn, so it still
+            # counts the prompt as in progress. Reset (mirrors the dashboard
+            # runner's needs_session_reset) or this channel's NEXT message
+            # collides with "prompt already in progress". No re-queue: the
+            # compaction notice already reached the user via the renderer.
+            try:
+                await sessions.reset(session_key)
+            except Exception:
+                logger.warning(
+                    "%s: session reset after compaction failure failed session=%s",
+                    turn.channel_type,
+                    session_key,
+                    exc_info=True,
+                )
 
         # ── Post-turn bookkeeping. Each step is guarded independently so a
         # failure here cannot fall through to the except and re-record a turn

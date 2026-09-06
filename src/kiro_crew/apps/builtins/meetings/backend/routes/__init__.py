@@ -209,6 +209,10 @@ def register_routes(app: web.Application) -> None:
     router.add_get(
         BASE + "/meetings/{meeting_id}/outputs", route(lifecycle_routes.handle_get_outputs)
     )
+    router.add_get(
+        BASE + "/meetings/{meeting_id}/translations",
+        route(lifecycle_routes.handle_get_translations),
+    )
     router.add_post(
         BASE + "/meetings/{meeting_id}/attachments",
         route(lifecycle_routes.handle_attachments),

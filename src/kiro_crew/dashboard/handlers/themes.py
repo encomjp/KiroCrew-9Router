@@ -61,8 +61,21 @@ from kiro_crew.dashboard.theme_validate import (
     _validate_theme_dir,
 )
 from kiro_crew.executors import discovery_executor
-from kiro_crew.hooks import safe_read_file_bytes_nolink
-from kiro_crew.sandbox import run_limited, sandboxed_spawn_argv
+from kiro_crew.hooks import (
+    is_unc_shape,
+    safe_read_file_bytes_nolink,
+    unc_probe_allowed,
+)
+from kiro_crew.platform_compat import (
+    IS_WINDOWS,
+    first_linked_ancestor,
+    is_link_or_junction,
+)
+from kiro_crew.sandbox import (
+    SandboxUnavailableError,
+    run_limited,
+    sandboxed_spawn_argv,
+)
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -72,24 +85,7 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
 
-# Theme install/serve traverses the O_NOFOLLOW + fd-real-path chokepoint in
-# hooks (safe_read_file_bytes_nolink), which has no Windows implementation
-# (_fd_real_path returns None there -> fail-closed on every read). Rather than
-# fail opaquely, gate the pack routes with an honest 501 on Windows.
-# Tracked: kirodotdev/KiroCrew#311. The editor custom-record (<slug>.json) CRUD
-# paths never touch that chokepoint, so they are intentionally NOT gated.
-_THEMES_WIN_UNSUPPORTED = os.name == "nt"
-
-
-def _win_unsupported_response() -> web.Response:
-    """501 for pack routes that rely on the POSIX-only nolink chokepoint."""
-    return web.json_response(
-        {
-            "error": "theme packs are not yet supported on Windows "
-            "(tracked: kirodotdev/KiroCrew#311)"
-        },
-        status=501,
-    )
+_THEME_GIT_SANDBOX_UNAVAILABLE = "theme install sandbox is unavailable on this server"
 
 
 def _list_themes_sync() -> list[dict[str, Any]]:
@@ -166,11 +162,13 @@ async def api_themes_create(request: web.Request) -> web.Response:
         or _THEME_DEFAULT_EMOJI
     )
 
+    # No NEW filesystem call on the loop: ``_themes_dir()`` returns the
+    # ``config_dir()`` memo resolved at boot, and the mkdir, the collision
+    # stats, and the write all happen inside ``_create_locked`` on a worker
+    # thread. On a UNC/SMB-backed data home a single on-loop stat or mkdir
+    # can block the whole gateway.
     themes_path = _themes_dir()
-    themes_path.mkdir(parents=True, exist_ok=True)
     target = themes_path / f"{slug}.json"
-    if target.exists():
-        return web.json_response({"error": f"theme '{slug}' already exists"}, status=409)
 
     theme_data = {
         "name": name,
@@ -190,6 +188,7 @@ async def api_themes_create(request: web.Request) -> web.Response:
     # record and a dir), the duplicate-slug corruption the installer guards too.
     def _create_locked() -> bool:
         with _theme_install_lock(slug):
+            themes_path.mkdir(parents=True, exist_ok=True)
             if target.exists() or _installed_theme_dir(slug).exists():
                 return False
             _atomic_write_theme_json(
@@ -210,7 +209,41 @@ def _resolve_local_source(path_str: str) -> tuple[Path | None, str | None]:
     if not isinstance(path_str, str) or not path_str.strip():
         return None, "local 'path' is required"
     p = Path(path_str).expanduser()
-    if p.is_symlink():
+    # EVERY filesystem call below is too late for these two, so both are screened
+    # first. `expanduser` only reads the environment and touches nothing.
+    #
+    # UNC: a UNC path names a HOST, so `is_dir()` on user-supplied
+    # `\\attacker\share` makes Windows open an SMB connection and authenticate,
+    # handing this gateway's credentials to a host the caller picked. The check is
+    # purely lexical (`normpath`/`normcase`) and never touches the network itself
+    # -- the same chokepoint acp/prompt_blocks.py applies to attachment paths.
+    # `unc_probe_allowed` keeps the one legitimate case working: a roaming profile
+    # whose home directory is itself a UNC share. Both the raw text and the
+    # expanded form are screened, since expansion is what actually gets stat-ed.
+    if IS_WINDOWS:
+        for candidate in (path_str, str(p)):
+            if is_unc_shape(candidate) and not unc_probe_allowed(candidate):
+                return None, "local path is not an allowed location"
+        # A LINKED ANCESTOR defeats the lexical screen above, because the path
+        # being probed is not itself UNC-shaped -- only the link's target is.
+        # This has to run before EVERY check below, including the leaf one:
+        # `is_link_or_junction` is an `lstat`, and while an lstat does not
+        # follow the FINAL component it still resolves every ancestor, so the
+        # leaf probe would itself traverse the junction and make the SMB
+        # connection this screen exists to prevent. Windows-only on purpose:
+        # the harm here is that the PROBE is the attack, which is a UNC
+        # property. On POSIX, stat-ing through a symlink is harmless and the
+        # real guard is `is_sensitive_path` on the RESOLVED path below -- so
+        # gating this keeps macOS installs from `/tmp` and `/var` (symlinks to
+        # `/private/*`) working, which an unconditional walk would refuse.
+        # The reply matches the leaf case on purpose: which ancestor is a link
+        # is filesystem layout, and the caller supplied a path to guess at it.
+        if first_linked_ancestor(p) is not None:
+            return None, "local path must not be a symlink"
+    # Root junction: `Path.is_symlink()` is False for a Windows junction, so a
+    # junction as the pack ROOT would pass an islink-only check and be resolved
+    # through -- the same predicate gap the copy walk closes for subdirectories.
+    if is_link_or_junction(p):
         return None, "local path must not be a symlink"
     if not p.is_dir():
         return None, f"not a directory: {path_str}"
@@ -244,9 +277,15 @@ def _clone_github(url: str, dest: Path) -> str | None:
     # content, so route through the sandbox chokepoint (OS filesystem isolation
     # + credential-scrubbed env) and apply the fork-bomb/resource ceiling via
     # run_limited — same discipline as git_coord._git.
-    argv, env, cleanup = sandboxed_spawn_argv(
-        ["git", "clone", "--depth", "1", "--quiet", "--", url, str(dest)]
-    )
+    try:
+        argv, env, cleanup = sandboxed_spawn_argv(
+            ["git", "clone", "--depth", "1", "--quiet", "--", url, str(dest)]
+        )
+    except SandboxUnavailableError:
+        # Translate the typed sandbox refusal at this boundary. In particular,
+        # Windows has no process-sandbox backend, but local theme installs and
+        # every descriptor-contained read route remain supported there.
+        return _THEME_GIT_SANDBOX_UNAVAILABLE
     try:
         proc = run_limited(
             argv,
@@ -294,9 +333,15 @@ def _copy_installed_theme(src: Path, dst: Path) -> None:
     copied = 0
     dst.mkdir(parents=True, exist_ok=True)
     for dirpath, dirnames, filenames in os.walk(src, followlinks=False):
-        # A subdirectory that is itself a symlink must never be descended.
+        # A subdirectory that is itself a link must never be descended.
+        # `is_link_or_junction`, not `os.path.islink`: islink() is False for a
+        # Windows JUNCTION, and `os.walk` reports a junction as an ordinary
+        # directory, so an islink-only guard descends it. A pack carrying a
+        # junction back to its own root would then recurse until a path-length
+        # OSError escaped as a 500 -- reachable as soon as local install is
+        # enabled on Windows, which is what this change does.
         for d in dirnames:
-            if os.path.islink(os.path.join(dirpath, d)):
+            if is_link_or_junction(os.path.join(dirpath, d)):
                 raise ValueError(
                     "refusing to install symlinked directory: "
                     f"{os.path.relpath(os.path.join(dirpath, d), src)}"
@@ -407,7 +452,8 @@ def _do_install(stype: Any, source: dict[str, Any]) -> tuple[dict[str, Any] | No
         else:
             return None, "source.type must be 'local' or 'github'", 400
         if err or src is None:
-            return None, err or "invalid source", 400
+            status = 503 if err == _THEME_GIT_SANDBOX_UNAVAILABLE else 400
+            return None, err or "invalid source", status
 
         # ── Stage-first (TOCTOU class fix) ──
         # The source dir stays writable by its owner throughout, so a
@@ -530,9 +576,6 @@ async def api_themes_install(request: web.Request) -> web.Response:
     Fetch/move -> validate (data + structure) -> register as
     ``_themes_dir()/<slug>/``.
     """
-    if _THEMES_WIN_UNSUPPORTED:
-        return _win_unsupported_response()
-
     # Governance admission gate: installing a pack ingests third-party content
     # (local move or server-side git clone) and serves sandboxed JS into the
     # dashboard, so an enterprise POLICY must be able to ban it wholesale
@@ -578,7 +621,10 @@ async def api_themes_install(request: web.Request) -> web.Response:
         discovery_executor(), _do_install, stype, source
     )
     if err or theme is None:
-        return web.json_response({"error": err or "install failed"}, status=status)
+        payload = {"error": err or "install failed"}
+        if err == _THEME_GIT_SANDBOX_UNAVAILABLE:
+            payload["code"] = "theme_install_sandbox_unavailable"
+        return web.json_response(payload, status=status)
 
     return web.json_response({"ok": True, "slug": theme["slug"], "theme": theme})
 
@@ -594,16 +640,31 @@ async def api_theme_detail(request: web.Request) -> web.Response:
     target = _themes_dir() / f"{safe_slug}.json"
     dir_target = _installed_theme_dir(safe_slug)
 
+    # One stat pass for the whole handler: ``exists()``/``is_dir()`` are
+    # SMB-backed on a UNC data home and can block for as long as the network
+    # takes, so they never run on the event loop — the same off-loop
+    # discipline as the asset routes' ``_resolve_theme_asset``. Both stats
+    # ride a single executor hop because every method branch consumes the
+    # pair as one logical check; the DELETE-dir branch re-checks under the
+    # per-slug install lock off-loop.
+    def _stat_targets() -> tuple[bool, bool]:
+        return target.exists(), dir_target.is_dir()
+
+    loop = asyncio.get_running_loop()
+    target_exists, dir_is_dir = await loop.run_in_executor(
+        discovery_executor(), _stat_targets
+    )
+
     if request.method == "DELETE":
-        if target.exists():
-            await asyncio.get_running_loop().run_in_executor(
-                discovery_executor(), target.unlink
+        if target_exists:
+            # ``missing_ok``: the stat rode an earlier hop, so a concurrent
+            # delete can win the race; deleting an already-gone file is the
+            # outcome the caller asked for, not a 500.
+            await loop.run_in_executor(
+                discovery_executor(), lambda: target.unlink(missing_ok=True)
             )
             return web.json_response({"ok": True})
-        if dir_target.is_dir():
-            if _THEMES_WIN_UNSUPPORTED:
-                return _win_unsupported_response()
-
+        if dir_is_dir:
             # Recursive delete of a many-file theme dir is blocking; run off-loop.
             # Acquire the per-slug install lock (same key _do_install stages/swaps
             # under) so we never rmtree mid-reinstall and race its stage→rename;
@@ -613,19 +674,17 @@ async def api_theme_detail(request: web.Request) -> web.Response:
                     if dir_target.is_dir():
                         shutil.rmtree(dir_target, ignore_errors=True)
 
-            await asyncio.get_running_loop().run_in_executor(
-                discovery_executor(), _locked_remove
-            )
+            await loop.run_in_executor(discovery_executor(), _locked_remove)
             return web.json_response({"ok": True})
         return web.json_response({"error": "not found"}, status=404)
 
     if request.method == "PUT":
-        if dir_target.is_dir() and not target.exists():
+        if dir_is_dir and not target_exists:
             return web.json_response(
                 {"error": "installed themes are read-only; reinstall to update"},
                 status=400,
             )
-        if not target.exists():
+        if not target_exists:
             return web.json_response({"error": "not found"}, status=404)
         try:
             body = await request.json()
@@ -662,14 +721,13 @@ async def api_theme_detail(request: web.Request) -> web.Response:
                 _atomic_write_theme_json(target, json.dumps(td, indent=2) + "\n")
                 return td
 
-        theme_data = await asyncio.get_running_loop().run_in_executor(
+        theme_data = await loop.run_in_executor(
             discovery_executor(), _update_locked
         )
         return web.json_response({"ok": True, "theme": theme_data})
 
     # GET — file reads and the validation walk are blocking; run off-loop.
-    loop = asyncio.get_running_loop()
-    if target.exists():
+    if target_exists:
         try:
             raw = await loop.run_in_executor(
                 discovery_executor(), target.read_text, "utf-8"
@@ -678,9 +736,7 @@ async def api_theme_detail(request: web.Request) -> web.Response:
         except (json.JSONDecodeError, OSError):
             return web.json_response({"error": "failed to read theme"}, status=500)
         return web.json_response(data)
-    if dir_target.is_dir():
-        if _THEMES_WIN_UNSUPPORTED:
-            return _win_unsupported_response()
+    if dir_is_dir:
         summary, err = await loop.run_in_executor(
             discovery_executor(), _validate_theme_dir, dir_target
         )
@@ -744,10 +800,15 @@ def _theme_html_response(text: str) -> web.Response:
 
 async def api_theme_asset(request: web.Request) -> web.Response:
     """GET /api/theme/{slug}/assets/{path} — serve a static theme asset."""
-    if _THEMES_WIN_UNSUPPORTED:
-        return _win_unsupported_response()
-    target, err = _resolve_theme_asset(
-        request.match_info["slug"], request.match_info.get("path", "")
+    # Offloaded, not called inline: `_resolve_theme_asset` does `resolve()` /
+    # `is_file()`, which are SMB-backed on a UNC data home (roaming profile),
+    # so running it on the loop stalls the whole gateway per request. Rides the
+    # same executor the read below already uses.
+    target, err = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(),
+        _resolve_theme_asset,
+        request.match_info["slug"],
+        request.match_info.get("path", ""),
     )
     if err or target is None:
         return web.json_response(
@@ -774,12 +835,19 @@ async def api_theme_asset(request: web.Request) -> web.Response:
 
 async def api_theme_overlay(request: web.Request) -> web.Response:
     """GET /api/theme/{slug}/overlay/{id} — serve overlay HTML (id = file stem)."""
-    if _THEMES_WIN_UNSUPPORTED:
-        return _win_unsupported_response()
     oid = request.match_info["id"].lower()
     if not oid or _safe_theme_slug(oid) != oid:
         return web.json_response({"error": "invalid overlay id"}, status=400)
-    target, err = _resolve_theme_asset(request.match_info["slug"], f"overlays/{oid}.html")
+    # Offloaded, not called inline: `_resolve_theme_asset` does `resolve()` /
+    # `is_file()`, which are SMB-backed on a UNC data home (roaming profile),
+    # so running it on the loop stalls the whole gateway per request. Rides the
+    # same executor the read below already uses.
+    target, err = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(),
+        _resolve_theme_asset,
+        request.match_info["slug"],
+        f"overlays/{oid}.html",
+    )
     if err or target is None:
         return web.json_response(
             {"error": err or "not found"},
@@ -795,12 +863,19 @@ async def api_theme_overlay(request: web.Request) -> web.Response:
 
 async def api_theme_topbar(request: web.Request) -> web.Response:
     """GET /api/theme/{slug}/topbar/{mode} — serve topbar HTML (mode dark|light)."""
-    if _THEMES_WIN_UNSUPPORTED:
-        return _win_unsupported_response()
     mode = request.match_info["mode"]
     if mode not in ("dark", "light"):
         return web.json_response({"error": "mode must be dark or light"}, status=400)
-    target, err = _resolve_theme_asset(request.match_info["slug"], f"topbar/{mode}.html")
+    # Offloaded, not called inline: `_resolve_theme_asset` does `resolve()` /
+    # `is_file()`, which are SMB-backed on a UNC data home (roaming profile),
+    # so running it on the loop stalls the whole gateway per request. Rides the
+    # same executor the read below already uses.
+    target, err = await asyncio.get_running_loop().run_in_executor(
+        discovery_executor(),
+        _resolve_theme_asset,
+        request.match_info["slug"],
+        f"topbar/{mode}.html",
+    )
     if err or target is None:
         return web.json_response(
             {"error": err or "not found"},

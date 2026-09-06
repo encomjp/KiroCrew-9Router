@@ -2,6 +2,7 @@ import { Lightbulb, Bug } from 'lucide-react'
 
 import { useAppSelector } from '../store'
 import { i18nT } from '../i18n/t'
+import { bytesAreTheStableRelease as followedLanePublishesRunningBytes } from '../utils/laneMembership'
 
 /**
  * Top-bar feedback control: "Request a Feature" on the left, and — only on a
@@ -41,11 +42,34 @@ export default function FeedbackPill({
   // drift and quietly classify a prerelease build as stable — which is the bug
   // this whole change fixes.
   const channel = useAppSelector(s => s.dashboard.status?.release_channel)
+  // ...but the gateway's answer is derived from the version STRING, and promotion
+  // re-points the soaked candidate's bytes at stable without re-stamping them: a
+  // promoted stable release is literally `0.4.1rc1`, which classifies as
+  // `insider`. So the stamp alone put a permanent bug chip in front of the entire
+  // stable population — exactly what the docstring above says stable must not
+  // show. The feed's own answer is the exemption: this install FOLLOWS stable and
+  // that lane publishes these very bytes (a completed check found nothing newer
+  // and no pending move). Both reads are `undefined` on an older gateway or
+  // before the first status frame, which correctly exempts nothing.
+  const followedChannel = useAppSelector(s => s.dashboard.status?.update_channel)
+  const checkSucceeded = useAppSelector(
+    s => s.dashboard.status?.update_check_status
+  ) === 'succeeded'
+  const movePending = useAppSelector(s => s.dashboard.status?.update_channel_move_pending) === true
+  // Shared with Settings › About (utils/laneMembership): one rule, so the header
+  // and the panel can never disagree about whether these bytes are the release.
+  const bytesAreTheStableRelease = followedLanePublishesRunningBytes({
+    followedChannel,
+    laneAnswered: checkSucceeded,
+    runningAheadOfLane: movePending,
+  })
 
   // `undefined` means an older gateway that does not send the field, or a status
   // payload that has not arrived yet. Treated as "not prerelease" so the header
   // never flickers a chip in and out, and never claims a lane it does not know.
-  const chipChannel = channel === 'nightly' || channel === 'insider' ? channel : null
+  const chipChannel = !bytesAreTheStableRelease && (channel === 'nightly' || channel === 'insider')
+    ? channel
+    : null
 
   const channelLabel =
     chipChannel === 'nightly'

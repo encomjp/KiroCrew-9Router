@@ -67,7 +67,7 @@ Object.defineProperty(window, 'matchMedia', {
 
 import ChatPage from '../pages/ChatPage'
 
-function makeStore(pendingInput = 'do not lose me') {
+function makeStore(pendingInput: string | null = 'do not lose me') {
   return configureStore({
     reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
     preloadedState: {
@@ -106,6 +106,21 @@ function makeSlotlessStore(pendingInput = 'do not lose me') {
       dashboard: { ...state.dashboard, slots: [], slotsLoaded: false } as unknown as RootState['dashboard'],
       chat: { ...state.chat, activeSlot: null, pendingInput } as unknown as RootState['chat'],
       notifications: { items: [] } as unknown as RootState['notifications'],
+    },
+  })
+}
+
+/** A new renderer with known sessions but no selected session. This is the
+ *  exact state where a failed `?new=1` intent can race the auto-select effect. */
+function makeInactiveStore() {
+  const store = makeStore(null)
+  const state = store.getState()
+  return configureStore({
+    reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+    preloadedState: {
+      dashboard: state.dashboard,
+      chat: { ...state.chat, activeSlot: null } as unknown as RootState['chat'],
+      notifications: state.notifications,
     },
   })
 }
@@ -447,5 +462,48 @@ describe('send() when creating the session fails', { timeout: 20_000 }, () => {
     expect(createChatSlot).toHaveBeenCalledTimes(2)
     // NOT 'slot-a' — that session has nothing to do with this message.
     expect(sendChat.mock.calls[0][1]).toBe('slot-z')
+  })
+})
+
+describe('full-dashboard new-window intent', () => {
+  it('creates a blank slot without copying or sending the current session', async () => {
+    createChatSlot.mockResolvedValue({
+      key: 'slot-new', title: 'slot-new', messages: 0, running: false,
+    })
+    const store = makeInactiveStore()
+
+    await renderSlotless(store, '/chat?new=1')
+
+    await waitFor(() => expect(createChatSlot).toHaveBeenCalledTimes(1))
+    expect(sendChat).not.toHaveBeenCalled()
+    expect(store.getState().chat.activeSlot).toBe('slot-new')
+  })
+
+  it('keeps a failed blank window from falling back to an existing session and retries explicitly', async () => {
+    let resolveRetry!: (slot: { key: string; title: string; messages: number; running: boolean }) => void
+    createChatSlot.mockRejectedValueOnce(new Error('gateway unavailable'))
+    createChatSlot.mockImplementationOnce(() => new Promise((resolve) => { resolveRetry = resolve }))
+    const store = makeInactiveStore()
+
+    await renderSlotless(store, '/chat?new=1')
+
+    await waitFor(() => expect(createChatSlot).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByText('Could not start a new session')).toBeTruthy())
+    expect(store.getState().chat.activeSlot).toBeNull()
+    expect(sendChat).not.toHaveBeenCalled()
+
+    const retry = screen.getByRole('button', { name: 'Start a new chat' })
+    fireEvent.click(retry)
+
+    await waitFor(() => expect(createChatSlot).toHaveBeenCalledTimes(2))
+    expect(retry).toBeDisabled()
+    fireEvent.click(retry)
+    expect(createChatSlot).toHaveBeenCalledTimes(2)
+    act(() => resolveRetry({
+      key: 'slot-retry', title: 'slot-retry', messages: 0, running: false,
+    }))
+    await waitFor(() => expect(store.getState().chat.activeSlot).toBe('slot-retry'))
+    expect(screen.queryByText('Could not start a new session')).toBeNull()
+    expect(sendChat).not.toHaveBeenCalled()
   })
 })

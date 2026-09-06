@@ -161,11 +161,16 @@ def main(argv: list[str] | None = None) -> int:
         cfg_path = f.name
 
     try:
+        # Explicit UTF-8 with replacement: the driver's stderr carries raw
+        # browser/ffmpeg bytes that the Windows locale codec (cp1252) cannot
+        # decode, which raises inside communicate() and masks the real result.
         proc = subprocess.run(
             [node, str(DRIVER), cfg_path],
             cwd=str(project),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=600,
         )
     finally:

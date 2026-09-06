@@ -1,5 +1,5 @@
-import { useCallback, useMemo, useRef, useState } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useCallback, useMemo, useState } from 'react'
+import { useQuery, useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { PIN_PREVIEW_INPUT_MAX_CHARS, pinsApi, type ChatPin, type PinApiError, type PinMessageBody } from '../api/pins'
 import { secureRandomId } from '../utils/secureId'
 
@@ -23,6 +23,45 @@ const pinQueryKey = (slotKey: string | undefined) => ['chat-pins', slotKey] as c
 type UnpinMutation = { id: string; slotKey: string }
 
 /**
+ * Unpin-race coordination state for a single QueryClient.
+ *
+ *  - `inFlightCreates`: in-flight create promises keyed by `${slot_key}::${mid}`.
+ *    A temp-id unpin awaits this promise to learn the real server id (or that
+ *    the create failed).
+ *  - `pinGenerations`: monotonic pin-intent generation per `${slot_key}::${mid}`.
+ *    A temp-id unpin snapshots the generation it is cancelling and, after
+ *    awaiting the create, only deletes the server pin if no newer pin intent
+ *    arrived meanwhile.
+ */
+type PinCoordStore = {
+  inFlightCreates: Map<string, Promise<ChatPin>>
+  pinGenerations: Map<string, number>
+}
+
+/**
+ * Coordination state lives on the QueryClient, not in per-instance `useRef`
+ * maps, so it is shared by every `useChatPins` instance bound to the same
+ * client and survives a remount. The pin DATA it guards already lives in that
+ * client's React Query cache; keeping the coordination beside it means a
+ * remount mid-create, or a second consumer of the hook for the same slot, sees
+ * the same in-flight promise instead of the "no tracked promise" branch (which
+ * would silently drop an unpin — the pin resurfaces on the settled refetch).
+ *
+ * A WeakMap keys the store off the client identity so it is reclaimed with the
+ * client and never leaks across the QueryClients that tests create per case.
+ */
+const coordStores = new WeakMap<QueryClient, PinCoordStore>()
+
+function coordStoreFor(qc: QueryClient): PinCoordStore {
+  let store = coordStores.get(qc)
+  if (!store) {
+    store = { inFlightCreates: new Map(), pinGenerations: new Map() }
+    coordStores.set(qc, store)
+  }
+  return store
+}
+
+/**
  * Hook to manage chat message pins for a given slot.
  * Uses React Query with optimistic updates – eliminates stale-closure race
  * conditions when the user switches slots quickly (each slot has its own
@@ -44,21 +83,11 @@ export function useChatPins(slotKey: string | undefined) {
   const clearError = useCallback(() => setError(null), [])
 
   /**
-   * Tracks in-flight create promises keyed by mid.
-   * When an unpin is requested for a pin whose id is still "temp-…" we await
-   * this promise to learn the real server id (or know the create failed).
+   * Race-coordination state scoped to this QueryClient (see PinCoordStore).
+   * Shared across every hook instance on the same client and stable across
+   * remounts — the maps are NOT recreated per render or per mount.
    */
-  const inFlightCreates = useRef<Map<string, Promise<ChatPin>>>(new Map())
-
-  /**
-   * Monotonic pin-intent generation per `${slot_key}::${mid}`. Bumped by every
-   * pinMessage; a temp-id unpin snapshots the generation it is cancelling and,
-   * after awaiting the create, only deletes the server pin if no NEWER pin
-   * intent arrived meanwhile. Without this, Pin -> pending Unpin -> Pin again
-   * loses the second pin: the idempotent create returns the first record's id,
-   * and the deferred DELETE would remove the pin the user just re-created.
-   */
-  const pinGenerations = useRef<Map<string, number>>(new Map())
+  const { inFlightCreates, pinGenerations } = coordStoreFor(qc)
 
   const { data: pins = [], isLoading: loading } = useQuery<ChatPin[]>({
     queryKey,
@@ -156,7 +185,7 @@ export function useChatPins(slotKey: string | undefined) {
         )
         qc.invalidateQueries({ queryKey: mutationQueryKey })
 
-        const inFlight = inFlightCreates.current.get(`${resolvedSlotKey}::${pin.mid}`)
+        const inFlight = inFlightCreates.get(`${resolvedSlotKey}::${pin.mid}`)
         if (!inFlight) {
           // No tracked promise. This is NOT always "nothing on the server":
           // the create may have already succeeded and been cleaned from the
@@ -175,7 +204,7 @@ export function useChatPins(slotKey: string | undefined) {
 
         let realPin: ChatPin
         const inFlightKey = `${resolvedSlotKey}::${pin.mid}`
-        const generationAtUnpin = pinGenerations.current.get(inFlightKey) ?? 0
+        const generationAtUnpin = pinGenerations.get(inFlightKey) ?? 0
         try {
           realPin = await inFlight
         } catch {
@@ -186,7 +215,7 @@ export function useChatPins(slotKey: string | undefined) {
         // If the user pinned this message AGAIN while we awaited the create,
         // that newer intent wins: the idempotent create returns the same
         // record, so deleting it now would destroy the re-created pin.
-        if ((pinGenerations.current.get(inFlightKey) ?? 0) !== generationAtUnpin) {
+        if ((pinGenerations.get(inFlightKey) ?? 0) !== generationAtUnpin) {
           return
         }
 
@@ -197,7 +226,7 @@ export function useChatPins(slotKey: string | undefined) {
 
       await unpinMessageAsync({ id: pin.id, slotKey: resolvedSlotKey })
     },
-    [slotKey, qc, unpinMessageAsync],
+    [slotKey, qc, unpinMessageAsync, inFlightCreates, pinGenerations],
   )
 
   const isPinned = useCallback(
@@ -223,16 +252,16 @@ export function useChatPins(slotKey: string | undefined) {
       const inFlightKey = `${fullBody.slot_key}::${fullBody.mid}`
       // A new pin intent supersedes any unpin still awaiting the previous
       // create for this message (see pinGenerations).
-      pinGenerations.current.set(inFlightKey, (pinGenerations.current.get(inFlightKey) ?? 0) + 1)
+      pinGenerations.set(inFlightKey, (pinGenerations.get(inFlightKey) ?? 0) + 1)
       const promise = pinMessageAsync(fullBody).finally(() => {
-        if (inFlightCreates.current.get(inFlightKey) === promise) {
-          inFlightCreates.current.delete(inFlightKey)
+        if (inFlightCreates.get(inFlightKey) === promise) {
+          inFlightCreates.delete(inFlightKey)
         }
       })
-      inFlightCreates.current.set(inFlightKey, promise)
+      inFlightCreates.set(inFlightKey, promise)
       await promise
     },
-    [slotKey, pinMessageAsync],
+    [slotKey, pinMessageAsync, inFlightCreates, pinGenerations],
   )
 
   const unpinMessage = useCallback(

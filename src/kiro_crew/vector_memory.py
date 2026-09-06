@@ -251,6 +251,18 @@ _EPISODIC_LONG_TEXT_CHARS = 300  # texts longer than this get a relaxed threshol
 _EPISODIC_LONG_TEXT_THRESHOLD = 0.42  # relaxed threshold for long entries
 _EPISODIC_TEXT_MIN = 10
 _EPISODIC_TEXT_MAX = 2000
+#: Codepoint ranges of scripts that spend enough meaning per character for a
+#: TWO-character token to be an ordinary whole word: kana, Han (+ extension A
+#: and the compatibility block) and Hangul syllables. Latin is deliberately
+#: absent -- a two-letter English token is a function word ("to", "in", "is"),
+#: and those are exactly what the keyword floor below exists to drop.
+_DENSE_SCRIPT_RANGES = (
+    (0x3040, 0x30FF),  # Hiragana + Katakana
+    (0x3400, 0x4DBF),  # CJK Unified Ideographs Extension A
+    (0x4E00, 0x9FFF),  # CJK Unified Ideographs
+    (0xAC00, 0xD7A3),  # Hangul syllables
+    (0xF900, 0xFAFF),  # CJK Compatibility Ideographs
+)
 # Episodic recency decay: score factor exp(-rate * days_old), per day. The
 # built-in rate applies when memory.decay_rates configures nothing else; the
 # reserved "default" key in that mapping replaces it for untagged/unmatched
@@ -770,6 +782,30 @@ def _sanitize_decay_rates(raw: Mapping[str, object] | None) -> dict[str, float]:
     return out
 
 
+def _is_selective_keyword(word: str) -> bool:
+    """Whether *word* is selective enough to spend a ``LIKE '%word%'`` scan on.
+
+    The episodic keyword fallback matches by plain substring, so the only thing
+    a term has to earn is selectivity. Counting characters is a fine proxy for
+    that in Latin script -- a one- or two-character token there is a function
+    word, and ``LIKE '%to%'`` matches nearly every row -- but it is the wrong
+    proxy for the scripts in :data:`_DENSE_SCRIPT_RANGES`, where two characters
+    is an ordinary word (``模型`` "model", ``会議`` "meeting", ``회의``
+    "meeting") and the substring is highly selective. Applying the Latin floor
+    to them emptied the term list, and an empty term list makes the fallback
+    return nothing at all rather than merely ranking differently.
+
+    A single character stays refused in every script: one Han character (``的``,
+    ``人``) is as unselective as an English stopword, so admitting it would
+    trade this recall bug for a precision one.
+    """
+    if len(word) > 2:
+        return True
+    return len(word) == 2 and any(
+        any(lo <= ord(ch) <= hi for lo, hi in _DENSE_SCRIPT_RANGES) for ch in word
+    )
+
+
 # ── Store ──
 
 
@@ -893,11 +929,11 @@ class VectorMemoryStore:
         just created.
 
         Missing files are skipped BY AN EXISTENCE CHECK, not by catching the failure:
-        on Windows ``restrict_to_owner`` shells out, so a missing path raises plain
-        ``OSError`` (icacls exits non-zero) rather than ``FileNotFoundError``, which
-        only ever comes from the POSIX ``os.chmod``. Catching alone would spawn up to
-        five futile ``icacls`` processes on a clean init and log a false "may be
-        readable by other users" warning for each, twice per init. The race between
+        on Windows ``restrict_to_owner`` raises plain ``OSError`` for a missing path
+        (the in-process DACL write's failure is translated to ``OSError``) rather
+        than ``FileNotFoundError``, which only ever comes from the POSIX
+        ``os.chmod``. Catching alone would log a false "may be readable by other
+        users" warning for each missing file, twice per init. The race between
         the check and the call is benign: a file that appears in between is created by
         SQLite or FAISS inside the already-tightened directory, so it inherits
         owner-only access on both platforms and the next init covers it regardless.
@@ -926,7 +962,7 @@ class VectorMemoryStore:
         # pass below repairs what already EXISTS, which a tightened parent cannot do:
         # Windows grants *Bypass Traverse Checking* to Everyone by default, so a
         # pre-lockdown file stays reachable through it. Full reasoning -- the sidecar
-        # file set, the every-init rationale, the Windows icacls cost, the fail-soft
+        # file set, the every-init rationale, the Windows lockdown cost, the fail-soft
         # contract -- lives in docs/guides/windows-install.md, "The memory store".
         #
         # SCOPE: with the default `db_path` this directory IS the data home
@@ -982,10 +1018,13 @@ class VectorMemoryStore:
         # no-op on Windows. Cost, file set and fail-soft contract:
         # docs/guides/windows-install.md, "The memory store".
         #
-        # CALLER CONTRACT: an async caller must offload this. The Windows path shells
-        # out to icacls, so calling ``init()`` directly on an event loop freezes it
-        # for seconds. All async callers now offload: ``eval.runner``,
-        # ``slack.gateway`` and ``cli_server._run_task`` via ``asyncio.to_thread``
+        # CALLER CONTRACT: an async caller must offload this. ``init()`` is
+        # blocking end to end — the sqlite connect, the schema migrations, and
+        # this lockdown pass (in-process on Windows since the advapi32
+        # conversion, but still filesystem work that can stall on a slow
+        # volume) — so calling it directly on an event loop stalls every task.
+        # All async callers now offload: ``eval.runner``, ``slack.gateway`` and
+        # ``cli_server._run_task`` via ``asyncio.to_thread``
         # (#5389); ``dashboard/handlers/memory.py``'s standalone fallback routes
         # through ``_get_vector_store_async``, which offloads the init-bearing
         # path (#5221).
@@ -3996,7 +4035,7 @@ class VectorMemoryStore:
         self, query: str, limit: int, tag_filter: list[str] | None = None
     ) -> list[dict]:
         """Simple LIKE-based text + tags search fallback for episodic memories."""
-        words = [w for w in query.strip().split()[:5] if len(w) > 2]
+        words = [w for w in query.strip().split()[:5] if _is_selective_keyword(w)]
         if not words:
             return []
         # H7/bounds: escape LIKE wildcards so user terms match literally;

@@ -119,6 +119,58 @@ describe('AboutPanel channel explainer', () => {
     expect(screen.queryByTestId('prerelease-report-note')).toBeNull()
   })
 
+  it('shows NO prompt for a PROMOTED stable release, whose bytes keep an insider stamp', async () => {
+    // Promotion re-points the soaked candidate's file at the stable channel
+    // without rebuilding it, so the stable release's own version is
+    // `0.4.1-insider.1` and `stampedChannel` reports `insider` for every stable
+    // desktop install. Keyed on the stamp alone, this note therefore greeted the
+    // ENTIRE stable population with "thanks for trying an early build".
+    //
+    // The exemption is the feed's answer, not the stamp: the followed lane is
+    // stable and it publishes exactly these bytes (runningAheadOfLane === false).
+    mountWithUpdateApi(
+      {
+        ...SWITCHABLE,
+        version: '0.4.1-insider.1',
+        channel: 'stable',
+        stampedChannel: 'insider',
+        channelPreference: '',
+        laneVersion: '0.4.1-insider.1',
+        runningAheadOfLane: false,
+      },
+      ok(),
+    )
+    await screen.findByTestId('channel-switcher')
+    expect(screen.queryByTestId('prerelease-report-note')).toBeNull()
+    // The version chip folds to the clean release it actually is.
+    expect(screen.getByTestId('about-version').textContent).toContain('0.4.1')
+  })
+
+  it('KEEPS the prompt, and the raw stamp, for insider bytes the stable lane never shipped', async () => {
+    // The switcher was flipped to stable while running 0.5.0-insider.2; stable
+    // publishes 0.4.1-insider.1, so these bytes are ahead of that lane and are
+    // NOT a stable release. Folding the chip to "v0.5.0" here claimed a release
+    // that does not exist, which is the bug this pair of signals fixes.
+    mountWithUpdateApi(
+      {
+        ...SWITCHABLE,
+        version: '0.5.0-insider.2',
+        channel: 'stable',
+        stampedChannel: 'insider',
+        channelPreference: 'stable',
+        laneVersion: '0.4.1-insider.1',
+        runningAheadOfLane: true,
+        downloadUrl: 'https://download.crew.kiro.dev/desktop/stable/latest',
+      },
+      ok(),
+    )
+    await screen.findByTestId('prerelease-report-note')
+    expect(screen.getByTestId('about-version').textContent).toContain('0.5.0-insider.2')
+    // ...and the panel names what stable publishes, so the move is actionable
+    // rather than a silent "up to date".
+    expect(screen.getByTestId('desktop-channel-move-pending').textContent).toContain('0.4.1')
+  })
+
   it('shows the report prompt on nightly, which has no switcher', async () => {
     mountWithUpdateApi({
       version: '0.1.0-nightly.20260722233638',

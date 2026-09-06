@@ -7,11 +7,13 @@
  * State management: polling via useQuery refetchInterval.
  * Poll faster during streaming (1s), slower when idle (5s).
  */
-import { useState, useRef, useCallback, useEffect, type ReactNode } from 'react'
-import { useImeGuard } from '../hooks/useImeGuard'
+import { useRef, useCallback, useEffect, useMemo, type ReactNode } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import { ArrowUp, Loader2 } from 'lucide-react'
 import ChatMessageList from './ChatMessageList'
+import FollowUpBar from '../components/FollowUpBar'
+import { deriveFollowUpOptions } from './protocol'
+import { useComposerDraft } from './useComposerDraft'
 import { useAppApi } from './index'
 import type { ChatMessage } from '../types'
 
@@ -66,8 +68,6 @@ interface ChatSlotData {
 
 function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSend, aboveComposer }: ChatEmbedProps) {
   const api = useAppApi()
-  const ime = useImeGuard()
-  const [input, setInput] = useState('')
   const endRef = useRef<HTMLDivElement>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const lastHashRef = useRef('')
@@ -87,6 +87,44 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
   const messages = slotData?.messages ?? []
   const running = slotData?.running ?? false
   const title = slotData?.title ?? ''
+
+  /** Derived from the same helper the main chat and side panel use, so "options only
+   *  after the answer settles" and "a later user message clears them" behave identically
+   *  here too — an agent's follow-up choices should never be silently dropped just
+   *  because the surface embedding them is thinner.
+   *
+   *  `followUpIsPlan` is DELIBERATELY dropped here (#6057): this embed is not a
+   *  plan-capable host, so a plan-shaped chip stays on the composer-draft path
+   *  instead of dispatching POST /api/chat/slots/{slot}/plan-action. Why that is
+   *  a recorded exclusion rather than a live mis-dispatch:
+   *  - The slot-detail payload this embed polls carries no `mode` field, so the
+   *    embed structurally lacks the orchestrator-mode gate the dispatch path
+   *    requires (ChatPane/ChatPage read the slot record's mode before
+   *    dispatching; there is no equivalent source here).
+   *  - Exposure is narrow: `api_chat_slot_detail` runs
+   *    `_deny_cross_app_slot_access`, so an app-token embed 404s on any foreign
+   *    or unscoped slot. That proves "not another surface's slot", not "never a
+   *    plan-bearing slot" — an app could create and embed its own
+   *    orchestrator-mode slot, which is exactly why the missing mode field
+   *    above, not the ownership guard, carries the exclusion.
+   *  - On hosts that DO dispatch, the `isPlanAction` allowlist keeps
+   *    non-protocol plan-shaped labels on the composer path; this file never
+   *    consults it because it never dispatches.
+   *  SideChat makes the same exclusion, silently — it also destructures only
+   *  `followUpOptions`, with no record there. If dashboard-token embeds ever
+   *  need working plan chips, the parity option is wiring `usePlanActionMutation`
+   *  plus a mode source into this file — a product decision, not an oversight.
+   *  Pinned by the plan-exclusion test in src/test/ChatEmbed.test.tsx. */
+  const { followUpOptions } = useMemo(
+    () => deriveFollowUpOptions(messages, running),
+    [messages, running]
+  )
+
+  /** The composer's draft behaviour, owned by the chat SDK rather than by this file —
+   *  see useComposerDraft's own docs. Picking a follow-up option edits the draft
+   *  (matching every other surface) instead of sending immediately. */
+  const { draft, setDraft, picked, toggleOption, composition, submitOnEnter } =
+    useComposerDraft({ followUpOptions })
 
   // Track whether the user is parked at the bottom (startAtBottom mode only).
   useEffect(() => {
@@ -128,12 +166,20 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
     onSettled: () => { void refetch() },
   })
 
-  const send = useCallback(() => {
-    const msg = input.trim()
-    if (!msg) return
-    setInput('')
+  /** `override` carries the text a follow-up chip's send arrow supplies (double-click
+   *  or the send segment); without it the draft is the source of truth. Every call
+   *  site wraps this in an arrow, so a click event can never arrive here as the
+   *  override — mirrors SideChat's send(). Guarded on `sendMutation.isPending` so a
+   *  chip's send arrow (unlike the composer's own Send button) can't fire a second
+   *  turn before the first settles. Only a composer submit owns the composer's
+   *  text — an override send carries its own text, so clearing the draft here would
+   *  throw away a draft the user has not sent yet. */
+  const send = useCallback((override?: string) => {
+    const msg = (override ?? draft).trim()
+    if (!msg || sendMutation.isPending) return
+    if (override == null) setDraft('')
     sendMutation.mutate(msg)
-  }, [input, sendMutation])
+  }, [draft, setDraft, sendMutation])
 
   // Resolve a pending tool approval from inside the embed.
   //
@@ -170,6 +216,32 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
     [approveMutation],
   )
 
+  // Batch resolver (Req 4.1-4.4): apply one decision to every pending approval
+  // in a group. Each id goes through the SAME slot-scoped approve endpoint the
+  // single path uses (POST /api/chat/slots/{slot}/approve with request_id) —
+  // Task 4 mandates the slot-scoped path for batches, never the bare id-scoped
+  // one-shot resolve (which matches slot futures by bare id with no session
+  // check). Uses allSettled, NOT a fail-fast loop: a call whose verdict changed
+  // between surfacing and resume (Req 4.3-4.4) is surfaced as an excluded
+  // rejection instead of aborting the batch with earlier ids already approved.
+  // Rejects (so the row rolls back) only if EVERY call failed; a partial
+  // success settles as resolved and refetch reconciles the still-pending rows.
+  const approveBatch = useCallback(
+    async (approvalIds: string[], decision: string) => {
+      const results = await Promise.allSettled(
+        approvalIds.map(id => api.post(`/api/chat/slots/${encodeURIComponent(slotKey)}/approve`, {
+          action: decision,
+          request_id: id,
+        })),
+      )
+      void refetch()
+      const rejected = results.filter(r => r.status === 'rejected')
+      if (rejected.length === approvalIds.length) throw (rejected[0] as PromiseRejectedResult).reason
+      return results
+    },
+    [slotKey, refetch],
+  )
+
   return (
     <div className={`flex flex-col h-full min-h-0 overflow-hidden ${frameless ? '' : 'border border-border rounded-lg bg-bg'}`}>
       {!frameless && (
@@ -188,32 +260,39 @@ function ChatEmbed({ slotKey, agent, placeholder, frameless, startAtBottom, onSe
         {/* canTrust: this embed's approve routes through the slot approve
             endpoint (above), which records standing trust — the one mount
             allowed to offer the tier (#5434). */}
-        <ChatMessageList messages={messages} running={running} onApprove={approve} canTrust />
+        <ChatMessageList messages={messages} running={running} onApprove={approve} onApproveBatch={approveBatch} canTrust />
         <div ref={endRef} />
       </div>
 
       {aboveComposer && <div className="shrink-0">{aboveComposer}</div>}
 
-      <div className={`flex items-center gap-2 px-3 py-2 shrink-0 ${frameless ? '' : 'border-t border-border bg-bg-subtle'}`}>
+      {followUpOptions.length > 0 && (
+        <div className={`shrink-0 px-3 ${frameless ? '' : 'bg-bg-accent'}`}>
+          <FollowUpBar
+            options={followUpOptions}
+            picked={picked}
+            onSelect={toggleOption}
+            onSend={text => send(text)}
+          />
+        </div>
+      )}
+
+      <div className={`flex items-center gap-2 px-3 py-2 shrink-0 ${frameless ? '' : 'border-t border-border bg-bg-accent'}`}>
         <input
           type="text"
+          {...composition}
           aria-label={i18nT('appSdk.chatEmbed.chat_message')}
           className="flex-1 min-w-0 px-3 py-2 text-sm bg-bg-elevated border border-border rounded-md text-text outline-none focus-visible:border-accent transition-colors"
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          {...ime.bindComposition()}
-          onKeyDown={e => {
-            if (e.key !== 'Enter' || e.shiftKey) return
-            // The emptiness test stays outside the guard.
-            if (input.trim() && ime.claimEnter(e)) send()
-          }}
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => submitOnEnter(e, () => send())}
           placeholder={running ? i18nT('appSdk.chatEmbed.agent_is_working') : (placeholder || i18nT('appSdk.chatEmbed.message'))}
           disabled={sendMutation.isPending}
         />
         <button
           className="p-2 rounded-md bg-accent text-accent-fg disabled:opacity-40 disabled:cursor-not-allowed hover:opacity-80 transition-opacity"
-          onClick={send}
-          disabled={sendMutation.isPending || !input.trim()}
+          onClick={() => send()}
+          disabled={sendMutation.isPending || !draft.trim()}
           title={i18nT('appSdk.chatEmbed.send')}
           aria-label={i18nT('appSdk.chatEmbed.send_message')}
         >

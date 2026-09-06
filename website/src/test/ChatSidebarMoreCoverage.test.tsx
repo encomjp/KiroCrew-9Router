@@ -326,6 +326,7 @@ const BAND_TOP_EDGE = { x: 20, y: 2 }
 
 beforeEach(() => {
   localStorage.clear()
+  localStorage.setItem('mc-session-stale-collapse-ms', '0')
   localStorage.setItem(HIDDEN_FOLDERS_LS_KEY, JSON.stringify([HIDDEN_FOLDER_ID]))
   cfg.value = { tagColumnsEnabled: false, confirmCloseSession: false, defaultAutopilot: false }
   mocks.chatFolders.mockResolvedValue(FOLDERS)
@@ -438,7 +439,7 @@ describe('ChatSidebar — sidebarCollision routing', () => {
     expect(ids).toEqual(['f2', 'f4'])
   })
 
-  it('a SESSION drag resolves to whatever droppable the pointer is inside', () => {
+  it('a SESSION drag resolves to whatever droppable the pointer is inside (single-candidate case; containment re-ranking across NESTED candidates is pinned in dndCollisionDepth.test.tsx, whose fakes carry real nodes)', () => {
     renderSidebar()
     const ids = collide({
       active: { type: 'session', key: SLOT_LOOSE },

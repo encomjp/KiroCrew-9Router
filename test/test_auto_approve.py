@@ -114,6 +114,12 @@ class TestAutoApproveDefault:
 # ══════════════════════════════════════════════════════════════════════
 
 
+def _discard_scheduled_coroutine(coro):
+    """Model create_task ownership without running execute_plan's worker."""
+    coro.close()
+    return MagicMock()
+
+
 class TestSettersSetAutoApprove:
     @pytest.mark.asyncio
     async def test_execute_plan_sets_auto_approve(self, tmp_path: Path) -> None:
@@ -122,7 +128,10 @@ class TestSettersSetAutoApprove:
         run.tasks = [Step(index=1, title="A", description="d")]
         runner._runs = {"t1": run}
         # Prevent the background _execute task from actually running.
-        with patch("kiro_crew.taskrunner.asyncio.create_task", return_value=MagicMock()):
+        with patch(
+            "kiro_crew.taskrunner.asyncio.create_task",
+            side_effect=_discard_scheduled_coroutine,
+        ):
             await runner.execute_plan("t1", auto_approve=True)
         assert run.auto_approve is True
         assert safety_override().is_scope_active(_auto_approve_scope("t1")) is True
@@ -133,7 +142,10 @@ class TestSettersSetAutoApprove:
         run = TaskRun(spec_path="s.md", spec_content="s", status="planned", task_id="t1")
         run.tasks = [Step(index=1, title="A", description="d")]
         runner._runs = {"t1": run}
-        with patch("kiro_crew.taskrunner.asyncio.create_task", return_value=MagicMock()):
+        with patch(
+            "kiro_crew.taskrunner.asyncio.create_task",
+            side_effect=_discard_scheduled_coroutine,
+        ):
             await runner.execute_plan("t1")
         assert run.auto_approve is False
         assert safety_override().is_scope_active(_auto_approve_scope("t1")) is False

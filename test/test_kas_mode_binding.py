@@ -20,7 +20,6 @@ import pytest
 
 from kiro_crew.acp import session_handle as sh
 from kiro_crew.acp.kas_agents import _KAS_FALLBACK_PROMPT
-from kiro_crew.acp.kas_assets import ENV_KAS_NODE, ENV_KAS_SCRIPT
 from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.types import ACP_BACKEND_KAS
 
@@ -98,11 +97,19 @@ def mode_stub(tmp_path, monkeypatch):
     script = tmp_path / "kas_mode_stub.py"
     script.write_text(_MODE_STUB)
     record = tmp_path / "stub-record.json"
-    launcher = tmp_path / "node-stub"
+    # Stands in for the kiro-cli binary the KAS relay argv is built around; the
+    # launcher ignores `acp --agent-engine v3 --auth-method cli` and runs the
+    # stub. Argv fidelity is asserted in test_kas_spawn.py, not here.
+    launcher = tmp_path / "kiro-cli-stub"
     launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}"\n')
     launcher.chmod(0o755)
-    monkeypatch.setenv(ENV_KAS_NODE, str(launcher))
-    monkeypatch.setenv(ENV_KAS_SCRIPT, str(script))
+
+    async def fake_bin() -> str:
+        return str(launcher)
+
+    monkeypatch.setattr(
+        "kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin
+    )
     monkeypatch.setenv("KAS_STUB_RECORD", str(record))
     return record
 

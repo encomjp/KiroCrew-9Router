@@ -9,7 +9,7 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Split View setting", "route": "/settings?tab=chat&highlight=chat.split-view-session-grid" }
+      "action": { "kind": "route", "label": "Open Split View setting", "route": "/settings/chat?highlight=chat.split-view-session-grid" }
     },
     {
       "id": "command-palette",
@@ -19,7 +19,7 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Shortcuts settings", "route": "/settings?tab=shortcuts" }
+      "action": { "kind": "route", "label": "Open Shortcuts settings", "route": "/settings/shortcuts" }
     },
     {
       "id": "steer-or-queue",
@@ -38,7 +38,7 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Interface setting", "route": "/settings?tab=display&highlight=display.interface" }
+      "action": { "kind": "route", "label": "Open Interface setting", "route": "/settings/display?highlight=display.interface" }
     },
     {
       "id": "warm-pool",
@@ -48,7 +48,7 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Warm Pool config", "route": "/settings?tab=overview" }
+      "action": { "kind": "route", "label": "Open Warm Pool config", "route": "/settings/overview" }
     },
     {
       "id": "mcp-gateway",
@@ -69,7 +69,7 @@
       "doc": "",
       "doc_link": "dynamic-subagent-sizing.md",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Subagent config", "route": "/settings?tab=overview" }
+      "action": { "kind": "route", "label": "Open Subagent config", "route": "/settings/overview" }
     },
     {
       "id": "local-telemetry",
@@ -129,7 +129,7 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Terminal settings", "route": "/settings?tab=display&highlight=key:dashboard.terminal.shell" }
+      "action": { "kind": "route", "label": "Open Terminal settings", "route": "/settings/display?highlight=key:dashboard.terminal.shell" }
     },
     {
       "id": "artifacts-library",
@@ -149,7 +149,7 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Language setting", "route": "/settings?tab=display&highlight=display.language" }
+      "action": { "kind": "route", "label": "Open Language setting", "route": "/settings/display?highlight=display.language" }
     },
     {
       "id": "auto-skills",
@@ -160,7 +160,7 @@
       "doc": "",
       "doc_link": "skills.md",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Skills settings", "route": "/settings?tab=skills&highlight=key:skills.auto_create_from_sessions" }
+      "action": { "kind": "route", "label": "Open Skills settings", "route": "/settings/skills?highlight=key:skills.auto_create_from_sessions" }
     },
     {
       "id": "role-models",
@@ -170,7 +170,7 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Background Model setting", "route": "/settings?tab=chat&highlight=chat.background-model" }
+      "action": { "kind": "route", "label": "Open Background Model setting", "route": "/settings/chat?highlight=chat.background-model" }
     },
     {
       "id": "agent-browsing",
@@ -180,7 +180,7 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Browser settings", "route": "/settings?tab=browser" }
+      "action": { "kind": "route", "label": "Open Browser settings", "route": "/settings/browser" }
     },
     {
       "id": "computer-use",
@@ -190,7 +190,7 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Computer Use settings", "route": "/settings?tab=computer-use&highlight=computer-use.enable-computer-use" }
+      "action": { "kind": "route", "label": "Open Computer Use settings", "route": "/settings/computer-use?highlight=computer-use.enable-computer-use" }
     },
     {
       "id": "issue-radar",
@@ -210,7 +210,17 @@
       "why": "",
       "doc": "",
       "cta_prompt": "",
-      "action": { "kind": "route", "label": "Open Remote Crew settings", "route": "/settings?tab=instances" }
+      "action": { "kind": "route", "label": "Open Remote Crew settings", "route": "/settings/instances" }
+    },
+    {
+      "id": "secrets-vault",
+      "feature": "Secrets Vault",
+      "title": "Store credentials in the encrypted vault",
+      "body": "Keep API keys and tokens out of your config and chat: save them in the encrypted vault under **Settings › Secrets**, then reference one as `secret://KEY` wherever an MCP server takes an env value — it is resolved at launch and never written to disk in the clear.",
+      "why": "",
+      "doc": "",
+      "cta_prompt": "",
+      "action": { "kind": "route", "label": "Open Secrets settings", "route": "/settings/secrets" }
     }
   ]
 }

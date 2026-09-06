@@ -96,10 +96,10 @@ downstream editions: overriding one variable rebrands every catalog string,
 instead of forking 13 locale files through every upstream sync (see
 [extension-seams](extension-seams.md)).
 
-> Transitional note: the mechanical conversion of pre-existing catalog values
-> is landing in follow-up PRs (the full-catalog diff exceeds the reviewable
-> size limit). The rules below bind new copy immediately; the catalog-wide
-> no-literal invariant test ships with the final conversion chunk.
+> The pre-existing catalog values were converted in batches (the full-catalog
+> diff exceeds the reviewable size limit). The conversion is complete; a
+> catalog-wide test in `productName.test.ts` pins that no value outside the
+> exceptions below carries the literal.
 
 Authoring rules that follow:
 
@@ -109,10 +109,17 @@ Authoring rules that follow:
 - **The `apps.<id>.manifest.*` keys are the deliberate exception.** They must
   stay byte-identical to the Python-side `app.json` prose (`[manifest-sync]`
   is a hard zero), so they keep the literal English name.
-- **Repo-attribution copy keeps the literal too.** A string naming this
-  project as the star/fork/issue target (`app.star_kirocrew_on_github`) wraps
-  a hardcoded upstream URL, so interpolating the product name would make an
-  edition render its own name linking to the upstream repository.
+- **Attribution and data-egress copy keeps the literal too.** A string whose
+  referent does not change with an edition must not interpolate the name:
+  `app.star_kirocrew_on_github` wraps a hardcoded upstream repo URL, and the
+  survey (`components.sessionPulseSurveyCard.email_disclosure`) and install
+  receipts (`privacyDisclosure.installReceipt*`) name the recipient of data
+  sent to hardcoded upstream endpoints. Interpolating those would make an
+  edition misattribute a link target or where user data goes.
+- **Wire-format identifiers keep their unspaced literal.** The generated
+  Slack app name (`KiroCrew-{{alias}}`) and the webhook signature headers
+  (`X-KiroCrew-Timestamp` / `X-KiroCrew-Signature`) are fixed by the backend,
+  so the UI must spell them exactly whatever the edition renders elsewhere.
 - **A call-time variable of the same name wins** over the default, per
   i18next's merge order — useful when a string names a *different* crew.
 - German compounds hyphenate through the placeholder
@@ -154,6 +161,21 @@ to verify none crept back in. Which keys are plural comes from that registry,
 never from sniffing a `_one` / `_other` suffix, because real copy ends in those
 words (`panel_to_add_one` is "panel to add one.").
 
+A **fully hardcoded** literal commits the same defect with no `i18nT` in it,
+in any of four spellings:
+
+```tsx
+// WRONG for the same reason — the plural form is chosen in JS, in English
+aria-label={`Retry ${n} failed subagent${n > 1 ? 's' : ''}`}   // template glue
+<span>{n} agent{n > 1 ? 's' : ''}</span>                        // JSX-text glue
+const label = 'agent' + (n > 1 ? 's' : '')                      // concatenation
+const word = n === 1 ? 'category' : 'categories'                // whole words
+```
+
+`--check` counts all of these too (`[plurals-hardcoded]`), against a ceiling that
+fails only when the class grows: the frozen sites each need a new catalog key, so
+they are converted by hand and the ceiling ratchets down with them.
+
 ## One key, one meaning
 
 **Never reuse a key across two grammatical roles.** English collapses distinctions
@@ -165,6 +187,35 @@ other languages keep, so a shared key forces a translator to guess:
   "please enter". It is two keys now, the verb one named `type_verb_to_confirm`.
 
 If a value's part of speech is not obvious from the key, **put it in the key**.
+
+## Destructive-confirm operands must be quoted
+
+A confirm string that interpolates a user-supplied name without quotes lets an
+ordinary-word name blend into the sentence: a pet named "Everything" produced
+"Reset Everything?", indistinguishable from a sentence about resetting
+everything (#4653, #4657, #4676, #4821).
+
+**Quote the operand in every authored catalog**, using that locale's pair from
+`OPERAND_QUOTE_PAIRS` in `scripts/lib/qa-checks.mjs` (curly doubles in English,
+guillemets with U+202F in French, `„“` in German, `「」` in Japanese, and so on).
+ASCII `"{{name}}"` is not enough.
+
+`src/i18n/destructiveConfirm.test.ts` is the convention detector, not an
+allowlist you can forget to extend:
+
+- every key whose **name** matches `/confirm/i` and whose English value
+  interpolates a placeholder must be on `QUOTED_OPERAND_CONFIRM_KEYS`, **or**
+- listed in `CONFIRM_OPERAND_KEY_EXEMPTIONS` with a reason (today: the #4657
+  kind-word forms, where "template" / "crew" already sit next to the name), **or**
+- interpolate **only** placeholder names in `EXEMPT_CONFIRM_PLACEHOLDER_NAMES`
+  (numerals, closed-set schedule fragments, version ids, and system error
+  text — they cannot parse as prose). The set lives next to the pin; do not
+  restate it here.
+
+A new confirm key with `{{name}}` and no kind word fails CI until it is quoted
+in all 12 catalogs and added to the pin. The glyph pin then requires **every**
+non-exempt placeholder in a pinned key to be wrapped, not merely one of them.
+After changing English, regenerate `en-XA.json` with `npm run i18n:pseudo`.
 
 **A literal token the user must type must never be a catalog value.** Keep it a
 code constant (`BULK_DELETE_TOKEN`), or translating it makes the action impossible

@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useLocation, useSearchParams } from 'react-router-dom'
 import { SETTINGS_REGISTRY } from '../components/commandPalette/settingsRegistry.gen'
 import { i18nT } from '../i18n/t'
 
@@ -78,6 +78,7 @@ export const SETTINGS_DEFAULT_MODEL_ID = 'chat.default-model'
  */
 export function useSettingHighlight(): void {
   const [params, setParams] = useSearchParams()
+  const location = useLocation()
   const rawHighlightId = params.get('highlight')
 
   // Resolve key: prefix to a registry id via configKey lookup
@@ -179,5 +180,12 @@ export function useSettingHighlight(): void {
     }, 100)
 
     return () => clearTimeout(timer)
-  }, [highlightId, directConfigKey, setParams])
+    // location.key: every navigation re-arms the probe. Without it, the
+    // legacy-URL translation (SettingsPage replace-navigates ?tab=X onto the
+    // path form, mounting the target panel one commit LATER) would race this
+    // effect's 100ms timer, which strips the param even when no element was
+    // found — the re-run today only happens because react-router's
+    // setParams identity churns with the search string, an implementation
+    // detail nothing pins.
+  }, [highlightId, directConfigKey, setParams, location.key])
 }

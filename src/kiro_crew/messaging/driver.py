@@ -22,7 +22,7 @@ import logging
 import re
 from typing import Any, Awaitable, Callable
 
-from kiro_crew import session_directive
+from kiro_crew import name_grant, session_directive
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
@@ -316,6 +316,8 @@ class TurnDriver:
         deny_all_tools: bool = False,
         tool_gate: Callable[[Any], str] | None = None,
         directive_consumer: DirectiveConsumer | None = None,
+        audit_session_key: str = "",
+        audit_agent: str = "kirocrew",
     ) -> None:
         self.provider = provider
         self.renderer = renderer
@@ -324,6 +326,12 @@ class TurnDriver:
         self.auto_approve_tool = auto_approve_tool
         self.auto_approve_session = auto_approve_session
         self.deny_all_tools = deny_all_tools
+        # Audit identity ONLY — injected by the caller (which owns the session
+        # key and agent name) so the driver's security-decision audit rows are
+        # attributable without the driver importing any channel module. Never
+        # used for routing or authorization.
+        self.audit_session_key = audit_session_key
+        self.audit_agent = audit_agent
         # PreToolUse security gate: given a permission-request event, returns
         # "deny" (hard-block, un-overridable), "auto_approve" (hook approves,
         # e.g. reads), or "" (passthrough to the approval ladder). Injected by
@@ -336,6 +344,9 @@ class TurnDriver:
         # EVENT_TOOL_RESULT for a tool call whose trusted ``_meta.kiro``
         # identity was recorded at EVENT_TOOL_CALL — the forgery gate.
         self.directive_consumer = directive_consumer
+        # Terminal stop reason of the last run() — read by the dispatcher's
+        # post-turn bookkeeping (e.g. COMPACTION_FAILED -> session reset).
+        self.last_stop_reason: str = ""
 
     async def run(self, message: str) -> str:
         """Drive one turn; return the accumulated channel-safe assistant text."""
@@ -517,18 +528,63 @@ class TurnDriver:
                         )
                         continue
                     if _gate == "auto_approve":
-                        await self.provider.approve_tool(event.request_id)
-                        sel().log_api_access(
-                            caller="turn_driver",
-                            operation="tool_permission",
-                            outcome="auto_approved",
-                            source="messaging",
-                            resources=(
-                                f"request_id={event.request_id} "
-                                f"mode={self.approval_mode} reason=hook"
-                            ),
+                        # The gate's hook granted this by NAME (the
+                        # `auto_approve_tools` globs, or the read-only
+                        # allowlist). Honour it only while each program name in
+                        # the command still resolves to the program it appears
+                        # to name; a shadowed, agent-tree or unidentified
+                        # resolution DOWNGRADES to the ladder below (spawn
+                        # hook, session trust, interactive buttons,
+                        # deny-by-default) — never a hard block. The check is
+                        # awaited HERE, at the one honour point shared by every
+                        # channel's gate, because each channel's `_tool_gate`
+                        # is synchronous and loop-bound and must not do the
+                        # check's filesystem work.
+                        _ng_refusal = await name_grant.refusal_for_event(event)
+                        if _ng_refusal is None:
+                            await self.provider.approve_tool(event.request_id)
+                            sel().log_api_access(
+                                caller="turn_driver",
+                                operation="tool_permission",
+                                outcome="auto_approved",
+                                source="messaging",
+                                resources=(
+                                    f"request_id={event.request_id} "
+                                    f"mode={self.approval_mode} reason=hook"
+                                ),
+                            )
+                            continue
+                        logger.warning(
+                            "declining a hook auto-approve: %s; the request "
+                            "falls through to the channel's normal approval "
+                            "ladder",
+                            _ng_refusal.log_text,
                         )
-                        continue
+                        # The decline row uses the shared cross-surface writer
+                        # (log_tool_invocation) rather than this ladder's
+                        # log_api_access rows, so every surface's decline has
+                        # ONE shape and the disclosure rule (constant log_text
+                        # + code, redacted title, never the detail) lives in
+                        # one place.
+                        name_grant.log_decline(
+                            # Empty source: SEL infers the real transport
+                            # (discord/telegram/...) from the session key's
+                            # namespace prefix. The driver is channel-neutral,
+                            # so naming a surface here would misattribute all
+                            # four transports to one made-up value.
+                            source="",
+                            # The caller-injected audit identity: the driver
+                            # itself is channel-neutral, but the one security
+                            # decision it makes must be attributable to a
+                            # session and agent.
+                            session_key=self.audit_session_key,
+                            agent=self.audit_agent,
+                            event=event,
+                            refusal=_ng_refusal,
+                            tier="hook_auto_approve",
+                            metadata={"mode": self.approval_mode},
+                            sel_factory=sel,
+                        )
                 # Early auto-approve paths take precedence over the interactive
                 # ladder, mirroring native handle_message: approve immediately,
                 # no buttons, no decider wait.
@@ -599,6 +655,11 @@ class TurnDriver:
                     OutputEvent(kind=COMPACTION, context_usage_pct=event.context_usage_pct)
                 )
             elif kind == EVENT_COMPLETE:
+                # Exposed for the dispatcher's post-turn bookkeeping: a
+                # COMPACTION_FAILED terminal is synthetic (the backend never
+                # sent end_turn) and needs a session reset the driver cannot
+                # perform itself (it holds no session key).
+                self.last_stop_reason = event.stop_reason or ""
                 pending = compaction_filter.flush()
                 if pending:
                     await dispatch_frames(steering_filter.feed(pending))

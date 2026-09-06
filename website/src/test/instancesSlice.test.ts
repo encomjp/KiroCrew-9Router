@@ -6,9 +6,15 @@ import reducer, {
   setPaneReady,
   setUnread,
   clearInstances,
+  setCrewAddForm,
+  setCrewEditForm,
 } from '../store/instancesSlice'
+import { EMPTY_INSTANCE_FORM as FORM } from '../pages/settings/InstanceFormFields'
 
-const initial = { warm: {}, activeId: null, mru: [], unread: {}, ready: {}, host: null }
+const initial = {
+  warm: {}, activeId: null, mru: [], unread: {}, ready: {}, host: null,
+  crewForms: { add: null, edit: null },
+}
 
 describe('instancesSlice', () => {
   it('setWarm stores the conn and fronts it in mru', () => {
@@ -55,8 +61,27 @@ describe('instancesSlice', () => {
     expect(s).toEqual(initial)
   })
 
-  it('setPaneReady marks the pane; setWarm with a NEW src clears it (a reload is coming)', () => {
-    let s = reducer(initial, setWarm({ id: 'a', conn: { port: 7778, token: 't1' } }))
+  it('holds and drops the crew forms, and tolerates a slice preloaded without them', () => {
+    // The container is created on demand because tests (and older persisted
+    // shapes) preload partial slices — a reducer that assumed it would throw on
+    // the first keystroke.
+    const partial = { warm: {}, activeId: null, mru: [], unread: {}, ready: {} } as never
+    const values = { ...FORM, name: 'Cirrus' }
+    let s = reducer(partial, setCrewAddForm(values))
+    expect(s.crewForms.add).toEqual(values)
+
+    const draft = { values, baseline: { id: 'c1', name: 'Nimbus' } as never }
+    s = reducer(s, setCrewEditForm({ id: 'c1', draft, seq: 0 }))
+    expect(s.crewForms.edit).toEqual({ id: 'c1', draft, seq: 0 })
+    // The two are independent: dropping one leaves the other standing.
+    s = reducer(s, setCrewAddForm(null))
+    expect(s.crewForms.add).toBeNull()
+    expect(s.crewForms.edit).not.toBeNull()
+    s = reducer(s, setCrewEditForm(null))
+    expect(s.crewForms.edit).toBeNull()
+  })
+
+  it('setPaneReady marks the pane; setWarm with a NEW src clears it (a reload is coming)', () => {    let s = reducer(initial, setWarm({ id: 'a', conn: { port: 7778, token: 't1' } }))
     s = reducer(s, setPaneReady('a'))
     expect(s.ready.a).toBe(true)
     // Token refresh -> new src -> the old readiness no longer applies.

@@ -53,6 +53,7 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/upload", handlers.api_upload)
     app.router.add_post("/api/upload/file", handlers.api_upload_file)
     app.router.add_post("/api/slack/upload-file", handlers.api_slack_upload_file)
+    app.router.add_post("/api/channel/upload-file", handlers.api_channel_upload_file)
     app.router.add_post("/api/slack/pins", handlers.api_slack_pins)
     app.router.add_post("/api/slack/reactions", handlers.api_slack_reactions)
     app.router.add_post("/api/chat/slots/{name}/slack-link", chat.api_chat_slot_slack_link)

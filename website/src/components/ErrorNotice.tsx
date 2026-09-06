@@ -74,7 +74,12 @@ export default function ErrorNotice({
         <AlertTriangle size={14} className="shrink-0" aria-hidden="true" />
         {title && <strong className="font-semibold">{title}</strong>}
         <span className="min-w-0" style={{ overflowWrap: 'anywhere' }}>{message}</span>
-        {askAgent && <AskAgentButton report={report} message={message} />}
+        {askAgent && (
+          <AskAgentButton
+            report={report}
+            message={message}
+          />
+        )}
         {onDismiss && (
           <button
             type="button"
@@ -99,7 +104,13 @@ export default function ErrorNotice({
         {title && <strong className="font-semibold">{title} </strong>}
         {message}
       </div>
-      {askAgent && <AskAgentButton report={report} message={message} className="mt-[1px]" />}
+      {askAgent && (
+        <AskAgentButton
+          report={report}
+          message={message}
+          className="mt-[1px]"
+        />
+      )}
       {onDismiss && (
         <button
           type="button"

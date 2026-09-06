@@ -23,7 +23,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from kiro_crew._sqlite_compat import FTS5_UNAVAILABLE_HINT, fts5_available, sqlite3
+from kiro_crew._sqlite_compat import (
+    FTS5_UNAVAILABLE_HINT,
+    fts5_available,
+    fts5_quote_tokens,
+    sqlite3,
+)
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 from kiro_crew.hooks import (
@@ -98,20 +103,6 @@ def _is_corruption_error(exc: BaseException) -> bool:
 _FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 
-def _sanitize_fts_query(raw: str) -> str:
-    """Escape user input for safe FTS5 MATCH usage (H7/bounds).
-
-    Each token is individually double-quoted so it is treated as a literal
-    FTS5 string — the user's input never contributes FTS5 operators
-    (parameterized quoting). Unquoted operators (*, OR, \", column:) would
-    otherwise be syntax errors or change match semantics (injection).
-    Mirrors ``knowledge.retrieval._sanitize_fts5_query`` and
-    ``personal_shopper.store._fts_query``.
-    """
-    tokens = _FTS_TOKEN_RE.findall(raw)
-    return " OR ".join(f'"{t}"' for t in tokens)
-
-
 def workspace_dir() -> Path:
     return config_dir() / WORKSPACE_DIR_NAME
 
@@ -151,6 +142,21 @@ def legacy_memory_present() -> bool:
 
 
 # ── MemoryStore ──
+
+
+def _fts5_literal_query(query: str) -> str:
+    """Turn user words into an FTS5 expression that matches them literally.
+
+    Tokens are quoted by the shared :func:`fts5_quote_tokens` primitive and
+    joined with FTS5's implicit AND: every word the user typed must appear. That
+    differs deliberately from knowledge retrieval, which drops stopwords and ORs
+    for natural-language recall -- a hand-typed memory query is precise, so
+    widening it would bury the both-words hit under single-word noise.
+
+    Returns "" when the query holds no tokens, which the caller treats as no
+    match rather than handing FTS5 an empty expression to reject.
+    """
+    return " ".join(fts5_quote_tokens(query))
 
 
 class MemoryStore:
@@ -980,14 +986,37 @@ class MemoryStore:
                 conn.close()
         return len(files)
 
+    def index_row_count(self) -> int | None:
+        """Rows in the FTS index, or ``None`` when the index cannot be read.
+
+        Lets a caller tell three states apart that :meth:`search` collapses into
+        one empty list: the index is unreadable, the index is empty, or the query
+        genuinely has no match. Without this, a corrupt or not-yet-built index
+        reports as "you never wrote about this", which is the one answer a memory
+        search must never give wrongly.
+        """
+        conn = None
+        try:
+            conn = self._get_db()
+            row = conn.execute("SELECT count(*) FROM memory_fts").fetchone()
+            return int(row[0]) if row else 0
+        except Exception:
+            logger.debug("FTS index count failed", exc_info=True)
+            return None
+        finally:
+            if conn is not None:
+                conn.close()
+
     def search(self, query: str, limit: int = 5) -> list[dict]:
-        """Search memory using FTS5. Returns [{path, snippet, rank}]."""
-        # H7/bounds: sanitize FTS MATCH input — raw user query may contain
-        # FTS5 operators (OR, *, \", column filters) that change semantics or
-        # raise syntax errors; quoting tokens neutralizes injection.
-        sanitized = _sanitize_fts_query(query)
-        if not sanitized:
-            return []
+        """Search memory for the literal words in ``query``.
+
+        Returns ``[{path, snippet, rank}]``. The query is treated as literal
+        text, not FTS5 expression syntax, because callers pass words a user
+        typed: a ticket id, a filename, a hyphenated term. Unescaped, ``-``
+        ``.`` and a bare ``AND`` are FTS5 syntax, so ``PROJ-123`` raises inside
+        the driver and the ``except`` below turns it into ``[]`` -- a silent
+        "you never wrote about this" for one of the likeliest queries.
+        """
         conn = None
         try:
             # Inside the try, not around it: this method handles its own errors
@@ -995,11 +1024,14 @@ class MemoryStore:
             # every failure as a success. Here a raising query is tagged
             # outcome=error before the except below swallows it.
             with timed_query("memory", "search"):
+                match = _fts5_literal_query(query)
+                if not match:
+                    return []
                 conn = self._get_db()
                 cursor = conn.execute(
                     "SELECT path, snippet(memory_fts, 1, '>>>', '<<<', '...', 32), rank "
                     "FROM memory_fts WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
-                    (sanitized, limit),
+                    (match, limit),
                 )
                 results = [
                     {"path": row[0], "snippet": row[1], "rank": row[2]} for row in cursor.fetchall()

@@ -35,6 +35,7 @@ from typing import Any, Generator
 
 from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.paths import config_dir
+from kiro_crew.constants import AWS_PROFILE_NAME_RE
 from kiro_crew.deploy import engine
 from kiro_crew.platform_compat import file_lock
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
@@ -78,7 +79,13 @@ _NOTE_MAX = 256
 
 # Same shapes handlers.py enforces for the legacy single-profile config — these
 # values flow into subprocess argv (--profile/--region) on every aws call.
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# The profile shape ('+' admitted for IAM Identity Center derived names, #6051;
+# first char excludes '-' so a name is never option-shaped; \Z rejects trailing
+# newlines) is constants.AWS_PROFILE_NAME_RE — the single source of truth
+# (#6063) — aliased rather than re-spelled here. Also used by
+# discover_aws_profiles() to filter `aws configure list-profiles` lines
+# (stripped before matching, so the anchor is behavior-neutral there).
+_PROFILE_RE = AWS_PROFILE_NAME_RE
 PROFILE_SPEC = FieldSpec(name="profile", type=str, max_len=128, pattern=_PROFILE_RE)
 # Multi-segment to admit GovCloud (us-gov-west-1) alongside standard regions;
 # max_len=32 keeps the backtracking surface negligible.
@@ -153,6 +160,16 @@ def load_registry() -> dict[str, Any]:
     v2 shape (``profiles.json``): ``{"version": 2, "profiles": [...], "default": "x"}``.
     Migration is read-through: a v1 config becomes a one-entry registry; the
     legacy file is left in place (GET /config keeps serving the default entry).
+
+    Valid JSON of the WRONG SHAPE degrades exactly like unparseable JSON. This
+    file is agent-writable, so ``[]``, ``"x"`` or ``{"profiles": 5}`` are all
+    reachable contents, and each of them used to escape as an ``AttributeError``
+    or ``TypeError`` from ``raw.get`` / the comprehension -- past the caller and
+    out as an HTTP 500 on every route that reads the registry. Catching them
+    here routes a mis-shaped file into the fallback chain the function already
+    implements (try the legacy registry, then the v1 config, then an empty
+    registry) rather than inventing a second recovery, and it fixes every reader
+    at once instead of asking each call site to guard a shape it did not parse.
     """
     try:
         raw = json.loads(_registry_path().read_text(encoding="utf-8"))
@@ -167,7 +184,7 @@ def load_registry() -> dict[str, Any]:
         if default and not any(p["name"] == default for p in profiles):
             default = profiles[0]["name"] if profiles else ""
         return {"version": 2, "profiles": profiles, "default": default}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError, TypeError):
         pass
     # Legacy app-dir registry migration (apps/deploy-web/data/profiles.json)
     try:
@@ -183,7 +200,7 @@ def load_registry() -> dict[str, Any]:
         if default and not any(p["name"] == default for p in profiles):
             default = profiles[0]["name"] if profiles else ""
         return {"version": 2, "profiles": profiles, "default": default}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError, TypeError):
         pass
     # v1 single-profile migration path (apps/deploy-web/data/config.json)
     try:
@@ -192,7 +209,7 @@ def load_registry() -> dict[str, Any]:
         if name:
             return {"version": 2, "default": name,
                     "profiles": [make_entry(name, str(legacy.get("region", "")))]}
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError, TypeError):
         pass
     return {"version": 2, "profiles": [], "default": ""}
 

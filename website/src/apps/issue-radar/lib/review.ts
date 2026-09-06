@@ -23,13 +23,15 @@ export interface UseReviewPr {
     repoRef: RepoRef,
     pr: PullRequest,
     existing: InvestigationRecord | null,
+    force?: boolean,
   ) => Promise<InvestigationRecord | null>
   busy: boolean
   error: Error | null
+  concludedFor: string | null
 }
 
 export function useReviewPr(): UseReviewPr {
-  const { openSession, busy, error } = useAgentSession()
+  const { openSession, busy, error, concludedFor } = useAgentSession()
   // Live selection rather than the stored one -- see useInvestigate.
   const { aiLanguage } = useIssueRadar()
 
@@ -38,6 +40,7 @@ export function useReviewPr(): UseReviewPr {
       repoRef: RepoRef,
       pr: PullRequest,
       existing: InvestigationRecord | null,
+      force = false,
     ): Promise<InvestigationRecord | null> =>
       openSession({
         repoRef,
@@ -48,9 +51,10 @@ export function useReviewPr(): UseReviewPr {
           repoRef, repoRef.owner, repoRef.repo, pr, resolveAiLanguage(aiLanguage),
         ),
         existing,
+        force,
       }),
     [openSession, aiLanguage],
   )
 
-  return { reviewPr, busy, error }
+  return { reviewPr, busy, error, concludedFor }
 }

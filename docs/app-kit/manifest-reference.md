@@ -20,6 +20,11 @@ The app manifest (`app.json`) declares your app's identity, resources, and requi
 | `minKiroCrewVersion` | string | Minimum Gateway version required |
 | `tags` | string[] | Discovery tags (e.g. `["oncall", "monitoring"]`) |
 | `jobFamilies` | string[] | Job families this app is relevant to |
+| `highlights` | string[] | Concise feature bullets for the detail page |
+| `useCases` | string[] | Short, operator-oriented situations where the app is useful |
+| `configuration` | string[] | Concise setup or configuration steps shown on the detail page |
+| `screenshots` | string[] | Real product screenshots; paths follow the same distribution rules as hero art |
+| `screenshotsDark` | string[] | Optional dark-appearance screenshot variants |
 
 ## Resources
 
@@ -70,6 +75,13 @@ installed against:
       "cron_expr": "0 9 * * 1-5",
       "message": "Generate daily digest",
       "agent": "digest-agent"
+    },
+    {
+      "name": "market-open",
+      "cron_expr": "30 9 * * 1-5",
+      "message": "Summarise the overnight tape",
+      "timezone": "America/New_York",
+      "skip_dates": ["2026-12-25"]
     }
   ]
 }
@@ -82,6 +94,8 @@ installed against:
 | `cron_expr` | string | Cron expression (mutually exclusive with `every`) |
 | `message` | string | Prompt sent to the agent on each run |
 | `agent` | string | Agent to run (optional, uses default if omitted) |
+| `timezone` | string | IANA zone name the schedule and `skip_dates` are evaluated in, e.g. `America/New_York`. Optional, but an empty value falls back to the gateway config's timezone and then to **UTC** — so `"cron_expr": "0 6 * * *"` without it fires at 06:00 UTC, the wrong calendar day for most users. An unknown zone is rejected at manifest validation. A per-**user** zone is not manifest data: pass `timezone=` to `ctx.cron.add_job` instead |
+| `skip_dates` | string[] | Calendar dates the job must not fire on, evaluated in `timezone`. Must be zero-padded `YYYY-MM-DD` — `2026-1-1` parses but never matches the padded fire-time rendering, so it is rejected at manifest validation rather than silently skipping nothing |
 | `enabled` | boolean | Default `true`. Must be a JSON boolean — any other type is rejected at manifest validation. When `false` the cron is registered **paused** (visible in the Schedule view, resumable) instead of firing on install/enable — for jobs that need user configuration first |
 
 > **Caveat:** disabling an app deletes its registered cron jobs, and re-enabling
@@ -168,6 +182,28 @@ At most one enabled app owns a slot. When two enabled apps declare the same
 `replaces`, the first by app name wins and the collision is reported -- the winner
 does not depend on which app was enabled or installed more recently.
 
+### App Icon
+
+`iconPath` is the App Store's card and row icon, and it is **top-level** — not
+under `ui`. `ui.pages[].icon` and `ui.pages[].iconUrl` above are the sidebar glyph
+for an app that is already *installed*, a different surface; neither one supplies
+a store icon, and an app that declares only those publishes no icon at all.
+
+```json
+{
+  "iconPath": "assets/icon.png"
+}
+```
+
+`kirocrew app init` scaffolds `assets/icon.png` and this field, so a new app
+starts with a working icon rather than a placeholder card. Replace the generated
+placeholder with real artwork before publishing.
+
+For the artwork requirements — path form, dimensions, why the icon must be
+opaque, and how the dark variant relates — see
+[Publishing an app](publishing-guide.md), which owns that spec for every art
+field.
+
 ### Hero Images
 
 Top-level manifest fields that supply the artwork rendered on App Store browse
@@ -179,7 +215,9 @@ and detail cards. The path form depends on how the app is distributed:
   ```json
   {
     "heroImage": "/apps/my-app/ui/hero-light.svg",
-    "heroImageDark": "/apps/my-app/ui/hero-dark.svg"
+    "heroImageDark": "/apps/my-app/ui/hero-dark.svg",
+    "heroImageDetail": "/apps/my-app/ui/hero-detail-light.svg",
+    "heroImageDetailDark": "/apps/my-app/ui/hero-detail-dark.svg"
   }
   ```
 
@@ -190,7 +228,9 @@ and detail cards. The path form depends on how the app is distributed:
   ```json
   {
     "heroImage": "ui/hero-light.svg",
-    "heroImageDark": "ui/hero-dark.svg"
+    "heroImageDark": "ui/hero-dark.svg",
+    "heroImageDetail": "ui/hero-detail-light.svg",
+    "heroImageDetailDark": "ui/hero-detail-dark.svg"
   }
   ```
 
@@ -198,6 +238,11 @@ and detail cards. The path form depends on how the app is distributed:
 |-------|------|-------------|
 | `heroImage` | string | Hero image shown on the App Store card (light theme) |
 | `heroImageDark` | string | Hero image variant used in dark theme |
+| `heroImageDetail` | string | Wide banner preferred by the detail page (light theme) |
+| `heroImageDetailDark` | string | Wide detail banner used in dark theme |
+
+Hero images are illustrative marketing art. `screenshots` are separate and must
+show the real product UI; the detail page renders both when both are declared.
 
 ## Backend
 
@@ -218,7 +263,7 @@ and detail cards. The path form depends on how the app is distributed:
 |-------|------|---------|-------------|
 | `backend.entryPoint` | string | | Script to run (relative to app root), or a dotted Python module path launched via `python -m` (used by built-in apps like `file-explorer`, e.g. `kiro_crew.apps.builtins.file_explorer.server`) |
 | `backend.port` | string | `"auto"` | Port number or `"auto"` for auto-assignment |
-| `backend.healthCheck` | string | `"/health"` | Health check endpoint path |
+| `backend.healthCheck` | string | `"/health"` | Absolute health-check path beginning with `/`; unsafe or ambiguous paths are refused. Polled until it answers at startup, then re-polled for the life of the backend — keep the handler cheap and dependency-free. A backend that stops answering it is dropped from the reverse proxy and its MCP servers are deregistered until it answers again. |
 | `backend.routes` | string | | Base route path for the backend |
 | `backend.type` | string | `""` | Backend runtime: `"python"`, `"asgi"`, `"node"`, `"exec"` (execute the entry point file as-is), or `""` (auto-detect from `entryPoint` — a `.sh` file or an extensionless executable with a non-Python shebang is treated as a shell launcher) |
 
@@ -259,6 +304,24 @@ root (validated against `HooksConfig._HOOK_PATH_RE`).
 `hooks.routes` handlers are wired up when the app is enabled (via
 `on_app_enable`, also re-run at gateway startup via `on_gateway_startup`), so
 they go live without waiting for a Gateway restart.
+
+**Importing your own modules.** Hook entry files are loaded from their file path
+into a synthetic package named after the app, never via `sys.path`, so use a
+**relative** import to reach a sibling module:
+
+```python
+# backend/routes.py
+from . import config          # backend/config.py
+from .render import to_html   # backend/render.py
+```
+
+A relative import resolves inside the app's own directory tree and cannot walk
+above the app root (`from ... import x` is refused). It is not a sandbox: app
+Python already runs in the Gateway process with full filesystem access, so a
+symlinked sibling resolves wherever it points. Do not use a bare
+`import config`: `sys.modules["config"]` is process-global, so two apps each
+shipping a `config.py` would end up sharing one module. `from kiro_crew...`
+absolute imports are for built-in apps only.
 
 ## Permissions
 
@@ -486,6 +549,11 @@ the user to run locally instead of executing it on the server.
 - `name` must match `/^[a-z0-9]+(?:-[a-z0-9]+)*$/` (kebab-case)
 - `name` must not be `system` (it would shadow the `system.*` notification-channel
   namespace)
+- `name` must not be `library` (the dashboard serves `/apps/library` as a static
+  page — the installed-app management surface — and it registers ahead of the
+  `/apps/:name` route, so an app by that name would have an unreachable page).
+  Refused at every install door, including registry installs before any
+  clone/build work, with the machine-readable error code `reserved_app_name`.
 - `name` must not be a Windows reserved device stem — `con`, `prn`, `aux`, `nul`,
   `com1`–`com9`, `lpt1`–`lpt9` — because the app name becomes a directory and
   Windows resolves those inside every directory. Names that merely resemble one
@@ -510,6 +578,9 @@ the user to run locally instead of executing it on the server.
   "description": "Monitor tickets, pipelines, and alarms for your on-call rotation",
   "author": "kirocrew",
   "tags": ["oncall", "monitoring"],
+  "useCases": ["Keep a shared view of firing alerts and active investigations"],
+  "configuration": ["Connect an alert provider in Settings, then start in read-only mode"],
+  "screenshots": ["ui/screenshots/board.png"],
   "agents": ["agents/ticket-analyst.json"],
   "skills": ["skills/oncall-runbook"],
   "crons": [

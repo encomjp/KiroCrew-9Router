@@ -1,4 +1,4 @@
-const { app, BaseWindow, BrowserWindow, WebContentsView, shell, dialog, Tray, Menu, nativeImage, nativeTheme, Notification, ipcMain, webContents, session, desktopCapturer, systemPreferences, screen } = require("electron");
+const { app, BaseWindow, BrowserWindow, WebContentsView, shell, dialog, Tray, Menu, nativeImage, nativeTheme, Notification, ipcMain, webContents, session, desktopCapturer, systemPreferences, screen, crashReporter } = require("electron");
 const Store = require("electron-store");
 const fs = require("fs");
 const os = require("os");
@@ -17,7 +17,7 @@ const {
   SPAWN_MARKER,
 } = require("./bundle-integrity");
 const { findConfiguredDashboardPort } = require("./data-home");
-const { createTokenRetryHandler } = require("./token-retry");
+const { createTokenRetryHandler, dashboardRetryPath } = require("./token-retry");
 const { createRendererRecovery } = require("./renderer-recovery");
 const { classifyAuthBlock, defaultedPort } = require("./gateway-auth-hint");
 const { exitImmersiveModes } = require("./blocking-prompt");
@@ -137,6 +137,7 @@ const { createLivenessMonitor } = require("./gateway-liveness");
 const {
   chooseRecoveryStrategy,
   classifyAdoptedGateway,
+  revealWindowForConnect,
   waitForServiceRebind,
   waitForProcessExit,
   snapshotPortPids,
@@ -146,6 +147,7 @@ const {
 const { capturePySpyDump } = require("./pyspy-dump");
 const { createMetricsRecorder, profilingEnabled } = require("./perf-metrics");
 const { createPierrePerfLog } = require("./pierre-perf-log");
+const { createBigAllocLog } = require("./big-alloc-log");
 const { identityFamily, decideGatewayAction, classifyGatewayReadiness, FAMILY_META, HEALTH_IDENTITY_PATH, READY_PATH } = require("./instance-guard");
 const { initMochi, shutdownMochi } = require("./mochi/index");
 const { borrowSessionToken } = require("./mochi-session-token");
@@ -203,6 +205,8 @@ const { migrateRemoteHostConfig, getRemoteHostConfig, setRemoteHostConfig } = re
 const { seedRenamedStore } = require("./store-rename");
 
 const { isLocalGatewayEnabled, setLocalGatewayEnabled, classifyStartFailure } = require("./local-gateway");
+
+const { initNativeLogging } = require("./native-logging");
 
 // Carry settings across the npm `name` rename, by writing the new store's file
 // BEFORE electron-store opens it. Order is load-bearing: construction writes the
@@ -352,6 +356,28 @@ if (IS_WIN) {
 if (!app.requestSingleInstanceLock()) {
   app.exit(0);
 } else {
+  // Arm native diagnostic capture as the FIRST thing the winning instance does:
+  // early enough that Chromium still reads the logging switches (it reads them
+  // during initialization, so a call after app-ready is accepted and ignored),
+  // but strictly INSIDE the lock-won branch. A rejected second instance must not
+  // reach this: it would rotate `chromium.log` out from under the primary — the
+  // primary's open fd follows the renamed inode, and the genuine previous
+  // generation is destroyed — so double-clicking the icon of a running app would
+  // wipe exactly the retained evidence this capture exists to keep. `app.exit(0)`
+  // above is synchronous, so placing it here is what makes that unreachable
+  // rather than merely unlikely.
+  //
+  // `gatewayLogPath` is a hoisted function declaration needing only the modules
+  // required at the top of this file, so calling it here reuses its logs-dir
+  // resolution (including the tmpdir fallback) rather than duplicating it.
+  initNativeLogging({
+    logsDir: path.dirname(gatewayLogPath()),
+    appendSwitch: (name, value) => app.commandLine.appendSwitch(name, value),
+    startCrashReporter: (opts) => crashReporter.start(opts),
+    fs,
+    log: (m) => glog(m),
+  });
+
   app.on("second-instance", () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       // Relaunching the app is a request for the window back; it must win over
@@ -458,6 +484,14 @@ function glog(line) {
 // the window's render-process-gone handler. Holds only plain numbers, bounded to
 // its capacity, and writes nothing until a crash.
 const pierrePerfLog = createPierrePerfLog();
+
+// Sibling of pierrePerfLog for large binary allocations (src/lib/allocWatch.ts):
+// the native log shows the renderer OOMs on the V8 cage with a near-empty JS
+// heap, i.e. on a big ArrayBuffer/TypedArray backing store whose stack V8 could
+// not capture. This buffers the allocation sites reported before each large
+// allocation and flushes them on render-process-gone. Bounded, writes nothing
+// until a crash.
+const bigAllocLog = createBigAllocLog();
 
 // ── Cross-app gateway ownership (shared ~/.kiro/crew, shared port) ─────────
 // The nightly app and the production app are different bundles sharing one
@@ -2398,6 +2432,15 @@ function createWindow() {
     // informative: no highlighting in the last two minutes points away from the
     // Pierre worker pool as the cause.
     for (const line of pierrePerfLog.flush()) glog(line);
+    // Then the large-allocation history: on a cage OOM the last entries name the
+    // binary buffer that pierre-perf's near-empty heap numbers cannot. Also
+    // unconditional. An empty flush rules out only LARGE JS-CONSTRUCTED buffers
+    // IN THE MAIN FRAME: the watcher sees JS constructor calls at or above its
+    // threshold in the top-level document, so a cage exhausted by host-API
+    // backing stores, cumulative sub-threshold buffers, a grown resizable
+    // ArrayBuffer, or allocations made off the main frame (workers, subframes,
+    // WASM memory) flushes empty too.
+    for (const line of bigAllocLog.flush()) glog(line);
     rendererRecovery.handleGone(details || {});
   });
 
@@ -2816,11 +2859,11 @@ function startLivenessMonitor(win) {
  * Recover a gateway that is alive-but-unresponsive (wedged event loop). A
  * graceful /api/shutdown can't help — that endpoint runs on the very loop that
  * is frozen — so SIGKILL the child, clear the port, respawn, and re-run the
- * boot flow. showLoadingThenConnect shows the loading screen + status (a visible
- * "restarting" state instead of an eternal spinner) and starts a fresh monitor
- * on success; its own catch handles a restart that fails.
+ * boot flow. showLoadingThenConnect loads the loading screen + status into the
+ * window (without raising it — this is a liveness reconnect, see #6373) and
+ * starts a fresh monitor on success; its own catch handles a restart that fails.
  */
-async function recoverWedgedGateway(win) {
+async function recoverWedgedGateway(win, { userInitiated = false } = {}) {
   // We only OWN (and may kill/respawn) a gateway we spawned. On the reuse path
   // the port-holder is someone else's process — in the remote-tunnel setup it is
   // our own SSH forward, whose backend lives on a remote host. An unresponsive
@@ -2889,7 +2932,12 @@ async function recoverWedgedGateway(win) {
   gatewayStartFailure = null; // re-arm so waitForGateway doesn't fail-fast on the kill we just did
   await startGateway(); // spawn a fresh child before re-waiting
   if (win.isDestroyed() || isQuitting) return;
-  return showLoadingThenConnect(win, BACKEND_URL);
+  // A user-initiated recovery (failed update install — the user clicked
+  // Install and is watching) keeps the raise; a liveness-triggered one stays
+  // silent (#6373). The reconnect fork branches above are liveness-only in
+  // practice (an install only ever stops a gateway we spawned) and stay
+  // silent either way — their needs-user states escalate on their own.
+  return showLoadingThenConnect(win, BACKEND_URL, { reconnect: !userInitiated });
 }
 
 /**
@@ -2905,8 +2953,11 @@ async function recoverWedgedGateway(win) {
 async function reconnectExternalGateway(win) {
   const wc = win.webContents;
   try { wc.loadFile(path.join(__dirname, "loading.html")); } catch { /* window may be mid-teardown */ }
-  if (!win || win.isDestroyed() || isQuitting) return; // loadFile may have thrown on a torn-down window; show() would too
-  win.show();
+  if (!win || win.isDestroyed() || isQuitting) return; // loadFile may have thrown on a torn-down window
+  // Deliberately NO reveal here: this is liveness-triggered, not user-initiated,
+  // so the window must not be raised, focused, or re-surfaced (#6373 — every
+  // tunnel drop stole focus on reconnect). The splash above loads fine into a
+  // background or hidden window.
   sendStatus("Connection lost — waiting for the gateway to come back…");
   for (;;) {
     if (!win || win.isDestroyed() || isQuitting) return;
@@ -2918,7 +2969,7 @@ async function reconnectExternalGateway(win) {
   if (!win || win.isDestroyed() || isQuitting) return;
   glog("liveness: external gateway reachable again — refetching token and reconnecting");
   gatewayStartFailure = null;
-  return showLoadingThenConnect(win, BACKEND_URL);
+  return showLoadingThenConnect(win, BACKEND_URL, { reconnect: true });
 }
 
 // How long recovery waits for an ADOPTED local gateway to answer again before
@@ -2945,7 +2996,7 @@ async function reconnectOrRespawnAdoptedGateway(win) {
   const wc = win.webContents;
   try { wc.loadFile(path.join(__dirname, "loading.html")); } catch { /* window may be mid-teardown */ }
   if (!win || win.isDestroyed() || isQuitting) return;
-  win.show();
+  // Deliberately NO reveal: liveness-triggered, not user-initiated (#6373).
   sendStatus("Gateway stopped responding — waiting for it to recover…");
   const deadline = Date.now() + ADOPTED_RECOVERY_WAIT_MS;
   while (Date.now() < deadline) {
@@ -2953,9 +3004,12 @@ async function reconnectOrRespawnAdoptedGateway(win) {
     let healthy = false;
     try { await checkBackend(HEALTH_URL); healthy = true; } catch { /* still down */ }
     if (healthy) {
+      // The probe just awaited — the window may have been torn down meanwhile,
+      // and showLoadingThenConnect would loadFile against a destroyed window.
+      if (!win || win.isDestroyed() || isQuitting) return;
       glog("liveness: adopted local gateway answering again — reconnecting");
       gatewayStartFailure = null;
-      return showLoadingThenConnect(win, BACKEND_URL);
+      return showLoadingThenConnect(win, BACKEND_URL, { reconnect: true });
     }
     await new Promise((r) => setTimeout(r, 2500));
   }
@@ -2998,11 +3052,13 @@ async function reconnectOrRespawnAdoptedGateway(win) {
       const health = await fetchHealthInfo();
       const decision = decideGatewayAction(app.getVersion(), health, { localOwner: owner });
       const readiness = await fetchGatewayReadiness();
+      // Three awaits since the last check — re-verify before touching the window.
+      if (win.isDestroyed() || isQuitting) return;
       if (decision.action === "reuse" && readiness !== "shutting-down") {
         glog(`liveness: service manager re-bound :${PORT} (owner=${owner}, reason=${decision.reason}, readiness=${readiness}) — reconnecting to the restarted gateway`);
         gatewayOwnership = classifyAdoptedGateway({ reason: decision.reason, localOwner: owner });
         gatewayStartFailure = null;
-        return showLoadingThenConnect(win, BACKEND_URL);
+        return showLoadingThenConnect(win, BACKEND_URL, { reconnect: true });
       }
       glog(`liveness: :${PORT} was re-bound by an unusable holder (owner=${owner}, action=${decision.action}, readiness=${readiness}) — cannot reconnect or spawn over it`);
       return showUnrecoverableGatewayError(win, PORT, "held");
@@ -3016,7 +3072,28 @@ async function reconnectOrRespawnAdoptedGateway(win) {
   gatewayStartFailure = null;
   await startGateway(); // spawn a fresh child (port is confirmed free)
   if (win.isDestroyed() || isQuitting) return;
-  return showLoadingThenConnect(win, BACKEND_URL);
+  return showLoadingThenConnect(win, BACKEND_URL, { reconnect: true });
+}
+
+/**
+ * Reveal a window because recovery reached a state that NEEDS the user (token
+ * prompt, terminal failure dialog). Silent reconnects (#6373) deliberately
+ * leave the window hidden/minimized while self-healing, so an escalation must
+ * do the full reveal the repo's other show paths do: cancel a deferred
+ * tray-hide first (hide-to-tray.js: every show expressing intent to see the
+ * window must, or the pending hide re-hides it — exitImmersiveModes can fire
+ * that very listener), un-minimize, show + focus, and on macOS steal app
+ * activation — the app is in the background by definition here, and without
+ * activation the window rises behind the frontmost app without keyboard
+ * focus (see the global-hotkey summon path). Idempotent on a visible window.
+ */
+function revealForUserDecision(win) {
+  if (!win || win.isDestroyed() || isQuitting) return;
+  cancelPendingTrayHide(win);
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+  if (IS_MAC) app.focus({ steal: true });
 }
 
 /**
@@ -3037,6 +3114,12 @@ async function showUnrecoverableGatewayError(win, port, options = {}) {
     ? { variant: options }
     : options;
   if (!win || win.isDestroyed()) return;
+  // Terminal needs-the-user state: the dialog below is a modal child of `win`,
+  // and a modal child of a hidden parent is ordered out with it. Liveness
+  // paths reach here with the window deliberately un-revealed (#6373's silent
+  // reconnect), so reveal it now — every branch of this dialog requires a
+  // human decision and quits afterwards, so raising is always right here.
+  revealForUserDecision(win);
   let logTail = "";
   try { logTail = tailLines(fs.readFileSync(gatewayLogPath(), "utf8"), 60); } catch { /* no log yet */ }
   const action = await showGatewayErrorDialog(win, {
@@ -3059,7 +3142,17 @@ async function showUnrecoverableGatewayError(win, port, options = {}) {
   if (win === mainWindow) { isQuitting = true; app.quit(); } else { win.destroy(); }
 }
 
-async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
+function dashboardEntryUrl(backendUrl, initialPath = "", token = "") {
+  const target = initialPath ? new URL(initialPath, backendUrl) : new URL(backendUrl);
+  if (token) target.searchParams.set("token", token);
+  return target.toString();
+}
+
+async function showLoadingThenConnect(
+  win,
+  backendUrl = BACKEND_URL,
+  { reconnect = false, initialPath = "" } = {},
+) {
   const healthUrl = `${backendUrl}/api/status`;
   const wc = win.webContents;
   // Paint the splash in the user's chosen accent (persisted from a prior session
@@ -3067,7 +3160,9 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
   wc.loadFile(path.join(__dirname, "loading.html"), {
     query: { accent: currentThemeAccent() },
   });
-  win.show();
+  // Cold launch and user-initiated connects raise as before; liveness-recovery
+  // reconnects (reconnect: true) stay silent — no raise, no focus steal (#6373).
+  revealWindowForConnect(win, { reconnect });
 
   try {
     await waitForBackend(win, healthUrl, { watchSpawn: backendUrl === BACKEND_URL });
@@ -3090,8 +3185,8 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
         // gateway is ready, then fade out and hand off to the dashboard.
         await fadeLoadingScreen(wc);
         if (win.isDestroyed()) return;
-        wc.loadURL(`${backendUrl}?token=${token}`);
-        if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        wc.loadURL(dashboardEntryUrl(backendUrl, initialPath, token));
+        if (backendUrl === BACKEND_URL && win === mainWindow) startLivenessMonitor(win);
         return;
       }
 
@@ -3106,8 +3201,8 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
 
       if (status !== 403) {
         // Not an auth block — the gateway serves without a token.
-        wc.loadURL(backendUrl);
-        if (backendUrl === BACKEND_URL) startLivenessMonitor(win);
+        wc.loadURL(dashboardEntryUrl(backendUrl, initialPath));
+        if (backendUrl === BACKEND_URL && win === mainWindow) startLivenessMonitor(win);
         return;
       }
 
@@ -3148,6 +3243,14 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
       // `window.close()` in the page would destroy the VIEW and leave a blank
       // shell behind. A keyboard exit has to go through the main process
       // (windowForWebContents) to close the host window.
+      // A prompt is a state that genuinely NEEDS the user, whatever path led
+      // here: a silent reconnect leaves the window hidden (#6373), and even a
+      // cold boot's window can be hidden/minimized by the time a slow install
+      // reaches this point. Reveal unconditionally — idempotent when already
+      // visible. BEFORE exitImmersiveModes: leaving fullscreen fires a
+      // deferred tray-hide's listener, so the cancel inside the reveal must
+      // come first.
+      revealForUserDecision(win);
       exitImmersiveModes(win);
       wc.loadFile(path.join(__dirname, "token-prompt.html"), {
         query: { port: promptPort, kind, host: remoteHost },
@@ -3238,6 +3341,11 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
     }
 
     // Loop so "Reveal Log" can re-show the dialog after opening Finder.
+    // The dialog is a modal child of `win` and needs the user: a hidden parent
+    // orders the modal out with it. Reveal unconditionally, whatever path led
+    // here — a silent reconnect leaves the window hidden (#6373), and even a
+    // cold boot's window can be hidden by now. Idempotent when visible.
+    revealForUserDecision(win);
     for (;;) {
       const action = await showGatewayErrorDialog(win, {
         title, message, logTail, logPath, portConflict, port: PORT, localGatewayOff,
@@ -3278,9 +3386,11 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
         }
         // The dialog, force-stop, and respawn above are all async — the user may
         // have closed the window meanwhile. Re-check before showLoadingThenConnect,
-        // which calls win.show()/loadFile and would throw on a destroyed window.
+        // which reveals the window / calls loadFile and would throw on a destroyed one.
+        // Deliberately NOT flagged as a reconnect: every path here goes through a
+        // dialog button the user just clicked, so the re-entry may raise (#6373).
         if (win.isDestroyed()) return;
-        return showLoadingThenConnect(win, backendUrl);
+        return showLoadingThenConnect(win, backendUrl, { initialPath });
       }
       // Quit
       if (win === mainWindow) {
@@ -3292,6 +3402,69 @@ async function showLoadingThenConnect(win, backendUrl = BACKEND_URL) {
       return;
     }
   }
+}
+
+// ── Standalone dashboard windows ──
+
+function createConnectionWindow(backendUrl, port, initialPath = "") {
+  const connOpts = {
+    width: 1280,
+    height: 860,
+    minWidth: 550,
+    minHeight: 600,
+    backgroundColor: "#0f1117",
+  };
+  // Same platform-conditional chrome as the main window (see createWindow):
+  // frameless + inset traffic lights on macOS, titleBarOverlay on Windows,
+  // frame:false on CSD-preferring Linux desktops, native frame elsewhere.
+  if (IS_MAC) connOpts.titleBarStyle = "hidden";
+  if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
+  if (IS_WINDOWS) {
+    connOpts.titleBarStyle = "hidden";
+    connOpts.autoHideMenuBar = true;
+    connOpts.titleBarOverlay = {
+      color: WINDOWS_TITLEBAR_BACKGROUND,
+      symbolColor: nativeTheme.shouldUseDarkColors
+        ? WINDOWS_TITLEBAR_SYMBOL_DARK
+        : WINDOWS_TITLEBAR_SYMBOL_LIGHT,
+      height: HEADER_CSS_PX,
+    };
+  }
+  if (LINUX_FRAMELESS) {
+    connOpts.frame = false;
+    connOpts.autoHideMenuBar = true; // same rationale as createWindow
+  }
+  const connWin = new BaseWindow(connOpts);
+  if (IS_WINDOWS && typeof connWin.setMenuBarVisibility === "function") {
+    connWin.setMenuBarVisibility(false);
+  }
+
+  setupWindowContents(connWin, backendUrl);
+
+  // `initialPath` may carry a one-shot intent ("/chat?new=1" mints a blank
+  // session), so the 403 retry must re-request where the window ACTUALLY is --
+  // replaying a consumed intent would mint a second session over the one on
+  // screen. Updated before onNavigate runs, so a 403 uses the URL that failed.
+  let retryTarget = initialPath;
+  const onNavigate = createTokenRetryHandler(async () => {
+    let token = await fetchLocalToken(backendUrl);
+    if (!token) ({ token } = await fetchRemoteToken(port));
+    if (token && !connWin.isDestroyed()) {
+      connWin.webContents.loadURL(dashboardEntryUrl(backendUrl, retryTarget, token));
+    }
+  });
+  connWin.webContents.on("did-navigate", (_e, url, httpCode) => {
+    retryTarget = dashboardRetryPath(url, backendUrl, retryTarget);
+    onNavigate(httpCode).catch((err) => console.error("Token retry failed:", err));
+  });
+
+  return connWin;
+}
+
+async function openNewSessionWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const win = createConnectionWindow(BACKEND_URL, PORT, "/chat?new=1");
+  await showLoadingThenConnect(win, BACKEND_URL, { initialPath: "/chat?new=1" });
 }
 
 // ── New Connection Window ──
@@ -3334,51 +3507,7 @@ async function openNewConnectionWindow() {
     if (!mainWindow || mainWindow.isDestroyed()) return;
 
     const backendUrl = `http://localhost:${port}`;
-    const connOpts = {
-      width: 1280,
-      height: 860,
-      minWidth: 550,
-      minHeight: 600,
-      backgroundColor: "#0f1117",
-    };
-    // Same platform-conditional chrome as the main window (see createWindow):
-    // frameless + inset traffic lights on macOS, titleBarOverlay on Windows,
-    // frame:false on CSD-preferring Linux desktops, native frame elsewhere.
-    if (IS_MAC) connOpts.titleBarStyle = "hidden";
-    if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
-    if (IS_WINDOWS) {
-      connOpts.titleBarStyle = "hidden";
-      connOpts.autoHideMenuBar = true;
-      connOpts.titleBarOverlay = {
-        color: WINDOWS_TITLEBAR_BACKGROUND,
-        symbolColor: nativeTheme.shouldUseDarkColors
-          ? WINDOWS_TITLEBAR_SYMBOL_DARK
-          : WINDOWS_TITLEBAR_SYMBOL_LIGHT,
-        height: HEADER_CSS_PX,
-      };
-    }
-    if (LINUX_FRAMELESS) {
-      connOpts.frame = false;
-      connOpts.autoHideMenuBar = true; // same rationale as createWindow
-    }
-    const connWin = new BaseWindow(connOpts);
-    if (IS_WINDOWS && typeof connWin.setMenuBarVisibility === "function") {
-      connWin.setMenuBarVisibility(false);
-    }
-
-    setupWindowContents(connWin, backendUrl);
-
-    const onNavigate = createTokenRetryHandler(async () => {
-      let token = await fetchLocalToken(backendUrl);
-      if (!token) ({ token } = await fetchRemoteToken(port));
-      if (token && !connWin.isDestroyed()) {
-        connWin.webContents.loadURL(`${backendUrl}?token=${token}`);
-      }
-    });
-    connWin.webContents.on("did-navigate", (_e, _url, httpCode) => {
-      onNavigate(httpCode).catch((err) => console.error("Token retry failed:", err));
-    });
-
+    const connWin = createConnectionWindow(backendUrl, port);
     // Every connection is a standalone window (tracked for menu actions).
     await showLoadingThenConnect(connWin, backendUrl);
   });
@@ -3609,7 +3738,7 @@ app.whenReady().then(async () => {
     win.focus();
     const wc = win._mcView.webContents;
     if (wc && !wc.isDestroyed()) {
-      wc.send("navigate", tab ? `/settings?tab=${tab}` : "/settings");
+      wc.send("navigate", tab ? `/settings/${tab}` : "/settings");
     }
   };
   // View > Keep on Top: flip always-on-top on the focused dashboard window,
@@ -3643,6 +3772,7 @@ app.whenReady().then(async () => {
       // same persisted state createWindow() restores from.
       alwaysOnTop: !!(store.get("windowState") || {}).alwaysOnTop,
       toggleAlwaysOnTop,
+      openNewSessionWindow: () => openNewSessionWindow(),
       openNewConnectionWindow: () => openNewConnectionWindow(),
       renameCurrentWindow: () => renameCurrentWindow(),
       promptRemoteHost: () => promptRemoteHost(),
@@ -4053,6 +4183,23 @@ app.whenReady().then(async () => {
     if (line) glog(line);
   });
 
+  // Large binary-allocation reports (src/lib/allocWatch.ts). Buffered in memory
+  // and flushed on render-process-gone next to the crash line — the last entries
+  // name the ArrayBuffer/TypedArray behind a V8 cage OOM, which pierre-perf's
+  // heap numbers show but cannot attribute. Steady state writes nothing (glog has
+  // no rotation); KIROCREW_DEBUG logs each event as it arrives for a live repro.
+  ipcMain.on("big-alloc", (_event, ev) => {
+    // Same primary-renderer discipline as pierre-perf: the flush is triggered by
+    // THIS window's death, so a sibling window's report would be filed under the
+    // wrong process's crash history. Mis-attributed evidence is worse than none.
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (_event.sender !== mainWindow.webContents) return;
+    if (!bigAllocLog.record(ev)) return;
+    if (!profilingEnabled(process.env)) return;
+    const line = bigAllocLog.lastLine();
+    if (line) glog(line);
+  });
+
   createTray();
   const win = createWindow();
   // Bind the summon hotkey only now that the main window exists: registering
@@ -4158,7 +4305,7 @@ app.whenReady().then(async () => {
       if (!installingUpdate) return; // deferred-quit path: app is quitting anyway
       installingUpdate = false;
       glog("update install failed — restoring gateway and liveness recovery");
-      recoverWedgedGateway(mainWindow).catch((e) => glog(`post-install-failure recovery failed: ${e && e.message}`));
+      recoverWedgedGateway(mainWindow, { userInitiated: true }).catch((e) => glog(`post-install-failure recovery failed: ${e && e.message}`));
     },
     onUpdateState: broadcastUpdateState,
     log: makeUpdaterLogger(glog),
@@ -4233,7 +4380,15 @@ app.whenReady().then(async () => {
   // Same shape and the same best-effort contract: the companion's windows follow
   // the app's enabled state, and a failure here must never block the dashboard.
   try {
-    initCrewCompanion({ backendUrl: BACKEND_URL, fetchLocalToken, glog });
+    // `getDashboardWindow` is what lets the companion's "Open session" CTA reach a
+    // dashboard route: the same window the app menu's Settings…/About items target,
+    // resolved here because main.js owns window lifecycle.
+    initCrewCompanion({
+      backendUrl: BACKEND_URL,
+      fetchLocalToken,
+      glog,
+      getDashboardWindow: () => focusedDashboardWindow() || null,
+    });
   } catch (err) {
     glog(`crew-companion: init failed — ${err && err.message}`);
   }

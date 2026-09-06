@@ -93,13 +93,14 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-from kiro_crew import platform_compat
+from kiro_crew import name_grant, platform_compat
 from kiro_crew.executors import discovery_executor
 from kiro_crew.hooks import validate_file_path
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     create_subprocess_limited,
     sandboxed_spawn_argv,
+    shielded_prepare_off_loop,
 )
 
 logger = logging.getLogger(__name__)
@@ -357,28 +358,13 @@ _ADMIN_WRITE_GIDS: frozenset[int] = frozenset({80} if platform_compat.IS_MACOS e
 #: write the project — which includes the agent — so resolving a command name to
 #: it would let a planted file run with gateway privileges the moment the user
 #: types that command's name.
-_PROJECT_LOCAL_SEGMENTS = frozenset({
-    ".venv", "venv", ".virtualenv", "virtualenv", "node_modules", ".tox", ".nox",
-    "vendor", ".direnv", "target", "build", "dist", ".git",
-})
+#:
+#: Owned by :mod:`kiro_crew.name_grant`, which asks the same question of an
+#: auto-approved command's program names. One definition, so the two answers
+#: cannot drift apart.
+_PROJECT_LOCAL_SEGMENTS = name_grant.PROJECT_LOCAL_SEGMENTS
 
-
-def _is_project_local(entry: str) -> bool:
-    """Whether a PATH entry belongs to a project tree rather than an install.
-
-    Segment-wise, not substring: ``/opt/venv-tools/bin`` is an installed prefix
-    that merely CONTAINS the text, while ``/home/u/proj/.venv/bin`` genuinely is
-    project-local.
-
-    Both separators are honoured regardless of host. ``os.sep`` alone would make
-    this silently useless for POSIX-shaped input on Windows (and vice versa) —
-    and a security filter that quietly stops matching is worse than one that is
-    absent, because the tests that cover it keep passing on the host that wrote
-    them. `_resolve` is reachable on either platform (only ``_run_probe`` is
-    POSIX-gated), so the check must not depend on which one it runs from.
-    """
-    parts = entry.replace("\\", "/").split("/")
-    return any(part in _PROJECT_LOCAL_SEGMENTS for part in parts)
+_is_project_local = name_grant.is_project_local
 
 
 def _own_uid() -> int | None:
@@ -799,8 +785,9 @@ async def _run_probe(argv: list[str], cwd: str | None) -> str | None:
         #   escapes the route as an HTTP 500 on a keystroke — for a tier whose
         #   entire contract is "no completions is a normal answer", the right
         #   degradation is no menu, not an error the client must special-case.
-        wrapped, env, cleanup = await loop.run_in_executor(
-            discovery_executor(), functools.partial(_prepare_probe, argv),
+        wrapped, env, cleanup = await shielded_prepare_off_loop(
+            functools.partial(_prepare_probe, argv),
+            executor=discovery_executor(),
         )
     except (SandboxUnavailableError, OSError, RuntimeError):
         return None

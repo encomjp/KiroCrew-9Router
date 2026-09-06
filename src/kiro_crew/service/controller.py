@@ -55,6 +55,38 @@ def installed_unit_path() -> "Path | None":
     return None
 
 
+def installed_service_has_managed_marker() -> "bool | None":
+    """Report whether an installed definition selects managed-service policy.
+
+    ``None`` means no service definition is installed on this platform. ``False``
+    includes an unreadable or malformed definition: doctor must tell the operator
+    to regenerate it rather than silently claim the wider watchdog budget applies.
+    """
+    path = installed_unit_path()
+    if path is None:
+        return None
+    plat = current_platform()
+    try:
+        if plat == Platform.SYSTEMD:
+            expected = 'Environment="KIROCREW_SERVICE_MANAGED=1"'
+            lines = path.read_text(encoding="utf-8").splitlines()
+            return expected in {line.strip() for line in lines}
+        if plat == Platform.LAUNCHD:
+            # Reuse the launchd reader so malformed XML (which plistlib exposes
+            # as an ExpatError) fails closed just like every other service
+            # inspection path instead of crashing `kirocrew doctor`.
+            payload = macos._plist_payload(path)
+            if payload is None:
+                return False
+            environment = payload.get("EnvironmentVariables")
+            return (
+                isinstance(environment, dict) and environment.get("KIROCREW_SERVICE_MANAGED") == "1"
+            )
+    except (OSError, ValueError):
+        return False
+    return None
+
+
 def _unsupported_message() -> None:
     print(
         "❌ kirocrew service management is only supported on Linux (systemd)\n"

@@ -388,8 +388,8 @@ async def api_mcp_custom_add(request: web.Request) -> web.Response:
             if not enable:
                 entry["disabled"] = True
             entries[name] = entry
-        # The secure store write DACLs its temp file via icacls on Windows —
-        # a blocking subprocess that must not run on the event loop.
+        # The secure store write applies an owner-only DACL to its temp file on
+        # Windows — blocking filesystem work kept off the event loop.
         await _mcp._offload_config_write(_mcp._atomic_write, _mcp._kirocrew_mcp_json(), data)
 
     await _rebuild_agent_config()
@@ -542,8 +542,8 @@ async def api_mcp_custom_update(request: web.Request) -> web.Response:
             return web.json_response(
                 {"error": _oauth_err, "code": "oauth_field_not_editable"}, status=400
             )
-        # Same offload rationale as the add path: the store write applies an
-        # owner-only DACL via a subprocess on Windows.
+        # Same offload rationale as the add path: the store write is blocking
+        # file IO (owner-only lockdown included, in-process on Windows).
         replaced = await _mcp._offload_config_write(_replace_kirocrew_spec, name, spec)
     if not replaced:
         return web.json_response({"error": f"server '{name}' not found"}, status=404)

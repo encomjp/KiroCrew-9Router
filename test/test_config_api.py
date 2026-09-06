@@ -30,7 +30,7 @@ def _owner_caller(monkeypatch):
     its own enumerate-the-invariant coverage in
     test_agents_endpoints_owner_auth.py."""
     monkeypatch.setattr(
-        "kiro_crew.dashboard.handlers.agents.is_owner_dashboard_request",
+        "kiro_crew.dashboard.handlers.source_providers.is_owner_dashboard_request",
         lambda request: True,
     )
 
@@ -669,5 +669,49 @@ class TestDefaultAgentGuard:
                     resp = await client.put("/api/config/default-agent", json={"agent": "default"})
                     assert resp.status == 200
                     assert json.loads(tmp.read_text())["default_agent"] == "default"
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Non-object request body rejection (regression: a JSON array/scalar body must
+# be a 400, not an unhandled TypeError -> 500 on ``"key" in body`` /
+# ``body[key]``. Reported against the session_color access in the PUT handler,
+# fixed with an isinstance(body, dict) guard in both create and update.)
+# ---------------------------------------------------------------------------
+
+
+class TestAgentMutationNonObjectBody:
+    """POST/PUT /api/agents reject a non-object JSON body with 400."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_body", [["session_color"], "session_color", 123, True])
+    async def test_create_rejects_non_object_body(self, bad_body) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(_seed_config(), f)
+            tmp = Path(f.name)
+        try:
+            with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp):
+                async with TestClient(TestServer(_make_crud_app())) as client:
+                    resp = await client.post("/api/agents", json=bad_body)
+                    assert resp.status == 400
+                    assert "object" in (await resp.json())["error"]
+                    assert (await resp.json())["code"] == "body_not_object"
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_body", [["session_color"], "session_color", 123, True])
+    async def test_update_rejects_non_object_body(self, bad_body) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(_seed_config(), f)
+            tmp = Path(f.name)
+        try:
+            with unittest.mock.patch("kiro_crew.config.loader.config_path", return_value=tmp):
+                async with TestClient(TestServer(_make_crud_app())) as client:
+                    resp = await client.put("/api/agents/default", json=bad_body)
+                    assert resp.status == 400
+                    assert "object" in (await resp.json())["error"]
+                    assert (await resp.json())["code"] == "body_not_object"
         finally:
             tmp.unlink(missing_ok=True)

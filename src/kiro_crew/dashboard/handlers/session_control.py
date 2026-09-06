@@ -46,9 +46,9 @@ async def _require_internal(request: web.Request) -> web.Response | None:
     # Off the loop AND best-effort, the two properties `_audit_denied` exists to
     # carry for exactly this shape of site: a refusal logged BEFORE the audit
     # middleware has run. `log_api_access` only enqueues, but the FIRST `sel()` of
-    # a process constructs the log -- trust-dir creation, key validation, and on
-    # Windows an `icacls` subprocess -- so a fresh gateway whose first
-    # session-control request is unauthenticated would run that synchronously on
+    # a process constructs the log -- trust-dir creation and key validation,
+    # blocking file IO -- so a fresh gateway whose first session-control request
+    # is unauthenticated would run that synchronously on
     # the event loop. And construction can raise (a trust root too short to sign
     # the chain), which unguarded would turn this 403 into a 500: losing the
     # denial in order to report it.
@@ -144,6 +144,30 @@ async def api_session_control_stop(request: web.Request) -> web.Response:
             state,
             caller_session_key=_read_session_key(request),
             target=_target(body),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_send(request: web.Request) -> web.Response:
+    """POST /api/session-control/send — deliver a message to another session."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # No prewarm here: `send_to_target` warms the config after its own SEL
+    # prewarm, the same ordering `stop_target` uses and for the same reason.
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        message = body.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise sc.SessionControlError("message is required", code="message_required")
+        result = await sc.send_to_target(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
+            message=message,
         )
     except sc.SessionControlError as exc:
         return _refusal(exc)

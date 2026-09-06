@@ -15,7 +15,7 @@ branches those files leave untouched:
 Everything here is hermetic and order-independent: no real process is spawned,
 no socket is bound, no network request is made, and no wall-clock duration is
 asserted. ``subprocess.Popen`` / ``subprocess.run``, the ``socket`` module,
-and ``urllib.request.urlopen`` are stubbed, and the spawn body is frozen at the
+and ``loopback_urlopen`` are stubbed, and the spawn body is frozen at the
 ``Popen`` seam with a sentinel exception.
 """
 from __future__ import annotations
@@ -654,6 +654,11 @@ class TestAdoptExistingInstance:
         monkeypatch.setattr(
             bmod, "popen_limited", lambda *_a, **_k: pytest.fail("spawned onto a taken port")
         )
+        # The adoption path registers through the serialized transition, which is gated
+        # on the app being enabled. "adoptee" is fabricated and so is not in
+        # installed.json; in production start_app_backend only ever runs for an enabled
+        # app. The gate itself is pinned by TestPromotionRequiresAConfirmedEnabledApp.
+        monkeypatch.setattr(bmod, "_app_enabled_state", lambda name: True)
         return spawn_root
 
     def _run(self, port: int) -> AppProcess | None:
@@ -663,7 +668,7 @@ class TestAdoptExistingInstance:
         self, occupied: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         port = bmod._MIN_PORT + 6
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(200))
         _stub_listeners(
             monkeypatch,
             [
@@ -695,7 +700,7 @@ class TestAdoptExistingInstance:
         to signal.
         """
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(200))
         monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
         _stub_listeners(
             monkeypatch,
@@ -715,7 +720,7 @@ class TestAdoptExistingInstance:
         v4 owner from an unrelated IPV6_V6ONLY listener sharing its port, and
         the latter never saw the 127.0.0.1 health probe."""
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(200))
         monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
         _stub_listeners(
             monkeypatch,
@@ -737,7 +742,7 @@ class TestAdoptExistingInstance:
             raise RuntimeError("sel unavailable")
 
         monkeypatch.setattr(bmod, "sel", _boom)
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(200))
         monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
         _stub_listeners(monkeypatch, [bmod.platform_compat.PortListener(333, "127.0.0.1", "4")])
         ap = self._run(bmod._MIN_PORT + 7)
@@ -749,7 +754,7 @@ class TestAdoptExistingInstance:
     ) -> None:
         """Adopting without PIDs would leave a backend we can never stop."""
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(200))
         _stub_listeners(monkeypatch, [])
         with caplog.at_level(logging.WARNING):
             assert self._run(bmod._MIN_PORT + 8) is None
@@ -763,7 +768,7 @@ class TestAdoptExistingInstance:
         attributed — adopting the other-address listener would be adopting a
         process that never answered the health check."""
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(200))
         _stub_listeners(monkeypatch, [bmod.platform_compat.PortListener(999, "192.168.1.5", "4")])
         assert self._run(bmod._MIN_PORT + 9) is None
         assert "adoptee" not in bmod._processes
@@ -775,7 +780,7 @@ class TestAdoptExistingInstance:
         later: stop and uninstall would skip it, leaving a third-party backend
         running after its trust was revoked. Refuse the adoption instead."""
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(200))
         monkeypatch.setattr(bmod, "_proc_start_time", lambda _pid: None)
         _stub_listeners(monkeypatch, [bmod.platform_compat.PortListener(111, "127.0.0.1", "4")])
         with caplog.at_level(logging.WARNING):
@@ -791,7 +796,7 @@ class TestAdoptExistingInstance:
         bystander (e.g. a coexisting v6-only wildcard) — the re-read owner set
         differs, so adoption is refused instead of recording the bystander."""
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(200))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(200))
         monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
         seqs = [
             [bmod.platform_compat.PortListener(111, "127.0.0.1", "4")],
@@ -821,7 +826,7 @@ class TestAdoptExistingInstance:
                 return _FakeResp(200)
             raise urllib.error.URLError("gone mid-capture")
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", _urlopen)
+        monkeypatch.setattr(bmod, "loopback_urlopen", _urlopen)
         monkeypatch.setattr(bmod, "_proc_start_time", lambda pid: f"st-{pid}")
         _stub_listeners(monkeypatch, [bmod.platform_compat.PortListener(111, "127.0.0.1", "4")])
         with caplog.at_level(logging.WARNING):
@@ -835,7 +840,7 @@ class TestAdoptExistingInstance:
         def _refused(*_a: Any, **_k: Any) -> Any:
             raise urllib.error.URLError("connection refused")
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", _refused)
+        monkeypatch.setattr(bmod, "loopback_urlopen", _refused)
         with caplog.at_level(logging.WARNING):
             assert self._run(bmod._MIN_PORT + 10) is None
         assert any("occupied by unhealthy process" in r.message for r in caplog.records)
@@ -843,7 +848,7 @@ class TestAdoptExistingInstance:
     def test_an_error_status_counts_as_unhealthy(
         self, occupied: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(503))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(503))
         assert self._run(bmod._MIN_PORT + 11) is None
 
 
@@ -1538,7 +1543,7 @@ class TestGateMcpRegistration:
         seen: list[tuple[str, int]] = []
         monkeypatch.setattr(
             "kiro_crew.apps.bridges.reregister_app_mcp_servers",
-            lambda name, live_port: seen.append((name, live_port)),
+            lambda name, live_port, io_failures=None: seen.append((name, live_port)),
         )
         bmod._gate_mcp_registration("app", 9133, healthy=True)
         assert seen == [("app", 9133)]
@@ -1586,10 +1591,10 @@ class TestHealthCheckLoop:
             attempts["n"] += 1
             return _FakeResp(500)
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", _urlopen)
+        monkeypatch.setattr(bmod, "loopback_urlopen", _urlopen)
         with bmod._lock:
             bmod._processes["sick"] = AppProcess(app_name="sick", port=9134)
-        bmod._health_check_loop("sick", 9134, "/health")
+        bmod._health_check_loop(bmod._processes.get("sick") or bmod.AppProcess(app_name="sick", port=9134), "/health")
         assert attempts["n"] == 2
         assert gate == [("sick", 9134, False)]
 
@@ -1611,10 +1616,10 @@ class TestHealthCheckLoop:
                 bmod._processes.pop("racy", None)
             return _FakeResp(200)
 
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", _urlopen)
+        monkeypatch.setattr(bmod, "loopback_urlopen", _urlopen)
         with bmod._lock:
             bmod._processes["racy"] = AppProcess(app_name="racy", port=9135)
-        bmod._health_check_loop("racy", 9135, "/health")
+        bmod._health_check_loop(bmod._processes.get("racy") or bmod.AppProcess(app_name="racy", port=9135), "/health")
         assert gate == []
 
 
@@ -1882,7 +1887,7 @@ class TestDefensiveBranches:
             raise RuntimeError("sel unavailable")
 
         monkeypatch.setattr(bmod, "sel", _no_sel)
-        monkeypatch.setattr(bmod.urllib.request, "urlopen", lambda *_a, **_k: _FakeResp(500))
+        monkeypatch.setattr(bmod, "loopback_urlopen", lambda *_a, **_k: _FakeResp(500))
         monkeypatch.setattr(
             bmod, "popen_limited", lambda *_a, **_k: pytest.fail("spawned onto a taken port")
         )

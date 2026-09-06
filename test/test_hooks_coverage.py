@@ -100,7 +100,10 @@ def _same(a: str, b: str) -> bool:
     returns the long one, so a raw string compare passes on POSIX and fails
     only on Windows.
     """
-    return os.path.realpath(a) == os.path.realpath(b)
+    def _normalized(path: str) -> str:
+        return os.path.normcase(os.path.normpath(os.path.realpath(path)))
+
+    return _normalized(a) == _normalized(b)
 
 
 def _identity(path: Path) -> tuple[int, int]:
@@ -400,6 +403,47 @@ class TestSafeReadFile:
         with pytest.raises(FileNotFoundError):
             safe_read_file(str(tmp_path / "nope.txt"))
 
+    def test_sensitive_refusal_message_escapes_the_path(self, monkeypatch):
+        """The refused path is caller/attacker influenced and the message reaches
+        log records via ``exc_info``; a raw newline in it would forge a second
+        record (refs #6371, the #6281/#6315 log-forgery class).
+        """
+        forged = "/tmp/pods/wt-evil\nWARNING forged: reclaim authorized"
+        # The message carries the RESOLVED path (drive-lettered and
+        # backslashed on Windows), so compute the expectation the same way
+        # production does.
+        resolved = os.path.realpath(os.path.expanduser(forged))
+        monkeypatch.setattr(hooks_mod, "is_sensitive_path", lambda p: True)
+        with pytest.raises(PermissionError, match="sensitive path") as excinfo:
+            safe_read_file(forged)
+        message = str(excinfo.value)
+        assert "\n" not in message
+        assert repr(resolved) in message
+
+    def test_symlink_refusal_message_escapes_the_path(self, tmp_path, monkeypatch):
+        """The ELOOP arm keeps the pre-race resolved path — including any
+        newline-bearing directory name — so its message must escape it too.
+        """
+        import errno as _errno
+
+        f = tmp_path / "map.json"
+        f.write_text("{}", encoding="utf-8")
+        resolved = os.path.realpath(str(f))
+
+        real_open = os.open
+
+        def _eloop(path, flags, *args, **kwargs):
+            if str(path) == resolved:
+                raise OSError(_errno.ELOOP, "symlink swapped in")
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", _eloop)
+        with pytest.raises(PermissionError, match="refusing to follow symlink") as excinfo:
+            safe_read_file(str(f))
+        message = str(excinfo.value)
+        assert "\n" not in message
+        assert repr(resolved) in message
+
 
 class TestSafeReadFileBytes:
     def test_reads_bytes(self, tmp_path):
@@ -484,9 +528,13 @@ class TestFdRealPath:
             got = _fd_real_path(fd)
         finally:
             os.close(fd)
-        # A platform with no supported mechanism fails closed (None); where one
-        # exists it must name the same file.
-        assert got is None or _same(got, str(f))
+        # Windows is a supported descriptor-containment platform. Other
+        # platforms without a supported mechanism still fail closed (None).
+        if os.name == "nt":
+            assert got is not None
+            assert _same(got, str(f))
+        else:
+            assert got is None or _same(got, str(f))
 
 
 class TestSafeReadPrefix:
@@ -1059,13 +1107,15 @@ class TestScriptHookStorePersistence:
         assert store.update(hook.id, {"timeout": 1}).timeout == 1
         assert store.update(hook.id, {"timeout": 300}).timeout == 300
 
-    def test_a_bool_timeout_is_accepted_as_its_int_value(self, tmp_path):
-        # Documents current behaviour, not an endorsement: bool is a subclass of
-        # int, so ``True`` satisfies the isinstance+range check and lands as a
-        # 1-second timeout. Recorded so a future tightening is a deliberate change.
+    def test_a_bool_timeout_is_rejected(self, tmp_path):
+        # The deliberate tightening the old test anticipated (issue #5444):
+        # ``bool`` is an ``int`` subclass, but ``True`` as a timeout is
+        # meaningless, so the shared validator now rejects it at the update
+        # boundary rather than silently landing a 1-second timeout.
         store = ScriptHookStore(tmp_path)
         hook = store.create({"name": "h1", "command": "true"})
-        assert store.update(hook.id, {"timeout": True}).timeout is True
+        with pytest.raises(ValueError, match="timeout must be an integer"):
+            store.update(hook.id, {"timeout": True})
 
     def test_update_applies_only_known_fields(self, tmp_path):
         store = ScriptHookStore(tmp_path)

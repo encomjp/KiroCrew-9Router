@@ -100,6 +100,17 @@ async def _armed(svc, **kwargs) -> NudgeLoop:
     return loop
 
 
+async def _stop_and_drain(svc: AutoNudgeService) -> None:
+    """Stop work this test started before pytest closes its event loop."""
+    timers = list(svc._timers.values())
+    svc.stop()
+    if timers:
+        await asyncio.gather(*timers, return_exceptions=True)
+    inflight = list(svc._inflight_adds)
+    if inflight:
+        await asyncio.gather(*inflight, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_starting_publishes_the_service_and_stopping_unpublishes_it(store_dir):
     """The contract the teardown above depends on.
@@ -305,10 +316,12 @@ async def test_stall_evidence_persists_across_restart(store_dir, _nosleep):
 
     svc2 = AutoNudgeService(base_dir=store_dir)
     await svc2.start()
-
-    restored = svc2.get_by_slot("chat-1-123")
-    assert restored is not None
-    assert restored.approval_stalled is True
+    try:
+        restored = svc2.get_by_slot("chat-1-123")
+        assert restored is not None
+        assert restored.approval_stalled is True
+    finally:
+        await _stop_and_drain(svc2)
 
 
 @pytest.mark.asyncio

@@ -1,7 +1,8 @@
 # Babysit PR Watch
 
 Status: implemented (this PR)
-Owners: babysit builtin skill (`builtin_skills/kirocrew-dev/babysit/`)
+Owners: babysit builtin skill (`builtin_skills/kirocrew-dev/babysit/`), on the
+interrupt controller in `irq.py` (see `agent-interrupt-controller.md`)
 
 ## 1. Problem
 
@@ -33,14 +34,22 @@ The babysit skill's decision table gains a watch-mode branch: `monitor_start`
 for phases where the agent acts most cycles, the watch cron for pure-wait
 phases, and an explicit composition pattern for switching between them.
 
+The generic half of that split now lives in `kiro_crew.irq`, the interrupt
+controller: state identity, masking, epoch resets, the coalescing window and
+the error backstop. This file is its first probe and owns only the two GitHub
+decisions — how to observe a pull request, and what counts as an anomaly. The
+probe never raises `Skip` / `Report` / `Done`; it returns a `Tick` of
+`Observation`s and the kernel raises the verdict.
+
 ## 3. Wake predicates
 
-Each fires once per head SHA per dedupe window (a force-push resets the
-memory immediately; while a condition persists on the same head, the alert
+Each fires once per dedupe window (while a condition persists, the alert
 re-arms after a few hours — the script cannot observe delivery, so dedupe is
 time-bounded rather than a permanent acknowledgement, and a delivery lost to
 a gateway failure costs a bounded delay, never a permanently suppressed
-signal):
+signal). Check-derived predicates are additionally scoped **per head SHA**, so
+a force-push resets their memory immediately; conversation predicates are not,
+because a comment is not a property of the commit (see below):
 
 | Reason | Trigger | Why it needs a brain |
 |---|---|---|
@@ -52,14 +61,89 @@ signal):
 `known_reds` carries the check names that are red on the base branch itself —
 the inherited-breakage filter that a human babysitter applies mentally. The
 watch never wakes for them, and counts them as green for the `ready`
-predicate.
+predicate. The probe filters them inside `observe()` and does not return them
+as observations at all. `known_reds` matches EITHER the bare check name (what
+an operator reads off GitHub's UI) or the workflow-qualified spelling the alert
+key uses, so a hand-written allow-list works while two workflows sharing a
+check name stay distinguishable.
 
-Deliberately not watched: reviewer comment bodies, marker freshness, human
-discussion. Parsing those requires the judgment this design exists to stop
-paying for per-cycle; the woken agent does that reading, exactly as in a
-manual cycle. CANCELLED check runs are classified as noise (force-push twins
-and re-run leftovers dominate); the rare real one surfaces through the checks
-it cancelled around.
+`new-red` and `ready` are **coalesced**; `conflict` is an `NMI` and fires
+immediately. The distinction is not importance but whether waiting can produce
+more information: a dirty PR dispatches no checks, so its `pending` count never
+drains and delaying the conflict signal would strand the operator on something
+already actionable.
+
+Coalescing was added because of a measured defect, not a hypothesis. Before it,
+`new-red` fired on the first failing check with no gate on `pending`. On this
+repository — roughly sixty-five checks finishing over about twenty minutes — one
+head woke the operator twice within four minutes, at 34 seconds for a body gate
+and at 4m55s for a reviewer lane, while twenty-four checks were still running.
+Neither wake could act: the first turn did not know whether more failures were
+coming, and both would have been serviced by the same edit and the same push.
+Notably a full read of the same file concluded it had no defects — the fault is
+a property of real CI timing, not of the code, and only running it exposed it.
+
+The conversation IS watched -- comments and submitted reviews -- but only as
+*events*. The probe reports that something was
+said, naming the author and the timestamp, and never quotes the body. Reading
+the text, deciding whether a verdict is real, checking marker freshness and
+composing a rebuttal remain the woken agent's job, done with the session's own
+trust rather than a cron script's. That boundary is what keeps the judgment this
+design exists to stop paying for per-cycle out of the script, while still
+closing the gap that made the watch insufficient on its own: a comment moves no
+check, and a reviewer lane on this repository can report success while its
+comment body carries findings, so a rollup-only watch sits quiet on a green PR
+nobody has read.
+
+Two consequences of watching a conversation rather than a commit:
+
+- Conversation dedupe keys are **epoch-independent** (`epoch_scoped=False`) and
+  survive the force-push reset. A comment belongs to the pull request, not to
+  the commit under review, so pushing a fix minutes after a review must not
+  replay that review.
+- Comments the watcher's own account authored are ignored (`viewerDidAuthor`).
+  Without that the watch is a feedback loop: the woken agent posts a
+  disposition, the next tick sees a new comment and wakes it to read what it
+  just wrote.
+- A signal older than five hours is never new (`DEFAULT_COMMENT_HORIZON_SECS`, a
+  constant rather than a cron parameter -- as a knob it had no caller, so it
+  offered only a misconfiguration path; its one constraint is now asserted at
+  import against the kernel's own `DEFAULT_REALERT_SECS` rather than merely
+  documented). The probe holds no state of its own, so the horizon is
+  what stops arming a watch on a long-discussed PR from reporting its whole
+  history on the first tick.
+
+  ASYMMETRY, and it is what sets the value. The two ends of this number do NOT
+  cost the same. Too large costs arm-time replay: bounded, folded into ONE
+  coalesced brief naming N events, deduped forever after. Too small costs a MISS
+  -- a watch that stops ticking for longer than the horizon (machine asleep,
+  gateway down, cron auto-paused) never sees conversation posted in the gap, and
+  unlike the `blind` backstop it leaves no trace. This feature also retires the
+  nudge loop that would otherwise have read that comment eventually, so it removes
+  the backstop at the same time as it opens the window. One annoying wake is not
+  the price of a lost signal, so the horizon is pushed as close to `realert_secs`
+  as the kernel permits (five hours against six) rather than kept small, and the
+  relationship is asserted in code rather than only documented.
+
+  An earlier revision of this spec claimed raising the horizon "trades the loss
+  window for arm-time replay in equal measure, the same knob read from opposite
+  ends". That was wrong and is recorded here because the wrong version was the
+  stated reason for keeping the value low. The residual gap is now bounded by
+  five hours rather than one; closing it entirely still needs the probe-owned
+  state channel below, which lets a probe record its own baseline instead of
+  inferring one from wall-clock age.
+- The overall `reviewDecision` is deliberately NOT observed. It carries no
+  timestamp, so it cannot be aged against the horizon, and a PR that has sat in
+  `CHANGES_REQUESTED` for a week would wake once the moment a watch is armed --
+  the exact arm-time replay the horizon exists to prevent. It is also
+  near-redundant, since the decision is computed from reviews and a review that
+  moves it emits its own timestamped observation. The residue is a decision that
+  changes with no new review (a dismissal, or approvals invalidated by a push):
+  real, but nothing to act on urgently and undatable from this payload.
+
+CANCELLED check runs are classified as noise (force-push twins and re-run
+leftovers dominate); the rare real one surfaces through the checks it cancelled
+around.
 
 ## 4. Mechanics
 
@@ -89,28 +173,44 @@ it cancelled around.
   call per tick (25s subprocess timeout). The rollup is bucketed tolerantly
   across the CheckRun and StatusContext shapes; unknown conclusion vocabulary
   buckets as failing — when in doubt, wake a brain.
-- **State**: `<data home>/pr-watch/<repo-fold>-<pr>.json` holding the last
-  head, the per-head alert memory, and the consecutive-error streak. Corrupt
-  or missing state reads as fresh; the cost of lost state is one duplicate
-  wake, never a lost signal.
+- **State**: owned by the kernel at
+  `<data home>/watch/gh-pr/<subject-fold>-<digest>.json`, where the digest
+  covers `gh-pr#<repo>#<pr>#<cron job id>` — so two sessions babysitting one PR
+  keep independent alert memories and neither can suppress the other's
+  delivery. It holds the last head (the kernel's `epoch`), the per-head alert
+  memory, the consecutive-error streak, and any open coalescing window.
+  Corrupt or missing state reads as fresh; the cost of lost state is one
+  duplicate wake, never a lost signal. **This path differs from the previous
+  `<data home>/pr-watch/...`**, so the first tick after upgrading is a cache
+  miss and any currently-open anomaly wakes once more. That is expected, not a
+  regression.
 - **Wake targeting**: the cron must be armed FROM the babysit session — the
   cron system captures the calling session key at `cron_add` time and the
   delivery path resolves it back to that slot (rehydrating it from history if
   the tab was closed). Armed headless, delivery degrades to a bell
   notification.
-- **Wake brief**: names the PR, head, reason, and the caller-supplied `note`
-  (worktree/branch orientation), and directs the woken turn to read the
-  session work ledger when one exists — pairing with the session-ledger
-  feature so a cold wake resumes from durable state.
+- **Wake brief**: each observation's line names the PR, head and reason. The
+  caller-supplied `note` (worktree/branch orientation) and the direction to read
+  the session work ledger are the WAKE's footer, not each observation's, so the
+  kernel appends them once per delivery through `Probe.wake_suffix()` — a
+  coalesced wake carrying six signals used to repeat both of them six times,
+  measured at 56% of the delivered bytes. A conversation signal also omits the
+  `(head ...)` tag, because a comment belongs to the pull request rather than to
+  any one commit.
 - Check names are attacker-influenceable text (a workflow names its jobs);
   they are charset-folded before entering state keys or the wake brief.
 
 ## 5. Non-goals
 
-- **Replacing `monitor_start`.** Active-fix phases — where the agent pushes,
-  re-runs gates, and answers reviewers most cycles — keep the nudge loop.
-  Watch mode is for the waiting between them.
-- **Reviewer-verdict parsing in the watcher.** See §3.
+- **Replacing `monitor_start` entirely.** Watch mode now covers the whole
+  waiting phase, conversation included, so a PR babysit no longer needs a nudge
+  loop merely to notice a comment. Two things still keep `monitor_start`: an
+  active-fix phase, where the next step is driven by the agent's own unfinished
+  work rather than by anything observable on the PR, and watching subjects that
+  are not pull requests at all (a deployment, a ticket, someone else's CI run).
+  Retiring it for those needs a probe each, which is not this feature.
+- **Parsing verdict text in the watcher.** See §3: the probe reports that a
+  comment or review exists, never what it says.
 - **Multi-PR watches.** One cron per PR; the state file and the wake brief
   are per-PR, and `cron_list` stays legible.
 - **A new wake primitive.** The script-cron `Report` delivery path already
@@ -124,7 +224,22 @@ it cancelled around.
 - Malformed cron message (bad JSON, missing repo/pr) → `Done` with the
   reason: a watch that can never succeed removes itself instead of retrying
   forever.
-- State file unwritable → alerts may repeat (duplicate wake), never lost.
+- State file unwritable → alerts may repeat (duplicate wake), never lost, and
+  every wake carries a warning naming the directory. If the probe is failing
+  *and* state cannot persist, the streak can never accumulate, so that case
+  reports on the first tick instead of waiting for a threshold it will never
+  reach.
+- **Coalescing costs at least one extra tick**, because a window cannot open
+  and fire within the same tick — `elapsed` is zero at the moment it opens. On
+  a 60-second cron that is at least 60 seconds of added latency. Set
+  `coalesce_secs: 0` in the cron message when latency matters more than being
+  woken once.
+- `pending` never draining (a check wedged in queued, a phantom pending row) →
+  the window fires at the `coalesce_max_secs` wall instead, which is measured
+  from the first anomaly and independent of `pending`. A new anomaly arriving
+  after that starts a fresh window, so under a permanently stuck `pending`
+  count the worst case is one wake per hard-cap interval — delayed, never
+  dropped.
 - Session tab closed → the delivery path rehydrates the slot from history;
   if the session's history was permanently deleted, delivery degrades to a
   bell notification.

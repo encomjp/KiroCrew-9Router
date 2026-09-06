@@ -15,7 +15,7 @@ from aiohttp import web
 
 from kiro_crew import webhooks
 from kiro_crew.agent import _VALID_HOOK_EVENTS, _shipped_defaults, kiro_agents_dir_path
-from kiro_crew.agent_discovery import list_agents
+from kiro_crew.agent_discovery import _read_agent_spec, list_agents
 from kiro_crew.config.loader import KiroCrewConfig, data_home
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.executors import run_in_embed_pool
@@ -100,10 +100,20 @@ async def api_kiro_hooks(request: web.Request) -> web.Response:
     from kiro_crew.platform import redact_via_context as redact
 
     agent_cfg = kiro_agents_dir_path() / "kirocrew.json"
-    try:
-        raw = json.loads(agent_cfg.read_text())
-        hooks = raw.get("hooks", {}) if isinstance(raw, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    # ``kirocrew.json`` lives in the user-writable, tool-shared agents dir, so
+    # the read goes through the hardened agents-dir reader (size cap, symlink
+    # and sensitive-target screens, explicit UTF-8, non-object rejection).
+    # ``None`` covers every case the old ``except (OSError, JSONDecodeError)``
+    # caught — plus the ones it missed, e.g. non-UTF-8 bytes, which previously
+    # escaped as an unhandled 500 — and degrades the same way: no user hooks.
+    # Off-loop: the reader stats + reads up to the size cap, and this handler
+    # runs on the gateway event loop (review-adopted, no-blocking-call rule).
+    raw = await asyncio.to_thread(_read_agent_spec, agent_cfg)
+    # The reader guarantees the TOP level is an object, not the "hooks" value:
+    # a user-writable {"hooks": []} would reach hooks.items() below and escape
+    # as a 500. Same degrade-as-absent rule as every other unusable shape.
+    hooks = raw.get("hooks") if raw is not None else None
+    if not isinstance(hooks, dict):
         hooks = {}
     # Load bundled defaults to tag source
     try:
@@ -186,6 +196,13 @@ async def api_hooks_create(request: web.Request) -> web.Response:
         hook = await _mutate_hook_store(store.create, validated)
     except _StoreUnavailable:
         return _store_unavailable_response()
+    except ValueError as exc:
+        # store.create now enforces the same invariants as store.update via the
+        # shared validator, so it can raise ValueError. The HOOK_CREATE_SCHEMA
+        # check above normally rejects bad input first, but catch it here too so
+        # any schema/validator drift surfaces as a 400 (like the update handler)
+        # rather than an unhandled 500.
+        return web.json_response({"error": str(exc), "code": "invalid_hook"}, status=400)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="hook.create",
@@ -282,6 +299,7 @@ async def api_hook_test(request: web.Request) -> web.Response:
     # circular import: kiro_crew.hooks pulls dashboard state at module load, so
     # this handler defers the import to call time (matches _get_hook_store above).
     from kiro_crew.hooks import HOOK_EVENT_STOP, run_script_hook  # noqa: F811
+    from kiro_crew.platform import redact_via_context
 
     store = _get_hook_store(request.app["state"])
     hook_id = request.match_info["hook_id"]
@@ -319,7 +337,7 @@ async def api_hook_test(request: web.Request) -> web.Response:
             "hook_event": hook.event,
             "exit_code": result.exit_code,
             "duration_ms": result.duration_ms,
-            "context": context,
+            "context": redact_via_context(context),
         },
     )
     return web.json_response(

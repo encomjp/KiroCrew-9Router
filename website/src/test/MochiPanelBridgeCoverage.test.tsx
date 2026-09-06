@@ -740,6 +740,44 @@ describe('panelBridge send', () => {
     await expect(bridge.ensureSlot()).rejects.toThrow(/could not verify/)
   })
 
+  // `agent` is stored VERBATIM by the backend, so it keeps reading `mochi` even
+  // when nothing dispatches that name and the default agent answers instead. The
+  // first gate is blind to that; `effective_agent` is what reports it.
+  it('refuses when the slot resolves to a different effective agent', async () => {
+    route(
+      '/api/chat/slots',
+      { body: { agent: 'mochi', effective_agent: 'kirocrew' } },
+      'POST',
+    )
+    const bridge = await loadBridge()
+    await expect(bridge.ensureSlot()).rejects.toThrow(/resolves to a different agent/)
+    expect(calls('/api/chat?ws=1', 'POST')).toHaveLength(0)
+  })
+
+  it('sends when the effective agent agrees with the request', async () => {
+    route(
+      '/api/chat/slots',
+      { body: { agent: 'mochi', effective_agent: 'mochi' } },
+      'POST',
+    )
+    const bridge = await loadBridge()
+    await expect(bridge.ensureSlot()).resolves.toBeUndefined()
+  })
+
+  // The compatibility half of the gate, and the reason it is a `typeof` check
+  // rather than a truthiness one: "" means "nothing to report" (an unsettled
+  // resolution during boot), and a caller predating the field sends no key at
+  // all. Either read as a mismatch would refuse every send on a healthy install.
+  it.each([
+    ['an empty effective agent', { agent: 'mochi', effective_agent: '' }],
+    ['no effective agent field at all', { agent: 'mochi' }],
+    ['a non-string effective agent', { agent: 'mochi', effective_agent: null }],
+  ])('treats %s as no news and sends', async (_label, body) => {
+    route('/api/chat/slots', { body }, 'POST')
+    const bridge = await loadBridge()
+    await expect(bridge.ensureSlot()).resolves.toBeUndefined()
+  })
+
   it('leaves the latch off when the bind request fails, so the next send retries', async () => {
     route('/api/chat/slots', { ok: false, status: 503 }, 'POST')
     const bridge = await loadBridge()
@@ -1135,11 +1173,11 @@ describe('panelBridge approvals', () => {
 
   it('a scoped trust grant goes to the slot route, carrying its pattern', async () => {
     const bridge = await loadBridge()
-    await bridge.respondApproval('req3', 'trust_command', 'ls -la')
+    await bridge.respondApproval('req3', 'trust_command', 'ls -la', true)
     const [call] = calls('/api/chat/slots/mochi/approve', 'POST')
     expect(bodyOf(call)).toEqual({ action: 'trust_command', request_id: 'req3', pattern: 'ls -la' })
 
-    await bridge.respondApproval('req4', 'trust')
+    await bridge.respondApproval('req4', 'trust', undefined, true)
     expect(bodyOf(calls('/api/chat/slots/mochi/approve', 'POST')[1]).pattern).toBeUndefined()
   })
 
@@ -1212,16 +1250,17 @@ describe('panelBridge model selection', () => {
 
   it('switches the slot model and reports failure honestly', async () => {
     const bridge = await loadBridge()
-    expect(await bridge.setModel('sonnet')).toBe(true)
+    expect(await bridge.setModel('sonnet')).toEqual({ ok: true })
     expect(bodyOf(calls('/api/chat/slots/mochi/model', 'POST')[0])).toEqual({ model: 'sonnet' })
 
+    // A code-less refusal stays a generic failure (no `code` field invented).
     route('/api/chat/slots/mochi/model', { ok: false, status: 400 }, 'POST')
     const failing = await loadBridge()
-    expect(await failing.setModel('bogus')).toBe(false)
+    expect(await failing.setModel('bogus')).toEqual({ ok: false })
 
     route('/api/chat/slots/mochi/model', { reject: true }, 'POST')
     const offline = await loadBridge()
-    expect(await offline.setModel('sonnet')).toBe(false)
+    expect(await offline.setModel('sonnet')).toEqual({ ok: false })
   })
 })
 
@@ -1318,15 +1357,6 @@ describe('panelBridge speech-to-text reuses the core stack', () => {
     route('/api/config/stt', { reject: true })
     bridge = await loadBridge()
     expect(await bridge.getSttConfig()).toBeUndefined()
-  })
-
-  it('an install failure carries its reason to the settings panel', async () => {
-    const bridge = await loadBridge()
-    expect(await bridge.installStt()).toEqual({ ok: true })
-
-    route('/api/stt/install', { ok: false, status: 500 }, 'POST')
-    const failing = await loadBridge()
-    expect(await failing.installStt()).toEqual({ ok: false, error: 'install failed (500)' })
   })
 
   it('transcribes a clip and defaults the mime type', async () => {

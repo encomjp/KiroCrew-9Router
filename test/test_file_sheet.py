@@ -12,6 +12,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard.handlers import api_file_sheet
 from kiro_crew.dashboard.handlers.files import (
+    _MAX_UPLOAD_BYTES,
     _SHEET_MAX_COLS,
     _SHEET_MAX_ROWS,
     _load_sheet_payload,
@@ -30,7 +31,7 @@ def _make_app() -> web.Application:
 @pytest.fixture
 def mock_sel():
     with patch("kiro_crew.sel.sel") as m, \
-         patch("kiro_crew.security.is_sensitive_path", return_value=False):
+         patch("kiro_crew.dashboard.handlers.files.is_sensitive_path", return_value=False):
         instance = MagicMock()
         m.return_value = instance
         yield instance
@@ -218,7 +219,10 @@ def test_zip_expansion_cap_refuses_before_parse(tmp_path):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("kiro_crew.dashboard.handlers.files._SHEET_MAX_EXPANDED_BYTES", 1024)
         with pytest.raises(_SheetRefusal) as exc:
-            _load_sheet_payload(str(f))
+            # The parser receives the checked-open file object (ownership
+            # transfers: it closes on every path) and the bounded-read cap as
+            # passed-in policy -- the same shape the endpoint uses.
+            _load_sheet_payload(open(f, "rb"), max_bytes=_MAX_UPLOAD_BYTES)
     assert exc.value.status == 413
     assert "expands" in str(exc.value)
 
@@ -233,7 +237,7 @@ def test_zip_member_count_cap_refuses_before_parse(tmp_path):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr("kiro_crew.dashboard.handlers.files._SHEET_MAX_MEMBERS", 10)
         with pytest.raises(_SheetRefusal) as exc:
-            _load_sheet_payload(str(f))
+            _load_sheet_payload(open(f, "rb"), max_bytes=_MAX_UPLOAD_BYTES)
     assert exc.value.status == 413
 
 
@@ -373,7 +377,7 @@ async def test_rejects_sensitive_path(tmp_path):
     f = tmp_path / "creds.xlsx"
     f.write_bytes(b"PK\x03\x04junk")
     with patch("kiro_crew.sel.sel", return_value=MagicMock()), \
-         patch("kiro_crew.security.is_sensitive_path", return_value=True), \
+         patch("kiro_crew.dashboard.handlers.files.is_sensitive_path", return_value=True), \
          patch("kiro_crew.dashboard.handlers._validate_dashboard_path", return_value=str(f)):
         async with TestClient(TestServer(_make_app())) as client:
             resp = await client.get(f"/api/file-sheet?path={f}")
@@ -427,3 +431,45 @@ async def test_cancellation_during_parse_still_audits(tmp_path, mock_sel):
         for call in mock_sel.log_tool_invocation.call_args_list
     ]
     assert "cancelled" in outcomes
+
+
+def test_the_sheet_vet_routes_through_the_shared_module(tmp_path, monkeypatch):
+    """The endpoint keeps its own caps and its own error channel, but the
+    implementation is the shared one -- so there is only one preflight to audit."""
+    import zipfile
+
+    from kiro_crew.dashboard.handlers import files as files_mod
+    from kiro_crew.zip_vet import ZipInventoryRejected
+
+    seen: dict = {}
+
+    def _fake_vet(data, *, max_members, max_cdir_entry_bytes):
+        seen["max_members"] = max_members
+        seen["max_cdir_entry_bytes"] = max_cdir_entry_bytes
+        raise ZipInventoryRejected("cdir_too_large", "boom")
+
+    monkeypatch.setattr(files_mod, "vet_zip_inventory_bytes", _fake_vet)
+    f = tmp_path / "x.xlsx"
+    with zipfile.ZipFile(f, "w") as z:
+        z.writestr("m", b"x")
+    with pytest.raises(_SheetRefusal) as exc:
+        files_mod._vet_zip_eocd(f.read_bytes())
+    assert exc.value.status == 413
+    assert exc.value.code == "workbook_expands_too_large"
+    assert seen["max_members"] == files_mod._SHEET_MAX_MEMBERS
+    assert seen["max_cdir_entry_bytes"] == files_mod._SHEET_MAX_CDIR_ENTRY_BYTES
+
+
+def test_an_unreadable_tail_reads_as_not_a_spreadsheet(monkeypatch):
+    """Fail closed, in this endpoint's own vocabulary."""
+    from kiro_crew.dashboard.handlers import files as files_mod
+    from kiro_crew.zip_vet import ZipInventoryRejected
+
+    def _fake_vet(data, **kw):
+        raise ZipInventoryRejected("unreadable", "boom")
+
+    monkeypatch.setattr(files_mod, "vet_zip_inventory_bytes", _fake_vet)
+    with pytest.raises(_SheetRefusal) as exc:
+        files_mod._vet_zip_eocd(b"PK\x03\x04")
+    assert exc.value.status == 415
+    assert exc.value.code == "not_a_spreadsheet"

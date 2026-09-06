@@ -338,8 +338,8 @@ async def _install_from_official(request: web.Request, server_id: str) -> web.Re
             return web.json_response({"error": "name already in use"}, status=409)
         if existing is None:
             # Fresh install: always written disabled (consent default).
-            # The store write can apply a Windows owner-only DACL via icacls —
-            # a blocking subprocess kept off the event loop.
+            # The store write can apply a Windows owner-only DACL —
+            # blocking filesystem work kept off the event loop.
             await _offload_config_write(_set_kirocrew_entry, name, enabled=enable_now, spec=spec)
         else:
             # Identical spec already present — a reinstall is a pure no-op:

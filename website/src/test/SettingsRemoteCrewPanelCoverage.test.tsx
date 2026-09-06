@@ -173,7 +173,11 @@ async function openSetupTab(u: ReturnType<typeof setup>) {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // The launch form's size now persists here (like its sibling profile/region), and
+  // the hand-off channel is a queue nothing drains, so without this a value left by
+  // one case leaks into the next.
   localStorage.clear()
+  sessionStorage.clear()
   // The copy affordances schedule a 1.5s revert. Without fake timers that
   // callback fires after teardown and throws as an unhandled error.
   vi.useFakeTimers({ shouldAdvanceTime: true })

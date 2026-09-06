@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, act } from '@testing-library/react'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
-import FollowUpBar from '../components/FollowUpBar'
+import FollowUpBar, { FOLLOWUP_CHIP_DEBOUNCE_MS } from '../components/FollowUpBar'
 
 // jsdom polyfill: scroll-layout uses ResizeObserver to track when the chip
 // strip can scroll left/right.
@@ -109,7 +109,9 @@ describe('FollowUpBar', () => {
       expect(onSelect).toHaveBeenCalledTimes(0) // timer pending
       act(() => { vi.advanceTimersByTime(250) })
       expect(onSelect).toHaveBeenCalledTimes(1)
-      expect(onSelect).toHaveBeenCalledWith('Ship it', expect.any(Object))
+      // Third arg is the click-time `sourceKey` snapshot — `undefined` here
+      // because this caller supplies no `sourceKey` prop at all.
+      expect(onSelect).toHaveBeenCalledWith('Ship it', expect.any(Object), undefined)
       expect(onSend).not.toHaveBeenCalled()
     })
 
@@ -264,11 +266,11 @@ describe('FollowUpBar', () => {
       const chip = screen.getByRole('button', { name: LONG })
       expect(chip.className).toContain('followup-chip')
       // The clamp must sit on an unpadded inner element, not on the padded
-      // button — otherwise a sliver of the third line shows in the padding.
+      // button — otherwise a sliver of the next line shows in the padding.
       const label = chip.querySelector('span')
-      expect(label?.className).toContain('line-clamp-2')
+      expect(label?.className).toContain('line-clamp-1')
       expect(label?.className).toContain('break-words')
-      expect(chip.className).not.toContain('line-clamp-2')
+      expect(chip.className).not.toContain('line-clamp-1')
     })
 
     it('caps the split-button wrapper too, not just the button', () => {
@@ -353,11 +355,29 @@ describe('FollowUpBar', () => {
       }
     })
 
-    it('caps chip width and clamps the label in the multiline layout', () => {
+    it('caps chip width and clamps the label to one line in the multiline layout', () => {
       render(<FollowUpBar options={[LONG]} picked={new Set()} onSelect={() => {}} />)
       const chip = screen.getByRole('button', { name: LONG })
       expect(chip.className).toContain('followup-chip')
-      expect(chip.querySelector('span')?.className).toContain('line-clamp-2')
+      expect(chip.querySelector('span')?.className).toContain('line-clamp-1')
+    })
+
+    it('clamps to ONE line so a long label cannot make its chip taller than its neighbours', () => {
+      // A chip's height is its label's line count, so a wrapping label is what
+      // produced a row of sibling controls at two different heights. One line
+      // removes the cause instead of equalising it with an alignment rule.
+      // jsdom reports no layout, so the clamp class is the assertable part.
+      for (const layout of ['scroll', 'multiline'] as const) {
+        const { unmount } = render(
+          <FollowUpBar options={[LONG, 'Ship it']} picked={new Set()} onSelect={() => {}} onSend={() => {}} layout={layout} />,
+        )
+        for (const label of [LONG, 'Ship it']) {
+          const span = screen.getByRole('button', { name: label }).querySelector('span')
+          expect(span?.className).toContain('line-clamp-1')
+          expect(span?.className).not.toContain('line-clamp-2')
+        }
+        unmount()
+      }
     })
 
     it('keeps the full label in the DOM so the accessible name is not truncated', () => {
@@ -365,15 +385,20 @@ describe('FollowUpBar', () => {
       expect(screen.getByRole('button', { name: LONG }).textContent).toBe(LONG)
     })
 
-    it('shows the full text as the tooltip when the label is long', () => {
+    it('puts the full text in the tooltip for a clamped label, followed by the hint', () => {
       render(<FollowUpBar options={[LONG]} picked={new Set()} onSelect={() => {}} onSend={() => {}} />)
-      expect(screen.getByRole('button', { name: LONG }).getAttribute('title')).toBe(LONG)
+      const title = screen.getByRole('button', { name: LONG }).getAttribute('title') ?? ''
+      // Full label FIRST so the reader gets the unreadable part before the hint.
+      expect(title.startsWith(LONG)).toBe(true)
+      expect(title).toMatch(/double-click/i)
     })
 
-    // A clamped label makes its own chip two lines tall. Centring the row then
-    // floats every single-line chip to that chip's middle; the row is read
-    // against the composer directly below it, so the shared edge is the bottom.
-    it('bottom-aligns the chips in the scroll layout so a two-line chip does not float its neighbours', () => {
+    // With the one-line clamp every chip is already the same height, so these
+    // two only pin where a taller chip WOULD sit if one is ever introduced. The
+    // row is read against the composer directly below it, so that edge is the
+    // bottom, and centring is the specific wrong answer: it would float every
+    // ordinary chip into the middle of the taller one's box.
+    it('bottom-aligns the chips in the scroll layout so a taller chip cannot float its neighbours', () => {
       const { container } = render(<FollowUpBar options={['Go', LONG]} picked={new Set()} onSelect={() => {}} layout="scroll" />)
       const strip = screen.getByRole('button', { name: 'Go' }).parentElement
       expect(strip?.className).toContain('items-end')
@@ -402,11 +427,21 @@ describe('FollowUpBar', () => {
       expect(wrapper?.className).toContain('items-stretch')
     })
 
-    it('leaves a short label tooltip as the gesture hint alone', () => {
-      render(<FollowUpBar options={['Merge it now']} picked={new Set()} onSelect={() => {}} onSend={() => {}} />)
-      const title = screen.getByRole('button', { name: 'Merge it now' }).getAttribute('title') ?? ''
-      expect(title.startsWith('Merge it now')).toBe(false)
-      expect(title).toMatch(/double-click/i)
+    it('carries the full label on EVERY chip, with no length threshold deciding it', () => {
+      // Regression: the tooltip used to switch to the full text only past 60
+      // characters, a number chosen when the label wrapped to two lines. At one
+      // clamped line the cut starts around 44, so every label in between was
+      // visibly truncated with the hover showing only the gesture hint. Length
+      // must not gate it — a 12-char label and a 200-char one behave the same.
+      for (const option of ['Merge it now', 'x'.repeat(50), LONG]) {
+        const { unmount } = render(
+          <FollowUpBar options={[option]} picked={new Set()} onSelect={() => {}} onSend={() => {}} />,
+        )
+        const title = screen.getByRole('button', { name: option }).getAttribute('title') ?? ''
+        expect(title.startsWith(option)).toBe(true)
+        expect(title).toMatch(/double-click/i)
+        unmount()
+      }
     })
 
     it('still passes the untruncated option text to onSelect', () => {
@@ -445,6 +480,53 @@ describe('FollowUpBar', () => {
       const chip = screen.getByRole('button', { name: 'Gamma' })
       expect(chip).toHaveAttribute('type', 'button')
       expect(fireEvent.mouseDown(chip)).toBe(false)
+    })
+  })
+
+  // ─── sourceKey is snapshotted at CLICK time, not at debounce-fire time ────
+  // The 220ms debounce means the transcript row these chips came from can be
+  // REPLACED while the timer is pending — and a byte-identical replacement
+  // footer (same labels, so the same chip keys) re-renders the chip WITHOUT
+  // remounting it, so the timer survives. A callee that acts on the click
+  // (the orchestrator plan dispatch) must therefore be told which row the
+  // user actually clicked, not whichever row happens to be current when the
+  // timer fires — otherwise one click on a stale footer approves the stage
+  // that replaced it.
+  describe('sourceKey (click-time row identity)', () => {
+    beforeEach(() => { vi.useFakeTimers() })
+    afterEach(() => { vi.useRealTimers() })
+
+    const PLAN = ['Go', 'Go All', 'Cancel']
+
+    it('hands onSelect the sourceKey from CLICK time after the row advances mid-debounce', () => {
+      const onSelect = vi.fn()
+      const bar = (sourceKey: string) => (
+        <FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} onSend={() => {}} sourceKey={sourceKey} />
+      )
+      const { rerender } = render(bar('row-1'))
+      const go = screen.getByRole('button', { name: 'Go' })
+      fireEvent.click(go, { detail: 1 })
+      expect(onSelect).not.toHaveBeenCalled() // timer pending
+
+      // The replacement footer: identical options (so `key={o}` matches and the
+      // chip is REUSED, not recreated) but a new row identity.
+      rerender(bar('row-2'))
+      // Pin the no-remount premise the whole race rests on — if React replaced
+      // the element, the pending timer would have been cleaned up and this test
+      // would pass for the wrong reason.
+      expect(screen.getByRole('button', { name: 'Go' })).toBe(go)
+
+      act(() => { vi.advanceTimersByTime(FOLLOWUP_CHIP_DEBOUNCE_MS + 30) })
+      expect(onSelect).toHaveBeenCalledTimes(1)
+      expect(onSelect).toHaveBeenCalledWith('Go', expect.any(Object), 'row-1')
+    })
+
+    it('hands onSelect the current sourceKey when the row does not change', () => {
+      const onSelect = vi.fn()
+      render(<FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} onSend={() => {}} sourceKey="row-1" />)
+      fireEvent.click(screen.getByRole('button', { name: 'Go All' }), { detail: 1 })
+      act(() => { vi.advanceTimersByTime(FOLLOWUP_CHIP_DEBOUNCE_MS + 30) })
+      expect(onSelect).toHaveBeenCalledWith('Go All', expect.any(Object), 'row-1')
     })
   })
 })

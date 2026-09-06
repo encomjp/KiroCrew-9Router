@@ -83,6 +83,15 @@ STATUS_DONE = "done"
 STATUS_ERROR = "error"
 
 
+class _CalibrationStopped(Exception):
+    """Internal signal that a Stop click landed between calibration phases.
+
+    Caught in :meth:`RunSupervisor._calibrate_loop` and recorded as a clean stop
+    rather than a failure — a stopped calibration has proven no ruler and writes
+    none, but it is not an error the operator needs to see reported.
+    """
+
+
 @dataclass
 class RunState:
     """Everything :meth:`RunSupervisor.status` reports. Mutated only under the lock."""
@@ -649,11 +658,31 @@ class RunSupervisor:
                         )
 
                 profile = build_profile(config)
+                # Duck-wire the supervisor's stop flag onto the ruler so a Stop click
+                # can interrupt calibration between measurement reps, exactly as the
+                # driver does for the Phase-1 preflight path (`Driver._preflight`).
+                # `calibrate` builds NO driver, so without this the ruler never sees a
+                # stop and a Stop click during a long baseline flips the status to
+                # `stopping` while the suite runs to completion — the "stuck
+                # calibrating" symptom. The ruler treats it as optional.
+                try:
+                    profile.ruler.stop_check = self._stop_check  # type: ignore[attr-defined]
+                except Exception:  # noqa: BLE001 — a frozen/slotted ruler just runs to completion
+                    pass
                 clone = Path(str(config.get("clone") or ""))
                 reps = _pos_int(config.get("calibrationReps"), 5)
 
+                # Between-phase cancellation. `baseline_samples` and `measure_canary`
+                # are each a multi-rep suite run, so honoring the stop only between
+                # baseline reps still leaves the canary to run in full; check the flag
+                # at every phase boundary and abort cleanly.
+                self._raise_if_stopped()
                 self._note(f"collecting {reps} baseline sample(s)")
                 samples = profile.ruler.baseline_samples(base_src=clone, reps=reps)
+                # A stop lands as a short/empty sample list from the ruler's own
+                # between-rep check; treat that as the stop it is, not as the genuine
+                # "harness produced nothing" error below.
+                self._raise_if_stopped()
                 if not samples:
                     raise RuntimeError("the ruler returned no baseline samples")
 
@@ -673,6 +702,7 @@ class RunSupervisor:
                 )
                 self._note(f"noise band = {band}")
 
+                self._raise_if_stopped()
                 self._note("running the canary (a known win must clear the band)")
                 canary = profile.ruler.measure_canary(base_src=clone)
                 observed = float(getattr(canary, "primary_delta", 0.0) or 0.0)
@@ -732,6 +762,11 @@ class RunSupervisor:
                     / "ruler"
                     / "ruler.json"
                 )
+                # Last boundary before the ruler write: a stop that landed during the
+                # canary must not persist a ruler. A stopped calibration has proven
+                # nothing, and a stale `calibrated` file would let a later run start on
+                # an unproven ruler.
+                self._raise_if_stopped()
                 ruler_path.parent.mkdir(parents=True, exist_ok=True)
                 store_mod.write_json_atomic(ruler_path, ruler_doc)
 
@@ -772,9 +807,37 @@ class RunSupervisor:
                         store.APP_NAME,
                         cleared,
                     )
+        except _CalibrationStopped:
+            # A Stop click, not a failure: record a clean terminal state. A stopped
+            # calibration wrote no ruler this run (the phase-boundary checks abort
+            # before the write), and — like the failure path below — it leaves any
+            # ruler an earlier calibration proved untouched: a stop is as often "this
+            # is taking too long" as "supersede this", so aborting must not destroy
+            # prior work the operator would have to re-pay a full suite run to rebuild.
+            self._mark_stopped()
         except BaseException as exc:  # noqa: BLE001 - a failure is state, not a crash
             logger.exception("%s: calibration failed", store.APP_NAME)
             self._fail(exc)
+
+    def _raise_if_stopped(self) -> None:
+        """Abort the current measurement phase if a stop has been requested.
+
+        Raised at each calibration phase boundary so a Stop click lands between
+        measurement phases rather than after the whole baseline-then-canary run
+        finishes on its own. The boundary before the ruler write is best-effort: a
+        stop in the window between it and the write still persists a fully proven
+        ruler, which is correct — that calibration actually completed.
+        """
+        if self._stop_check():
+            raise _CalibrationStopped
+
+    def _mark_stopped(self) -> None:
+        """Record a cooperative calibration stop as a clean terminal state (no error)."""
+        with self._lock:
+            self._state.status = STATUS_DONE
+            self._state.stage = ""
+            self._state.finished_at = time.time()
+            self._state.activity.append({"t": time.time(), "note": "calibration stopped"})
 
     def _fail(self, exc: BaseException) -> None:
         """Record a TERMINAL failure: status, redacted message, finish time, feed entry.

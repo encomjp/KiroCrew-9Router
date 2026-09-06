@@ -365,8 +365,8 @@ class TestRouteMessageStop:
     async def test_stop_cancels_active_task_and_cleans_up(self):
         """!stop in _route_message cancels the asyncio task and cleans _session_tasks."""
         orch = _make_orch()
-        orch.sessions = AsyncMock()
-        orch.sessions.has_session.return_value = True
+        orch.sessions = MagicMock()
+        orch.sessions.has_session = MagicMock(return_value=True)
         orch.sessions.stop_turn = AsyncMock(return_value="soft")
         orch.sessions.enqueue = MagicMock(return_value=False)
         orch.sessions.dequeue = MagicMock(return_value=None)
@@ -410,8 +410,8 @@ class TestRouteMessageStop:
     async def test_stop_bypasses_semaphore(self):
         """!stop is handled before handle_message — never enters the semaphore path."""
         orch = _make_orch()
-        orch.sessions = AsyncMock()
-        orch.sessions.has_session.return_value = True
+        orch.sessions = MagicMock()
+        orch.sessions.has_session = MagicMock(return_value=True)
         orch.sessions.stop_turn = AsyncMock(return_value="soft")
         orch.sessions.enqueue = MagicMock(return_value=False)
         orch.sessions.dequeue = MagicMock(return_value=None)

@@ -19,6 +19,7 @@ and terminal-state handling through a real spine cycle.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import threading
@@ -28,7 +29,9 @@ from typing import Any
 
 import pytest
 
+from kiro_crew.apps.builtins.auto_improvement.backend import progress as progress_mod
 from kiro_crew.apps.builtins.auto_improvement.backend import runner as R
+from kiro_crew.apps.builtins.auto_improvement.backend import store
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -477,6 +480,24 @@ def _join(supervisor: R.RunSupervisor, *, timeout: float = 30.0) -> None:
         time.sleep(0.02)
 
 
+def _join_calibration(supervisor: R.RunSupervisor, *, timeout: float = 30.0) -> None:
+    """Wait for a calibration worker to reach a terminal status.
+
+    Unlike :func:`_join`, this waits for the calibration thread to leave the
+    ``calibrating``/``stopping`` states, so an assertion about what the worker did
+    (ran the canary, wrote a ruler) runs only after the worker has finished — never
+    mid-phase, which would race the worker.
+    """
+    thread = supervisor._thread
+    if thread is not None:
+        thread.join(timeout=timeout)
+        assert not thread.is_alive(), "the calibration thread did not finish in time"
+    deadline = time.time() + 2.0
+    transient = (R.STATUS_CALIBRATING, R.STATUS_RUNNING, R.STATUS_STOPPING)
+    while time.time() < deadline and supervisor.status()["status"] in transient:
+        time.sleep(0.02)
+
+
 class TestCalibrationWritesToTheLaunchedWorkspace:
     """`_calibrate_loop` runs on a background thread and used to write the ruler via
     `store.ruler_dir()`, which re-reads the LIVE `config.json`. If the operator retargeted
@@ -556,3 +577,280 @@ class TestCalibrationWritesToTheLaunchedWorkspace:
         assert not ruler_b.is_file(), "the ruler leaked into the retargeted workspace"
         doc = json.loads(ruler_a.read_text(encoding="utf-8"))
         assert doc["status"] == "calibrated"
+
+
+class TestCalibrationRespondsToStop:
+    """`POST /run/stop` during a standalone calibration must interrupt it.
+
+    A run built by :meth:`~RunSupervisor.start` gets a driver whose
+    ``request_stop`` is wired to the ruler's ``stop_check``, so a Stop click aborts
+    the measurement between reps. Calibration (:meth:`~RunSupervisor.calibrate`)
+    builds NO driver and runs the whole baseline-then-canary measurement back to
+    back, so it must observe the supervisor's ``_stop_requested`` flag itself —
+    otherwise a Stop click during a long baseline flips the status to ``stopping``
+    while the suite keeps running to completion (the "stuck calibrating" symptom).
+    """
+
+    def _profile_factory(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        ruler: Any,
+    ) -> None:
+        class _Cal:
+            noise_floor = 0.0
+
+        class _Profile:
+            def __init__(self) -> None:
+                self.ruler = ruler
+                self.calibration = _Cal()
+
+        monkeypatch.setattr(
+            "kiro_crew.apps.builtins.auto_improvement.profiles.build_profile",
+            lambda cfg: _Profile(),
+        )
+
+    def _sequenced_ruler(
+        self,
+        *,
+        in_baseline: threading.Event,
+        release_baseline: threading.Event,
+        canary_ran: threading.Event,
+    ) -> Any:
+        """A ruler that blocks in the baseline phase until the test releases it, so
+        the test can request a stop while calibration is provably mid-baseline —
+        the exact "stuck calibrating" window a Stop click has to interrupt. The
+        baseline honors the duck-wired ``stop_check`` the supervisor must set (the
+        real ``SuiteRuler`` polls it between reps); if it is never wired, the
+        baseline returns full samples and the canary runs regardless of the stop."""
+
+        class _SequencedRuler:
+            primary_name = "ttft"
+            unit = "ms"
+            direction = "minimize"
+            #: The supervisor must duck-wire this, exactly as the driver does for
+            #: the Phase-1 preflight path. Left unset here so an unwired production
+            #: path is visible as ``None``.
+            stop_check: Any = None
+
+            def baseline_samples(self, *, base_src: Any, reps: int) -> list[float]:
+                in_baseline.set()
+                # Wait until the test has issued the stop, then behave like the real
+                # ruler: poll the wired stop_check and abort with a partial (here
+                # empty) sample list when it reports True.
+                release_baseline.wait(timeout=10.0)
+                check = self.stop_check
+                if callable(check) and check():
+                    return []
+                return [10.0, 11.0, 12.0]
+
+            def measure_canary(self, *, base_src: Any) -> Any:
+                canary_ran.set()
+
+                class _M:
+                    ok = True
+                    primary_delta = -50.0
+
+                return _M()
+
+        return _SequencedRuler()
+
+    def test_stop_during_baseline_interrupts_via_stop_check(
+        self, supervisor: R.RunSupervisor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stop issued while calibration is blocked in the baseline phase must
+        interrupt it: the ruler's ``stop_check`` must be wired to the supervisor's
+        stop flag, and the canary must not run after the stop."""
+        in_baseline = threading.Event()
+        release_baseline = threading.Event()
+        canary_ran = threading.Event()
+
+        ruler = self._sequenced_ruler(
+            in_baseline=in_baseline,
+            release_baseline=release_baseline,
+            canary_ran=canary_ran,
+        )
+        self._profile_factory(monkeypatch, ruler)
+
+        supervisor.calibrate({"clone": "", "target_display": "owner/repo", "branch": "main"})
+        assert in_baseline.wait(timeout=10.0), "calibration never reached the baseline phase"
+
+        # The Stop click, issued from the main thread while the baseline is blocked.
+        # stop() joins the worker (bounded), and the worker cannot finish until the
+        # baseline is released, so run stop() on a helper thread and release the
+        # baseline once the stop flag is set — mirroring a real Stop click landing
+        # mid-measurement.
+        stop_result: dict[str, Any] = {}
+
+        def _issue_stop() -> None:
+            stop_result.update(supervisor.stop())
+
+        stopper = threading.Thread(target=_issue_stop)
+        stopper.start()
+        # Wait until the stop has actually been requested before asserting on it —
+        # the supervisor wires stop_check BEFORE the baseline blocks, so polling on
+        # stop_check being callable would not wait for the stopper thread to run.
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not supervisor._stop_check():
+            time.sleep(0.01)
+        # The supervisor must wire a live stop_check onto the ruler so the baseline
+        # can observe the request; without the wiring it stays None.
+        assert callable(ruler.stop_check), "calibration did not wire a stop_check onto the ruler"
+        assert ruler.stop_check() is True, "the wired stop_check does not report the stop"
+
+        release_baseline.set()
+        stopper.join(timeout=10.0)
+        _join(supervisor)
+
+        assert stop_result.get("stopped") is True, "stop() did not interrupt the calibration"
+        assert not canary_ran.is_set(), "calibration proceeded to the canary after a stop"
+        # A stopped calibration is a clean terminal outcome, not a crash.
+        assert supervisor.status()["status"] != R.STATUS_ERROR
+
+    def test_stop_between_baseline_and_canary_skips_the_canary(
+        self, supervisor: R.RunSupervisor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stop requested after the baseline finishes but before the canary starts
+        must short-circuit before ``measure_canary`` — the canary is itself a
+        multi-rep suite run, so honoring the stop only between baseline reps is not
+        enough. Here the baseline returns a FULL sample set (it was not itself
+        interrupted); the boundary check before the canary is what must catch it."""
+        in_baseline = threading.Event()
+        release_baseline = threading.Event()
+        canary_ran = threading.Event()
+
+        ruler = self._sequenced_ruler(
+            in_baseline=in_baseline,
+            release_baseline=release_baseline,
+            canary_ran=canary_ran,
+        )
+
+        # Neutralize stop_check so the baseline returns full samples even after the
+        # stop — isolating the between-phase boundary check as the thing under test.
+        def _blocking_baseline(*, base_src: Any, reps: int) -> list[float]:
+            in_baseline.set()
+            release_baseline.wait(timeout=10.0)
+            return [10.0, 11.0, 12.0]
+
+        ruler.baseline_samples = _blocking_baseline  # type: ignore[method-assign]
+        self._profile_factory(monkeypatch, ruler)
+
+        supervisor.calibrate({"clone": "", "target_display": "owner/repo", "branch": "main"})
+        assert in_baseline.wait(timeout=10.0), "calibration never reached the baseline phase"
+
+        # Issue the stop while the baseline is blocked, then release it. stop() joins
+        # the worker, so run it on a helper thread and release the baseline once the
+        # stop flag is observable — the worker then completes the baseline and must
+        # skip the canary at the between-phase boundary check.
+        stopper = threading.Thread(target=supervisor.stop)
+        stopper.start()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not supervisor._stop_check():
+            time.sleep(0.01)
+        release_baseline.set()
+        stopper.join(timeout=10.0)
+        _join_calibration(supervisor)
+
+        st = supervisor.status()
+        # The worker must have reached a terminal state and NOT failed for an
+        # unrelated reason — otherwise "canary did not run" would be a false pass.
+        assert st["status"] != R.STATUS_ERROR, f"calibration errored: {st.get('error')!r}"
+        assert st["status"] in (R.STATUS_DONE, R.STATUS_STOPPING)
+        assert not canary_ran.is_set(), "the canary ran even though a stop was requested"
+
+    def test_stopped_calibration_does_not_write_a_ruler(
+        self, supervisor: R.RunSupervisor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A calibration interrupted before it proved the ruler must NOT leave a
+        ``ruler.json`` behind — a stopped run has no proven ruler, and a stale
+        ``calibrated`` file would let a subsequent run start on an unproven ruler."""
+        cfg = {"clone": "", "target_display": "owner/repo", "branch": "main"}
+        in_baseline = threading.Event()
+        release_baseline = threading.Event()
+        canary_ran = threading.Event()
+
+        ruler = self._sequenced_ruler(
+            in_baseline=in_baseline,
+            release_baseline=release_baseline,
+            canary_ran=canary_ran,
+        )
+        self._profile_factory(monkeypatch, ruler)
+
+        supervisor.calibrate(cfg)
+        assert in_baseline.wait(timeout=10.0), "calibration never reached the baseline phase"
+
+        stopper = threading.Thread(target=supervisor.stop)
+        stopper.start()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not supervisor._stop_check():
+            time.sleep(0.01)
+        release_baseline.set()
+        stopper.join(timeout=10.0)
+        _join_calibration(supervisor)
+
+        ruler_path = (
+            store.data_dir()
+            / "repos"
+            / store.workspace_key(cfg)
+            / "ruler"
+            / "ruler.json"
+        )
+        assert not ruler_path.is_file(), "a stopped calibration wrote a ruler.json"
+
+    def test_stopping_a_recalibration_preserves_the_prior_ruler(
+        self, supervisor: R.RunSupervisor, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Stopping a RECALIBRATION must leave a previously-proven ruler intact.
+
+        A stop is as often "this is taking too long" as "supersede this", so the
+        abort lever must not destroy prior work the operator would have to re-pay a
+        full multi-rep suite run to rebuild. This mirrors the failure path, which
+        also leaves the prior ruler untouched — Stop is not more destructive than a
+        crash. The stopped re-run itself writes nothing (it proved nothing), so the
+        earlier ``calibrated`` ruler is exactly what survives."""
+        cfg = {"clone": "", "target_display": "owner/repo", "branch": "main"}
+        # Point live config at the same workspace so `ruler_calibrated()` (which
+        # reads the live-config workspace) inspects the ruler this test seeds.
+        (store.data_dir() / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+        ruler_path = (
+            store.data_dir()
+            / "repos"
+            / store.workspace_key(cfg)
+            / "ruler"
+            / "ruler.json"
+        )
+        ruler_path.parent.mkdir(parents=True, exist_ok=True)
+        # A prior, fully-proven ruler from an earlier calibration.
+        prior = {"status": "calibrated"}
+        ruler_path.write_text(json.dumps(prior), encoding="utf-8")
+        assert progress_mod.ruler_calibrated() is True, "seed did not read as calibrated"
+
+        in_baseline = threading.Event()
+        release_baseline = threading.Event()
+        canary_ran = threading.Event()
+        ruler = self._sequenced_ruler(
+            in_baseline=in_baseline,
+            release_baseline=release_baseline,
+            canary_ran=canary_ran,
+        )
+        self._profile_factory(monkeypatch, ruler)
+
+        supervisor.calibrate(cfg)
+        assert in_baseline.wait(timeout=10.0), "calibration never reached the baseline phase"
+
+        stopper = threading.Thread(target=supervisor.stop)
+        stopper.start()
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not supervisor._stop_check():
+            time.sleep(0.01)
+        release_baseline.set()
+        stopper.join(timeout=10.0)
+        _join_calibration(supervisor)
+
+        assert ruler_path.is_file(), "the prior ruler.json was destroyed by a stopped recalibration"
+        assert json.loads(ruler_path.read_text(encoding="utf-8")) == prior, (
+            "the prior ruler was mutated by a stopped recalibration"
+        )
+        assert progress_mod.ruler_calibrated() is True, (
+            "the workspace stopped reporting calibrated after a stopped recalibration"
+        )

@@ -14,11 +14,12 @@ const MAX_TINT = MAX_RECENT_TINT_COUNT
  *
  * Covers:
  *  (a) Page load with tab strip rendering
- *  (b) Tab navigation + ?tab= query-param round-trip
+ *  (b) Tab navigation + /settings/<tab> path round-trip (desktop first tab
+ *      stays the bare /settings; legacy ?tab= links translate to the path)
  *  (c) Config mutation round-trip via the "Highlight recent sessions" stepper
  *      (dashboard.recent_tint_count — server-persisted, cosmetic, test-safe)
- *  (d) Redirect contracts: /overview → /settings?tab=overview,
- *      /instances → /settings?tab=instances
+ *  (d) Redirect contracts: /overview → /settings/overview,
+ *      /instances → /settings/instances
  */
 test.describe('Settings Page', () => {
   test('loads and renders the tab strip with known tabs', async ({ page }) => {
@@ -35,18 +36,20 @@ test.describe('Settings Page', () => {
     await expect(page.getByRole('button', { name: 'About', exact: true })).toBeVisible()
   })
 
-  test('defaults to the overview tab when no ?tab= param', async ({ page }) => {
+  test('defaults to the overview tab at the bare /settings path', async ({ page }) => {
     await page.goto('/settings', { waitUntil: 'domcontentloaded' })
-    // Overview is the first tab and renders when no param is present.
+    // Overview is the first tab and renders when no segment is present.
     // The content area heading should show "Overview"
     await expect(page.getByRole('heading', { name: 'Overview' }).or(
       page.locator('div').filter({ hasText: /^Overview$/ }).first()
     )).toBeVisible({ timeout: 10000 })
-    // URL should NOT have ?tab=overview (SidePanelLayout strips the default)
+    // Desktop first tab is the segment-less base path — no /overview segment,
+    // and never a legacy ?tab= param.
     expect(page.url()).not.toContain('tab=')
+    expect(new URL(page.url()).pathname).toBe('/settings')
   })
 
-  test('navigating between tabs updates the ?tab= query param', async ({ page }) => {
+  test('navigating between tabs updates the /settings/<tab> path', async ({ page }) => {
     await page.goto('/settings', { waitUntil: 'domcontentloaded' })
 
     // Click Display tab button
@@ -54,22 +57,31 @@ test.describe('Settings Page', () => {
     await expect(displayTab).toBeVisible({ timeout: 10000 })
     await displayTab.click()
 
-    // URL should update to ?tab=display
-    await expect(page).toHaveURL(/[?&]tab=display/)
+    // URL should update to the path segment — navigation state lives in the
+    // path now, never in ?tab=.
+    await expect(page).toHaveURL(/\/settings\/display(?:[?#]|$)/)
 
     // Click About tab button
     await page.getByRole('button', { name: 'About', exact: true }).click()
-    await expect(page).toHaveURL(/[?&]tab=about/)
+    await expect(page).toHaveURL(/\/settings\/about(?:[?#]|$)/)
   })
 
-  test('direct navigation to ?tab=chat renders the Chat panel', async ({ page }) => {
-    await page.goto('/settings?tab=chat', { waitUntil: 'domcontentloaded' })
+  test('direct navigation to /settings/chat renders the Chat panel', async ({ page }) => {
+    await page.goto('/settings/chat', { waitUntil: 'domcontentloaded' })
 
     // The Chat panel should render its content — check for a known setting label
     // ChatPanel contains the "Timestamps" toggle and other settings
     await expect(page.locator('[data-setting-label]').first()).toBeVisible({ timeout: 10000 })
-    // URL should still have ?tab=chat
-    expect(page.url()).toContain('tab=chat')
+    expect(new URL(page.url()).pathname).toBe('/settings/chat')
+  })
+
+  test('a legacy ?tab= link translates to the path form and still renders the panel', async ({ page }) => {
+    // Old bookmarks and docs keep landing: SettingsPage replace-navigates the
+    // legacy query form onto the canonical path.
+    await page.goto('/settings?tab=chat', { waitUntil: 'domcontentloaded' })
+    await page.waitForURL('**/settings/chat**', { timeout: 10000 })
+    await expect(page.locator('[data-setting-label]').first()).toBeVisible({ timeout: 10000 })
+    expect(page.url()).not.toContain('tab=')
   })
 
   test('config mutation round-trip: recent_tint_count via Display stepper', async ({ page, request }) => {
@@ -78,7 +90,7 @@ test.describe('Settings Page', () => {
     const originalCount: number = before?.dashboard?.recent_tint_count ?? 0
 
     // Navigate to the Display tab
-    await page.goto('/settings?tab=display', { waitUntil: 'domcontentloaded' })
+    await page.goto('/settings/display', { waitUntil: 'domcontentloaded' })
 
     // Find the "Highlight recent sessions" stepper
     const field = page.locator('[data-setting-label="Highlight recent sessions"]')
@@ -112,18 +124,20 @@ test.describe('Settings Page', () => {
     })
   })
 
-  test('/overview redirects to /settings?tab=overview', async ({ page }) => {
+  test('/overview redirects to /settings/overview', async ({ page }) => {
     await page.goto('/overview', { waitUntil: 'domcontentloaded' })
-    // React Router Navigate with replace — URL should land on /settings
-    // (overview is default so ?tab=overview may or may not be stripped)
-    await page.waitForURL('**/settings**', { timeout: 10000 })
+    // React Router Navigate with replace — the redirect mints the PATH form,
+    // and nothing rewrites it afterwards (the tab-sync effect short-circuits
+    // on a present segment).
+    await page.waitForURL('**/settings/overview', { timeout: 10000 })
+    expect(new URL(page.url()).pathname).toBe('/settings/overview')
     // The Overview panel content should render (health status)
     await expect(page.getByText(/All systems running|Connecting|Reconnecting/)).toBeVisible({ timeout: 10000 })
   })
 
-  test('/instances redirects to /settings?tab=instances', async ({ page }) => {
+  test('/instances redirects to /settings/instances', async ({ page }) => {
     await page.goto('/instances', { waitUntil: 'domcontentloaded' })
-    await page.waitForURL('**/settings?tab=instances', { timeout: 10000 })
+    await page.waitForURL('**/settings/instances', { timeout: 10000 })
     // Remote Crew panel should render — check for the tab being active
     await expect(page.getByRole('button', { name: 'Remote Crew', exact: true })).toBeVisible({ timeout: 5000 })
   })

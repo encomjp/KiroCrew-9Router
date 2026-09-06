@@ -30,9 +30,9 @@ import logging
 from aiohttp import web
 
 from kiro_crew import aws_consent
+from kiro_crew.dashboard.handlers._shared import _owner_denial_response
 from kiro_crew.dashboard.handlers.source_providers import (
     is_owner_dashboard_request,
-    stale_owner_session_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -83,12 +83,7 @@ def _deny_non_owner(request: web.Request, operation: str) -> web.Response | None
     )
     # Deny decision made above; only the response label changes for a signed
     # pre-owner bootstrap subject (see stale_owner_session_response).
-    stale = stale_owner_session_response(request)
-    if stale is not None:
-        return stale
-    return web.json_response(
-        {"error": "dashboard owner required", "code": _CODE_OWNER_REQUIRED}, status=403
-    )
+    return _owner_denial_response(request, "dashboard owner required", _CODE_OWNER_REQUIRED)
 
 
 def _requested_service(request: web.Request) -> str | None:
@@ -109,6 +104,19 @@ async def _effective_target(service: str) -> tuple[str, str]:
         from kiro_crew.slack.handler import _vc
 
         return _vc.aws_profile, _vc.region
+
+    if service in (aws_consent.SERVICE_S3, aws_consent.SERVICE_COST_EXPLORER):
+        # AWS Control's paid services run against the deploy profile registry's
+        # default entry — the same resolution the engine will use for the call
+        # itself, so the confirmation names the account that would really bill.
+        # No registered profile resolves to the empty profile (the CLI default
+        # chain), which the card labels explicitly rather than hiding.
+        from kiro_crew.deploy import profiles as deploy_profiles
+
+        resolved = await asyncio.to_thread(deploy_profiles.resolve_profile, "")
+        if resolved is not None:
+            return resolved
+        return "", deploy_profiles.DEFAULT_REGION
 
     from kiro_crew.config.loader import KiroCrewConfig
 

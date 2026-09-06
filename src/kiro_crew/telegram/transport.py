@@ -19,6 +19,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
+from kiro_crew.messaging.outbound_files import OutboundFile
 from kiro_crew.messaging.tables import TABLE_POLICY_NATIVE
 from kiro_crew.messaging.transport import (
     ConfiguredChannelTarget,
@@ -233,6 +234,29 @@ class TelegramTransport(MessagingTransport):
         mid = await self._client.send_message(
             int(conversation_id),
             content,
+            message_thread_id=int(thread_id) if thread_id else None,
+        )
+        return str(mid or "")
+
+    async def send_document(
+        self,
+        conversation_id: str,
+        file: "OutboundFile",
+        *,
+        caption: str = "",
+        thread_id: str | None = None,
+    ) -> str:
+        """Send one validated file into this conversation. Returns the message id.
+
+        The transport-level upload verb, Discord's ``send_message_with_files``
+        counterpart: a caller holding a transport does not reach past it into
+        the client. ``file`` carries validated bytes (the ``OutboundFile``
+        contract — the path is provenance, never re-opened).
+        """
+        mid = await self._client.send_document(
+            int(conversation_id),
+            file,
+            caption=caption or None,
             message_thread_id=int(thread_id) if thread_id else None,
         )
         return str(mid or "")

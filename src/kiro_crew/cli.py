@@ -27,18 +27,22 @@ _ensure_ssl_certs()
 
 import argparse
 import asyncio
+import atexit
 import faulthandler
 import importlib
+import importlib.machinery
 import logging
 import os
+import queue
 import shutil
 import subprocess
 import sys
-from logging.handlers import RotatingFileHandler
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import NoReturn
 
 from kiro_crew import __version__, cli_help, platform_compat
+from kiro_crew.apps import builtins as _builtins_pkg
 from kiro_crew.apps.builtins import BUILTIN_NAMES as _BUILTIN_NAMES
 from kiro_crew.config import KiroCrewConfig, config_dir, ensure_data_home
 from kiro_crew.config.loader import (
@@ -534,6 +538,7 @@ def _resolve_gateway_args(args: argparse.Namespace) -> dict:
     return {
         "no_dashboard": getattr(args, "slack_only", False),
         "no_crons": getattr(args, "no_crons", False),
+        "no_tunnel": getattr(args, "no_tunnel", False),
         "no_open": no_open,
         "port_override": port,
         "json_ready": json_ready,
@@ -766,6 +771,97 @@ class _FdTrackingRotatingFileHandler(RotatingFileHandler):
         _redirect_fds_to(Path(self.baseFilename))
 
 
+class _CliLogQueueHandler(QueueHandler):
+    """Marker subclass so re-entrant setup (and tests) can find the CLI's own
+    queue handler among whatever other handlers the process accumulated."""
+
+
+# Commands that run an asyncio event loop for hours -- the ones the loop-stall
+# watchdog guards. Only these need file-handler I/O moved off the calling
+# thread, and none of them ever exec-over-self, so the atexit / bounded
+# force-exit drains cover every exit path they have. Short-lived CLI verbs
+# keep synchronous handlers: several replace the process via ``os.exec*``
+# (``logs -f`` -> tail/journalctl, ``config edit`` -> $EDITOR, ``pod exec``),
+# which skips atexit and would strand queued records -- and none of them runs
+# an event loop, so the queue buys them nothing.
+_LONG_LIVED_COMMANDS = {"serve", "gateway", "chat", None}
+
+_LOG_QUEUE_LISTENER: QueueListener | None = None
+
+
+def _stop_log_queue_listener(timeout: float | None = None) -> None:
+    """Stop the log queue listener, draining every queued record to disk.
+
+    Idempotent — registered via ``atexit`` so process shutdown flushes the
+    queued tail. Also the deterministic drain point for tests: after this
+    returns, every record logged before the call has been written by the
+    file handler.
+
+    ``timeout`` bounds the drain for force-exit paths (a second SIGINT/
+    SIGTERM hard-exits via ``os._exit``, which skips atexit): the sentinel
+    is enqueued and the listener thread joined for at most that long, so a
+    wedged disk cannot hang the force exit. When the thread does not finish
+    in time, flush/close are skipped — they would block on the same wedged
+    handler.
+    """
+    global _LOG_QUEUE_LISTENER
+    listener, _LOG_QUEUE_LISTENER = _LOG_QUEUE_LISTENER, None
+    if listener is None:
+        return
+    try:
+        if timeout is None:
+            listener.stop()
+        else:
+            listener.enqueue_sentinel()
+            # QueueListener has no bounded stop; join its (private but stable
+            # across 3.10-3.14) thread handle against the deadline.
+            thread = getattr(listener, "_thread", None)
+            if thread is not None:
+                thread.join(timeout)
+                if thread.is_alive():
+                    return  # wedged handler — do not block the force exit
+    except Exception:
+        return  # interpreter-teardown races must not raise
+    for handler in listener.handlers:
+        try:
+            handler.flush()
+            handler.close()
+        except Exception:
+            pass  # a broken handler must not block shutdown
+
+
+async def drain_log_queue_before_hard_exit(timeout: float = 2.0) -> None:
+    """Flush the queued ``gateway.log`` tail from an ``async`` hard-exit path.
+
+    ``os._exit`` runs no ``atexit`` handler, so the drain registered by
+    :func:`_setup_cli_logging` never fires on a path that hard-exits -- every
+    record still sitting in the queue is lost, including the ones logged
+    immediately before the exit, which are the most diagnostic ones a
+    post-mortem has.
+
+    :func:`_stop_log_queue_listener` is a *synchronous* bounded drain (it
+    joins the listener thread), so calling it inline from a coroutine would
+    park the event loop for up to ``timeout``. Offload it to
+    :func:`~kiro_crew.executors.subprocess_executor` -- the pool reserved for
+    teardown work that can block on a wedged resource -- under an outer
+    deadline, exactly as the restart path already does for the SEL flush. A
+    wedged disk therefore delays neither the loop nor the exit.
+
+    Never raises: a hard exit must not be blocked, or replaced, by logging.
+    """
+    from kiro_crew.executors import subprocess_executor
+
+    try:
+        await asyncio.wait_for(
+            asyncio.get_running_loop().run_in_executor(
+                subprocess_executor(), _stop_log_queue_listener, timeout
+            ),
+            timeout=timeout + 1.0,
+        )
+    except Exception:
+        pass  # includes TimeoutError: reaching the exit is what matters
+
+
 def _setup_cli_logging(command: str | None, verbose: int) -> None:
     """Configure console echo + persistent ``gateway.log`` logging.
 
@@ -786,6 +882,14 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
       redirect still land, now formatted and PID-stamped;
     - after the boot rotation, fds 1/2 are re-pointed at the live log so raw
       writes (uncaught tracebacks, child stderr) do not land in ``.prev``.
+
+    In BOTH modes, for LONG-LIVED commands (``_LONG_LIVED_COMMANDS``) the file
+    handler is not attached to a logger directly: the logger gets a
+    ``QueueHandler`` and the file handler lives on a ``QueueListener`` thread,
+    so no file I/O (rollover included) ever runs on the event-loop thread.
+    Short-lived commands attach the file handler synchronously — they run no
+    event loop, and several exec-over-self (skipping atexit), where a queued
+    tail would be lost. See the inline comment at the attach site.
     """
     if verbose >= 2:
         level = logging.DEBUG
@@ -861,18 +965,82 @@ def _setup_cli_logging(command: str | None, verbose: int) -> None:
         # Root attach: kiro_crew records arrive once via propagation, and
         # third-party WARNINGs land formatted — replacing what the accidental
         # stderr echo used to provide unformatted.
-        logging.getLogger().addHandler(fh)
+        target_logger = logging.getLogger()
     else:
-        logging.getLogger("kiro_crew").addHandler(fh)
+        target_logger = logging.getLogger("kiro_crew")
+
+    # Never run file-handler I/O on the caller's thread of a LONG-LIVED
+    # command: the gateway invokes this from the thread that will run the
+    # asyncio event loop, and an inline emit contends for Handler.lock with
+    # every worker thread — while a size-based rollover runs the WHOLE rename
+    # chain plus the dup2 fd re-point on the loop. Blocking past the
+    # loop-stall watchdog's ``exit_after`` hard-exits the gateway mid-turn
+    # and orphans every in-flight subagent. A QueueHandler makes emit a
+    # non-blocking put; the QueueListener's thread owns the file handler, so
+    # ALL file I/O — ``doRollover()`` and ``_redirect_fds_to()`` included —
+    # happens off the loop. Secret redaction is unaffected: it hooks the
+    # log-record FACTORY (creation time, producer thread), upstream of any
+    # handler.
+    #
+    # Short-lived commands keep the synchronous handler on purpose: none of
+    # them runs an event loop (nothing to stall), and several replace the
+    # process via ``os.exec*`` (``logs -f``, ``config edit``, ``pod exec``),
+    # which skips atexit — a queue there would strand its tail records, while
+    # a sync handler has already written them by the time exec runs. See
+    # ``_LONG_LIVED_COMMANDS``.
+    if command in _LONG_LIVED_COMMANDS:
+        global _LOG_QUEUE_LISTENER
+        _stop_log_queue_listener()  # re-entrant call (tests): retire the old thread
+        for lgr in (logging.getLogger(), logging.getLogger("kiro_crew")):
+            for stale in [h for h in lgr.handlers if isinstance(h, _CliLogQueueHandler)]:
+                lgr.removeHandler(stale)  # re-entrant call: orphaned producer
+        log_queue: "queue.SimpleQueue[logging.LogRecord]" = queue.SimpleQueue()
+        queue_handler = _CliLogQueueHandler(log_queue)
+        # Gate at the producer: records the file handler would drop must not
+        # transit the queue at all.
+        queue_handler.setLevel(fh.level)
+        _LOG_QUEUE_LISTENER = QueueListener(log_queue, fh, respect_handler_level=True)
+        _LOG_QUEUE_LISTENER.start()
+        atexit.register(_stop_log_queue_listener)
+        target_logger.addHandler(queue_handler)
+    else:
+        target_logger.addHandler(fh)
 
     # Install secret redaction filter — scrubs Bearer tokens from all kiro_crew
     # log output before it reaches any handler. The filter also accepts literal
     # secret values to redact, but none are passed here: wiring resolved vault
     # secret values into the filter is a follow-up PR. Bearer token redaction is
     # active immediately with zero vault I/O.
-    _LONG_LIVED_COMMANDS = {"serve", "gateway", "chat", None}
     if command in _LONG_LIVED_COMMANDS:
         install_log_redaction([])
+
+
+def _builtin_mcp_server_available(name: str) -> bool:
+    """True when ``kiro_crew.apps.builtins.<name>.mcp_server`` resolves.
+
+    ``_BUILTIN_NAMES`` answers two different questions: which builtins get HTTP
+    routes (all of them) and which get an ``mcp-<name>`` CLI verb (only those
+    that actually ship an ``mcp_server`` module). Gating the verb on this
+    predicate keeps the two decoupled — a builtin without the module is simply
+    not registered, instead of advertising a command that dies with a raw
+    ``ModuleNotFoundError`` traceback (#5901).
+
+    Resolution deliberately uses ``PathFinder`` rather than
+    ``importlib.util.find_spec``: ``find_spec`` IMPORTS the parent package as a
+    side effect, and every builtin's ``__init__`` pulls in its whole
+    ``backend.routes`` chain — which would execute all builtin apps at
+    parser-build time on every CLI invocation, including the gateway boot path.
+    ``PathFinder`` walks the same import machinery (source, bytecode, extension
+    loaders) without executing anything. Worst-case boot cost is bounded by
+    ``len(BUILTIN_NAMES)``: one directory listing per builtin package
+    (mtime-cached by the import system), independent of user data or profile
+    size.
+    """
+    finder = importlib.machinery.PathFinder
+    pkg_spec = finder.find_spec(name, list(_builtins_pkg.__path__))
+    if pkg_spec is None or not pkg_spec.submodule_search_locations:
+        return False
+    return finder.find_spec("mcp_server", list(pkg_spec.submodule_search_locations)) is not None
 
 
 def main() -> None:
@@ -1021,6 +1189,18 @@ Examples:
         "--no-crons",
         action="store_true",
         help="Skip cron scheduler — use when another instance handles cron execution",
+    )
+    gw_parser.add_argument(
+        "--no-tunnel",
+        action="store_true",
+        help=(
+            "Never publish a tunnel — this process refuses to start or provision "
+            "one for its whole life, whatever tunnel.enabled says. Scoped to "
+            "TUNNELS: it does not change where the dashboard binds, so a config "
+            "that widens dashboard.url off loopback still does. Use for an "
+            "instance that must not publish a tunnel (a Dev Fleet pod passes "
+            "this); reach it with `ssh -L` instead."
+        ),
     )
     gw_parser.add_argument(
         "--seed",
@@ -1339,6 +1519,29 @@ Examples:
             "MANIFEST.json records that it was staged unpinned."
         ),
     )
+    snap_parser.add_argument(
+        "--components",
+        default=None,
+        help="Comma-separated components to include (default: all); see restore --list-components",
+    )
+    snap_parser.add_argument(
+        "--purpose",
+        default="backup",
+        choices=("backup", "share"),
+        help=(
+            "backup = restoring onto a host you control, keeps credential-bearing "
+            "components (the default, and the only one that produces a bundle today); "
+            "share = leaves your control, so it carries only components certified free "
+            "of credential material — no component is certified yet, so this currently "
+            "refuses rather than emitting a bundle that has not been checked"
+        ),
+    )
+
+    # Retired, and defined only so it fails with a pointer instead of a bare argparse
+    # error. Dropping it entirely would still fail loudly ("unrecognized arguments"), but
+    # an operator whose muscle memory or old cron line still says `--to s3://bucket/prefix`
+    # is better served by being told where that capability went than by exit 2.
+    snap_parser.add_argument("--to", default=None, help=argparse.SUPPRESS)
 
     rest_parser = cli_help.add_command(sub, "restore")
     rest_parser.add_argument("snapshot", nargs="?", help="Path to snapshot .tar.gz")
@@ -1471,6 +1674,20 @@ Examples:
     explain_parser.add_argument("--app", default="", help="App slug (optional)")
     profile_show = policy_sub.add_parser("profile", help="Show a profile by name")
     profile_show.add_argument("name", help="Profile file stem (without .json)")
+    policy_sub.add_parser(
+        "source", help="Show whether this host fetches its policy from a central source"
+    )
+    policy_fetch = policy_sub.add_parser(
+        "fetch", help="Fetch the central policy now and apply it if it is usable"
+    )
+    policy_fetch.add_argument(
+        "--force",
+        action="store_true",
+        # Skips the conditional-request validators. An operator running this by
+        # hand wants to prove the round trip end to end; a 304 tells them nothing
+        # about whether the document they just published reads correctly.
+        help="Ignore the cached validators and re-download the whole document",
+    )
 
     register_perf_parser(sub)
     register_bench_parser(sub)
@@ -1489,6 +1706,20 @@ Examples:
         "--apply",
         action="store_true",
         help="Apply the deletions (default: dry-run preview that changes nothing)",
+    )
+
+    # secrets — encrypted vault maintenance. Only the migration importer lives
+    # here; the set/list/rm surface is owned by a separate change.
+    secrets_parser = sub.add_parser("secrets", help="Encrypted secret vault")
+    secrets_sub = secrets_parser.add_subparsers(dest="secrets_action")
+    secrets_import = secrets_sub.add_parser(
+        "import",
+        help="Migrate plaintext .env credentials into the vault (dry-run unless --apply)",
+    )
+    secrets_import.add_argument(
+        "--apply",
+        action="store_true",
+        help="Store the secrets and rewrite .env to secret:// refs (default: dry-run)",
     )
 
     # pod — isolated, throwaway, full-stack test instances per worktree (kubectl-style)
@@ -1601,6 +1832,12 @@ Examples:
     pod_cleanup.add_argument("name")
 
     update_parser = cli_help.add_command(sub, "update")
+    update_parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["approve"],
+        help="approve: approve a pending in-app update armed from the dashboard",
+    )
     update_parser.add_argument(
         "--force",
         action="store_true",
@@ -1903,9 +2140,22 @@ Examples:
     # a session nothing: kiro-cli loads a server only when `tools` names it.
     sub.add_parser("mcp-dashboard")
 
-    # Builtin app MCP servers (spawned by the agent backend, not user-facing)
+    # Builtin app MCP servers (spawned by the agent backend, not user-facing).
+    # Only builtins that actually ship an ``mcp_server`` module get a verb —
+    # ``_BUILTIN_NAMES`` is load-bearing for HTTP route registration and lists
+    # every builtin, so registering unconditionally advertised commands that
+    # crashed with a raw ModuleNotFoundError traceback (#5901). A builtin that
+    # gains an ``mcp_server.py`` gains its verb automatically.
+    #
+    # The probe only runs when the invocation actually names an ``mcp-*``
+    # command: registration precision is unobservable otherwise (the verbs are
+    # hidden from help/choices by hide_internal_commands, and dispatch cannot
+    # reach them), so every other command — including the gateway boot path —
+    # pays nothing for it.
+    _probe_mcp_verbs = any(_a.startswith("mcp-") for _a in sys.argv[1:])
     for _bname in _BUILTIN_NAMES:
-        sub.add_parser(f"mcp-{_bname}")
+        if not _probe_mcp_verbs or _builtin_mcp_server_available(_bname):
+            sub.add_parser(f"mcp-{_bname}")
 
     # them in the ``kirocrew-computer`` MCP server instead.
     computer_parser = cli_help.add_command(
@@ -2024,8 +2274,18 @@ Examples:
     mem_parser = cli_help.add_command(sub, "memory")
     mem_sub = mem_parser.add_subparsers(dest="mem_action")
     mem_sub.add_parser("list", help="Show semantic memory entries")
-    mem_search = mem_sub.add_parser("search", help="Search episodic memories")
+    mem_search = mem_sub.add_parser("search", help="Search memory (vector + markdown layers)")
     mem_search.add_argument("query", help="Search query text")
+    mem_search.add_argument(
+        "--layer",
+        choices=["vector", "history", "all"],
+        default="all",
+        help=(
+            "Which memory to search: vector (episodic semantic recall), "
+            "history (keyword FTS over preferences/projects/daily history), "
+            "or all (default)"
+        ),
+    )
     mem_show = mem_sub.add_parser(
         "show", help="Show the markdown memory layer (preferences, projects, daily history)"
     )
@@ -2256,7 +2516,6 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
     # which call config_dir(). Skipped for the seed path above, which set up its
     # own $KIROCREW_HOME (an override → migration is a no-op there anyway).
     ensure_data_home()
-
     # Console + gateway.log logging. Extracted to a helper because the
     # detach-spawned gateway needs double-write protection (stderr IS
     # gateway.log in that mode) — see _setup_cli_logging.
@@ -2426,8 +2685,15 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         # optional subsystem must not be imported to start it.
         importlib.import_module("kiro_crew.mcp_dashboard").run_mcp_server()
     elif args.command.startswith("mcp-") and args.command[4:] in _BUILTIN_NAMES:
-        _mod = importlib.import_module(f"kiro_crew.apps.builtins.{args.command[4:]}.mcp_server")
-        _mod.run_mcp_server()
+        # Registration gates this verb on _builtin_mcp_server_available, and
+        # _run_app_mcp_server is the ONE dispatch-time spelling of "import the
+        # builtin's mcp_server and run it or refuse cleanly" — the same helper
+        # the `kirocrew app mcp <name>` manifest path uses (clean stderr line +
+        # exit 1 on ImportError or a missing run_mcp_server entrypoint), so an
+        # unresolvable module cannot reach a raw traceback here (#5901).
+        from kiro_crew.cli_commands import _run_app_mcp_server
+
+        _run_app_mcp_server(args.command[4:])
     elif args.command == "computer":
         # Deferred import: ``computer_use.cli`` reaches the driver seam, and the
         # macOS driver loads native frameworks on first use. Keeping it out of
@@ -2458,14 +2724,27 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         _policy(args)
     elif args.command == "knowledge":
         _knowledge(args)
+    elif args.command == "secrets":
+        # Dispatch through the module-level `importlib` rather than a
+        # function-local `from kiro_crew.cli_commands import …`: the latter trips
+        # the `top-level-imports` lint, while a module-scope import of
+        # `cli_commands` is deliberately avoided (issue #3504 — it costs ~556 ms
+        # on every CLI start). `importlib.import_module` keeps the load lazy AND
+        # satisfies the linter.
+        importlib.import_module("kiro_crew.cli_commands")._handle_secrets(args)
     elif args.command == "pod":
         from kiro_crew.cli_commands import _pod
 
         _pod(args)
     elif args.command == "update":
-        from kiro_crew.cli_server import _update
+        if getattr(args, "action", None) == "approve":
+            from kiro_crew.cli_server import _update_approve
 
-        _update(force=args.force)
+            _update_approve()
+        else:
+            from kiro_crew.cli_server import _update
+
+            _update(force=args.force)
     elif args.command == "stop":
         from kiro_crew.cli_server import _stop
 

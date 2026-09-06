@@ -30,6 +30,10 @@ from typing import Any
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain.dictionary import DomainDictionary
+from kiro_crew.apps.builtins.meetings.backend.domain.translate import (
+    TranslationQueue,
+    run_oneshot_translation,
+)
 from kiro_crew.llm_helpers import ToolApprovalPolicy, stream_and_collect
 from kiro_crew.security import redact
 from kiro_crew.sel import sel
@@ -411,6 +415,46 @@ class MeetingSession:
     started_at: float = field(default_factory=time.time)
     agents: dict[str, AgentQueue] = field(default_factory=dict)
     muted_agents: set[str] = field(default_factory=set)
+    #: Lines held while THIS session's agents initialize, in arrival order, each
+    #: paired with the agent names an unmuted fan-out would have reached AT THE
+    #: MOMENT IT WAS SPOKEN.
+    #:
+    #: Lives on the session, not on the holder, so it is bound to the identity
+    #: whose initialization it covers: a session that is replaced or torn down
+    #: takes its hold with it, and a later session can never inherit and replay
+    #: lines that were spoken into a meeting that no longer exists.
+    #:
+    #: The recipient set is stored rather than recomputed at drain because the
+    #: hold must change WHEN a line is delivered, never WHO it was addressed to.
+    #: Resolving it at drain let a mute applied during initialization reach
+    #: backwards and rob a line spoken while that agent was still listening —
+    #: an outcome the live path cannot produce, since it fans out immediately.
+    #:
+    #: NAMES, not queue objects: an agent disabled mid-initialization has its
+    #: queue removed from ``agents``, and holding a reference would enqueue into
+    #: a queue nothing flushes. A name that no longer resolves is simply skipped.
+    init_buffer: list[tuple[str, frozenset[str]]] = field(default_factory=list)
+    #: How many of the OLDEST held lines the cap displaced. Read at drain time
+    #: to size the marker, so a drop is announced once with an exact count
+    #: rather than per line.
+    init_dropped: int = 0
+    #: The agents that lost one of those displaced lines — the union of the
+    #: recipient sets recorded on every line the cap dropped.
+    #:
+    #: The marker's audience has to be derived from the DROPPED lines, not from
+    #: whoever is unmuted at drain time. Those two sets diverge the moment a mute
+    #: lands between the drop and the drain: the agent still receives the
+    #: surviving pre-mute lines (they carry their own arrival-time recipients) but
+    #: would fall outside a drain-time audience, so its output would begin
+    #: mid-conversation with nothing to say a turn was lost — the exact silent gap
+    #: the marker exists to prevent.
+    init_dropped_recipients: set[str] = field(default_factory=set)
+    #: Data root override, threaded through so the translation worker's writes land
+    #: in the test tmp dir rather than the real app data dir.
+    root: Any = None
+    #: Live transcript translation, or None when no target language is configured
+    #: (the default). Not an ``AgentQueue``: see ``domain/translate.py``.
+    translations: "TranslationQueue | None" = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         config = self.config if self.config is not None else store.read_config()
@@ -425,6 +469,18 @@ class MeetingSession:
         self.agents[k.TASK_EXTRACTOR_ID] = self._make_queue(
             k.TASK_EXTRACTOR_ID, k.TASK_EXTRACTOR_AGENT
         )
+        # Live translation, only when a target language is configured. Built here
+        # rather than lazily so the language is fixed for the meeting: changing it
+        # mid-flight would interleave two languages in one panel.
+        language = str(config.get("translation_language") or "")
+        if language in k.TRANSLATION_LANG_CODES and self.sessions is not None:
+            sessions = self.sessions
+            self.translations = TranslationQueue(
+                meeting_id=self.meeting_id,
+                language=language,
+                runner=lambda prompt: run_oneshot_translation(sessions, prompt),
+                root=self.root,
+            )
 
     def _make_queue(self, agent_id: str, agent: str) -> AgentQueue:
         return AgentQueue(
@@ -444,20 +500,122 @@ class MeetingSession:
         self.muted_agents.discard(agent_id)
         return queue
 
+    def _prepare_line(self, text: str) -> str:
+        """Correct and clamp one inbound line; ``""`` when it is not worth a turn.
+
+        The front half of :meth:`broadcast`, split out so the initialization hold
+        can run it at ARRIVAL rather than at delivery. Deferring it made the hold's
+        cap dishonest: recognizer filler occupied a slot until drain and only then
+        was discarded, so a burst of ``"uh"`` could evict the genuine opening
+        speech it was supposed to be counted against.
+        """
+        text = _dictionary.correct(text.strip())[: k.MAX_TRANSCRIPT_CHARS]
+        return "" if not text or is_noise(text) else text
+
+    def _recipient_names(self) -> frozenset[str]:
+        """The agents an unmuted fan-out would reach right now."""
+        return frozenset(
+            queue.name for queue in self.agents.values() if queue.name not in self.muted_agents
+        )
+
     def broadcast(self, text: str) -> int:
         """Correct, filter, and enqueue *text* for every unmuted agent.
 
         Returns the number of queues that accepted the line (0 when filtered).
         """
-        text = _dictionary.correct(text.strip())[: k.MAX_TRANSCRIPT_CHARS]
-        if not text or is_noise(text):
+        prepared = self._prepare_line(text)
+        if not prepared:
             return 0
+        # Translated from the DICTIONARY-CORRECTED text, and from inside the same
+        # noise gate the agents get: the corrections exist because speech-to-text
+        # mangles project nouns, and a mangled noun mistranslates into something
+        # unrecognisable. Enqueueing never blocks or raises, and the count below
+        # deliberately does not include it — `dispatched` means "agents reached".
+        if self.translations is not None:
+            self.translations.enqueue(text)
         accepted = 0
-        for queue in self.agents.values():
-            if queue.name not in self.muted_agents:
-                queue.enqueue(text)
-                accepted += 1
+        for name in self._recipient_names():
+            self.agents[name].enqueue(prepared)
+            accepted += 1
         return accepted
+
+    def buffer_during_init(self, text: str) -> bool:
+        """Hold *text* until initialization finishes. False when it displaced a line.
+
+        The agents cannot receive anything yet — they do not know which file they
+        own until ``init_agents`` has run — but the speaker is already talking, and
+        refusing the line is what lost the opening of every meeting (issue #4610).
+
+        Normalized and filtered HERE, at arrival, and stored with the recipients of
+        this moment: both halves of "what happens to this line" are decided when a
+        live line would have decided them, so the hold only ever shifts delivery in
+        TIME. Filler never occupies a slot it would later vacate, and a mute landing
+        mid-initialization cannot reach back to a line spoken before it.
+
+        Bounded by :data:`~..constants.MAX_INIT_BUFFER_LINES`, and the overflow
+        rule is DROP-OLDEST: an initialization slow enough to overflow is one where
+        the newest speech is the most likely to still be in play, and the tail is
+        what the agents need to pick up a conversation mid-flight. The count of
+        displaced lines is kept so :meth:`drain_init_buffer` can announce them —
+        dropping them quietly is the one outcome worse than refusing the request.
+
+        Returns whether the hold is intact: a filtered line displaces nothing, so
+        it reports True alongside a line that simply fit.
+        """
+        prepared = self._prepare_line(text)
+        if not prepared:
+            return True
+        self.init_buffer.append((prepared, self._recipient_names()))
+        overflow = len(self.init_buffer) - k.MAX_INIT_BUFFER_LINES
+        if overflow <= 0:
+            return True
+        for _line, recipients in self.init_buffer[:overflow]:
+            self.init_dropped_recipients |= recipients
+        del self.init_buffer[:overflow]
+        self.init_dropped += overflow
+        return False
+
+    def drain_init_buffer(self) -> tuple[int, int]:
+        """Fan every held line out in ARRIVAL ORDER. Returns ``(delivered, dropped)``.
+
+        Called once, immediately after initialization completes and under the same
+        ``DISPATCH_LOCK`` acquisition that reopens ingress — so a live line arriving
+        the instant ingress opens cannot overtake the held ones and reorder the
+        meeting's opening.
+
+        Each line is replayed to the recipients recorded when it was SPOKEN, not to
+        whoever is unmuted now: correction, filtering and addressing were all decided
+        at arrival, so the hold shifts delivery in time and nothing else. A recorded
+        agent whose queue is gone (disabled mid-initialization) is skipped rather
+        than resurrected.
+
+        A drop is announced FIRST, because drop-oldest puts the gap at the head of
+        what survived — so the marker sits where the missing turns actually were, and
+        it is addressed to the agents that LOST one of the dropped lines rather than
+        to whoever happens to be unmuted at drain time. Those two audiences diverge
+        under a mute landing mid-initialization, and the agent with the gap is
+        precisely the one a drain-time audience would omit.
+        """
+        held, dropped = self.init_buffer, self.init_dropped
+        deprived = self.init_dropped_recipients
+        self.init_buffer, self.init_dropped = [], 0
+        self.init_dropped_recipients = set()
+        if dropped:
+            marker = k.SYSTEM_INIT_BUFFER_OVERFLOW.format(
+                count=dropped, limit=k.MAX_INIT_BUFFER_LINES
+            )
+            for name in deprived:
+                queue = self.agents.get(name)
+                if queue is not None:
+                    queue.enqueue(marker)
+        delivered = 0
+        for line, recipients in held:
+            reached = [self.agents[name] for name in recipients if name in self.agents]
+            for queue in reached:
+                queue.enqueue(line)
+            if reached:
+                delivered += 1
+        return delivered, dropped
 
     @property
     def expired(self) -> bool:
@@ -488,9 +646,26 @@ class MeetingSession:
         for queue in self.agents.values():
             await queue.flush_now()
 
+    def cancel_translations(self) -> None:
+        """Drop pending translation work.
+
+        Deliberately NOT part of ``flush_all``: the agent flush exists to save
+        transcript that would otherwise be lost from the notes, whereas a pending
+        translation is a live reading aid for a meeting that has just ended.
+        Waiting on up to a backlog's worth of model calls would make shutdown slow
+        to produce something nobody is looking at.
+        """
+        if self.translations is not None:
+            self.translations.clear()
+
     def cancel_all(self) -> None:
         for queue in self.agents.values():
             queue.cancel()
+        # Every teardown path reaches here (``drain_and_clear`` composes ``clear``,
+        # which calls this), so cancelling translations here rather than at each
+        # call site is what makes it impossible to leave a worker running against a
+        # meeting that is gone.
+        self.cancel_translations()
 
     def resume_all(self) -> list[str]:
         resumed: list[str] = []

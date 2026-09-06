@@ -23,6 +23,7 @@ class _Sessions:
         self.released = 0
         self.successes = 0
         self.failures = 0
+        self.resets = 0
         self._raise_on_acquire = raise_on_acquire
 
     async def get_or_create(self, key, agent=None, channel_id=None):
@@ -35,6 +36,9 @@ class _Sessions:
 
     def record_success(self, key):
         self.successes += 1
+
+    async def reset(self, key):
+        self.resets += 1
 
     async def record_failure(self, key):
         self.failures += 1
@@ -71,6 +75,8 @@ class _CtxBuilder:
 
 
 class _Driver:
+    last_stop_reason = ""
+
     def __init__(self, *a, **kw):
         pass
 
@@ -178,6 +184,66 @@ def test_the_happy_path_releases_exactly_once(monkeypatch) -> None:
     assert renderer.closed == 1
     assert sessions.released == 1
     assert sessions.successes == 1
+
+
+def test_a_compaction_failed_terminal_resets_the_session(monkeypatch) -> None:
+    """A COMPACTION_FAILED terminal is synthetic — the backend abandoned the
+    turn after a failed auto-compaction and never sent end_turn, so it still
+    counts the prompt as in progress. The dispatcher must reset the session
+    or this channel's NEXT message collides with "prompt already in
+    progress" (no re-queue; the notice already reached the user)."""
+    from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
+
+    class _AbandonedDriver(_Driver):
+        last_stop_reason = STOP_REASON_COMPACTION_FAILED
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(D, "TurnDriver", _AbandonedDriver)
+    sessions = _Sessions()
+    renderer = _Renderer()
+
+    asyncio.run(drive_turn(_turn(renderer), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.resets == 1
+    assert sessions.released == 1
+
+
+def test_a_driver_without_a_stop_reason_still_finishes_the_turn(monkeypatch) -> None:
+    """The stop-reason read is defensive, like every other attribute read on
+    this seam. ``TurnDriver`` is resolved through the module attribute, so a
+    stand-in that predates the field must mean "no synthetic completion" — not
+    an AttributeError raised at a real inbound message AFTER the turn already
+    ran and the user already got the answer."""
+
+    class _FieldlessDriver:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        async def run(self, message: str) -> str:
+            return "the answer"
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(D, "TurnDriver", _FieldlessDriver)
+    sessions = _Sessions()
+    renderer = _Renderer()
+
+    asyncio.run(drive_turn(_turn(renderer), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.resets == 0
+    assert sessions.released == 1
+
+
+def test_an_ordinary_terminal_does_not_reset_the_session(monkeypatch) -> None:
+    """The reset is scoped to the compaction-failed terminal — an ordinary
+    end_turn keeps the session alive (resetting it would pay a cold start on
+    every message)."""
+    _patch_pipeline(monkeypatch)
+    sessions = _Sessions()
+    renderer = _Renderer()
+
+    asyncio.run(drive_turn(_turn(renderer), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert sessions.resets == 0
 
 
 def test_a_denied_turn_neither_renders_nor_releases(monkeypatch) -> None:

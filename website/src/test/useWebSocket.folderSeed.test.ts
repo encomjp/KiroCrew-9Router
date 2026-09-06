@@ -14,6 +14,13 @@
  * GET has loaded counts, leaves the cache alone — and (3) the first-paint seed
  * invalidates the query so the real GET backfills the omitted `history_count`.
  *
+ * Property (2) is about the SEED arm only, and every frame here deliberately
+ * carries no `foldersGeneration`. Keeping a tab up to date with folder changes
+ * made elsewhere is the separate generation arm's job (see
+ * useWebSocket.folderGeneration.test.ts): it invalidates — never writes the
+ * cache — and only when the store's generation actually moved, so it cannot
+ * clobber an optimistic edit the way a re-seed would.
+ *
  * Uses the SINGLETON store for the same reason as slotsFrameDedupe: the hook
  * reads slots off the imported singleton.
  */

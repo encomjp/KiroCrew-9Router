@@ -16,7 +16,8 @@
     "A crew of agents works the meeting in parallel: structured notes, an HTML/Mermaid diagram, and an action-item list",
     "Correct recurring speech-to-text mistakes once with a domain dictionary and every later meeting gets them right",
     "Review extracted action items before anything is filed — archive the noise, file the rest",
-    "Pluggable task and calendar providers: ships a local task ledger and an iCalendar (.ics) reader, and an organization can register its own"
+    "Pluggable task and calendar providers: ships a local task ledger and an iCalendar (.ics) reader, and an organization can register its own",
+    "Read the transcript back line by line in another language while the meeting runs"
   ],
   "defaultEnabled": false,
   "platform": {
@@ -53,5 +54,14 @@
   },
   "iconUrl": "/app-assets/meetings/icon.svg",
   "heroImage": "/app-assets/meetings/hero-light.svg",
-  "heroImageDark": "/app-assets/meetings/hero-dark.svg"
+  "heroImageDark": "/app-assets/meetings/hero-dark.svg",
+  "useCases": [
+    "Capture a live meeting while parallel agents build the transcript, structured notes, diagram, and action-item review."
+  ],
+  "configuration": [
+    "Allow browser microphone access for live capture; optionally configure an iCalendar path or URL, the local task ledger, agent roles, and speech-correction terms in Settings."
+  ],
+  "screenshots": [
+    "/app-assets/meetings/screenshot-main.png"
+  ]
 }

@@ -113,7 +113,7 @@ describe('createSettingsProvider — search', () => {
     expect(hit!.subtitle).toBe('Display › Zoom Level')
   })
 
-  it('navigates to /settings?tab=...&highlight=... on activate', async () => {
+  it('navigates to /settings/<tab>?highlight=... on activate', async () => {
     const { nav, spy } = navigate()
     const p = createSettingsProvider(nav)
     const arr = await run(p, 'zoom')
@@ -122,7 +122,7 @@ describe('createSettingsProvider — search', () => {
     hit!.onActivate()
     expect(spy).toHaveBeenCalledTimes(1)
     const url = spy.mock.calls[0][0] as string
-    expect(url).toContain('/settings?tab=display')
+    expect(url).toContain('/settings/display')
     expect(url).toContain('highlight=')
   })
 
@@ -135,12 +135,11 @@ describe('createSettingsProvider — search', () => {
     expect(hit).toBeDefined()
     hit!.onActivate()
     const url = spy.mock.calls[0][0] as string
-    // Without the second-level param the Channels tab defaults elsewhere (or
+    // Without the second-level segment the Channels tab defaults elsewhere (or
     // shows the bare list) and the highlight silently no-ops on an unmounted
-    // panel. The registry's legacy `channel` key is translated to the
-    // canonical `sub` at the settingsRoute write path.
-    expect(url).toContain('tab=channels')
-    expect(url).toContain('sub=slack')
+    // panel. The registry's legacy `channel` key becomes the second PATH
+    // segment at the settingsRoute write path.
+    expect(url).toContain('/settings/channels/slack')
     expect(url).toContain('highlight=')
   })
 

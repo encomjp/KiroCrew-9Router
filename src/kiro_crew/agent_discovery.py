@@ -144,7 +144,12 @@ SKILL_URI_PREFIX = "skill://"
 AGENT_SPEC_SUFFIX = ".agent-spec.json"
 
 
-def _read_agent_spec(path: Path) -> dict[str, Any] | None:
+def _read_agent_spec(
+    path: Path,
+    *,
+    operation: str = "list_agents",
+    source: str = "list_agents",
+) -> dict[str, Any] | None:
     """Parse an agent config file, or ``None`` when it is not usable.
 
     The one reader for both scopes, so every guard applies uniformly: AppleDouble
@@ -156,6 +161,20 @@ def _read_agent_spec(path: Path) -> dict[str, Any] | None:
     the size cap instead of being slurped into memory during a cache warm. The
     agents directories are user-writable and shared with other tools, so none of
     these are hypothetical.
+
+    *operation*/*source* label the SEL denial event emitted on a sensitive
+    resolved target. Precisely BECAUSE this is the one reader for every surface,
+    a fixed label would record a denial served for an unrelated request as an
+    agent-listing cache warm (#6722): the calling surface names itself here so
+    the security trail attributes the refusal to the request that triggered it.
+    ``source`` is the interface channel (``SecurityEvent.source`` vocabulary:
+    dashboard, cli, slack, cron, ...; ``"unknown"`` when the caller serves
+    multiple channels) — every call site passes it explicitly, enforced by the
+    call-site ratchet test. Both defaults exist ONLY so a bare call reproduces
+    the historical event byte-for-byte (a forgotten future call site degrades
+    to exactly today's trail); they are not for new call sites.
+    ``caller`` stays fixed at ``"agent_discovery"``: the reader genuinely is the
+    caller into SEL, and a fixed value keeps the trail greppable by module.
     """
     if path.name.startswith("._"):
         return None
@@ -172,9 +191,9 @@ def _read_agent_spec(path: Path) -> dict[str, Any] | None:
         logger.debug("Skipping sensitive agent config: %s", path)
         _sel().log_api_access(
             caller="agent_discovery",
-            operation="list_agents",
+            operation=operation,
             outcome="denied",
-            source="list_agents",
+            source=source,
             resources=str(real),
             error="sensitive path rejected",
         )
@@ -196,6 +215,28 @@ def _read_agent_spec(path: Path) -> dict[str, Any] | None:
         logger.debug("Skipping non-object agent config: %s", path)
         return None
     return data
+
+
+def _warn_on_systematic_scan_failure(directory: Path, candidates: int, parsed: int) -> None:
+    """Emit ONE warning when a scan rejected every candidate spec it saw.
+
+    :func:`_read_agent_spec` deliberately degrades per file to ``None`` at debug
+    level — callers depend on that contract. The cost is that a SYSTEMATIC
+    failure (every spec in a scope unreadable for the same reason, e.g. the
+    trusted-root gate refusing an entire home layout) is indistinguishable at
+    default log levels from an empty agents directory: discovery lists nothing,
+    model resolution silently falls back, and nothing says why. This scan-level
+    check makes that case visible without touching the per-file contract: one
+    warning per scan invocation (the rate limit), none when the directory is
+    empty (N=0 is not failure) or when at least one spec parsed.
+    """
+    if candidates > 0 and parsed == 0:
+        logger.warning(
+            "agent discovery: read %d candidate spec file(s) under %s but parsed 0 — "
+            "all were unreadable or rejected; enable debug logging for per-file reasons",
+            candidates,
+            directory,
+        )
 
 
 def project_agent_files(
@@ -259,7 +300,7 @@ def _declared_project_agent_name(spec: Path) -> str | None:
     allowlist: offering the filename of a broken spec has the session accept the
     agent and then fail at ``session/set_mode``.
     """
-    data = _read_agent_spec(spec)
+    data = _read_agent_spec(spec, operation="resolve_project_agent_name", source="unknown")
     if data is None:
         return None
     return spec_str(data, "name", _project_agent_fallback_name(spec))
@@ -327,14 +368,20 @@ def project_agent_names(project_dir: str | Path | None) -> frozenset[str]:
     cached = _PROJECT_NAMES_CACHE.get(key)
     if cached is not None and cached[0] == signature:
         return cached[1]
-    names = frozenset(
-        name
-        for f in project_agent_files(project_dir)
+    candidates = 0
+    declared: list[str] = []
+    for f in project_agent_files(project_dir):
+        # AppleDouble sidecars are rejected by design, not by failure — a
+        # directory holding only sidecars is empty of specs, not broken.
+        if not f.name.startswith("._"):
+            candidates += 1
         # Only a spec that parses contributes: a malformed or unreadable file can
         # never become a kiro-cli mode, and admitting its filename fallback here
         # would have dispatch accept a name whose session/set_mode then fails.
-        if (name := _declared_project_agent_name(f)) is not None
-    )
+        if (name := _declared_project_agent_name(f)) is not None:
+            declared.append(name)
+    _warn_on_systematic_scan_failure(project_agents_dir(project_dir), candidates, len(declared))
+    names = frozenset(declared)
     _PROJECT_NAMES_CACHE[key] = (signature, names)
     return names
 
@@ -436,6 +483,57 @@ def spec_model(data: dict[str, Any]) -> str:
     It also leaked into ``subagent.py``'s spawn kwargs as a ``--model`` argument.
     """
     return spec_str(data, "model", _DEFER_MODEL)
+
+
+def agent_model_map(
+    agents_dir: Path | None = None,
+    *,
+    operation: str,
+    source: str,
+) -> dict[str, str]:
+    """Build the full agent name/stem-to-model map for legacy history restore.
+
+    Restore needs every entry, so this intentionally scans the complete scope.
+    It keeps that surface on the hardened reader while preserving
+    security-event attribution through the required *operation* and *source*
+    arguments. A missing or non-string model stays ``""`` here so a restored
+    legacy session continues to inherit its crew/global model; this deliberately
+    differs from session's targeted runtime resolver, where no pin means
+    ``"auto"``.
+
+    A refused spec is skipped like an absent one.  If every candidate in a
+    non-empty directory is refused, the scan-level warning used by discovery is
+    emitted so a systematic gate failure is not mistaken for an empty install.
+    """
+    directory = agents_dir or _kiro_agents_dir()
+    if not directory.is_dir():
+        return {}
+    try:
+        files = sorted(directory.glob("*.json"))
+    except OSError:
+        return {}
+
+    candidates = 0
+    parsed = 0
+    result: dict[str, str] = {}
+    for spec_file in files:
+        if not spec_file.name.startswith("._"):
+            candidates += 1
+        data = _read_agent_spec(
+            spec_file,
+            operation=operation,
+            source=source,
+        )
+        if data is None:
+            continue
+        model = spec_str(data, "model", "")
+        declared_name = spec_str(data, "name")
+        if declared_name:
+            result[declared_name] = model
+        result[spec_file.stem] = model
+        parsed += 1
+    _warn_on_systematic_scan_failure(directory, candidates, parsed)
+    return result
 
 
 def _builder_mcp_skills(data: dict[str, Any]) -> list[str]:
@@ -552,19 +650,16 @@ def agent_skill_globs(agent: str, agents_dir: Path | None = None) -> list[str]:
     except OSError:
         return []
     for f in candidates:
-        if f.name.startswith("._"):
-            continue
-        try:
-            real = f.resolve(strict=True)
-        except OSError:
-            continue
-        if is_sensitive_path(str(real)):
-            continue
-        try:
-            data = json.loads(real.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
+        # The one hardened reader for the user-writable agents dir: AppleDouble
+        # sidecars, symlink loops (``RuntimeError`` on resolve), sensitive
+        # resolved targets (with the SEL ``denied`` event), the size cap, and
+        # non-UTF-8 / non-object JSON all collapse to ``None`` — skipped like an
+        # absent file, preserving this function's never-raises / ``[]`` contract.
+        # Pass ``f``, not the resolved target: ``f.stem`` and
+        # ``expand_skill_uri`` below must see the ORIGINAL path so a symlinked
+        # spec's relative globs stay anchored where the symlink lives.
+        data = _read_agent_spec(f, operation="agent_skill_globs", source="unknown")
+        if data is None:
             continue
         if data.get("name") != agent and f.stem != agent:
             continue
@@ -768,15 +863,27 @@ def list_agents(
     agents: list[AgentInfo] = []
 
     if d.is_dir():
+        user_candidates = 0
+        user_parsed = 0
         for f in sorted(d.glob("*.json")):
+            # AppleDouble sidecars are rejected by design, not by failure — a
+            # directory holding only sidecars is empty of specs, not broken.
+            if not f.name.startswith("._"):
+                user_candidates += 1
             try:
-                data = _read_agent_spec(f)
+                data = _read_agent_spec(f, operation="list_agents", source="unknown")
                 if data is None:
                     continue
                 agents.append(_global_agent_info(f, data))
+                # Counted AFTER the append: a spec that parses but whose row
+                # construction raises into the handler below still ends in
+                # "discovery listed nothing", which is exactly what the
+                # systematic-failure warning exists to surface.
+                user_parsed += 1
             except Exception:
                 logger.debug("Skipping invalid agent config: %s", f)
                 continue
+        _warn_on_systematic_scan_failure(d, user_candidates, user_parsed)
 
     # Deduplicate by name — prefer package-installed (has package) over fallback
     seen: dict[str, AgentInfo] = {}
@@ -818,9 +925,13 @@ def list_agents(
     # dir as cwd, so the project entry is what would actually run. The warning
     # mirrors kiro-cli's own conflict notice — shadowing is correct here, silent
     # shadowing is not, because the two configs can differ in tools and permissions.
+    project_candidates = 0
+    project_parsed = 0
     for pf in project_files:
+        if not pf.name.startswith("._"):
+            project_candidates += 1
         try:
-            data = _read_agent_spec(pf)
+            data = _read_agent_spec(pf, operation="list_agents", source="unknown")
             if data is None:
                 continue
             info = _project_agent_info(pf, data)
@@ -833,9 +944,14 @@ def list_agents(
                     shadowed.filename,
                 )
             seen[info.name] = info
+            project_parsed += 1
         except Exception:
             logger.debug("Skipping invalid project agent config: %s", pf)
             continue
+    if project_dir:  # type narrowing only; without it candidates is 0 anyway
+        _warn_on_systematic_scan_failure(
+            project_agents_dir(project_dir), project_candidates, project_parsed
+        )
 
     result = list(seen.values())
     _LIST_AGENTS_CACHE[cache_key] = (signature, result)

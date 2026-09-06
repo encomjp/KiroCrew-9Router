@@ -21,8 +21,8 @@ Piper:  POST /api/voice/synthesize → synthesize_speech() one WAV
 
 | Component | File | Role |
 |-----------|------|------|
-| Sentence detector | `frontend/src/hooks/useWebSocket.ts` | Watches streaming chunks for sentence boundaries |
-| Playback queue | `frontend/src/hooks/useWebSocket.ts` | Queues and plays audio chunks sequentially |
+| Sentence detector | `website/src/hooks/useWebSocket.ts` | Watches streaming chunks for sentence boundaries |
+| Playback queue | `website/src/hooks/useWebSocket.ts` | Queues and plays audio chunks sequentially |
 | Synthesize endpoint | `src/kiro_crew/dashboard/chat_voice.py` | `POST /api/voice/synthesize` — Polly: splits text into sentences + broadcasts chunks; Piper: `_synthesize_nonstreaming()` emits one clip (re-exported via `chat.py`) |
 | Voice config endpoint | `src/kiro_crew/dashboard/chat_voice.py` | `GET/PUT /api/voice/config` — read/update voice settings incl. `provider` + `piper_*` (re-exported via `chat.py`) |
 | TTS synthesis | `src/kiro_crew/voice_reply.py` | `synthesize_speech()` provider dispatcher (Polly `aws polly` / local `piper`), `streaming_voice_reply()` (Polly-only), `validate_length_scale()`, `stitch_mp3s()` |
@@ -59,12 +59,13 @@ Stored in `~/.kiro/crew/config.json` under `voice_reply`:
 
 | Setting | Default | Range |
 |---------|---------|-------|
-| `provider` | piper | `piper` (local) or `polly` (AWS). Invalid values fall back to `polly` on load |
+| `provider` | piper | `piper` (local) or `polly` (AWS). An unrecognized value falls back to `voice_reply.DEFAULT_PROVIDER`, which is `piper`: the fallback has to be the local one, because reaching for a paid AWS service is not a choice a typo may make on the operator's behalf |
 | `voice_id` | Ruth | Any Polly voice ID (Polly only) |
 | `engine` | generative | generative, neural, long-form, standard (Polly only) |
 | `rate` | 100% | 50%–200% (Polly only) |
 | `pitch` | +0% | -20% to +20% (Polly only) |
-| `enabled` | true | Controls auto-speak and Slack voice replies |
+| `enabled` | true | Primary voice switch; gates Slack voice replies. Independent of `auto_speak` |
+| `auto_speak` | false | Dashboard auto-speak: speak each assistant reply automatically. Independent of `enabled` — the manual 🔊 Speak button works regardless of either flag |
 | `aws_profile` | _(empty)_ | AWS CLI profile name for Polly calls. Empty = use default credentials |
 | `region` | _(empty)_ | AWS region for Polly. Empty = use CLI default |
 | `piper_model` | _(empty)_ | Path to a Piper `.onnx` voice model. Required for Piper |
@@ -87,6 +88,23 @@ etc.). To use a specific profile, set `aws_profile` in the config:
   }
 }
 ```
+
+### Polly needs a recorded consent, not just credentials
+
+Polly is a paid service, so `_synthesize_polly` calls
+`aws_consent.refuse_and_log(SERVICE_POLLY, profile, region)` before it spends
+anything, and returns `None` when that refuses. The check is local and makes no
+AWS call of its own, because this path runs unattended (a Slack thread reply, an
+auto-reply to a voice memo, a scheduled job) and there is nobody present to
+prompt. `None` is the function's established "no audio" answer, so every caller
+already degrades to a text-only reply.
+
+The grant is per profile, per region and per resolved account, and it lives in
+`aws_service_consent.json` under the data home rather than in `config.json`
+because it is an authorization: that file is on the read and write keystone floor,
+so the agent can neither read it nor grant itself permission to spend. An empty
+`aws_profile` is not "no account", it is the CLI's own credential chain, so the
+consent record pins whichever account that resolves to and the log names it.
 
 ### Sandbox requirement
 
@@ -113,7 +131,7 @@ instruction for two of the three kinds.
 
 ### API
 
-- `GET /api/voice/config` — returns current settings + `autoSpeak` flag
+- `GET /api/voice/config` — returns current settings + `autoSpeak` flag (mirrors `auto_speak`, not `enabled`)
 - `PUT /api/voice/config` — update settings (partial patch), persists to config.json
 - `POST /api/voice/synthesize` — `{ slot, text, voice?, engine?, rate?, pitch? }`
 - `GET /api/voice/voices` — list available Polly voices via `aws polly
@@ -203,10 +221,10 @@ async pipeline: markdown strip → SSML → Polly → Slack file upload.
 
 Redux state in `chatSlice`:
 - `voicePlaying: boolean` — drives UI indicators
-- `voiceAudio: string | null` — base64 stitched MP3 for replay via 🔊 button
+- `voiceAudio: string | null` — base64 stitched MP3 for replay via the Speak button
 
 ## Manual Replay
 
-The 🔊 Speak button appears on hover over assistant messages ≥50 chars.
+The Speak button appears on hover over assistant messages ≥50 chars.
 Clicking it calls `api.voiceSynthesize(slot, content)` which streams the
 full message through the same pipeline. This works independently of auto-speak.

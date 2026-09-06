@@ -30,9 +30,17 @@ from kiro_crew.dashboard.refresh_tokens import (
     generate_refresh_token,
     refresh_cookie_name,
     refresh_token_boot,
+    refresh_token_peer_key,
+    refresh_token_requires_peer,
     validate_refresh_token,
 )
-from kiro_crew.dashboard.tailnet import TailnetTrust, peer_pin_key, resolve_forwarded_peer
+from kiro_crew.dashboard.tailnet import (
+    TailnetTrust,
+    login_allowed,
+    peer_pin_key,
+    peer_pin_key_for_claim,
+    resolve_forwarded_peer,
+)
 from kiro_crew.dashboard.token_auth import (
     MAX_SESSION_TTL_SECS,
     _cookie_port_from_host,
@@ -337,15 +345,33 @@ async def api_auth_me(request: web.Request) -> web.Response:
     if not user_id:
         return web.json_response({"error": "unauthenticated"}, status=401)
 
-    # The middleware has already validated the access cookie. We can read
-    # session_exp from the cookie payload directly.
+    # Read the credential the MIDDLEWARE VALIDATED, published as
+    # ``request["auth_token"]`` — the same contract ``_caller_bounds`` and the
+    # frame-ancestors reader follow. Re-extracting the cookie here was only ever
+    # correct because extraction order was guaranteed to match the middleware's;
+    # it does not hold when a valid ``?token=`` won (pre-existing) and, now that
+    # an invalid query token falls back to the cookie, the order is not fixed at
+    # all. Reading the wrong credential mis-reports ``session_exp``, which is
+    # what drives the frontend's proactive-refresh scheduler.
+    #
+    # The re-extraction stays as a FALLBACK rather than being deleted. On the
+    # first request of a link exchange the published credential is the link
+    # token, whose nonce this very request added to the cookie denylist, so the
+    # numeric read yields nothing — exactly the case where the old path already
+    # reported 0.0. Falling back keeps this strictly better than before instead
+    # of trading one blind spot for another.
     port = request.app.get("port", 7777)
     cookie_name = f"mc_token_{_cookie_port_from_host(request, port)}"
-    access_token = request.cookies.get(cookie_name, "")
+    published = request.get("auth_token", "")
+    access_token = published if isinstance(published, str) and published else ""
     # session_exp is a FLOAT claim; the string-only extract_claims_from_token
     # silently drops it (always yielding 0.0 here), which disabled the
     # frontend's proactive-refresh scheduler. Use the numeric extractor.
     session_exp = extract_numeric_claim(access_token, "session_exp") or 0.0
+    if not session_exp:
+        session_exp = (
+            extract_numeric_claim(request.cookies.get(cookie_name, ""), "session_exp") or 0.0
+        )
 
     # Refresh-cookie expiry: best effort — if a refresh cookie is present,
     # we report its session_exp. The cookie is path-scoped to /api/auth/
@@ -418,6 +444,66 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
 
     state = _get_state()
 
+    # An identity-bound chain (the persistent QR session shape) may only be USED
+    # while a daemon-verified tailnet peer can be established. Placed here, ahead
+    # of BOTH the reuse branch and the mint, because every path below this line
+    # hands the caller a live credential: the grace-replay branch re-serves the
+    # cached pair and re-sets both cookies without minting anything, so a check
+    # sited at the mint leaves a 60-second window in which a replayed token is
+    # honoured with no identity check at all. That window was the review finding.
+    #
+    # Ordering it BEFORE reuse detection is deliberate, not incidental. Reuse
+    # detection revokes the chain, so letting it run first would let any
+    # unverified caller destroy a legitimate 30-day session by replaying one
+    # consumed token — a sign-out handed to anyone who can reach the port. An
+    # unverified caller gets 401 either way, so refusing first loses no theft
+    # signal: a thief who CAN verify still trips reuse detection normally.
+    #
+    # A refusal does NOT revoke. Identity resolution fails transiently (daemon
+    # restart, a stripped header), and burning a 30-day credential over a blip
+    # would turn a recoverable hiccup into a re-scan. The session simply cannot
+    # be used until identity is established again, which is the honest reading of
+    # "bounded by identity" — and it is the only bound available here, since
+    # behind `tailscale serve` every request arrives from 127.0.0.1, so an
+    # address pin would read as a pin while excluding nobody.
+    carried_require_peer = refresh_token_requires_peer(refresh_token)
+    carried_peer_key = refresh_token_peer_key(refresh_token) if carried_require_peer else ""
+    verified_peer_key = (
+        await _verified_peer_key(request, carried_peer_key) if carried_require_peer else ""
+    )
+    if carried_require_peer and (
+        not verified_peer_key or not carried_peer_key or verified_peer_key != carried_peer_key
+    ):
+        if not verified_peer_key:
+            outcome = "peer_unverified"
+            code = "peer_identity_unverified"
+            message = (
+                "This device could not be verified on the tailnet, so the session "
+                "cannot be renewed. Reconnect to the tailnet and try again."
+            )
+        elif not carried_peer_key:
+            outcome = "peer_binding_missing"
+            code = "peer_binding_missing"
+            message = (
+                "This session predates restart-safe device binding and cannot be "
+                "renewed. Show a new phone-access QR code and scan it once."
+            )
+        else:
+            outcome = "peer_mismatch"
+            code = "peer_identity_mismatch"
+            message = "This session belongs to a different tailnet device and cannot be renewed."
+        _audit(user_id, "refresh_token_use", outcome, chain_id)
+        # Prose in ``error``, machine id in ``code``, per the error-code contract:
+        # the dashboard renders ``error`` verbatim into a localized UI, so an
+        # un-coded identifier would be untranslatable by construction.
+        return web.json_response(
+            {
+                "error": message,
+                "code": code,
+            },
+            status=401,
+        )
+
     # Reuse detection: if this jti is already consumed AND it is NOT
     # within the multi-tab grace window, treat as theft and revoke.
     if state.is_consumed(jti):
@@ -476,15 +562,29 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     # this path, carrying degrades to "unbound", while re-deriving would silently
     # mint a live binding for it.
     carried_boot = refresh_token_boot(refresh_token)
+    _carried_claims: dict[str, str] = {}
+    if carried_boot:
+        _carried_claims["boot"] = carried_boot
+    if carried_require_peer:
+        # Carried onto BOTH halves of the rotated pair. Dropping it on either one
+        # would make the FIRST rotation silently downgrade an identity-bound
+        # session to an ordinary one — the same shape of defect as the review
+        # finding this check answers, one rotation later.
+        _carried_claims["require_peer"] = "1"
     new_access_token = generate_token(
         user_id,
         ttl_seconds=MAX_SESSION_TTL_SECS,
         register_nonce=False,
-        extra={"boot": carried_boot} if carried_boot else None,
+        peer_key=carried_peer_key,
+        extra=_carried_claims or None,
     )
     new_session_exp = now + MAX_SESSION_TTL_SECS
     new_refresh_token, _new_chain, _new_jti, new_refresh_exp = generate_refresh_token(
-        user_id, chain_id=chain_id, boot=carried_boot
+        user_id,
+        chain_id=chain_id,
+        boot=carried_boot,
+        require_peer=carried_require_peer,
+        peer_key=carried_peer_key,
     )
 
     public_payload = {
@@ -513,9 +613,15 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
         replacement=json.dumps(grace_payload, separators=(",", ":")),
     )
 
-    await _rebind_rotated_token_to_peer(
-        request, new_access_token, new_session_exp, boot_bound=bool(carried_boot)
-    )
+    if carried_require_peer:
+        # The signed claim, not a second whois result, is authoritative. The
+        # request already proved it matches ``verified_peer_key`` above; mirror
+        # that exact key into the hot in-memory map for posture/reporting.
+        bind_token_peer(new_access_token, carried_peer_key, new_session_exp)
+    else:
+        await _rebind_rotated_token_to_peer(
+            request, new_access_token, new_session_exp, boot_bound=bool(carried_boot)
+        )
 
     resp = web.json_response(public_payload)
     _set_access_cookie(resp, request, new_access_token, new_session_exp)
@@ -523,6 +629,29 @@ async def api_auth_refresh(request: web.Request) -> web.Response:
     _expire_foreign_port_cookies(resp, request)
     _audit(user_id, "refresh_token_use", "ok")
     return resp
+
+
+async def _verified_peer_key(request: web.Request, claimed_peer_key: str = "") -> str:
+    """Return the allowed daemon-verified peer key for this request.
+
+    Reads the same ``tailnet_trust`` gate and the same resolver that
+    :func:`_rebind_rotated_token_to_peer` uses, so "can this be pinned" and "may
+    this rotate" cannot answer differently — a rotation admitted here that the
+    rebind then could not pin is precisely the gap this pair closes.
+    """
+    trust = request.app.get("tailnet_trust")
+    if not (isinstance(trust, TailnetTrust) and trust.trust_identity and trust.allowed_logins):
+        return ""
+    try:
+        peer = await resolve_forwarded_peer(request, trust)
+        if peer is None or not login_allowed(peer.login, trust.allowed_logins):
+            return ""
+        if claimed_peer_key:
+            return peer_pin_key_for_claim(peer, claimed_peer_key)
+        return peer_pin_key(peer, trust.pin_scope)
+    except Exception:  # noqa: BLE001 - an auth decision must not 500 on the probe
+        logger.debug("refresh: tailnet peer resolution failed", exc_info=True)
+        return ""
 
 
 async def _rebind_rotated_token_to_peer(
@@ -534,7 +663,7 @@ async def _rebind_rotated_token_to_peer(
     replacement access token would be UNBOUND — one rotation would launder a
     node-scoped identity pin into an any-peer token. When the refresh request
     itself resolves a verified peer, the fresh token is pinned to that peer's
-    key; when no peer resolves (non-tailnet setups, daemon down, Windows) the
+    key; when no peer resolves (non-tailnet setups or daemon down) the
     token stays unbound, which is byte-for-byte the pre-identity behaviour.
     The middleware's early allowlist deny already covers this route (it runs
     before the bypass list), so a verified-but-unallowlisted peer never

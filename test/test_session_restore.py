@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
+from dashboard_owner_helpers import as_owner
 
 from kiro_crew.dashboard.chat import restore_recent_sessions
 from kiro_crew.dashboard.state import DashboardState
@@ -59,7 +60,7 @@ def _make_config_app(tmp_path):
     app["state"] = state
     app.router.add_get("/api/dashboard/config", api_dashboard_config)
     app.router.add_put("/api/dashboard/config", api_dashboard_config)
-    return app
+    return as_owner(app)
 
 
 # ── restore_recent_sessions tests ──
@@ -82,7 +83,12 @@ class TestRestoreRecentSessions:
                 {"role": "user", "content": "hello", "ts": "2026-03-23T10:00:00"},
                 {"role": "assistant", "content": "hi there", "ts": "2026-03-23T10:00:01"},
             ],
-            meta={"title": "Test Chat", "agent": "kirocrew", "workspace": "myws", "mode": "orchestrator"},
+            meta={
+                "title": "Test Chat",
+                "agent": "kirocrew",
+                "workspace": "myws",
+                "mode": "orchestrator",
+            },
         )
         # Touch the file to make it recent
         path = tmp_path / "dashboard_chat1.jsonl"
@@ -222,6 +228,62 @@ class TestRestoreRecentSessions:
         assert len(slot.messages) == 500
         assert slot.messages[0]["content"] == "msg 100"
         assert slot._disk_older_count == 100  # 600 total - 500 loaded = 100 older on disk
+
+    def test_restore_computes_the_durable_prefix_count_from_disk(self, tmp_path, monkeypatch):
+        """A trimmed prefix holding transient-role lines splits the two counters.
+
+        ``_disk_older_count`` counts every on-disk line older than the window
+        (the frozen prefix the save model preserves); the durable counter must
+        count only the rows a durable read returns, and must be RECOMPUTED from
+        the messages on disk — a slot restored by an older build has no durable
+        counter persisted anywhere to trust.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        messages = [
+            {"role": "user", "content": f"msg {i}", "ts": f"2026-03-23T10:{i:04d}"}
+            for i in range(600)
+        ]
+        # 10 transient-role lines inside the trimmed prefix (a legacy or foreign
+        # writer put them on disk; the save path itself never does).
+        for i in range(10):
+            messages[i * 5] = {
+                "role": "permission",
+                "content": "approve?",
+                "ts": messages[i * 5]["ts"],
+            }
+        _write_session(tmp_path, "dashboard_big", messages)
+        (tmp_path / "dashboard_big.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        assert restore_recent_sessions(state, window_minutes=60) == 1
+        slot = state._slots["big"]
+        assert slot._disk_older_count == 100
+        assert (
+            slot._disk_older_durable_count == 90
+        ), "the 10 transient prefix lines must not count as durable"
+
+    def test_channel_rebuild_window_computes_the_durable_prefix_count(self, tmp_path, monkeypatch):
+        """The channel restore path draws the same durable/all-rows line."""
+        from kiro_crew.dashboard import channel_slots
+        from kiro_crew.dashboard.channel_slots import _rebuild_window
+
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        slot = state.get_or_create_slot("slack_1.1", linked_session_key="slack:1.1")
+        n = channel_slots._RESTORE_WINDOW
+        messages = [
+            {"role": "user", "content": f"msg {i}", "ts": f"2026-03-23T10:{i:04d}"}
+            for i in range(n + 40)
+        ]
+        # 7 transient lines inside the 40-row trimmed prefix.
+        for i in range(7):
+            messages[i * 3] = {"role": "queued", "content": "q", "ts": messages[i * 3]["ts"]}
+
+        _rebuild_window(slot, messages)
+
+        assert slot._disk_older_count == 40
+        assert slot._disk_older_durable_count == 33
+        assert len(slot.messages) == n
 
     def test_restores_multiple_sessions(self, tmp_path, monkeypatch):
         """Multiple recent dashboard sessions are all restored."""
@@ -1064,9 +1126,9 @@ class TestAsyncRehydrateSlotFromHistory:
         slot = await rehydrate_slot_from_history_async(state, "racy")
 
         assert slot is state._slots["racy"]
-        assert [m["content"] for m in slot.messages] == ["from the other task"], (
-            "the snapshot was applied on top of a concurrently created slot"
-        )
+        assert [m["content"] for m in slot.messages] == [
+            "from the other task"
+        ], "the snapshot was applied on top of a concurrently created slot"
 
 
 class TestPartialRehydrateRollsBack:
@@ -1090,8 +1152,12 @@ class TestPartialRehydrateRollsBack:
         from kiro_crew.dashboard.chat import _rehydrate_slot_from_history
 
         state = _make_state(tmp_path)
-        _write_session(tmp_path, "dashboard_doomed", [{"role": "user", "content": "hi"}],
-                       meta={"title": "T", "memory_mode": "ephemeral"})
+        _write_session(
+            tmp_path,
+            "dashboard_doomed",
+            [{"role": "user", "content": "hi"}],
+            meta={"title": "T", "memory_mode": "ephemeral"},
+        )
         # Fail inside the population, after the slot is registered.
         monkeypatch.setattr(chat_persistence, "redact_credentials", self._boom)
 
@@ -1112,8 +1178,12 @@ class TestPartialRehydrateRollsBack:
         from kiro_crew.dashboard import chat_persistence
 
         state = _make_state(tmp_path)
-        _write_session(tmp_path, "dashboard_doomed-async", [{"role": "user", "content": "hi"}],
-                       meta={"title": "T", "memory_mode": "ephemeral"})
+        _write_session(
+            tmp_path,
+            "dashboard_doomed-async",
+            [{"role": "user", "content": "hi"}],
+            meta={"title": "T", "memory_mode": "ephemeral"},
+        )
         monkeypatch.setattr(chat_persistence, "redact_credentials", self._boom)
 
         with pytest.raises(RuntimeError):
@@ -1140,16 +1210,20 @@ class TestPartialRehydrateRollsBack:
 
         state = _make_state(tmp_path)
         state._restricted_keys.add("dashboard:keeper")
-        _write_session(tmp_path, "dashboard_keeper", [{"role": "user", "content": "hi"}],
-                       meta={"title": "T", "memory_mode": "ephemeral"})
+        _write_session(
+            tmp_path,
+            "dashboard_keeper",
+            [{"role": "user", "content": "hi"}],
+            meta={"title": "T", "memory_mode": "ephemeral"},
+        )
         monkeypatch.setattr(chat_persistence, "redact_credentials", self._boom)
 
         with pytest.raises(RuntimeError):
             _rehydrate_slot_from_history(state, "keeper")
 
-        assert "dashboard:keeper" in state._restricted_keys, (
-            "rollback discarded a restricted key it did not add"
-        )
+        assert (
+            "dashboard:keeper" in state._restricted_keys
+        ), "rollback discarded a restricted key it did not add"
 
     def test_the_rollback_lives_in_the_callee_not_the_caller(self):
         """Source guard: the rollback belongs at the creation site so EVERY caller
@@ -1169,3 +1243,409 @@ class TestPartialRehydrateRollsBack:
             "restore_open_slots re-grew its own rollback: two copies of the same "
             "undo will drift, and the callee's is the one every caller reaches"
         )
+
+
+# ── restore_recent_sessions_async: the reads must leave the loop (#895) ──
+#
+# This driver is the slower of the two startup restores: it calls list_sessions()
+# (a glob + stat + first-line read of EVERY session file) and then per selected
+# session a get_metadata plus a chained transcript walk — measured at 13.6s for
+# 76 sessions, all of it on the event loop between per-session yields. The yield
+# bounded one session's share; it did not stop a single large transcript from
+# stalling the stall-watchdog heartbeat. So every read is hoisted into
+# asyncio.to_thread and only the slot build stays on the loop, which is
+# mandatory: slot creation broadcasts through asyncio.Queue.put_nowait /
+# Event.set, neither of which is thread-safe.
+
+
+class TestAsyncRestoreRecentSessionsOffLoop:
+    @pytest.mark.asyncio
+    async def test_matches_the_sync_driver(self, tmp_path, monkeypatch):
+        """Parity guard: the two drivers no longer share a generator body."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        for name in ("dashboard_par1", "dashboard_par2"):
+            _write_session(
+                tmp_path,
+                name,
+                [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+                meta={"title": name, "agent": "kirocrew"},
+            )
+            (tmp_path / f"{name}.jsonl").touch()
+
+        sync_state = _make_state(tmp_path)
+        async_state = _make_state(tmp_path)
+        sync_n = restore_recent_sessions(sync_state, window_minutes=60)
+        async_n = await restore_recent_sessions_async(async_state, window_minutes=60)
+
+        assert sync_n == async_n == 2
+        assert set(sync_state._slots) == set(async_state._slots) == {"par1", "par2"}
+        assert [m["content"] for m in async_state._slots["par1"].messages] == ["hi"]
+
+    @pytest.mark.asyncio
+    async def test_every_read_runs_off_the_loop_and_the_build_runs_on_it(
+        self, tmp_path, monkeypatch
+    ):
+        """list_sessions, get_metadata and the transcript walk must all be offloaded."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard import chat_persistence
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        for i in range(3):
+            name = f"dashboard_off{i}"
+            _write_session(
+                tmp_path,
+                name,
+                [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+                meta={"title": name},
+            )
+            (tmp_path / f"{name}.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        log = state.conversation_log
+        reads: list[str] = []
+        builds: list[str] = []
+
+        real_list = log.list_sessions
+        real_meta = log.get_metadata
+        real_chained = log.read_messages_chained
+        real_apply = chat_persistence._apply_recent_session
+
+        def _list():
+            reads.append(threading.current_thread().name)
+            return real_list()
+
+        def _meta(key):
+            reads.append(threading.current_thread().name)
+            return real_meta(key)
+
+        def _chained(key):
+            reads.append(threading.current_thread().name)
+            return real_chained(key)
+
+        def _apply(*a, **kw):
+            builds.append(threading.current_thread().name)
+            return real_apply(*a, **kw)
+
+        monkeypatch.setattr(log, "list_sessions", _list)
+        monkeypatch.setattr(log, "get_metadata", _meta)
+        monkeypatch.setattr(log, "read_messages_chained", _chained)
+        monkeypatch.setattr(chat_persistence, "_apply_recent_session", _apply)
+
+        main = threading.current_thread().name
+        restored = await restore_recent_sessions_async(state, window_minutes=60)
+
+        assert restored == 3
+        assert reads, "nothing was read — the test would not detect the bug"
+        assert all(t != main for t in reads), (
+            "a startup restore read ran ON the event-loop thread "
+            f"(threads seen: {sorted(set(reads))})"
+        )
+        assert builds == [main] * 3, (
+            "slot construction left the event-loop thread; it broadcasts through "
+            f"asyncio.Queue.put_nowait / Event.set (threads seen: {builds})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_skipped_session_never_pays_for_its_transcript(self, tmp_path, monkeypatch):
+        """The filters run BETWEEN the two reads, on the cheap one.
+
+        Reading a multi-megabyte transcript and then discarding it because the
+        session is closed or outside the window is pure waste, and it is the read
+        that dominates startup.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        _write_session(
+            tmp_path,
+            "dashboard_keep",
+            [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+            meta={"title": "keep"},
+        )
+        _write_session(
+            tmp_path,
+            "dashboard_shut",
+            [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+            meta={"title": "shut", "closed": True},
+        )
+        for name in ("dashboard_keep", "dashboard_shut"):
+            (tmp_path / f"{name}.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        log = state.conversation_log
+        walked: list[str] = []
+        real_chained = log.read_messages_chained
+
+        def _chained(key):
+            walked.append(key)
+            return real_chained(key)
+
+        monkeypatch.setattr(log, "read_messages_chained", _chained)
+
+        assert await restore_recent_sessions_async(state, window_minutes=60) == 1
+        assert set(state._slots) == {"keep"}
+        assert not any(
+            "shut" in k for k in walked
+        ), f"read the transcript of a session it then skipped: {walked}"
+
+    @pytest.mark.asyncio
+    async def test_the_restoring_guard_is_released_even_on_failure(self, tmp_path, monkeypatch):
+        """A stuck flag silently disables open-tab persistence for the process."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        state = _make_state(tmp_path)
+        with patch.object(
+            state.conversation_log, "list_sessions", side_effect=RuntimeError("boom")
+        ):
+            with pytest.raises(RuntimeError):
+                await restore_recent_sessions_async(state, window_minutes=60)
+        assert state.restoring_open_slots is False
+
+    @pytest.mark.asyncio
+    async def test_a_channel_born_session_is_left_to_the_reconciler(self, tmp_path, monkeypatch):
+        """Non-dashboard keys stay out of this path — the reconciler owns them."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        _write_session(
+            tmp_path,
+            "slack_1712793600.123456",
+            [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+            meta={"title": "thread"},
+        )
+        (tmp_path / "slack_1712793600.123456.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        assert await restore_recent_sessions_async(state, window_minutes=60) == 0
+        assert state._slots == {}
+
+    @pytest.mark.asyncio
+    async def test_a_slot_published_during_the_read_is_not_replayed_over(
+        self, tmp_path, monkeypatch
+    ):
+        """Post-hop re-check: the pre-hop ``_slots`` answer is seconds stale.
+
+        Offloading the reads opened a window that did not exist before — the
+        check and the apply used to run atomically on the loop. If a resume, a
+        nudge or the user opening the tab publishes the slot while its transcript
+        loads, ``_apply_recent_session`` -> ``get_or_create_slot`` returns that
+        LIVE slot and the replay appends the on-disk messages a second time, then
+        persists the duplicates. Flagged as blocking by GPT 5.6 review and by
+        Design review on the first CI round.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        _write_session(
+            tmp_path,
+            "dashboard_racy",
+            [
+                {"role": "user", "content": "first", "ts": "2026-03-23T10:00:00"},
+                {"role": "assistant", "content": "reply", "ts": "2026-03-23T10:00:01"},
+            ],
+            meta={"title": "Racy"},
+        )
+        (tmp_path / "dashboard_racy.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        log = state.conversation_log
+        real_chained = log.read_messages_chained
+
+        def _publish_then_read(key):
+            # Stand in for a resume publishing the slot mid-read: the live slot
+            # already holds the transcript, which is exactly the state a replay
+            # would double.
+            if "racy" in key and "racy" not in state._slots:
+                live = state.get_or_create_slot("racy")
+                live.append("user", "first", "msg msg-u", ts="2026-03-23T10:00:00")
+                live.append("assistant", "reply", "msg msg-a", ts="2026-03-23T10:00:01")
+                live.drain()
+            return real_chained(key)
+
+        monkeypatch.setattr(log, "read_messages_chained", _publish_then_read)
+
+        restored = await restore_recent_sessions_async(state, window_minutes=60)
+
+        assert restored == 0, "restored a session that was already live"
+        assert [m["content"] for m in state._slots["racy"].messages] == [
+            "first",
+            "reply",
+        ], "the transcript was replayed onto a live slot — duplicated history"
+
+    @pytest.mark.asyncio
+    async def test_a_tab_closed_during_the_read_is_not_resurrected(self, tmp_path, monkeypatch):
+        """✕ clicked mid-read must win over the metadata snapshot.
+
+        The close pops the slot and records a tombstone synchronously, but
+        persists the ``closed`` flag only after its own awaits — so the metadata
+        read before the click still says open. Rebuilding from it would re-create
+        a dismissed tab and then fire a nudge turn into it. Mirrors the guard
+        ``rehydrate_slot_from_history_async`` applies after its own hop.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard import channel_slots
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        _write_session(
+            tmp_path,
+            "dashboard_dismissed",
+            [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+            meta={"title": "Dismissed"},
+        )
+        (tmp_path / "dashboard_dismissed.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        log = state.conversation_log
+        real_chained = log.read_messages_chained
+
+        def _close_then_read(key):
+            channel_slots.note_slot_closed(state, "dismissed")
+            return real_chained(key)
+
+        monkeypatch.setattr(log, "read_messages_chained", _close_then_read)
+
+        assert await restore_recent_sessions_async(state, window_minutes=60) == 0
+        assert "dismissed" not in state._slots, "resurrected a tab the user closed"
+
+    @pytest.mark.asyncio
+    async def test_an_older_tombstone_does_not_block_a_reopened_tab(self, tmp_path, monkeypatch):
+        """Only a close DURING the read is the race; older tombstones are inert.
+
+        Without the ``>= started`` comparison the guard would make a reopened tab
+        un-restorable for the tombstone's whole lifetime.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard import channel_slots
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        _write_session(
+            tmp_path,
+            "dashboard_reopened",
+            [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+            meta={"title": "Reopened"},
+        )
+        (tmp_path / "dashboard_reopened.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        channel_slots.note_slot_closed(state, "reopened")  # then reopened
+        time.sleep(0.01)
+
+        assert await restore_recent_sessions_async(state, window_minutes=60) == 1
+        assert "reopened" in state._slots
+
+    @pytest.mark.asyncio
+    async def test_a_session_deleted_during_the_read_is_not_restored(self, tmp_path, monkeypatch):
+        """Third post-hop window: permanent deletion during the offloaded read.
+
+        ``delete_session`` leaves no tombstone, so a slot published from content
+        already in hand rewrites the deleted file on its next flush. The
+        dashboard's listener is bound before startup restore runs, so a user
+        delete really can land here. Raised as blocking by GPT 5.6 review.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        _write_session(
+            tmp_path,
+            "dashboard_doomed",
+            [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+            meta={"title": "Doomed", "created_at": "2026-03-23T10:00:00"},
+        )
+        (tmp_path / "dashboard_doomed.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        log = state.conversation_log
+        real_chained = log.read_messages_chained
+
+        def _delete_then_read(key):
+            msgs = real_chained(key)
+            log.delete_session(key)
+            return msgs
+
+        monkeypatch.setattr(log, "read_messages_chained", _delete_then_read)
+
+        assert await restore_recent_sessions_async(state, window_minutes=60) == 0
+        assert "doomed" not in state._slots, (
+            "restored a slot for a permanently deleted session; its flush would "
+            "rewrite the deleted transcript"
+        )
+        assert not (
+            tmp_path / "dashboard_doomed.jsonl"
+        ).exists(), "the deleted transcript came back"
+
+    @pytest.mark.asyncio
+    async def test_an_intact_session_is_not_refused_by_the_deletion_guard(
+        self, tmp_path, monkeypatch
+    ):
+        """Negative control: the guard must not refuse an untouched session."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        _write_session(
+            tmp_path,
+            "dashboard_intact",
+            [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+            meta={"title": "Intact", "created_at": "2026-03-23T10:00:00"},
+        )
+        (tmp_path / "dashboard_intact.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        assert await restore_recent_sessions_async(state, window_minutes=60) == 1
+        assert "intact" in state._slots
+
+    @pytest.mark.asyncio
+    async def test_a_session_deleted_before_its_metadata_read_builds_no_phantom(
+        self, tmp_path, monkeypatch
+    ):
+        """An empty metadata line must skip, not build a phantom slot.
+
+        ``list_sessions()`` is a snapshot taken one thread hop earlier, so a
+        session deleted in that gap still appears in the list while its metadata
+        reads back ``{}``. An empty dict sails past every filter (folder, pin,
+        closed, cutoff all read falsy) and used to reach ``get_or_create_slot`` —
+        registering a phantom slot whose flush RECREATES the deleted transcript.
+        Raised as blocking by GPT 5.6 review, round 3.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        from kiro_crew.dashboard.chat_persistence import restore_recent_sessions_async
+
+        _write_session(
+            tmp_path,
+            "dashboard_vanished",
+            [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+            meta={"title": "Vanished", "created_at": "2026-03-23T10:00:00"},
+        )
+        _write_session(
+            tmp_path,
+            "dashboard_survivor",
+            [{"role": "user", "content": "hi", "ts": "2026-03-23T10:00:00"}],
+            meta={"title": "Survivor", "created_at": "2026-03-23T10:00:00"},
+        )
+        for name in ("dashboard_vanished", "dashboard_survivor"):
+            (tmp_path / f"{name}.jsonl").touch()
+
+        state = _make_state(tmp_path)
+        log = state.conversation_log
+        real_list = log.list_sessions
+
+        def _list_then_delete():
+            listed = real_list()
+            # The delete lands after the snapshot, before the per-session read.
+            log.delete_session("dashboard:vanished")
+            return listed
+
+        monkeypatch.setattr(log, "list_sessions", _list_then_delete)
+
+        restored = await restore_recent_sessions_async(state, window_minutes=60)
+
+        assert restored == 1
+        assert set(state._slots) == {"survivor"}, (
+            "built a phantom slot for a deleted session; its flush would "
+            f"recreate the transcript (slots: {sorted(state._slots)})"
+        )
+        assert not (
+            tmp_path / "dashboard_vanished.jsonl"
+        ).exists(), "the deleted transcript came back"

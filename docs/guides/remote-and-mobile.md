@@ -309,13 +309,26 @@ the same and the difference is the whole security story:
   certificate file to create or install manually. The action still refuses to
   replace a different service already mounted at `443/`.
 
-  The CLI equivalent is:
+  The same click enrolls this machine's daemon-reported Tailscale login in the
+  explicit allowlist and makes the phone session survive gateway restarts and
+  application updates. Each request still has to resolve through the local
+  Tailscale daemon as that allowed identity; persistence does not turn the QR
+  into a tailnet-wide bearer session. Users who set up phone access on an older
+  build migrate when they next choose **Show QR code** on the desktop. A session
+  already invalidated by the update that installed this migration cannot be
+  revived, so that upgrade requires one final scan; later updates do not.
+
+  The basic CLI equivalent is:
   ```bash
   kirocrew config set dashboard.tailscale.enabled true   # once per machine
   kirocrew restart
   kirocrew tailnet up
   kirocrew token                                         # the link to open on the phone
   ```
+  This manual sequence keeps the config's selected session policy. The guided
+  card is the path that safely discovers the local login and atomically enables
+  identity-bound restart persistence without asking you to hand-edit an
+  allowlist.
   `kirocrew tailnet up` runs `tailscale serve` for you — HTTPS on 443 in front of
   the dashboard's loopback port — and prints the URL to open on your phone. That is
   the half that used to be an undocumented command you had to know and type.
@@ -370,11 +383,13 @@ the same and the difference is the whole security story:
   At startup the setting reads your own MagicDNS name from the local Tailscale
   daemon and trusts `https://<that name>` as an origin, so you do **not** have to
   look the name up and hand-write `dashboard.url`. The Overview one-click flow
-  performs and waits for the same required restart automatically. If
-  Tailscale is absent, stopped, or MagicDNS is off at startup it contributes
-  nothing and the dashboard starts exactly as before. It does not widen the
-  network bind and does not change authentication — every request still needs a
-  dashboard session.
+  performs and waits for the restart required when it turns the setting on. If
+  Tailscale is absent, stopped, or MagicDNS is off during a later gateway start,
+  the dashboard starts exactly as before and retries in the background, with a
+  delay that grows to one minute. Once the daemon returns a validated name, the
+  running gateway accepts it without another restart. This does not widen the
+  network bind or change authentication — every request still needs a dashboard
+  session.
 
   If you would rather do it by hand, the equivalent is:
   ```bash
@@ -383,11 +398,12 @@ the same and the difference is the whole security story:
   kirocrew restart
   ```
   `dashboard.tailscale.enabled` reads your own MagicDNS name from the local
-  Tailscale daemon once at startup and trusts `https://<that name>` as an origin,
-  so you do **not** have to look the name up and hand-write `dashboard.url`. If
-  Tailscale is absent, stopped, or MagicDNS is off it contributes nothing and the
-  dashboard starts exactly as before. It does not widen the network bind and does
-  not change authentication — every request still needs a dashboard session.
+  Tailscale daemon and trusts `https://<that name>` as an origin, so you do **not**
+  have to look the name up and hand-write `dashboard.url`. A failed startup read
+  contributes nothing initially and is retried in the background; the validated
+  origin is added to the running gateway when Tailscale becomes ready. It does
+  not widen the network bind or change authentication — every request still
+  needs a dashboard session.
 
   Optionally, opt in to **identity-pinned sessions** so the session pin binds to
   your device's daemon-verified tailnet identity instead of the tunnel's shared
@@ -616,9 +632,19 @@ bugs:
   `ServiceWorkerRegistration.showNotification()`. Tracked in
   [issue #2267](https://github.com/kirodotdev/KiroCrew/issues/2267); the Android
   symptom is [issue #1828](https://github.com/kirodotdev/KiroCrew/issues/1828).
-- **Not edge-to-edge.** The shell sets neither `viewport-fit=cover` nor any
-  `env(safe-area-inset-*)` padding, so on a notched device the installed app
-  renders inside the safe area rather than filling the screen.
+- **Pinch zoom is off.** The installed app behaves like an application, not a
+  web page: two-finger pinch and double-tap no longer scale the shell. **To
+  magnify, use the OS display-zoom setting** (iOS: Settings → Display &
+  Brightness → Display Zoom; Android: Settings → Display → Display size and
+  text), which still enlarges everything; in a browser tab Safari's Aa
+  text-size control works too, but it is **not** reachable from the
+  installed app, which has no Safari toolbar. Pinch is off because magnifying a
+  fixed-height layout whose scrollers are all inner leaves no way to reach the
+  topbar and composer it pushes off-screen. The surfaces that need magnifying
+  keep it — the image viewer and the diagram viewer both zoom on their own pinch,
+  the diagram viewer also on a double-tap, and code blocks scroll sideways. On a
+  laptop or desktop those two viewers also zoom on a **trackpad pinch**, and on
+  **`ctrl`+scroll** with a mouse; a plain scroll still scrolls.
 
 Installing changes nothing about authentication: the app carries the same cookies
 the browser holds, on the same clocks as [Session duration](#session-duration).

@@ -59,6 +59,7 @@ class SupersededDefault:
     old_default: object
     new_default: object
     changed_in: str
+    new_default_display: str | None = None
 
 
 # The explicit, versioned registry of superseded defaults. APPEND-ONLY: a future
@@ -78,6 +79,57 @@ SUPERSEDED_DEFAULTS: tuple[SupersededDefault, ...] = (
         old_default=False,
         new_default=True,
         changed_in="#4566",
+    ),
+    # #4388 changed session.autocompact_pct from 90.0 to 70.0 because 90.0 was
+    # also the maximum its own validator accepted, so the shipped default was
+    # the most expensive value an operator could hold: credits scale with
+    # context and steepen near the ceiling, and compacting AT the ceiling pays
+    # that rate repeatedly before acting. It shipped deliberately without a
+    # migration -- on disk, "chose 90" and "90 was the default when this file
+    # was written" are the same bytes -- so an install materialized before it
+    # still compacts at 90 and nothing told anyone (issue #4389).
+    SupersededDefault(
+        dotted_key="session.autocompact_pct",
+        old_default=90.0,
+        new_default=70.0,
+        changed_in="#4388",
+    ),
+    # 0.5.0 changed stt.streaming from False to True: every provider now produces
+    # partial results, so the reason the default was off (two of the six providers
+    # could stream) no longer exists. An install materialized before that keeps
+    # resolving False and sees text only after it stops speaking, which reads as
+    # the feature being missing rather than switched off.
+    SupersededDefault(
+        dotted_key="stt.streaming",
+        old_default=False,
+        new_default=True,
+        changed_in="0.5.0",
+    ),
+    # 0.5.0 changed stt.model from turbo to base. The stored name is still honoured
+    # (it resolves onto large-v3-turbo), so this is not a broken value -- it is a
+    # 1.6 GB first-use download where the current default is 148 MB, on an install
+    # that materialized the name back when the model was fetched by a separate
+    # whisper CLI the user had already installed themselves.
+    #
+    # stt.provider is deliberately NOT registered even though its default moved to
+    # ``local``: a stored retired provider is coerced at parse time, so the stored
+    # value does not win and there is no drift to report.
+    SupersededDefault(
+        dotted_key="stt.model",
+        old_default="turbo",
+        new_default="base",
+        changed_in="0.5.0",
+    ),
+    # #6651 changed the watchdog budget from a materialized 25 seconds to a
+    # nullable, launch-class default: 25 seconds for desktop/foreground and 90
+    # seconds for managed services. A stored 25 may be either the old default or
+    # a deliberate operator pin, so report it instead of rewriting it.
+    SupersededDefault(
+        dotted_key="dashboard.loop_stall_exit_after_secs",
+        old_default=25,
+        new_default=None,
+        changed_in="#6651",
+        new_default_display="unset (automatic: 25s desktop / 90s managed service)",
     ),
 )
 
@@ -133,12 +185,18 @@ def drift_summary(entry: SupersededDefault) -> str:
     options -- this mechanism does not know whether the stored value was chosen
     deliberately, and must not imply the value is wrong.
     """
+    new_default = entry.new_default_display or repr(entry.new_default)
+    adoption = (
+        "removing the key or setting it to JSON null"
+        if entry.new_default is None
+        else f"removing the key or setting it to {entry.new_default!r}"
+    )
     return (
         f"{entry.dotted_key} is stored as {entry.old_default!r}, which was the default "
-        f"before {entry.changed_in} changed it to {entry.new_default!r}. An install that "
+        f"before {entry.changed_in} changed it to {new_default}. An install that "
         f"predates that change keeps the old value because a stored value beats the "
-        f"default. If {entry.old_default!r} was not a deliberate choice, removing the key "
-        f"or setting it to {entry.new_default!r} adopts the current default."
+        f"default. If {entry.old_default!r} was not a deliberate choice, {adoption} "
+        f"adopts the current default."
     )
 
 

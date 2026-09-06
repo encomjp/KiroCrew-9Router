@@ -35,6 +35,43 @@ export function deleteSubSelection(params: URLSearchParams): void {
  *  drifted (one call site unconditional, one gated). */
 export const COARSE_TOUCH_TARGET = '[@media(pointer:coarse)]:min-h-11'
 
+/** Encode one navigation key as exactly one URL path segment. Percent-encoding
+ *  keeps a key containing `/`, `?`, `#` or `%` from minting extra depth or a
+ *  query/hash boundary. Dot-only keys are the one thing encoding cannot make
+ *  safe — the WHATWG URL parser treats `.` / `..` AND their percent-forms
+ *  (`%2E`, `%2E%2E`) as dot-segments and resolves them against the tree, so a
+ *  crafted `?tab=..` would escape /settings entirely. Those return null and
+ *  the caller drops that level (the same fallback an unknown key gets). */
+export function toPathSegment(key: string): string | null {
+  if (key === '.' || key === '..') return null
+  return encodeURIComponent(key)
+}
+
+/** Parse the pathname under `basePath` into POSITIONAL segments:
+ *  segment[0] = tab, segment[1] = a SubNav's second-level selection, deeper
+ *  reserved. Positional means an empty segment (double slash, trailing slash)
+ *  stays in place as `''` — never matching a key — instead of letting deeper
+ *  segments shift forward (`/settings/channels//slack` must NOT open the
+ *  slack pane). Segments are percent-DECODED so keys round-trip through
+ *  toPathSegment; a malformed escape decodes to itself (still matches no key,
+ *  so it falls back exactly like any unknown value). Empty when the location
+ *  is outside the base — e.g. for one render during a cross-page navigate
+ *  before the consumer unmounts. */
+export function parsePathSegments(basePath: string, pathname: string): string[] {
+  if (pathname === basePath) return []
+  if (!pathname.startsWith(basePath + '/')) return []
+  return pathname
+    .slice(basePath.length + 1)
+    .split('/')
+    .map(seg => {
+      try {
+        return decodeURIComponent(seg)
+      } catch {
+        return seg
+      }
+    })
+}
+
 /** history.state marker set on entries MINTED BY A DRILL-IN PUSH (root -> tab,
  *  list -> pane). The matching back control checks it to decide between a real
  *  `history.back()` (entry is ours: popping keeps push/pop symmetric, so the

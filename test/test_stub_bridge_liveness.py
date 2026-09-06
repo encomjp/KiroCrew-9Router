@@ -2,9 +2,10 @@
 
 Covers:
 * A silent peer (accepts, never answers) causes the stub to emit a JSON-RPC
-  error and return a BridgeLivenessFailure — not park forever.
+  error and report ``peer_dead`` on the session -- not park forever.
 * A legitimately slow call (peer still answers pings) is NOT killed.
-* Normal bridge teardown (stdin EOF) returns None (no liveness failure).
+* Normal bridge teardown (stdin EOF, or a stop) is reported as itself, so a
+  reconnect is never attempted on a shutdown.
 """
 
 from __future__ import annotations
@@ -18,11 +19,35 @@ import pytest
 from kiro_crew.mcp_gateway.stub import (
     _BRIDGE_PING_TYPE,
     _BRIDGE_PONG_TYPE,
-    BridgeLivenessFailure,
+    StubSession,
     run_bridge,
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _strip_comments(source: str) -> str:
+    """``source`` with every comment removed, for source-text ratchets.
+
+    A ratchet that greps raw text cannot tell a call from a comment explaining
+    why that call is absent, so a well-documented invariant trips the very
+    assertion documenting it. Tokenizing is exact where a ``#`` split would also
+    cut string literals.
+    """
+    import io
+    import tokenize
+
+    kept: list[str] = []
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type != tokenize.COMMENT:
+                kept.append(tok.string)
+    except (tokenize.TokenError, IndentationError):
+        # A partial tail need not be valid Python on its own; fall back to a
+        # line-wise cut, which is coarser but never blind.
+        return "\n".join(ln.split("#", 1)[0] for ln in source.splitlines())
+    return "\n".join(kept)
+
 
 # Pin to one xdist worker (requires --dist loadgroup) alongside the other
 # mcp_gateway suites.
@@ -46,7 +71,7 @@ def _jsonrpc_response(req_id: str = "req-1") -> bytes:
 @pytest.mark.asyncio
 async def test_silent_peer_triggers_liveness_failure() -> None:
     """A gateway that accepts connections but never replies to pings or
-    requests must trigger a BridgeLivenessFailure within a bounded time,
+    requests must be reported as ``peer_dead`` within a bounded time,
     not park the stub forever."""
     # Socket-side reader: gateway never sends anything.
     gw_reader = asyncio.StreamReader()
@@ -88,7 +113,8 @@ async def test_silent_peer_triggers_liveness_failure() -> None:
 
     # Use very short intervals so the test completes quickly.
     # 3 misses × 0.05s interval = 0.15s wait per ping + response wait.
-    result = await asyncio.wait_for(
+    session = StubSession()
+    await asyncio.wait_for(
         run_bridge(
             gw_reader,
             _FakeWriter(),  # type: ignore[arg-type]
@@ -98,13 +124,13 @@ async def test_silent_peer_triggers_liveness_failure() -> None:
             ping_interval=0.05,
             ping_max_misses=3,
             peer_supports_ping=True,
+            session=session,
         ),
         timeout=10,
     )
 
-    assert result is not None
-    assert isinstance(result, BridgeLivenessFailure)
-    assert "call-42" in result.outstanding_ids
+    assert session.reason == "peer_dead"
+    assert "call-42" in session.outstanding_ids
 
     # Verify pings were sent to the gateway.
     ping_frames = [
@@ -175,7 +201,8 @@ async def test_slow_call_not_killed_when_pongs_arrive() -> None:
 
     stop_task = asyncio.create_task(_stop_after_pings())
 
-    result = await asyncio.wait_for(
+    session = StubSession()
+    await asyncio.wait_for(
         run_bridge(
             gw_reader,
             fake_writer,  # type: ignore[arg-type]
@@ -185,13 +212,15 @@ async def test_slow_call_not_killed_when_pongs_arrive() -> None:
             ping_interval=0.05,
             ping_max_misses=3,
             peer_supports_ping=True,
+            session=session,
         ),
         timeout=10,
     )
     await stop_task
 
-    # No liveness failure: the peer answered pings.
-    assert result is None
+    # No liveness failure: the peer answered pings, so the bridge ended on the
+    # stop event rather than on a dead peer.
+    assert session.reason == "stop"
 
     # Verify pings were sent AND pongs were received (at least 2 cycles).
     ping_frames = [
@@ -239,7 +268,8 @@ async def test_normal_teardown_returns_none() -> None:
     )
 
     stop_event = asyncio.Event()
-    result = await asyncio.wait_for(
+    session = StubSession()
+    await asyncio.wait_for(
         run_bridge(
             gw_reader,
             _FakeWriter(),  # type: ignore[arg-type]
@@ -249,11 +279,12 @@ async def test_normal_teardown_returns_none() -> None:
             ping_interval=0.05,
             ping_max_misses=3,
             peer_supports_ping=True,
+            session=session,
         ),
         timeout=10,
     )
 
-    assert result is None
+    assert session.reason != "peer_dead"
 
 
 @pytest.mark.asyncio
@@ -297,7 +328,8 @@ async def test_no_pings_when_idle() -> None:
 
     stop_task = asyncio.create_task(_stop_after())
 
-    result = await asyncio.wait_for(
+    session = StubSession()
+    await asyncio.wait_for(
         run_bridge(
             gw_reader,
             _FakeWriter(),  # type: ignore[arg-type]
@@ -307,12 +339,13 @@ async def test_no_pings_when_idle() -> None:
             ping_interval=0.05,
             ping_max_misses=3,
             peer_supports_ping=True,
+            session=session,
         ),
         timeout=10,
     )
     await stop_task
 
-    assert result is None
+    assert session.reason != "peer_dead"
     # No pings should have been sent (only an unregister on clean close, if any).
     ping_frames = [
         b for b in gw_written
@@ -388,16 +421,28 @@ class TestLivenessIsNegotiated:
         assert "bridge_ping" in REGISTERED_CAPABILITIES
 
     def test_liveness_path_does_not_exec(self) -> None:
-        """The degrade path must fail fast, not exec a fresh server.
+        """The degrade path must reconnect or fail fast, never exec a server.
 
         Pre-flight fallbacks work because kiro-cli's `initialize` is still unread
         in fd0. Mid-bridge it has already been consumed and kiro-cli never
-        re-sends it, so an exec'd server would reject every later call — the
-        session's tools are lost either way, and exec would additionally discard
-        the socket a future reconnect could reuse.
+        re-sends it, so an exec'd server would reject every later call. What
+        recovers the session instead is re-attaching to the restarted gateway and
+        replaying the captured handshake, so this pins both halves: from the
+        point the stub owns state that outlives one connection there is no
+        ``fallback_exec``, and a reconnect is actually attempted rather than the
+        outage being merely reported.
         """
         src = (_REPO_ROOT / "src/kiro_crew/mcp_gateway/stub.py").read_text(encoding="utf-8")
-        marker = "if liveness_failure is not None:"
+        # Anchor where the stub starts owning cross-connection state: every
+        # pre-flight fallback site sits above it.
+        marker = "    session = StubSession()"
         assert marker in src
         tail = src[src.index(marker):]
-        assert "fallback_exec" not in tail
+        # Judge CODE, not prose. The tail deliberately explains at length why it
+        # does not exec, and a text search would read those very words as the
+        # violation -- so comments are tokenized away before the check.
+        assert "fallback_exec" not in _strip_comments(tail)
+        assert "_reconnect(" in tail, (
+            "the mid-bridge degrade path no longer attempts a reconnect, so a "
+            "broker restart again strips an attached session's servers for good"
+        )

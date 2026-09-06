@@ -31,6 +31,7 @@ import threading
 import pytest
 
 from kiro_crew.computer_use import capture_windows as C
+from kiro_crew.computer_use.types import MAX_SCREENSHOT_MAX_PX
 
 #: Bytes per pixel at the module's current depth. Derived rather than written as a
 #: literal: the depth is dictated by what ``PW_RENDERFULLCONTENT`` will render into
@@ -424,7 +425,13 @@ class TestTheEncodeAndSpoolPath:
             (0, (320, 160)),  # a config zero would otherwise be "no scaling at all"
             (-1, (320, 160)),
             (64, (320, 160)),  # below MIN_SCREENSHOT_MAX_PX
-            (99999, (4096, 2048)),  # above MAX_SCREENSHOT_MAX_PX
+            # Derived from the constant rather than written out, so lowering the
+            # ceiling cannot leave this asserting a size the clamp no longer
+            # produces. A 10000x5000 source clamps to ceiling x ceiling/2.
+            (
+                99999,
+                (MAX_SCREENSHOT_MAX_PX, MAX_SCREENSHOT_MAX_PX // 2),
+            ),  # above MAX_SCREENSHOT_MAX_PX
         ],
         ids=["zero", "negative", "below-floor", "above-ceiling"],
     )
@@ -604,8 +611,8 @@ class TestEnsureShotsDir:
         assert made == [str(target)]
 
     def test_the_tighten_runs_ONCE_per_process(self, monkeypatch, tmp_path) -> None:
-        """``restrict_to_owner`` shells out to icacls on Windows; once per screenshot
-        would put a subprocess on the capture path."""
+        """``restrict_to_owner`` rewrites a DACL on Windows; once per screenshot
+        would put that on the capture path."""
         calls: list = []
         monkeypatch.setattr(C, "shots_dir", lambda: str(tmp_path / "s"))
         monkeypatch.setattr(C, "_dir_ready", False)

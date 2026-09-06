@@ -25,7 +25,7 @@ import GitlabLogo from './icons/GitlabLogo'
 import JiraLogo from './icons/JiraLogo'
 import { timeAgo } from '../utils/timeAgo'
 import MarkdownRenderer from './MarkdownRenderer'
-import { pullRequestErrorDetails } from './PullRequestPanel'
+import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
 import { Btn } from './ui'
 
 import { i18nT } from '../i18n/t'

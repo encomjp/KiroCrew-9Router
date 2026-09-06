@@ -60,3 +60,14 @@ describe('MarkdownPanel diff view controls', () => {
     expect(src).toContain('onToggleDiffSplit')
   })
 })
+
+describe('FileChangeChips diff view controls', () => {
+  const FILE_CHANGE_CHIPS = join(__dirname, '..', 'components', 'FileChangeChips.tsx')
+  const src = readFileSync(FILE_CHANGE_CHIPS, 'utf8')
+
+  it('lights the card split button up in split mode, not unified mode', () => {
+    const line = buttonLine(src, 'setSideBySide', 'FileChangeChips.tsx')
+    expect(line).toContain(`\${sideBySide ? ${ACTIVE}`)
+    expect(line).not.toContain(`\${!sideBySide ? ${ACTIVE}`)
+  })
+})

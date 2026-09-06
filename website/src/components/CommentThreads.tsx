@@ -9,6 +9,7 @@
 // Writes go through the gateway's owner-only mutations, which hold the provider
 // credential and re-verify that the thread belongs to this pull request.
 import { useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
   Check, ChevronDown, ChevronRight, CornerDownRight, Loader2, MessageSquare,
   MessageSquarePlus, MessagesSquare, RotateCcw,
@@ -19,6 +20,7 @@ import { api } from '../api/client'
 import MarkdownRenderer from './MarkdownRenderer'
 import type { PullRequestComment, PullRequestSource } from '../types'
 import { platformShortcut } from '../utils/platform'
+import { OWNER_SETTINGS_PATH, pullRequestErrorDetails } from '../utils/pullRequestErrors'
 import { timeAgo } from '../utils/timeAgo'
 
 import { i18nT } from '../i18n/t'
@@ -143,11 +145,13 @@ function ThreadComment(
  *  submit would throw away what the user typed the moment the provider refused,
  *  and leave the error with nowhere to appear. */
 function ReplyBox({
-  onSubmit, pending, error, label = 'Reply',
+  onSubmit, pending, error, errorAction, label = 'Reply',
 }: {
   onSubmit: (body: string) => Promise<unknown>
   pending: boolean
   error: string | null
+  /** Recovery affordance rendered beside the error (e.g. a settings link). */
+  errorAction?: React.ReactNode
   label?: string
 }) {
   const ime = useImeGuard()
@@ -222,9 +226,23 @@ function ReplyBox({
         >
           {i18nT('components.commentThreads.cancel')}
         </button>
-        {error && <span className="text-[12px] text-danger">{error}</span>}
+        {error && (
+          <span className="text-[12px] text-danger">
+            {error}
+            {errorAction && <> {errorAction}</>}
+          </span>
+        )}
       </div>
     </div>
+  )
+}
+
+/** The owner-not-configured recovery link, shared by every refusal surface here. */
+function OwnerSettingsLink() {
+  return (
+    <Link to={OWNER_SETTINGS_PATH} className="text-accent hover:underline">
+      {i18nT('components.pullRequestPanel.open_slack_settings')}
+    </Link>
   )
 }
 
@@ -352,12 +370,16 @@ export default function CommentThreads(
                   reads as "the click did nothing" rather than "the provider said
                   no". Scoped to the thread that failed, not every rendered one. */}
               {setResolved.isError
-                && setResolved.variables?.threadId === t.threadId && (
-                <span className="text-[11.5px] text-danger">
-                  {(setResolved.error as Error | null)?.message
-                    || i18nT('components.commentThreads.could_not_change_the_thread_s_state')}
-                </span>
-              )}
+                && setResolved.variables?.threadId === t.threadId && (() => {
+                  const resolveErr = pullRequestErrorDetails(setResolved.error)
+                  return (
+                    <span className="text-[11.5px] text-danger">
+                      {resolveErr.message
+                        || i18nT('components.commentThreads.could_not_change_the_thread_s_state')}
+                      {resolveErr.ownerNotConfigured && <> <OwnerSettingsLink /></>}
+                    </span>
+                  )
+                })()}
             </div>
 
             <div className="flex flex-col gap-2.5 px-2.5 py-2">
@@ -370,9 +392,16 @@ export default function CommentThreads(
                   onSubmit={(body) => reply.mutateAsync({ threadId: t.threadId, body })}
                   pending={reply.isPending
                     && reply.variables?.threadId === t.threadId}
-                  error={reply.variables?.threadId === t.threadId
-                    ? (reply.error as Error | null)?.message ?? null
+                  // `|| null` collapses an empty derived message to null on
+                  // purpose — ReplyBox renders errors with a falsy guard, so
+                  // '' and null are the same "nothing to show".
+                  error={reply.isError && reply.variables?.threadId === t.threadId
+                    ? pullRequestErrorDetails(reply.error).message || null
                     : null}
+                  errorAction={reply.isError && reply.variables?.threadId === t.threadId
+                    && pullRequestErrorDetails(reply.error).ownerNotConfigured
+                    ? <OwnerSettingsLink />
+                    : undefined}
                 />
               )}
             </div>
@@ -387,7 +416,10 @@ export default function CommentThreads(
             label={i18nT('components.commentThreads.comment_on_this_pull_request')}
             onSubmit={(body) => comment.mutateAsync(body)}
             pending={comment.isPending}
-            error={(comment.error as Error | null)?.message ?? null}
+            error={comment.isError ? pullRequestErrorDetails(comment.error).message || null : null}
+            errorAction={comment.isError && pullRequestErrorDetails(comment.error).ownerNotConfigured
+              ? <OwnerSettingsLink />
+              : undefined}
           />
         </div>
       )}

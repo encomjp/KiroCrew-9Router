@@ -7,12 +7,12 @@
  * Order in this file = order in the rail (within each group). Add new
  * built-in surfaces here; do not add hardcoded badge logic to `App.tsx`.
  */
-import { MessageSquare, Bell, BookOpen, Component, CalendarDays, Settings, ClipboardCheck, LayoutGrid, Webhook } from 'lucide-react'
+import { MessageSquare, Bell, Component, CalendarDays, Settings, ClipboardCheck, Compass, Webhook, Users } from 'lucide-react'
 import { createSelector } from '@reduxjs/toolkit'
 import { KiroGhostMark } from '../components/KiroGhostMark'
 import { registerBuiltinSurface, surfaceMachineValue } from './registry'
 import { selectSubagentActivityCount } from '../store/chatSlice'
-import { PREVIEW_WEBHOOKS } from '../utils/previewFlags'
+import { PREVIEW_CREW, PREVIEW_WEBHOOKS } from '../utils/previewFlags'
 import type { RootState } from '../store'
 
 // Memoized at the source so `selectAllSurfacesAttention`'s per-dispatch
@@ -41,6 +41,36 @@ registerBuiltinSurface({
   // specific work when the user opens Sessions.
   activitySelector: selectSubagentActivityCount,
   activityLabel: 'subagents in flight',
+})
+
+// Crew Members — one durable, pinned DM thread per crew member. Sits directly
+// under Sessions: both are conversation surfaces, but here the primary object
+// is a NAMED MEMBER rather than a task-shaped session. `slotMode: 'member'`
+// claims the `member-<slug>` slots this page's threads live in, so their
+// unread counts ride this rail item instead of leaking into Sessions
+// (`isChatPageSurface` deliberately does not admit 'member').
+//
+// `previewFlag` because crew is not released yet: the page errors out on paths
+// that are still being built, so it is not advertised until the operator opts in
+// at Developer > Feature Previews. Unlike Webhooks below this surface is NOT
+// `hiddenFromNav` — the rail IS where it belongs once released, so dropping the
+// flag is the whole release. Two of the three advertising paths apply the gate
+// for themselves — the rail and Search Everywhere both read
+// `getAdvertisedSurfaces()` — and the third, the browser-tab attention count,
+// applies it inside `selectAllSurfacesAttention`, because that sum reads the
+// registry directly rather than the advertised list. The other door into crew
+// (the sidebar's "New Crew Mode chat" entry) reads PREVIEW_CREW directly, since
+// a create-menu item is not a surface at all.
+registerBuiltinSurface({
+  navId: 'members',
+  route: '/members',
+  label: surfaceMachineValue('Crew Members'),
+  labelKey: 'nav.crew_members',
+  icon: <Users size={16} />,
+  group: surfaceMachineValue('Main'),
+  slotMode: 'member',
+  badgeLabel: 'unread member threads',
+  previewFlag: PREVIEW_CREW,
 })
 
 registerBuiltinSurface({
@@ -122,8 +152,11 @@ registerBuiltinSurface({
   navId: 'apps',
   route: '/apps',
   label: 'Explore',
-  labelKey: 'nav.explore',
-  icon: <LayoutGrid size={16} />,
+  // Renders as "Discover": `surfaceLabel()` resolves `labelKey` first, so the
+  // legacy `label` above is only the missing-catalog fallback (kept verbatim —
+  // a required field whose English value the i18n literal gate freezes).
+  labelKey: 'nav.discover',
+  icon: <Compass size={16} />,
   group: 'Apps',
   // Rendered by App.tsx as the accent link in the "Apps" section-header row
   // (expanded) / an icon row (collapsed) — not a regular rail list item.
@@ -144,17 +177,10 @@ registerBuiltinSurface({
   group: 'Main',
 })
 
-// Knowledge sits in the Main group directly below Artifacts (order in this file
-// = order in the rail within a group), keeping the two content surfaces
-// adjacent and always-visible rather than tucked into the collapsible Apps group.
-registerBuiltinSurface({
-  navId: 'knowledge',
-  route: '/knowledge',
-  label: 'Knowledge',
-  labelKey: 'nav.knowledge',
-  icon: <BookOpen size={16} />,
-  group: 'Main',
-})
+// Knowledge is NOT a main-rail surface: it lives as a tab inside Agent
+// Capabilities (CapabilitiesPage), grouped with Prompts and Steering — the
+// other feed-the-agent assets. The old /knowledge route redirects there
+// (App.tsx), so bookmarks and deep links keep resolving.
 
 // ── Bottom ─────────────────────────────────────────────────────────────────
 // Agents + Capabilities merged into one bottom-pinned "Agent Capabilities"

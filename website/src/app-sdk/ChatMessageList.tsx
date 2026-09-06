@@ -32,6 +32,16 @@ export interface ChatMessageListProps {
    *  deliberately has no `void` arm so a fire-and-forget handler — the exact
    *  shape behind #5524 — cannot compile against this boundary. */
   onApprove?: (approvalId: string, decision: string) => Promise<unknown>
+  /** Resolve EVERY pending approval in a permission group with one decision
+   *  (batch multi-select, Req 4.1-4.4). The host receives all pending approval
+   *  ids and MUST route each through the SLOT-scoped approve endpoint (the same
+   *  path `onApprove` uses when it records trust) — never the bare id-scoped
+   *  one-shot resolve, which matches slot futures by bare id with no session
+   *  check. Like `onApprove`, MUST return the settle promise so the row's
+   *  rollback restores the buttons; it settles per id and surfaces any excluded
+   *  call rather than aborting the whole batch. Wired only by hosts whose
+   *  approve path is slot-scoped; left unset elsewhere. */
+  onApproveBatch?: (approvalIds: string[], decision: string) => Promise<unknown>
   /** Offer the standing-trust tier on pending-approval rows. FAIL-CLOSED: set it
    *  only when `onApprove` routes to an endpoint that RECORDS standing trust
    *  (the slot approve endpoint carries the decision verbatim). Hosts resolving
@@ -68,6 +78,7 @@ const ChatMessageList = memo(function ChatMessageList({
   running,
   contentWidth = '900px',
   onApprove,
+  onApproveBatch,
   canTrust,
   onFileOpen,
   renderTool,
@@ -200,16 +211,42 @@ const ChatMessageList = memo(function ChatMessageList({
       ? (decision: string) => onApprove(lastPerm.meta!.approval_id as string, decision)
       : undefined
 
+    // Batch resolver over EVERY pending id in this group (Req 4.1-4.4). Only
+    // offered when the host supplied onApproveBatch AND there is MORE THAN ONE
+    // pending approval — a single-id "batch" is never invoked (CollapsibleToolGroup
+    // batches only when pendingPermCount > 1) yet a > 0 handler still flips the
+    // (onApprove || onApproveBatch) render gates, so the gate matches its one
+    // real trigger by requiring > 1 here. TOOL_DENY calls never surface as
+    // pending permissions (backend gate; locked by the T5-guard test), so this
+    // id list is deny-free.
+    const batchIds = unresolvedPerms
+      .map(m => m.meta?.approval_id as string | undefined)
+      .filter((x): x is string => !!x)
+    const handleApproveBatch = onApproveBatch && batchIds.length > 1
+      ? (decision: string) => onApproveBatch(batchIds, decision)
+      : undefined
+    // Every pending call's meta, so the batch row can preview ALL N commands the
+    // one click will approve — not just the newest (permissionMeta). The human
+    // gate against an untrusted agent must show each command being approved.
+    // Map 1:1 over unresolvedPerms (NO filter): a meta-less pending perm becomes
+    // an empty {} so CollapsibleToolGroup renders its "No preview available"
+    // placeholder row for it. Filtering here would make permissionMetas.length <
+    // pendingPermCount, so the "Review all N" note would promise more rows than
+    // render — the silent-row gap the placeholder exists to prevent.
+    const batchMetas = unresolvedPerms.map(m => m.meta ?? {})
+
     return (
       <div key={'grp-' + item.startIdx} className="px-4 mx-auto w-full py-0" style={{ maxWidth: `var(--mc-content-width, ${contentWidth})` }}>
         <CollapsibleToolGroup
           count={nonPerm.length}
-          autoExpand={running && item.startIdx >= messages.length - 5}
+          autoExpand={(running && item.startIdx >= messages.length - 5) || !!handleApproveBatch}
           hasPermission={unresolvedPerms.length > 0}
           isRunning={running}
           permissionMeta={lastPerm?.meta}
+          permissionMetas={batchMetas}
           pendingPermCount={unresolvedPerms.length}
           onApprove={handleApprove}
+          onApproveBatch={handleApproveBatch}
           canTrust={canTrust}
         >
           {/* Grouped messages (thinking, permission) return null from renderMessage
@@ -219,7 +256,7 @@ const ChatMessageList = memo(function ChatMessageList({
         </CollapsibleToolGroup>
       </div>
     )
-  }, [renderMessage, running, messages.length, contentWidth, onApprove, canTrust])
+  }, [renderMessage, running, messages.length, contentWidth, onApprove, onApproveBatch, canTrust])
 
   // Render a DisplayItem (single, group, or turn)
   const renderDisplayItem = useCallback((item: DisplayItem, i: number) => {

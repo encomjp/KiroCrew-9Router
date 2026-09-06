@@ -7,8 +7,10 @@ agent-overlay rewrites) piles onto that default pool it can saturate it and
 starve the loop's own DNS resolution -- which is exactly the failure mode that
 turns a brief network blip into a multi-second event-loop stall.
 
-This module provides *separate*, bounded pools for that blocking work so it
-can never contend with the loop's default executor.
+This module provides *separate*, bounded pools for that blocking work and also
+names the loop's default executor's threads ``mc-default`` (Python's default
+names them anonymously), so profilers like py-spy can attribute blocking work
+to this gateway.
 
 Three pools, deliberately split:
 
@@ -46,6 +48,16 @@ Three pools, deliberately split:
   work gets its OWN small pool so a burst of screenshots queues among ITSELF
   and can never occupy the :func:`maintenance_executor` workers the orphan
   sweeps need to recover from a wedge.
+* :func:`stt_executor` -- in-process speech-to-text inference
+  (:mod:`kiro_crew.stt.engine`, which loads the model here and decodes on it).
+  A warm decode is tens of milliseconds, but a model load is seconds and the
+  first ever load also compiles a GPU pipeline.  It cannot share
+  :func:`subprocess_executor`: a ``run_in_executor`` future cannot be
+  cancelled, so a wedged model load would hold one of the eight PTY-teardown
+  workers indefinitely -- and those exist precisely so a teardown storm has
+  somewhere to go.  A caller that gives up on a timeout does NOT free the
+  thread, which is the whole reason this work needs a pool it can only starve
+  for itself.
 
 Long-term direction: this blocking work should move into a dedicated
 supervised process (the VS Code extension-host model), so a wedge there cannot
@@ -66,12 +78,14 @@ _T = TypeVar("_T")
 
 __all__ = [
     "CronQueueTimeout",
+    "configure_default_executor",
     "maintenance_executor",
     "subprocess_executor",
     "cron_executor",
     "discovery_executor",
     "embed_executor",
     "image_executor",
+    "stt_executor",
     "governance_executor",
     "cron_gate_executor",
     "CronGateTimeout",
@@ -83,9 +97,16 @@ __all__ = [
     "shutdown_maintenance_executor",
 ]
 
+# ── Default executor naming ──
+# asyncio.to_thread and run_in_executor(None, ...) route onto the loop's default
+# executor.  The loop itself uses that same pool for getaddrinfo (DNS).  Python
+# caps it at min(32, cpu_count + 4) and names threads anonymously.  This module
+# keeps that cap but names threads ``mc-default`` so profilers like py-spy can
+# attribute blocking work to this gateway.
+
 # Bounded so a burst of maintenance work cannot spawn unbounded threads.  Four
-# is enough for the periodic sweeps + agent-overlay rewrites while leaving the
-# default executor entirely free for the loop's own I/O.
+# is enough for the periodic sweeps + agent-overlay rewrites while keeping them
+# isolated from the default executor's own bounded pool.
 _MAX_MAINT_WORKERS = 4
 
 # Subprocess/PTY teardown can block on a wedged kernel resource and a single
@@ -211,6 +232,18 @@ _CRON_GATE_QUEUE_SHARE = 0.25
 # maintenance sweeps or head-of-line blocking any other pool's work.
 _MAX_IMAGE_WORKERS = 2
 
+# In-process STT inference is the longest-running work in this module: minutes of
+# CPU on a meeting-length recording, and the first call for a model size can block
+# on a multi-GB weight download inside the library's constructor.  TWO workers,
+# deliberately small for a reason the other pools do not share -- each in-flight
+# call holds a fully quantised model in RAM (up to ~GBs for large-v3), so the
+# worker count is a MEMORY ceiling, not just a CPU one.  Two lets a queued
+# recording start while one finishes; more would let concurrent dictations OOM a
+# small host.  Sizing it here rather than reusing the 8-worker subprocess pool is
+# the point: a wedged model load cannot be cancelled, so it must only ever be able
+# to starve other STT work.
+_MAX_STT_WORKERS = 2
+
 _lock = threading.Lock()
 _pool: ThreadPoolExecutor | None = None
 _subprocess_pool: ThreadPoolExecutor | None = None
@@ -218,8 +251,34 @@ _cron_pool: ThreadPoolExecutor | None = None
 _discovery_pool: ThreadPoolExecutor | None = None
 _embed_pool: ThreadPoolExecutor | None = None
 _image_pool: ThreadPoolExecutor | None = None
+_stt_pool: ThreadPoolExecutor | None = None
 _governance_pool: ThreadPoolExecutor | None = None
 _cron_gate_pool: ThreadPoolExecutor | None = None
+
+
+def configure_default_executor() -> None:
+    """Name the event loop's default executor threads.
+
+    Call once per event loop at startup, BEFORE any ``asyncio.to_thread`` or
+    ``run_in_executor(None, ...)`` runs.  Creates a fresh pool for the current
+    loop; the loop owns the pool and shuts it down when it closes.
+
+    Effects:
+
+    * Keeps Python's default cap (``min(32, cpu_count + 4)``).
+    * Names threads ``mc-default`` so they appear labeled in profilers like
+      py-spy, instead of the anonymous ``ThreadPoolExecutor-N_M``.
+
+    Does NOT make the documented "default executor free for the loop's own I/O"
+    invariant literally true -- 1700+ call sites still route onto it.  That
+    migration is tracked separately; this function names the pool until then.
+    """
+    loop = asyncio.get_running_loop()
+    pool = ThreadPoolExecutor(
+        max_workers=None,  # keep Python's default: min(32, cpu_count + 4)
+        thread_name_prefix="mc-default",
+    )
+    loop.set_default_executor(pool)
 
 
 def maintenance_executor() -> ThreadPoolExecutor:
@@ -319,6 +378,31 @@ def image_executor() -> ThreadPoolExecutor:
                 )
                 atexit.register(shutdown_maintenance_executor)
     return _image_pool
+
+
+def stt_executor() -> ThreadPoolExecutor:
+    """Return the process-wide STT inference pool, creating it on first use.
+
+    Threads are named ``mc-stt``.  Separate from :func:`subprocess_executor` for the
+    reason a started ``run_in_executor`` future cannot be cancelled: a wedged model
+    load (or a first-run weight download inside the library constructor) holds its
+    worker until the process exits, and on the PTY-teardown pool that would consume
+    one of the eight workers whose whole purpose is absorbing a teardown storm.
+    Here it can only starve other STT work, which is the containment we want.
+
+    Callers bound their own wait (``stt.timeout_secs``); that releases the CALLER,
+    never the thread — see :func:`kiro_crew.transcribe._transcribe_faster`.
+    """
+    global _stt_pool
+    if _stt_pool is None:
+        with _lock:
+            if _stt_pool is None:
+                _stt_pool = ThreadPoolExecutor(
+                    max_workers=_MAX_STT_WORKERS,
+                    thread_name_prefix="mc-stt",
+                )
+                atexit.register(shutdown_maintenance_executor)
+    return _stt_pool
 
 
 def embed_executor() -> ThreadPoolExecutor:
@@ -677,9 +761,13 @@ async def run_in_embed_pool(func: Callable[..., _T], /, *args: Any, **kwargs: An
 
 
 def shutdown_maintenance_executor() -> None:
-    """Shut down all maintenance pools if they were created.  Idempotent."""
+    """Shut down all maintenance pools if they were created.  Idempotent.
+
+    The default executor pool is NOT included here -- it is owned by each event
+    loop and shut down by asyncio when the loop closes.
+    """
     global _pool, _subprocess_pool, _cron_pool, _discovery_pool, _embed_pool
-    global _governance_pool, _image_pool, _cron_gate_pool
+    global _governance_pool, _image_pool, _cron_gate_pool, _stt_pool
     with _lock:
         pool, _pool = _pool, None
         subprocess_pool, _subprocess_pool = _subprocess_pool, None
@@ -689,6 +777,7 @@ def shutdown_maintenance_executor() -> None:
         governance_pool, _governance_pool = _governance_pool, None
         image_pool, _image_pool = _image_pool, None
         cron_gate_pool, _cron_gate_pool = _cron_gate_pool, None
+        stt_pool, _stt_pool = _stt_pool, None
     if pool is not None:
         pool.shutdown(wait=False, cancel_futures=True)
     if subprocess_pool is not None:
@@ -705,3 +794,5 @@ def shutdown_maintenance_executor() -> None:
         image_pool.shutdown(wait=False, cancel_futures=True)
     if cron_gate_pool is not None:
         cron_gate_pool.shutdown(wait=False, cancel_futures=True)
+    if stt_pool is not None:
+        stt_pool.shutdown(wait=False, cancel_futures=True)

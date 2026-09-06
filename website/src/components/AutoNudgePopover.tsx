@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Goal, X } from 'lucide-react'
 import { Popover, PopoverTrigger, PopoverContent } from './ui/popover'
+import { api } from '../api/client'
+import { runBelongsToSlot } from '../apps/workflows/runModel'
 import { loadGoalDraft, saveGoalDraft, type GoalDraft } from '../utils/goalDrafts'
 import { DRAFT_SAVE_DEBOUNCE_MS } from '../utils/draftConstants'
 
 import { i18nT } from '../i18n/t'
-import { fmtTimeNumeric } from '../i18n/format'
+import { fmtTimeNumeric, fmtDuration } from '../i18n/format'
 export interface AutoNudgeLoop {
   id: string
   slot_key: string
@@ -15,6 +18,10 @@ export interface AutoNudgeLoop {
   cycle_count: number
   active: boolean
   last_fire_ts: number
+  /** Absolute wall-clock deadline for the next fire; 0 = not yet scheduled.
+   *  Already serialized by the backend's `asdict(loop)` — the field simply
+   *  was not surfaced here before (#6482). */
+  next_due_ts: number
 }
 
 interface Props {
@@ -34,6 +41,14 @@ interface Props {
 
 const DEFAULT_MSG = `Your north star is in north_star.md, roadmap in roadmap.md, tasks in tasks.md. Pick the single highest-leverage next step toward the goal and execute it. Update tasks.md. Post a blocker ONCE if genuinely stuck. To halt the loop, create {{STOP_FILE}}`
 
+/** One armed script cron owned by this chat slot. */
+interface SlotWatch {
+  id: string
+  name: string
+  schedule: string
+  next_run_ts: number | null
+}
+
 export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, onChange, interrupted = false }: Props) {
   // `||` (not `??`) is deliberate on the loop tier: it preserves the fallback
   // so a loop with idle_secs/max_cycles of 0 or an empty message still shows
@@ -50,6 +65,43 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
   const [maxCyclesInput, setMaxCyclesInput] = useState(() => String(loop?.max_cycles || 0))
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  // Watches armed on this slot, read through the SHARED `cron-jobs` query rather
+  // than a private fetch. That key is invalidated by the websocket hook, so a
+  // watch deleted or paused elsewhere disappears from an open popover instead of
+  // lingering until it is reopened -- and the request dedupes with the other
+  // consumer of the same key. `enabled: open` keeps a zero-token watch from
+  // costing a request on every chat render just to say "still nothing".
+  const { data: cronJobs } = useQuery({
+    queryKey: ['cron-jobs'],
+    queryFn: () => api.crons().then(r => r.jobs || []),
+    enabled: open,
+  })
+
+  const watches: SlotWatch[] = useMemo(() => {
+    const rows: unknown[] = Array.isArray(cronJobs) ? cronJobs : []
+    return rows
+      .filter((j): j is Record<string, unknown> => !!j && typeof j === 'object')
+      .filter(j => {
+        // One ownership rule, one spelling. `runBelongsToSlot` already maps a
+        // session_key onto a chat slot against the same backend convention
+        // (`dashboard:<slotKey>`); a second inline predicate here would drift
+        // from it the day that key format moves.
+        if (!runBelongsToSlot(typeof j.session_key === 'string' ? j.session_key : '', slotKey)) {
+          return false
+        }
+        // A watch is a SCRIPT cron: it runs a Python callable and never reaches a
+        // model. A message-only cron on this slot is an ordinary reminder that
+        // DOES wake the agent, so it does not belong under a heading that
+        // promises zero tokens.
+        return typeof j.script === 'string' && !!j.script && j.enabled !== false
+      })
+      .map(j => ({
+        id: String(j.id ?? ''),
+        name: String(j.name ?? ''),
+        schedule: String(j.schedule ?? ''),
+        next_run_ts: typeof j.next_run_ts === 'number' ? j.next_run_ts : null,
+      }))
+  }, [cronJobs, slotKey])
 
   const parseIdle = (s: string) => parseInt(s, 10) || 60
   const parseCycles = (s: string) => parseInt(s, 10) || 0
@@ -166,6 +218,50 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
     }
   }
 
+  // ── Countdown to the next trigger (#6482) ──
+  // The 1s ticker runs only while the popover is OPEN (review finding: a
+  // closed-but-armed loop must not re-render the toolbar button every second
+  // all day). The hover affordance needs no ticker: a native title tooltip
+  // snapshots at hover-start, so the trigger's onMouseEnter/onFocus refresh
+  // nowTs once, which is exactly the freshness a tooltip glance can show.
+  const ticking = open && !!loop?.active && (loop.next_due_ts || 0) > 0
+  const [nowTs, setNowTs] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    if (!ticking) return
+    setNowTs(Date.now() / 1000)
+    const timer = setInterval(() => setNowTs(Date.now() / 1000), 1000)
+    return () => clearInterval(timer)
+  }, [ticking])
+  const refreshNow = () => setNowTs(Date.now() / 1000)
+  /** Hover/popover line for the next trigger, or '' when no active loop.
+   *  Semantics: the loop is deadline-preserving — a user turn defers a due fire
+   *  until the turn ends but never pushes the deadline back — so an elapsed
+   *  deadline reads "due, fires after the current turn" rather than a negative
+   *  countdown. next_due_ts of 0 means the next arm has not scheduled yet.
+   *  next_due_ts is a SERVER wall-clock deadline rendered against the CLIENT
+   *  clock; skew shifts the countdown by that skew, and the due-fallback below
+   *  bounds the visible damage. */
+  const countdownText = (() => {
+    if (!loop?.active) return ''
+    if (!(loop.next_due_ts > 0)) return i18nT('components.autoNudgePopover.next_cycle_unscheduled')
+    const remaining = Math.round(loop.next_due_ts - nowTs)
+    if (remaining <= 0) return i18nT('components.autoNudgePopover.next_cycle_due')
+    const h = Math.floor(remaining / 3600)
+    const m = Math.floor((remaining % 3600) / 60)
+    const s = remaining % 60
+    // Above an hour the seconds digit is noise on a tooltip; below it, keep
+    // the tick visible so the affordance reads as live.
+    const parts: Array<[number, 'hour' | 'minute' | 'second']> =
+      h > 0 ? [[h, 'hour'], [m, 'minute']] : [[m, 'minute'], [s, 'second']]
+    return i18nT('components.autoNudgePopover.next_cycle_in', {
+      time: fmtDuration(parts, { dropZero: true }),
+    })
+  })()
+  /** The tooltip only carries a REAL deadline signal (counting or due) — the
+   *  "not yet scheduled" placeholder is popover-only, so an armed-but-unscheduled
+   *  loop keeps the plain "Goal active (cycle N)" title. */
+  const titleCountdown = loop?.active && (loop.next_due_ts || 0) > 0 ? countdownText : ''
+
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>
@@ -177,8 +273,12 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
                 : 'text-accent hover:text-accent hover:bg-accent/10 animate-pulse'
               : 'text-muted hover:text-text hover:bg-bg-hover'
           }`}
-          title={loop?.active ? (interrupted ? i18nT('components.autoNudgePopover.goal_interrupted_cycle', { cycle: loop.cycle_count }) : i18nT('components.autoNudgePopover.goal_active_cycle', { cycle: loop.cycle_count })) : i18nT('components.autoNudgePopover.set_a_goal')}
+          title={loop?.active ? `${interrupted ? i18nT('components.autoNudgePopover.goal_interrupted_cycle', { cycle: loop.cycle_count }) : i18nT('components.autoNudgePopover.goal_active_cycle', { cycle: loop.cycle_count })}${titleCountdown ? ` · ${titleCountdown}` : ''}` : i18nT('components.autoNudgePopover.set_a_goal')}
+          // The countdown stays OUT of aria-label (review finding): a
+          // per-second label change re-announces the button to screen readers.
           aria-label={loop?.active ? (interrupted ? i18nT('components.autoNudgePopover.goal_interrupted_cycle', { cycle: loop.cycle_count }) : i18nT('components.autoNudgePopover.goal_active_cycle', { cycle: loop.cycle_count })) : i18nT('components.autoNudgePopover.set_a_goal')}
+          onMouseEnter={refreshNow}
+          onFocus={refreshNow}
         >
           <Goal size={16} className="shrink-0" />
           {loop?.active && loop.cycle_count > 0 ? loop.cycle_count : null}
@@ -196,6 +296,28 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
           </button>
         </div>
         <p className="text-muted text-[11px] mb-3 leading-relaxed">{i18nT('components.autoNudgePopover.give_the_agent_a_goal_and_it_will_keep_working_t')}</p>
+
+        {watches.length > 0 && (
+          <div className="border border-border rounded p-2 mb-3">
+            <div className="text-text text-[11px] font-medium mb-1">
+              {i18nT('components.autoNudgePopover.watches_title')}
+            </div>
+            <ul className="list-none p-0 m-0 mb-1">
+              {watches.map(w => (
+                <li key={w.id} className="text-muted text-[11px] leading-relaxed">
+                  <span className="text-text">{w.name}</span>
+                  {w.schedule && <span> · {w.schedule}</span>}
+                  {w.next_run_ts && (
+                    <span> · {i18nT('components.autoNudgePopover.watches_next')} {fmtTimeNumeric(w.next_run_ts)}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+            <div className="text-muted text-[11px] leading-relaxed">
+              {i18nT('components.autoNudgePopover.watches_note')}
+            </div>
+          </div>
+        )}
 
         <div className="text-muted text-[11px] mb-1">{i18nT('components.autoNudgePopover.goal_description')}</div>
         <textarea
@@ -238,6 +360,7 @@ export default function AutoNudgePopover({ slotKey, loop, open, onOpenChange, on
         {loop && (
           <div className="text-muted text-[11px] mb-3">
             {i18nT('components.autoNudgePopover.last_fire')} {loop.last_fire_ts ? fmtTimeNumeric(loop.last_fire_ts) : i18nT('components.autoNudgePopover.never')}
+            {countdownText && <span> · {countdownText}</span>}
           </div>
         )}
 

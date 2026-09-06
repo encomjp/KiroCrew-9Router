@@ -600,6 +600,8 @@ function initAutoUpdate(deps) {
   let stagedVersion = null; // version electron-updater has downloaded + staged
   let stagedNotes = "";
   let foundVersion = null; // last version surfaced to the user, awaiting consent
+  let stagedWasAutomatic = false;
+  let downloadWasAutomatic = false;
   let installing = false;
   let quitHandled = false;
   function currentChannel() {

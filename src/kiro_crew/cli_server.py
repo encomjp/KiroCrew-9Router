@@ -95,6 +95,12 @@ from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.taskrunner import TaskRunner
 from kiro_crew.vector_memory import VectorMemoryStore
 
+# NOTE: wheel_engine is imported lazily inside _update_wheel(), not here — it
+# pulls the manifest-verify / crypto path, and `kirocrew gateway` imports this
+# module on the boot path before the dashboard socket binds
+# (no-new-work-on-gateway-boot-path).
+
+
 # Loopback address used for the CLI's OWN requests to the gateway. Deliberately
 # the literal IPv4 address, never the name ``localhost``: on a dual-stack host
 # ``localhost`` may resolve to ``::1`` first, so a different local user who binds
@@ -1028,13 +1034,21 @@ def _update(force: bool = False) -> None:
     print(f"  📂 {proj}")
 
     # Detect current branch
-    branch_result = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=proj,
-        capture_output=True,
-        timeout=10,
-        **UTF8_TEXT,
-    )
+    try:
+        branch_result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git rev-parse timed out after %ss during update", exc.timeout
+        )
+        print("❌ Could not determine current branch (git rev-parse timed out)")
+        sys.exit(1)
     if branch_result.returncode != 0:
         print("❌ Could not determine current branch")
         sys.exit(1)
@@ -1054,25 +1068,44 @@ def _update(force: bool = False) -> None:
 
     # Fetch + reset --hard: no merge conflicts, untracked files preserved
     print("  ⬇️  git fetch…")
-    result = subprocess.run(
-        ["git", "fetch", "origin", branch],
-        cwd=proj,
-        capture_output=True,
-        timeout=60,
-        **UTF8_TEXT,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "fetch", "origin", branch],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=60,
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git fetch timed out after %ss during update", exc.timeout
+        )
+        print(f"  ❌ git fetch timed out after {exc.timeout}s")
+        sys.exit(1)
     if result.returncode != 0:
         print(f"  ❌ git fetch failed:\n{result.stderr.strip()}")
         sys.exit(1)
 
     # Check if there are new commits
-    diff_result = subprocess.run(
-        ["git", "diff", "HEAD", f"origin/{branch}", "--quiet"],
-        cwd=proj,
-        capture_output=True,
-        timeout=10,
-    )
-    if diff_result.returncode == 0:
+    try:
+        diff_result = subprocess.run(
+            ["git", "diff", "HEAD", f"origin/{branch}", "--quiet"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+        )
+        up_to_date = diff_result.returncode == 0
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git diff timed out after %ss during update", exc.timeout
+        )
+        # Same branch a non-zero exit takes: assume new commits exist and let
+        # the divergence guard below re-classify before anything destructive.
+        print("  ⚠️  git diff timed out — continuing to the divergence check")
+        up_to_date = False
+    if up_to_date:
         print("\n✅ Already up to date!")
         return
 
@@ -1145,13 +1178,24 @@ def _update(force: bool = False) -> None:
         print(f"  ⚠️  --force: discarding {ahead} local commit(s) not on origin/{branch}.")
 
     # Warn about local tracked-file changes before discarding
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=proj,
-        capture_output=True,
-        timeout=10,
-        **UTF8_TEXT,
-    )
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git status timed out after %ss during update", exc.timeout
+        )
+        # Fail closed: this check exists to warn before the hard reset
+        # discards local tracked changes, so an unreadable answer must
+        # refuse the reset — same stance as the unreadable-divergence guard.
+        print("  ❌ Could not check for local changes (git status timed out)")
+        sys.exit(1)
     tracked_changes = [
         line for line in status.stdout.strip().splitlines() if not line.startswith("??")
     ]
@@ -1188,13 +1232,21 @@ def _update(force: bool = False) -> None:
         sys.exit(1)
 
     print(f"  🔄 git reset --hard origin/{branch}…")
-    result = subprocess.run(
-        ["git", "reset", "--hard", f"origin/{branch}"],
-        cwd=proj,
-        capture_output=True,
-        timeout=10,
-        **UTF8_TEXT,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "reset", "--hard", f"origin/{branch}"],
+            cwd=proj,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=10,
+            **UTF8_TEXT,
+        )
+    except subprocess.TimeoutExpired as exc:
+        logging.getLogger(__name__).warning(
+            "git reset timed out after %ss during update", exc.timeout
+        )
+        print(f"  ❌ git reset timed out after {exc.timeout}s")
+        sys.exit(1)
     if result.returncode != 0:
         print(f"  ❌ git reset failed:\n{result.stderr.strip()}")
         sys.exit(1)
@@ -1202,7 +1254,18 @@ def _update(force: bool = False) -> None:
     # Update the optional kiro-cli backend if present.
     if shutil.which("kiro-cli"):
         print("  🔄 kiro-cli update")
-        subprocess.run(["kiro-cli", "update"], capture_output=True, timeout=120)
+        try:
+            subprocess.run(
+                ["kiro-cli", "update"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as exc:
+            logging.getLogger(__name__).warning(
+                "kiro-cli update timed out after %ss; skipping (best-effort)", exc.timeout
+            )
+            print("  ⚠️  kiro-cli update timed out — run manually: kiro-cli update")
 
     # Ensure a supported Node.js for frontend builds
     from kiro_crew.cli import _ensure_node  # circular import: cli -> cli_server -> cli
@@ -1294,6 +1357,11 @@ def _update_wheel(layout) -> None:
         release_channel,
         wheel_update_command,
     )
+    from kiro_crew.platform.wheel_engine import (
+        WheelUpdateError,
+        apply_wheel_update,
+        running_from_managed_venv,
+    )
 
     channel = release_channel()
     feed_base, artifact_base = cdn_bases()
@@ -1374,6 +1442,52 @@ def _update_wheel(layout) -> None:
         print("\n✅ Already on the latest version!")
         return
 
+    # The managed-venv shape takes the shadow path: the new version is built
+    # into a fresh sibling tree while this install keeps working, verified,
+    # then promoted atomically. The running gateway is never overwritten in
+    # place — its restart picks the new tree up through the stable link. Every
+    # other shape (pipx, a bare venv the operator manages) keeps the
+    # installer re-run, whose behavior is owned by cli.sh.
+    if running_from_managed_venv():
+        print("\n  🔄 Building the new version beside the current one…")
+        try:
+            promoted = apply_wheel_update(
+                channel=channel,
+                feed_base=feed_base,
+                artifact_base=artifact_base,
+                expected_version=remote_version,
+                progress=lambda msg: print(f"     {msg}"),
+            )
+        except (WheelUpdateError, OSError) as e:
+            # The engine wraps its own I/O failures in WheelUpdateError, but
+            # staging-filesystem errors raised outside those conversion sites
+            # (a full or unwritable disk at mkdir/tempdir time) surface as raw
+            # OSError — both take the same operator-facing failure path
+            # instead of a traceback.
+            # Failure text can quote the URL it tried, and the fallback
+            # installer command embeds the CDN base — either may carry
+            # credentials (a token-bearing KIROCREW_CDN_BASE), and this
+            # print lands in terminal history/scrollback. Same redaction
+            # pair the dashboard update surface applies before showing
+            # failure text.
+            from kiro_crew.security import (
+                redact_credentials,
+                redact_exfiltration_urls,
+            )
+
+            msg, _ = redact_credentials(str(e))
+            msg, _ = redact_exfiltration_urls(msg)
+            fallback, _ = redact_credentials(wheel_update_command(channel))
+            print(f"\n  ❌ {msg}")
+            print("  The current install was not modified. To update by")
+            print("  re-running the installer instead:")
+            print(f"    {fallback}")
+            sys.exit(1)
+        print(f"\n✅ Kiro Crew {remote_version} installed at {promoted}")
+        print("\n  Restart the gateway to switch to it:")
+        print("    kirocrew restart")
+        return
+
     # Run the installer
     cmd = wheel_update_command(channel)
     print("\n  🔄 Running installer…")
@@ -1410,6 +1524,67 @@ def _update_wheel(layout) -> None:
     print(f"\n✅ Kiro Crew updated to {remote_version}!")
     print("\n  Restart the gateway to use the new version:")
     print("    kirocrew restart")
+
+
+def _update_approve() -> None:
+    """Approve a pending in-app update armed from the dashboard (RFC OQ7).
+
+    The proof of host identity is READING THE NONCE FILE: it lives in the data
+    home with owner-only permissions, so presenting its nonce back to the
+    gateway demonstrates filesystem access as the gateway's own user — the
+    step a remote dashboard bearer cannot perform. The gateway then runs the
+    shadow apply itself and restarts; progress lands on the dashboard's
+    update overlay.
+    """
+    from kiro_crew.platform.update_stepup import read_pending
+
+    print("👻 Approving the pending in-app update…\n")
+    pending = read_pending()
+    if pending is None:
+        print("❌ No armed update request (it may have expired).")
+        print("   Arm one from the dashboard's About panel first, then re-run this.")
+        sys.exit(1)
+    print(f"  📦 v{pending.version} ({pending.channel} channel), expires in {pending.expires_in}s")
+
+    port = resolve_client_port(None)
+    url = f"http://127.0.0.1:{port}/api/update/approve"
+    payload = json.dumps({"nonce": pending.nonce}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    # The local secret authenticates this CLI to a token-auth-enabled gateway.
+    # X-Internal-Secret is the header the middleware's internal-route branch
+    # validates (X-Local-Secret is a different, route-specific mechanism used
+    # by /api/token/local). Reading the secret is itself host-local evidence,
+    # the same class as the nonce file. An absent secret still works on a
+    # default loopback install where no token auth runs.
+    secret = read_local_secret(port)
+    if secret:
+        headers["X-Internal-Secret"] = secret
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+    # Prefer the gateway's unix socket: it kernel-verifies the caller
+    # (SO_PEERCRED), so the approval works on a token-auth-enabled install
+    # without this CLI ever holding a dashboard token. TCP loopback is the
+    # fallback for hosts without the socket.
+    try:
+        from kiro_crew.dashboard.urls import dashboard_socket_path
+
+        socket_path: str | None = str(dashboard_socket_path(port))
+    except Exception:
+        socket_path = None
+    try:
+        with loopback_urlopen(req, timeout=15, unix_socket_path=socket_path) as resp:
+            body = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("error", "")
+        except Exception:
+            detail = ""
+        print(f"❌ Gateway refused the approval (HTTP {e.code})" + (f": {detail}" if detail else ""))
+        sys.exit(1)
+    except (urllib.error.URLError, OSError):
+        print("❌ Gateway is not running — start it, or update directly with: kirocrew update")
+        sys.exit(1)
+    print(f"\n✅ Approved. The gateway is applying v{body.get('version', pending.version)}")
+    print("   and will restart itself; watch progress in the dashboard.")
 
 
 def _status(args: argparse.Namespace) -> None:
@@ -1479,6 +1654,7 @@ async def _gateway(
     *,
     no_dashboard: bool = False,
     no_crons: bool = False,
+    no_tunnel: bool = False,
     no_open: bool = False,
     port_override: str | None = None,
     json_ready: bool = False,
@@ -1538,6 +1714,7 @@ async def _gateway(
         cfg,
         no_dashboard=no_dashboard,
         no_crons=no_crons,
+        no_tunnel=no_tunnel,
         no_open=no_open,
         port_override=port_override,
         json_ready=json_ready,
@@ -1575,8 +1752,9 @@ async def _run_task(args: argparse.Namespace) -> None:
         embedding_dim=cfg.memory.embedding_dim,
         decay_rates=cfg.memory.decay_rates or None,
     )
-    # CALLER CONTRACT (vector_memory.py): async callers offload init() — the
-    # Windows path shells out to icacls and would freeze the loop for seconds.
+    # CALLER CONTRACT (vector_memory.py): async callers offload init() — it is
+    # blocking file IO end to end (sqlite connect, migrations, lockdown pass)
+    # and would stall the loop.
     await asyncio.to_thread(vector_memory.init)
     # Embeddings are always-on: wire the factory; bind embed_fn when the model
     # is already present. Deliberately NO download kick here — `kirocrew run`

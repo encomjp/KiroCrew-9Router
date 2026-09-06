@@ -8,9 +8,13 @@ accessibility / capture work and all SEL auditing happen in the GATEWAY.
 That split exists because ``hooks._governance_denial`` — the PreToolUse gate — is
 fail-**OPEN** by deliberate repo policy (a governance glitch must not wedge every
 tool call on every surface), so it cannot be the sole authorization point for a
-surface that can read a password field's ``AXValue``. The authoritative gate
-(``computer_use/gate.py::require_computer_use``) fails CLOSED and needs the
-OS-resolved app identity and the addressed element's role, which only the
+surface that can read a password field's ``AXValue``. The fail-CLOSED gate is the
+keystone primary enable, read at the top of ``computer_use/tools.py``'s ordered
+chokepoint: a keystone that is missing, unreadable or disabled refuses the call
+outright. ``computer_use/gate.py::require_computer_use`` is audit-only — it
+unconditionally permits and records the call — and the refusals downstream of the
+enable (the operator's target policy, the element and pointer shape checks) need
+the OS-resolved app identity and the addressed element's role, which only the
 gateway-side tool body has.
 
 Two halves are tested here:
@@ -2255,8 +2259,13 @@ class TestTheInvokeCallIsNeverProxied:
             for key in self.PROXY_ENV_KEYS:
                 monkeypatch.delenv(key, raising=False)
             monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{proxy_port}")
+            # Paired resolution (#4106): an attempt threads (base, socket_path).
+            # The empty socket keeps this case on TCP, which is what the proxy
+            # question is about.
             monkeypatch.setattr(
-                mcp_computer, "_api_base", lambda: f"http://127.0.0.1:{gateway_port}"
+                mcp_computer,
+                "_resolve_api_target",
+                lambda: (f"http://127.0.0.1:{gateway_port}", ""),
             )
             monkeypatch.setattr(mcp_computer, "_internal_secret", lambda: self.CANARY)
 
@@ -2289,8 +2298,13 @@ class TestTheInvokeCallIsNeverProxied:
                 monkeypatch.delenv(key, raising=False)
             monkeypatch.setenv("http_proxy", f"http://127.0.0.1:{proxy_port}")
             monkeypatch.setenv("no_proxy", "localhost")
+            # Paired resolution (#4106): an attempt threads (base, socket_path).
+            # The empty socket keeps this case on TCP, which is what the proxy
+            # question is about.
             monkeypatch.setattr(
-                mcp_computer, "_api_base", lambda: f"http://127.0.0.1:{gateway_port}"
+                mcp_computer,
+                "_resolve_api_target",
+                lambda: (f"http://127.0.0.1:{gateway_port}", ""),
             )
             monkeypatch.setattr(mcp_computer, "_internal_secret", lambda: self.CANARY)
 

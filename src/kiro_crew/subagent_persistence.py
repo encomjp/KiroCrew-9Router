@@ -18,6 +18,7 @@ from pathlib import Path
 
 from kiro_crew.acp.types import PROVIDER_LABEL_DEFAULT
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
+from kiro_crew.jsonl_util import rotate_jsonl_at
 from kiro_crew.providers.cleanup import _is_safe_path
 
 logger = logging.getLogger(__name__)
@@ -140,17 +141,26 @@ def read_state(agent_id: str) -> dict | None:
         return None
 
 
-def update_state(agent_id: str, **fields: object) -> None:
-    """Merge *fields* into state.json (atomic rewrite)."""
+def update_state(agent_id: str, **fields: object) -> bool:
+    """Merge *fields* into state.json (atomic rewrite).
+
+    Returns True when the merge was written, False when it was SKIPPED because
+    the current state could not be read (missing/corrupt/unreadable). The skip
+    is deliberate -- fabricating a fresh state here would resurrect a record
+    the reaper deleted -- but callers with a durability contract (the pre-spawn
+    provenance write, #5394) need to see the skip to retry rather than mistake
+    a silent no-op for success.
+    """
     p = _agent_dir(agent_id) / "state.json"
     try:
         state = json.loads(p.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         logger.debug("update_state: cannot read state for %s, skipping", agent_id)
-        return
+        return False
     state.update(fields)
     state["updated_at"] = time.time()
     _atomic_write(p, state)
+    return True
 
 
 # ── result streaming ─────────────────────────────────────────────────
@@ -245,19 +255,46 @@ def clear_tombstone(agent_id: str) -> bool:
 # ── slow-command record (stalled but STILL RUNNING) ──────────────────
 
 
+# Rotate ``slow_commands.jsonl`` once it exceeds this size, keeping ONE
+# previous generation (``.jsonl.1``) — the same 1 MiB cap / ~2 MiB total
+# shape as ``mcp_gateway.stub._FALLBACK_LOG_MAX_BYTES``. The log lives at
+# the subagents-dir root so it survives per-agent folder cleanup, which
+# also keeps it outside ``prune_stale_tombstones``'s sweep (that prune
+# skips non-directories) — this cap is its only bound.
+_SLOW_LOG_MAX_BYTES = 1024 * 1024
+
+
 def record_slow_command(agent_id: str, **fields: object) -> None:
     """Append a stalled subagent's slow command to ``slow_commands.jsonl``.
 
     Unlike :func:`write_tombstone`, this does NOT mark the agent dead — a
     stalled subagent is still running; the record is purely for later analysis
-    of which commands run slow. Append-only, at the subagents-dir root so it
-    survives per-agent folder cleanup. Best-effort: never raises to the caller.
+    of which commands run slow. At the subagents-dir root so it survives
+    per-agent folder cleanup; rotated at :data:`_SLOW_LOG_MAX_BYTES` keeping
+    one previous generation. Best-effort: never raises to the caller.
+
+    Bounded via rotate-by-rename (``os.replace``, O(1)) rather than a
+    read-and-rewrite trim: this is invoked synchronously from the async
+    stall detector (``subagent._maybe_flag_stall``), so whole-file work
+    here would stall the gateway event loop.
     """
     entry = {"id": agent_id, "flagged": time.time(), **fields}
     base = _subagents_dir()
     try:
         base.mkdir(parents=True, exist_ok=True)
-        with open(base / "slow_commands.jsonl", "a", encoding="utf-8") as fh:
+        log_path = base / "slow_commands.jsonl"
+        # Rotation (shared helper): O(1) rotate-by-rename at the cap, guarded
+        # by a non-blocking try-lock so two writers hitting the cap together
+        # cannot both rotate, and a loser never waits — no call can stall the
+        # gateway event loop. The helper is best-effort by contract: ANY of
+        # its failures — the lock file unopenable (fd exhaustion, read-only or
+        # ACL-restricted dir), a fresh-boot missing log, a Windows sharing
+        # violation rejecting the rename — degrades to appending without
+        # rotating. Fd/disk exhaustion is a leading cause of the very stalls
+        # this log diagnoses, so a rotation failure must never cost the
+        # record; only a failure of the append itself may.
+        rotate_jsonl_at(log_path, _SLOW_LOG_MAX_BYTES)
+        with open(log_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, default=str) + "\n")
     except OSError:
         logger.warning("record_slow_command failed for %s", agent_id, exc_info=True)

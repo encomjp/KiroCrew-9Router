@@ -340,6 +340,194 @@ class TestUncProbeGate:
         if os.name == "nt":
             assert hooks.unc_probe_allowed(r"\\fileserver\other\x.png") is False
 
+    # --- kiro agents dir as a trusted UNC root (#6721) ----------------------
+    #
+    # Forward-slash UNC spellings are used for every assertion that must hold
+    # on the Linux CI box: ``normcase``/``normpath`` leave a ``//host/share``
+    # spelling intact on POSIX, so the purely lexical gate behaves exactly as
+    # it does on Windows. Backslash spellings only normalize on Windows, so
+    # those assertions are additionally guarded like the older tests above.
+
+    _UNC_KIRO_HOME = "//fileserver/profiles/alice/.kiro"
+
+    def _patch_roots(self, monkeypatch, tmp_path, agents_dir):
+        """Local data home + the given agents dir, isolating the new root."""
+        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", lambda: agents_dir)
+
+    def test_unc_kiro_agents_dir_is_allowed(self, monkeypatch, tmp_path):
+        """Headline #6721: on a roaming-profile (UNC) home, a spec under the
+        kiro agents dir passes the gate. The data home is patched LOCAL so the
+        admission can only come from the new agents root."""
+        self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/foo.json") is True
+        if os.name == "nt":
+            assert (
+                hooks.unc_probe_allowed(r"\\fileserver\profiles\alice\.kiro\agents\foo.json")
+                is True
+            )
+
+    def test_sibling_share_refused_for_agents_root(self, monkeypatch, tmp_path):
+        """Same HOST, different share: proves the new root is prefix-anchored,
+        not host-anchored."""
+        self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
+        assert hooks.unc_probe_allowed("//fileserver/other/agents/foo.json") is False
+
+    def test_neighbour_directory_of_agents_root_refused(self, monkeypatch, tmp_path):
+        """``agents-evil`` is not under ``agents``: the comparison must require
+        a separator boundary, not a bare ``startswith``."""
+        self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents-evil/foo.json") is False
+
+    def test_local_agents_root_is_not_admitted(self, monkeypatch, tmp_path):
+        """On an ordinary local home the added root admits nothing: UNC
+        candidates stay refused (the ``is_unc_shape(rootn)`` skip), and the
+        root itself is not admitted by exact match either -- the assertion
+        that keeps the skip from being dropped for the new root."""
+        local_agents = tmp_path / ".kiro" / "agents"
+        self._patch_roots(monkeypatch, tmp_path, local_agents)
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert hooks.unc_probe_allowed(r"\\evil\share\x.png") is False
+        assert hooks.unc_probe_allowed(str(local_agents)) is False
+        assert hooks.unc_probe_allowed(str(local_agents / "foo.json")) is False
+
+    def test_broken_agents_root_fails_safe(self, monkeypatch):
+        """``kiro_agents_dir()`` raising (broken home resolution) must not take
+        the gate down: the always-computable roots still apply and the function
+        stays total."""
+
+        def boom():
+            raise RuntimeError("no usable home")
+
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", boom)
+        monkeypatch.setattr(
+            "kiro_crew.config.paths.data_home",
+            lambda: Path("//fileserver/home/me/.kiro/crew"),
+        )
+        assert hooks.unc_probe_allowed("//fileserver/home/me/.kiro/crew/uploads/x.png") is True
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+
+    def test_agents_root_is_resolved_once_per_configuration(self, monkeypatch, tmp_path):
+        """Review finding (#6728 round 2): ``kiro_agents_dir()`` resolves
+        ``KIRO_HOME`` (``Path.resolve()`` -- filesystem I/O, SMB on a UNC
+        override), so the gate must NOT consult it per check. The root is
+        memoized on the raw ``KIRO_HOME`` + accessor identity; repeated gate
+        checks under one configuration hit the accessor exactly once."""
+        calls: list[int] = []
+
+        def counting_agents_dir():
+            calls.append(1)
+            return Path(self._UNC_KIRO_HOME + "/agents")
+
+        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", counting_agents_dir)
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/foo.json") is True
+        assert hooks.unc_probe_allowed(self._UNC_KIRO_HOME + "/agents/bar.json") is True
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert len(calls) == 1
+
+    def test_agents_root_failure_is_memoized_not_retried(self, monkeypatch, tmp_path):
+        """A failing resolution is memoized as root-absent for the
+        configuration: the gate must not re-run a resolve that can block on an
+        SMB timeout on every subsequent check."""
+        calls: list[int] = []
+
+        def boom():
+            calls.append(1)
+            raise RuntimeError("no usable home")
+
+        monkeypatch.setattr("kiro_crew.config.paths.data_home", lambda: tmp_path / "home")
+        monkeypatch.setattr("kiro_crew.config.paths.kiro_agents_dir", boom)
+        assert hooks.unc_probe_allowed("//evil/share/x.png") is False
+        assert hooks.unc_probe_allowed("//evil/share/y.png") is False
+        assert len(calls) == 1
+
+    class _NtOs:
+        """Proxy for the ``os`` module that reports ``name == "nt"``.
+
+        Installed onto ``hooks`` only (``monkeypatch.setattr(hooks, "os", ...)``)
+        so ``validate_file_path``'s Windows-only UNC branch runs, while every
+        other module keeps the real ``os``: a GLOBAL ``os.name`` patch makes
+        ``pathlib.Path.home()`` raise ``RuntimeError`` on this POSIX box, which
+        crashes ``security.is_sensitive_path``'s cache-key derivation.
+
+        ``path.realpath`` is additionally stubbed to a LEXICAL no-op (review
+        finding): the simulated-Windows tests must never hand the synthetic
+        UNC host to a real resolver -- on a Windows host that resolution is
+        itself the outbound SMB probe the gate exists to prevent.
+        """
+
+        name = "nt"
+
+        class _LexicalPath:
+            @staticmethod
+            def realpath(p):
+                return p
+
+            def __getattr__(self, attr):
+                return getattr(os.path, attr)
+
+        path = _LexicalPath()
+
+        def __getattr__(self, attr):
+            return getattr(os, attr)
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="simulates the Windows resolver on POSIX; on a real Windows host "
+        "the downstream resolution of the synthetic UNC host would itself be "
+        "the outbound SMB probe the gate exists to prevent",
+    )
+    def test_validate_file_path_accepts_unc_agents_spec(self, monkeypatch, tmp_path):
+        """The surrounding gate: hooks' view of ``os`` is shimmed to report
+        ``"nt"`` so ``validate_file_path`` consults the UNC gate on the Linux
+        CI box; the gate itself is lexical, and the forward-slash spelling is
+        the one ``normpath`` preserves on POSIX."""
+        self._patch_roots(monkeypatch, tmp_path, Path(self._UNC_KIRO_HOME + "/agents"))
+        monkeypatch.setattr(hooks, "os", self._NtOs())
+        assert hooks.validate_file_path(self._UNC_KIRO_HOME + "/agents/foo.json") is not None
+        assert hooks.validate_file_path("//evil/share/x.png") is None
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="simulates the Windows resolver on POSIX; on a real Windows host "
+        "the downstream resolution of the synthetic UNC host would itself be "
+        "the outbound SMB probe the gate exists to prevent",
+    )
+    def test_read_agent_spec_under_unc_agents_dir(self, monkeypatch, tmp_path):
+        """End-to-end #6721 symptom: a spec under a UNC-shaped kiro agents dir
+        parses instead of silently reading as absent (``None``).
+
+        Windows-resolver simulation, stated per the task spec: hooks' view of
+        ``os`` is shimmed to report ``"nt"`` (see ``_NtOs``) so
+        ``validate_file_path`` consults the UNC gate, and the spec path reaches
+        the reader through a stub whose ``resolve`` keeps the UNC spelling --
+        on a real roaming-profile host ``Path.resolve`` keeps a UNC path UNC,
+        while on this POSIX box it would collapse the leading ``//`` and dodge
+        the gate entirely. The double-slash spelling of a real local file IS
+        openable on Linux, so everything downstream of the gate (realpath,
+        ``O_NOFOLLOW`` open, JSON parse) runs for real.
+        """
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "foo.json").write_text('{"name": "foo", "model": "m1"}', encoding="utf-8")
+        unc_agents = "/" + str(agents)  # //local/... -- UNC-shaped
+        unc_spec = unc_agents + "/foo.json"
+
+        class _WindowsResolvedPath:
+            """Duck-typed spec path whose ``resolve`` keeps the UNC spelling."""
+
+            name = "foo.json"
+
+            def resolve(self, strict=False):
+                return Path(unc_spec)
+
+        self._patch_roots(monkeypatch, tmp_path, Path(unc_agents))
+        monkeypatch.setattr(hooks, "os", self._NtOs())
+        assert _read_agent_spec(_WindowsResolvedPath()) == {"name": "foo", "model": "m1"}
+
     def test_untrusted_unc_text_is_never_stat_probed_on_windows(self, monkeypatch):
         """End-to-end: build_prompt_blocks must not touch the filesystem for a
         refused UNC candidate."""

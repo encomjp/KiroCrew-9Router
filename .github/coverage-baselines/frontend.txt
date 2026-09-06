@@ -29,7 +29,6 @@ src/apps/crew-companion/useWalking.ts 28.3   # 17/60
 src/apps/design-critique/api.ts 0.0   # 0/30
 src/apps/issue-radar/components/PrFiltersSection.tsx 0.0   # 0/16
 src/apps/issue-radar/components/ReviewButton.tsx 0.0   # 0/17
-src/apps/issue-radar/lib/agentSession.ts 16.4   # 9/55
 src/apps/issue-radar/views/ComingSoon.tsx 0.0   # 0/2
 src/apps/issue-radar/views/OverviewView.tsx 29.5   # 23/78
 src/apps/issue-radar/views/SettingsView.tsx 0.0   # 0/3
@@ -63,7 +62,6 @@ src/apps/pptx-maker/api.ts 3.5   # 2/57
 src/apps/spec-builder/components/ChatColumn.tsx 0.0   # 0/2
 src/apps/workflows/WorkflowRunTree.tsx 3.4   # 1/29
 src/apps/workflows/WorkflowSourcePanel.tsx 4.7   # 2/43
-src/apps/workflows/WorkflowsRuns.tsx 35.5   # 22/62
 src/components/AddJobSplitButton.tsx 66.7   # 2/3
 src/components/AppIcon.tsx 51.1   # 24/47
 src/components/BottomTerminalPanel.tsx 55.1   # 49/89
@@ -78,7 +76,6 @@ src/components/Strands.tsx 52.2   # 71/136
 src/components/folderColorPaint.ts 0.0   # 0/4
 src/components/notifications/NotificationDetailPanel.tsx 43.2   # 16/37
 src/hooks/sceneCanvas.ts 39.1   # 18/46
-src/hooks/useAgentSync.ts 0.0   # 0/31
 src/hooks/useArtifactFolders.ts 29.6   # 8/27
 src/hooks/useBottomTerminal.ts 66.3   # 65/98
 src/hooks/useCronActions.ts 31.0   # 9/29

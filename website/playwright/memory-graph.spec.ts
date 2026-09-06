@@ -21,7 +21,7 @@ test.describe('Memory surfaces E2E Tests', () => {
   })
 
   test('memory browser exposes the manual summarize action', async ({ page }) => {
-    await page.goto('/settings?tab=overview&view=memory', { waitUntil: 'domcontentloaded' })
+    await page.goto('/settings/overview?view=memory', { waitUntil: 'domcontentloaded' })
     await expect(page.getByRole('button', { name: /summarize now/i })).toBeVisible({ timeout: 5000 })
   })
 

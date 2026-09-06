@@ -12,6 +12,7 @@ import { issueRadarApi, type Issue, type InvestigationResponse, RepoRef } from '
 import { useInvestigate } from '../lib/investigate'
 import AgentSessionButton from './AgentSessionButton'
 import { repoScopeKey } from '../lib/links'
+import { itemKey } from '../lib/agentSession'
 
 import { i18nT } from '../../../i18n/t'
 export default function InvestigateButton({
@@ -30,20 +31,26 @@ export default function InvestigateButton({
     staleTime: 30_000,
   })
   const record = recordQuery.data?.investigation ?? null
-  const { investigate, busy, error } = useInvestigate()
+  const { investigate, busy, error, concludedFor } = useInvestigate()
   // Same rule as ReviewButton: a pending or failed lookup must not be read as
   // "no session", or clicking would start a second one and orphan the first.
   const unresolved = !recordQuery.isSuccess
 
-  const onClick = async () => {
+  // `force` is what separates the first click from the second. The first declines
+  // on a concluded investigation and explains; only this second, deliberate one
+  // re-runs finished work.
+  const run = async (force: boolean) => {
     if (busy || unresolved) return
-    const saved = await investigate(repoRef, issue, record)
+    const saved = await investigate(repoRef, issue, record, force)
     if (saved) {
       queryClient.setQueryData<InvestigationResponse>(key, {
         owner, repo, number: issue.number, investigation: saved,
       })
     }
   }
+
+  const onClick = () => { void run(false) }
+  const onStartOver = () => { void run(true) }
 
   return (
     <AgentSessionButton
@@ -54,6 +61,8 @@ export default function InvestigateButton({
       disabled={unresolved}
       error={error ?? (recordQuery.error as Error | null) ?? null}
       onClick={onClick}
+      concluded={concludedFor === itemKey(repoRef, issue.number)}
+      onStartOver={onStartOver}
       startHint={
         recordQuery.isError
           ? i18nT('apps.issueRadar.components.investigateButton.could_not_check_for_an_existing_investigation_re')

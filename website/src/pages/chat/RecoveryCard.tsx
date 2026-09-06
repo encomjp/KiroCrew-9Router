@@ -4,6 +4,7 @@ import { ChevronRight, Info, Layers, RotateCcw, TriangleAlert } from 'lucide-rea
 import { i18nT } from '../../i18n/t'
 import { DENY_REASON_MARKER } from '../../utils/denyReason'
 import { useRowDisclosure } from './rowDisclosure'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 
 /**
  * The synthetic-continuation prefixes the gateway prepends when it recovers a
@@ -389,6 +390,7 @@ export function resolveInjectCard(m: { content: string; meta?: Record<string, un
  * NudgeCard.
  */
 export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: ParsedRecovery; disclosureKey?: string }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   const { kind, title, detail, chip, body } = parsed
   // Severity split: a refusal or a stall means something was blocked or died and
@@ -430,7 +432,7 @@ export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: P
         // one thing a screen-reader user would otherwise have to expand the raw
         // machine prose to learn. The inner text names the button (matching what
         // sighted users read) and aria-expanded carries the toggle state.
-        className="w-full flex items-center gap-2 px-3 py-2 min-w-0 text-left text-[13px] leading-5 hover:text-fg transition-colors"
+        className="w-full flex items-center gap-2 px-3 py-2 min-w-0 text-left text-[13px] leading-5 hover:text-text transition-colors"
         data-testid="recovery-card-toggle"
       >
         <ChevronRight
@@ -440,10 +442,10 @@ export default memo(function RecoveryCard({ parsed, disclosureKey }: { parsed: P
         />
         <Icon
           size={13}
-          className={`lucide-inline shrink-0 ${routine ? 'text-muted' : 'text-warning'}`}
+          className={`lucide-inline shrink-0 ${routine ? 'text-muted' : 'text-warn'}`}
           aria-hidden="true"
         />
-        <span className="font-medium text-fg shrink-0">{title}</span>
+        <span className="font-medium text-text shrink-0">{title}</span>
         <span className="truncate text-[12px] leading-5 opacity-75 min-w-0">{detail}</span>
         {chip && (
           <code

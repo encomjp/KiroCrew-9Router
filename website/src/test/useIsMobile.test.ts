@@ -72,4 +72,46 @@ describe('useIsMobile', () => {
     act(() => { listener?.() })
     expect(result.current).toBe(true)
   })
+
+  // These never call `listener`: they assert recovery from a MISSED change event,
+  // so they fail against a subscription that only listens to the query itself.
+  it('recovers on orientationchange when the change event never fires', () => {
+    currentMatches = false
+    const { result } = renderHook(() => useIsMobile())
+    expect(result.current).toBe(false)
+
+    act(() => {
+      currentMatches = true
+      window.dispatchEvent(new Event('orientationchange'))
+    })
+    expect(result.current).toBe(true)
+  })
+
+  it('recovers on visibilitychange when the change event never fires', () => {
+    currentMatches = false
+    const { result } = renderHook(() => useIsMobile())
+    expect(result.current).toBe(false)
+
+    act(() => {
+      currentMatches = true
+      // Fires at the document, not the window — a rotation that happened while
+      // the tab was backgrounded surfaces here.
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    expect(result.current).toBe(true)
+  })
+
+  it('negative control: an unsubscribed event does not refresh the value', () => {
+    // `focus` is unsubscribed, so this proves the two passes above come from the
+    // subscription rather than an incidental renderHook re-render.
+    currentMatches = false
+    const { result } = renderHook(() => useIsMobile())
+    expect(result.current).toBe(false)
+
+    act(() => {
+      currentMatches = true
+      window.dispatchEvent(new Event('focus'))
+    })
+    expect(result.current).toBe(false)
+  })
 })

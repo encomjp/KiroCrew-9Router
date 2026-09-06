@@ -42,11 +42,13 @@ Reading is cached; reclaiming never is
 --------------------------------------
 Enumerating the stores is the entire cost of a read here — half a million replay
 files on the measured machine — so a pass is kept briefly and shared between the
-row list, the totals and each row's detail. Only the FILESYSTEM half is cached:
-which sessions are in use is recomputed from the caller's index every call, and
-every mutation re-enumerates and re-reads the index inside the lock. So no
-refusal is ever answered from a snapshot, and a stale cache can only make the
-report slightly old, never make a reclaim take something it should not.
+row list, the totals and each row's detail. Only the FILESYSTEM halves are
+cached — the store scan and, on read paths, the co-tenant pass beside it: the
+flags derived from the caller's index are recomputed every call, every
+refusal-deriving path runs uncached, and every mutation re-enumerates and
+re-reads the index inside the lock. So no refusal is ever answered from a
+snapshot, and a stale cache can only make the report slightly old, never make a
+reclaim take something it should not.
 
 Sessions this instance does not own
 -----------------------------------
@@ -77,6 +79,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import IO, Any
 
 from kiro_crew import hooks, platform_compat
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import (
     CONFIG_DIR_LEAF,
     KIRO_BASE_DIR_NAME,
@@ -329,9 +332,13 @@ def _archive_index() -> dict[str, list[tuple[Path, int, float]]]:
 # So a pass is kept for a few seconds and shared. Two properties make that safe
 # rather than merely faster:
 #
-# * Only the filesystem half is cached. Which sessions are active or live is
-#   applied over it from the caller's index on every call, so no refusal is ever
-#   decided from a snapshot.
+# * Only the filesystem halves are cached — the store scan and, on read paths,
+#   the co-tenant pass beside it (its own cache, further down). The flags derived
+#   from the caller's index are applied over them on every call, and every path
+#   that DERIVES A REFUSAL — the reclaim gates, the pre-move re-read, the
+#   dashboard's trash pre-classification — runs uncached, so no refusal is ever
+#   decided from a snapshot. The one cached contribution to ``active`` (the
+#   co-tenant set) therefore only ever staleness-affects what a read displays.
 # * Only READ paths opt in. A reclaim re-enumerates, and additionally re-reads
 #   the index inside the mutation lock, so the selection it acts on is current.
 #
@@ -356,14 +363,20 @@ def _scan_key(sid_for_stem: Mapping[str, str]) -> tuple[object, ...]:
 
     Pairing is the rest of it: it decides which unit a transcript belongs to, so a
     session that gained or lost its mapping must not be answered from an older
-    pass. Compared by value rather than hashed — a hash collision here would serve
-    a pass built under different assumptions, and the whole point of the key is
-    that it cannot.
+    pass. The mapping is compared directly by dict equality — still by value,
+    never hashed — because a hash collision here would serve a pass built under
+    different assumptions, and the whole point of the key is that it cannot.
+    Embedding the dict makes the key tuple unhashable, so "never hashed" is
+    enforced by the interpreter rather than by convention, and the hit check
+    is linear — one dict copy plus one dict compare — with no sort. The
+    ``dict()`` copy is load-bearing:
+    it snapshots the pairing, so a caller's later in-place edit cannot mutate
+    the stored key in lockstep and masquerade as a hit.
     """
     return (
         str(kiro_sessions_dir()),
         str(_crew_sessions_dir()),
-        tuple(sorted(sid_for_stem.items())),
+        dict(sid_for_stem),
     )
 
 
@@ -390,10 +403,20 @@ def invalidate_scan_cache() -> None:
     the cache is process-wide and its key covers the store paths and the pairing,
     not the CONTENTS of the stores, so a test that writes more files and re-reads
     inside the TTL would otherwise be answered from its own earlier pass.
+
+    Drops the co-tenant pass too (see :func:`cotenant_sids`). A mutation that
+    invalidates one cache has changed the world the other described, and clearing
+    both here keeps every existing mutation hook correct without each having to
+    know that two caches exist. Pod-lifecycle changes — a pod appearing, being
+    torn down, or rewriting its map — have no hook here and are covered by the
+    TTL alone; that is acceptable because every destructive path re-reads the
+    co-tenant view uncached regardless.
     """
-    global _scan_cache
+    global _scan_cache, _cotenant_cache
     with _scan_cache_lock:
         _scan_cache = None
+    with _cotenant_cache_lock:
+        _cotenant_cache = None
 
 
 def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUnit]:
@@ -402,12 +425,16 @@ def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUni
     Two halves of the answer, deliberately separated. :func:`_scan_raw` does the
     filesystem work and knows nothing about which sessions are in use; this
     applies the caller's index over that result. So the expensive half can be
-    reused (see *cached*) while the answer to "may this be reclaimed" is always
-    computed from the index the caller passed in this call.
+    reused (see *cached*) while the flags derived from the index are always
+    computed from the index the caller passed in this call. ``active`` has one
+    further input — the co-tenant set — which follows *cached* below.
 
-    *cached* permits a recent filesystem pass to be reused. It is for READ paths
-    only: no refusal is derived from the cached half, but a reclaim must not
-    select against a snapshot at all, so every mutation path leaves it False.
+    *cached* permits a recent filesystem pass to be reused — both halves of it:
+    the store scan (:func:`_scan_raw`) and the co-tenant lookup below thread the
+    same flag. It is for READ paths only: every path that derives a refusal from
+    the result (the mutation gates, and the dashboard pre-classification that
+    feeds one) leaves it False, and a reclaim must not select against a snapshot
+    at all, so every mutation path leaves it False too.
     """
     raw = _scan_raw(index.stem_to_sid, cached=cached)
     active_stems = index.active_stems
@@ -417,7 +444,7 @@ def _scan_units(index: SessionIndex, *, cached: bool = False) -> list[SessionUni
     # one place every read and every reclaim passes through — measure, the row
     # list, the pre-classification and move_to_trash all derive `active` from it,
     # so one assignment protects all of them. A caller cannot forget to ask.
-    cotenant, _unreadable = cotenant_sids()
+    cotenant, _unreadable = cotenant_sids(cached=cached)
     units = []
     for entry in raw:
         active = (
@@ -657,6 +684,7 @@ def measure(
     *,
     now: float | None = None,
     units: list[SessionUnit] | None = None,
+    batches: list[TrashBatch] | None = None,
 ) -> StorageReport:
     """Measure session storage and report what is reclaimable.
 
@@ -664,6 +692,12 @@ def measure(
     rather than paying for a second pass. The inventory screen needs both the rows
     and these totals, and they must describe the same instant anyway — computing
     them from one pass makes agreement structural instead of coincidental.
+
+    *batches* is the same bargain for the trash, with one sharpening: unlike the
+    units fallback, which is answered from a 30s scan cache, ``list_trash`` reads
+    every batch manifest uncached on each call — so a caller that already has the
+    list should always hand it over, and a payload that lists the batches beside
+    these totals must not let the two describe different instants.
     """
     clock = time.time() if now is None else now
     units = _scan_units(index, cached=True) if units is None else units
@@ -671,7 +705,7 @@ def measure(
     # Sub-floor sessions are neither active nor offered: reporting them as
     # reclaimable would promise bytes no threshold can actually move.
     reclaimable = [u for u in units if not u.active and u.age_days(clock) >= MIN_RECLAIM_AGE_DAYS]
-    batches = list_trash()
+    batches = list_trash() if batches is None else batches
     report = StorageReport(
         total_bytes=sum(u.bytes for u in units),
         total_sessions=len(units),
@@ -697,7 +731,7 @@ def measure(
     return report
 
 
-def list_units(index: SessionIndex) -> list[SessionUnit]:
+def list_units(index: SessionIndex, *, cached: bool = True) -> list[SessionUnit]:
     """Every session on disk as one unit each, with its total size and age.
 
     The inventory screen's row source. Exposed separately from :func:`measure`
@@ -708,10 +742,13 @@ def list_units(index: SessionIndex) -> list[SessionUnit]:
     six-figure store. Anything requiring a read (a title's metadata line, a first
     message, a turn or image count) is fetched per row instead.
 
-    A recent scan is reused when there is one: this is a read, and the in-use
-    flags are recomputed from *index* on every call regardless.
+    A recent scan is reused by default: this is a read, and the flags derived
+    from *index* are recomputed on every call regardless. The co-tenant
+    contribution to ``active`` rides the cached half though, so a caller that
+    derives a REFUSAL from the result — the dashboard's trash pre-classification
+    — must pass ``cached=False`` and pay for a fresh pass instead.
     """
-    return _scan_units(index, cached=True)
+    return _scan_units(index, cached=cached)
 
 
 def select_reclaimable(
@@ -762,7 +799,42 @@ def _replay_store_cotenants() -> list[str]:
     )
 
 
-def cotenant_sids() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
+_cotenant_cache_lock = threading.Lock()
+# (expires_at, cache key, (protected sids, refusals))
+_cotenant_cache: (
+    tuple[float, tuple[object, ...], tuple[frozenset[str], tuple[tuple[str, str], ...]]] | None
+) = None
+
+
+def _cotenant_key() -> tuple[object, ...]:
+    """Everything a cached co-tenant pass depends on besides the maps themselves.
+
+    The pod root is part of it, for the same reason the store locations are part
+    of :func:`_scan_key`: it is resolved per call (``KIROCREW_POD_ROOT`` overrides
+    it), so a process can legitimately answer for different roots over its
+    lifetime, and a key without the location would answer a question about one
+    root with a pass taken over another.
+
+    The home overrides are part of it because the answer is not a function of the
+    pod root alone: each map is read through ``hooks.safe_read_file``, whose
+    sensitive-path gate re-anchors on ``KIROCREW_HOME`` / ``KIRO_HOME`` — the
+    same symlinked map can be refused under one anchoring and readable under
+    another, and *refusals* is part of what this cache stores. The RAW env values
+    are keyed, not the sanitized ``data_home()``/``kiro_home()`` forms, because
+    the gate reads them raw with no validity check: an unsafe override and an
+    unset one anchor differently even though both sanitize to the default. Of the
+    two, the read tier re-anchors on ``KIROCREW_HOME``; ``KIRO_HOME`` reaches
+    only the write tier today and is kept as defensive over-keying — a spurious
+    miss costs a re-scan, a spurious hit would cost a wrong answer.
+    """
+    return (
+        str(_pod_root()),
+        os.environ.get("KIROCREW_HOME"),
+        os.environ.get("KIRO_HOME"),
+    )
+
+
+def cotenant_sids(*, cached: bool = False) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
     """Replay-store sessions a co-tenant instance can still resume.
 
     Returns ``(sids, refusals)``. The sids are protected exactly like this
@@ -797,7 +869,22 @@ def cotenant_sids() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
     Liveness is deliberately not the test anywhere here. A stopped instance's map
     still names sessions it would resume if restarted, so ownership — not whether a
     process is running this second — is what protects them.
+
+    *cached* permits a recent pass over the pod maps to be reused, mirroring
+    :func:`_scan_raw`'s flag: opt-in per call site, never global. It exists for
+    the read paths behind :func:`_scan_units`. The refusal derivation in
+    :func:`reclaim_block_reason` and the pre-move re-read in
+    :func:`move_to_trash` must never opt in — a stale answer there could let a
+    reclaim proceed against a store another instance still holds, which is the
+    exact staleness the pre-move re-read exists to close.
     """
+    global _cotenant_cache
+    if cached:
+        with _cotenant_cache_lock:
+            if _cotenant_cache is not None:
+                expires, key, result = _cotenant_cache
+                if time.monotonic() < expires and key == _cotenant_key():
+                    return result
     protected: set[str] = set()
     refusals: list[tuple[str, str]] = []
     root = _pod_root()
@@ -820,13 +907,15 @@ def cotenant_sids() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
             # escape past the parse guard below and reach the caller. All four
             # mean the same thing here — which sessions this instance claims
             # cannot be established — so fail closed on it.
-            logger.warning("co-tenant %s has an unreadable session map", name, exc_info=True)
+            # %r, not %s: the directory name is agent-influenced and passes no
+            # identifier gate, so a newline in it would forge a second record.
+            logger.warning("co-tenant %r has an unreadable session map", name, exc_info=True)
             refusals.append((name, "its session map could not be read"))
             continue
         try:
             data = json.loads(raw)
         except ValueError:
-            logger.warning("co-tenant %s has a malformed session map", name)
+            logger.warning("co-tenant %r has a malformed session map", name)
             refusals.append((name, "its session map could not be parsed"))
             continue
         if not isinstance(data, dict):
@@ -860,7 +949,11 @@ def cotenant_sids() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
             refusals.append(
                 (name, "it shares this replay store and can resume sessions at any time")
             )
-    return frozenset(protected), tuple(refusals)
+    result = (frozenset(protected), tuple(refusals))
+    if cached:
+        with _cotenant_cache_lock:
+            _cotenant_cache = (time.monotonic() + _SCAN_CACHE_TTL, _cotenant_key(), result)
+    return result
 
 
 def _has_own_replay_store(pod_home: Path) -> bool:
@@ -926,7 +1019,11 @@ def reclaim_block_reason() -> str:
         if _norm(kiro_home()) == home / KIRO_BASE_DIR_NAME:
             _protected, refusals = cotenant_sids()
             if refusals:
-                listed = "; ".join(f"{name} — {why}" for name, why in refusals[:3])
+                # !r, not plain interpolation: the directory name is
+                # agent-influenced and passes no identifier gate, so a newline
+                # or ANSI payload in it would forge a second record the moment
+                # a caller logs this text (the #6281/#6371 forgery class).
+                listed = "; ".join(f"{name!r} — {why}" for name, why in refusals[:3])
                 return (
                     f"{len(refusals)} other instance(s) sharing this kiro-cli session "
                     f"store make reclaiming unsafe ({listed}). Evict them with "
@@ -1220,7 +1317,7 @@ def _unlisted_files(batch: Path) -> list[Path]:
                 unlisted.append(path)
     if failures:
         raise SessionStorageError(
-            f"could not read all of {batch.name}, so it is not known whether it "
+            f"could not read all of {batch.name!r}, so it is not known whether it "
             f"holds files nothing lists: {failures[0]}"
         )
     return unlisted
@@ -1237,12 +1334,12 @@ def _discard_restored_batch(batch: Path, header: dict[str, Any]) -> None:
         leftovers = _unlisted_files(batch)
     except SessionStorageError as exc:
         # Not knowing is treated exactly like finding leftovers: keep the batch.
-        logger.warning("keeping trash batch %s: %s", batch.name, exc)
+        logger.warning("keeping trash batch %r: %s", batch.name, exc)
         _rewrite_manifest(batch, header, [])
         return
     if leftovers:
         logger.warning(
-            "keeping trash batch %s: %d staged file(s) are absent from its manifest, "
+            "keeping trash batch %r: %d staged file(s) are absent from its manifest, "
             "so removing it would delete the only copy",
             batch.name,
             len(leftovers),
@@ -1270,46 +1367,184 @@ def _append_entry(handle: IO[str], entry: dict[str, Any]) -> None:
     handle.flush()
 
 
+# Longest manifest record accepted, in characters (terminator excluded: the
+# threshold applies to the stripped record). A real record is a header or one
+# session's file list — kilobytes at most. The manifest lives in an
+# agent-writable tree, so a reader that trusts line length would hand a single
+# multi-gigabyte no-newline line one allocation; a record past this cap ABORTS the
+# read instead (the whole batch is then treated as having no readable manifest,
+# exactly like an unreadable file). Skipping just the record would be worse than
+# failing: a partial restore REWRITES the manifest from the records it parsed, so
+# a skipped record's staged files would be silently orphaned. The transient peak
+# on a hostile manifest is a small multiple of this value (up to two cap-sized
+# reads concatenated, times Python's up-to-4-bytes-per-char widening), flat
+# regardless of file size — this constant is the dial if that ceiling moves.
+_MANIFEST_RECORD_CAP = 8 * 1024 * 1024
+
+
+class _OversizedManifestRecord(Exception):
+    """A manifest record exceeded ``_MANIFEST_RECORD_CAP``; the batch is unreadable."""
+
+
+def _manifest_records(handle: IO[str], batch: Path) -> Iterator[dict[str, Any]]:
+    """Yield each JSON object record of an open manifest, header first.
+
+    Record boundaries match ``str.splitlines`` — the previous whole-file reader —
+    so a manifest split on any unicode line boundary parses exactly as it always
+    did: reads are accumulated in a carry-over buffer and re-split per chunk, so a
+    cap-sized read ending mid-record never invents or destroys a boundary. Blank
+    and non-dict lines are skipped silently. A record that fails to parse is
+    skipped and counted: a trailing partial line (a crash mid-append) is expected
+    and logged at debug, while any other unparseable record — mid-file corruption —
+    gets one aggregated warning per read (#6292 item 3). Either way every complete
+    record before it describes real moved files that must stay restorable, so a
+    parse failure never fails the batch wholesale.
+
+    A record longer than ``_MANIFEST_RECORD_CAP`` is different: it raises
+    :class:`_OversizedManifestRecord` (readers map it to ``None``, the
+    no-readable-manifest posture) rather than being skipped, and its bytes are
+    never materialised past the cap. Skipping would lose data: ``restore()``
+    rewrites the manifest from the records it parsed, so a skipped record's
+    staged files would be orphaned. Aborting keeps every file protected by the
+    unlisted-file guards until a human looks.
+
+    The skip counting and its log lines run only when the generator is driven to
+    exhaustion; both callers do, and a future caller that stops early forfeits
+    them knowingly.
+    """
+    corrupt = 0
+    trailing_partial = False
+    buf = ""  # partial record carried between reads; capped below
+
+    def _parse(piece: str) -> dict[str, Any] | None:
+        nonlocal corrupt
+        piece = piece.strip()
+        if not piece:
+            return None
+        if len(piece) > _MANIFEST_RECORD_CAP:
+            raise _OversizedManifestRecord(batch.name)
+        try:
+            record = json.loads(piece)
+        except ValueError:
+            corrupt += 1
+            return None
+        return record if isinstance(record, dict) else None
+
+    while True:
+        chunk = handle.readline(_MANIFEST_RECORD_CAP)
+        if not chunk:
+            break
+        data = buf + chunk
+        pieces = data.splitlines()
+        # The final piece is complete iff data ends on a line boundary. \n is the
+        # common case; the appended probe catches every other splitlines boundary
+        # (\u2028, \x1c, ...) without enumerating them.
+        ends_on_boundary = data.endswith("\n") or len((data + "x").splitlines()) > len(pieces)
+        if ends_on_boundary:
+            complete, buf = pieces, ""
+        else:
+            complete, buf = pieces[:-1], pieces[-1]
+        for piece in complete:
+            record = _parse(piece)
+            if record is not None:
+                yield record
+        if len(buf) > _MANIFEST_RECORD_CAP:
+            raise _OversizedManifestRecord(batch.name)
+    # EOF: whatever is left in buf is a genuinely unterminated final line. It can
+    # never exceed the cap here — an over-cap carry raised above — and the assert
+    # keeps that invariant enforced if the loop is ever reshaped.
+    assert len(buf) <= _MANIFEST_RECORD_CAP
+    if buf:
+        stripped = buf.strip()
+        if stripped:
+            try:
+                record = json.loads(stripped)
+            except ValueError:
+                trailing_partial = True
+            else:
+                if isinstance(record, dict):
+                    yield record
+    if corrupt:
+        # %r: the batch name is a directory name from an agent-writable tree, so it
+        # can embed newlines; the repr keeps one log record from forging others.
+        logger.warning("trash manifest in %r: skipped %d unparseable line(s)", batch.name, corrupt)
+    if trailing_partial:
+        logger.debug("trash manifest in %r ends in a partial line (crash mid-append)", batch.name)
+
+
 def _read_manifest(batch: Path) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     """Parse a batch manifest into its header and session entries.
 
-    A trailing partial line (a crash mid-append) is skipped rather than failing
-    the whole batch: every complete line before it describes real moved files that
-    must stay restorable.
+    Streams the file line by line rather than materialising it as one string; the
+    entries list itself is still O(sessions), which the two callers that rewrite or
+    enumerate the manifest genuinely need. Callers that need only aggregates should
+    use :func:`_summarize_manifest` instead. A trailing partial line (a crash
+    mid-append) is skipped rather than failing the whole batch — every complete
+    line before it describes real moved files that must stay restorable (see
+    :func:`_manifest_records`).
     """
-    try:
-        raw = (batch / MANIFEST_NAME).read_text(encoding="utf-8")
-    except OSError:
-        return None
     header: dict[str, Any] | None = None
     entries: list[dict[str, Any]] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(record, dict):
-            continue
-        if header is None:
-            header = record
-            continue
-        entries.append(record)
+    try:
+        with (batch / MANIFEST_NAME).open(encoding="utf-8") as handle:
+            for record in _manifest_records(handle, batch):
+                if header is None:
+                    header = record
+                    continue
+                entries.append(record)
+    except OSError:
+        return None
+    except _OversizedManifestRecord:
+        logger.warning(
+            "trash manifest in %r has a record over %d chars; treating it as unreadable",
+            batch.name,
+            _MANIFEST_RECORD_CAP,
+        )
+        return None
     if header is None or header.get("schema") != MANIFEST_SCHEMA:
         return None
     return header, entries
 
 
+def _summarize_manifest(batch: Path) -> tuple[dict[str, Any], int, int] | None:
+    """The manifest's header plus (session count, staged byte total).
+
+    A batch can hold six figures of sessions, and the trash listing needs only
+    these two aggregates — so they are accumulated during the same single streamed
+    pass :func:`_read_manifest` makes, without ever holding the parsed entries.
+    Guards match :func:`_read_manifest` exactly: same skipped-line tolerance, same
+    schema rejection, and ``None`` on an unreadable manifest.
+    """
+    header: dict[str, Any] | None = None
+    sessions = 0
+    staged_bytes = 0
+    try:
+        with (batch / MANIFEST_NAME).open(encoding="utf-8") as handle:
+            for record in _manifest_records(handle, batch):
+                if header is None:
+                    header = record
+                    continue
+                sessions += 1
+                staged_bytes += _entry_bytes(record)
+    except OSError:
+        return None
+    except _OversizedManifestRecord:
+        logger.warning(
+            "trash manifest in %r has a record over %d chars; treating it as unreadable",
+            batch.name,
+            _MANIFEST_RECORD_CAP,
+        )
+        return None
+    if header is None or header.get("schema") != MANIFEST_SCHEMA:
+        return None
+    return header, sessions, staged_bytes
+
+
 def _rewrite_manifest(batch: Path, header: dict[str, Any], entries: list[dict[str, Any]]) -> None:
-    """Replace a manifest atomically after a partial restore."""
-    tmp = batch / f"{MANIFEST_NAME}.tmp"
-    with tmp.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps(header) + "\n")
-        for entry in entries:
-            handle.write(json.dumps(entry) + "\n")
-    os.replace(tmp, batch / MANIFEST_NAME)
+    """Replace and sync a manifest after a partial restore."""
+    header_line = json.dumps(header) + "\n"
+    entry_lines = "".join(json.dumps(entry) + "\n" for entry in entries)
+    atomic_write(batch / MANIFEST_NAME, header_line + entry_lines, fsync=True)
 
 
 def _entry_bytes(entry: dict[str, Any]) -> int:
@@ -1428,9 +1663,13 @@ def _move_to_trash_locked(
     cotenant_now, refusals = cotenant_sids()
     if refusals:
         name, why = refusals[0]
+        # name!r, not plain interpolation: the directory name is agent-influenced
+        # and passes no identifier gate, so a newline or ANSI payload in it would
+        # forge a second record the moment a caller logs str(exc) (the
+        # #6281/#6371 forgery class).
         raise SessionStorageError(
             f"{len(refusals)} instance(s) sharing this session store make reclaiming "
-            f"unsafe ({name} — {why}); nothing was moved"
+            f"unsafe ({name!r} — {why}); nothing was moved"
         )
     live_sids = live_sids | cotenant_now
 
@@ -1521,7 +1760,7 @@ def _move_to_trash_locked(
                 try:
                     _append_entry(manifest, {"uid": uid, "files": files})
                 except OSError:
-                    logger.warning("could not record session %s in the manifest; rolling back", uid)
+                    logger.warning("could not record session %r in the manifest; rolling back", uid)
                     try:
                         manifest.truncate(mark)
                         manifest.seek(mark)
@@ -1581,19 +1820,22 @@ def list_trash() -> list[TrashBatch]:
         # listed as a real batch and the sweep would delete through it.
         if platform_compat.is_link_or_junction(candidate) or not candidate.is_dir():
             continue
-        parsed = _read_manifest(candidate)
+        parsed = _summarize_manifest(candidate)
         if parsed is None:
-            logger.debug("trash batch %s has no readable manifest", candidate.name)
+            # %r: the directory name is agent-controlled; repr keeps an embedded
+            # newline from forging additional log records.
+            logger.debug("trash batch %r has no readable manifest", candidate.name)
             continue
-        header, entries = parsed
+        header, sessions, staged_bytes = parsed
         # The DIRECTORY is the batch's identity. A header that names a different
         # batch would make a targeted empty delete the batch it named instead of
         # the one it came from, so a disagreement is treated as corruption rather
         # than resolved in the header's favour.
         claimed = header.get("batch_id")
         if isinstance(claimed, str) and claimed and claimed != candidate.name:
+            # %r on the name: agent-controlled, same forgery risk as above.
             logger.warning(
-                "trash batch %s has a manifest claiming batch id %r; not offering it",
+                "trash batch %r has a manifest claiming batch id %r; not offering it",
                 candidate.name,
                 claimed,
             )
@@ -1604,8 +1846,8 @@ def list_trash() -> list[TrashBatch]:
                 batch_id=candidate.name,
                 created_at=float(created) if isinstance(created, (int, float)) else 0.0,
                 reason=str(header.get("reason") or ""),
-                sessions=len(entries),
-                bytes=sum(_entry_bytes(e) for e in entries),
+                sessions=sessions,
+                bytes=staged_bytes,
             )
         )
     batches.sort(key=lambda b: b.created_at, reverse=True)
@@ -1659,7 +1901,7 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
                 # A record we cannot read is a file we cannot place. Restoring the
                 # rest would leave the session split with that file staged and
                 # unreferenced, so the whole session stays put.
-                logger.warning("manifest record for %s is not an object", uid)
+                logger.warning("manifest record for %r is not an object", uid)
                 blocked = True
                 break
             rel = str(record.get("rel") or "")
@@ -1700,7 +1942,7 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
                     # entry retained — restoring the rest would splice two
                     # generations of one session together.
                     logger.warning(
-                        "session %s was recreated while being restored; leaving it " "staged",
+                        "session %r was recreated while being restored; leaving it " "staged",
                         uid,
                     )
                     lost_race = True
@@ -1711,7 +1953,7 @@ def _restore_locked(batch_id: str, uids: list[str] | None = None) -> int:
                 remaining.append(entry)
                 continue
         except OSError:
-            logger.warning("could not fully restore session %s", uid, exc_info=True)
+            logger.warning("could not fully restore session %r", uid, exc_info=True)
             # Without this the session is split *and* wedged: the files that did
             # move are gone from the batch while the manifest still lists them, so
             # every later retry fails its own "staged file present" check and the
@@ -1891,7 +2133,7 @@ def _incomplete_if_present(batch: Path) -> str | None:
     """
     try:
         if batch.exists():
-            logger.warning("emptying %s did not remove it", batch.name)
+            logger.warning("emptying %r did not remove it", batch.name)
             return SKIP_INCOMPLETE
     except OSError:
         return SKIP_INCOMPLETE
@@ -2006,7 +2248,7 @@ def _empty_trash_locked(
         except OSError:
             continue
         if resolved == root or not resolved.is_relative_to(root):
-            logger.warning("refusing to empty %s: outside the trash root", target)
+            logger.warning("refusing to empty %r: outside the trash root", target)
             _skipped(SKIP_OUTSIDE_ROOT)
             continue
         # A batch can hold files no manifest line mentions, left by an interruption
@@ -2018,12 +2260,12 @@ def _empty_trash_locked(
         except SessionStorageError as exc:
             # Skip, not abort: one unreadable batch must not make the whole trash
             # un-emptyable. Skipping deletes nothing, which is the safe direction.
-            logger.warning("refusing to empty %s: %s", target.name, exc)
+            logger.warning("refusing to empty %r: %s", target.name, exc)
             _skipped(SKIP_UNREADABLE)
             continue
         if leftovers:
             logger.warning(
-                "refusing to empty %s: %d staged file(s) are absent from its "
+                "refusing to empty %r: %d staged file(s) are absent from its "
                 "manifest, so this would delete the only copy",
                 target.name,
                 len(leftovers),

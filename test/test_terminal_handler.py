@@ -3280,3 +3280,289 @@ class TestPollTerminalTitles:
              patch("asyncio.sleep", side_effect=[None, asyncio.CancelledError]):
             await terminal.poll_terminal_titles(self._app(sess))  # must not raise
         ws.send_str.assert_not_awaited()
+
+
+class TestTerminalRefusalCodes:
+    """Every JSON refusal from the terminal routes carries a machine-readable
+    ``code`` (contract gate: ``test/test_error_code_contract.py``).
+
+    Only the JSON routes are in scope. ``api_terminal_ws``, create's auth/enable
+    guards, and delete answer ``web.Response(text=...)`` — a plain-text contract
+    that carries no envelope to put a code in, and giving them one would change
+    their content type rather than complete this one.
+    """
+
+    @staticmethod
+    def _body(resp):
+        return json.loads(resp.body)
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_over_the_session_cap_with_a_code(self):
+        registry = {"s1": _make_session(), "s2": _make_session()}
+        req = _make_request(registry=registry)
+        with patch.object(
+            terminal, "_get_config", return_value={"enabled": True, "max_sessions": 2}
+        ), patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
+            resp = await terminal.api_terminal_create(req)
+        assert resp.status == 429
+        assert self._body(resp)["code"] == "terminal_max_sessions"
+
+    @pytest.mark.asyncio
+    async def test_redact_refusals_are_coded(self):
+        cases = [
+            ({"text": 42}, 400, "terminal_invalid_body"),
+            ({"text": "x" * (terminal._REDACT_MAX_BYTES + 1)}, 413,
+             "terminal_selection_too_large"),
+        ]
+        for body, status, code in cases:
+            req = _make_request()
+            req.json = AsyncMock(return_value=body)
+            with patch.object(terminal, "_is_enabled", return_value=True):
+                resp = await terminal.api_terminal_redact(req)
+            assert resp.status == status, body
+            assert self._body(resp)["code"] == code, body
+
+    @pytest.mark.asyncio
+    async def test_a_failed_redaction_is_coded_and_still_fails_closed(self):
+        """The 500 must name the operation without carrying the selection: this
+        route exists to keep a credential out of the model's input, so its own
+        failure must not put the text back in the response."""
+        secret = "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+        req = _make_request()
+        req.json = AsyncMock(return_value={"text": secret})
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "redact_exfiltration_urls", side_effect=RuntimeError):
+            resp = await terminal.api_terminal_redact(req)
+        assert resp.status == 500
+        assert self._body(resp)["code"] == "terminal_redaction_failed"
+        assert "wJalrXUtnFEMI" not in resp.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("body", "status", "reason"),
+        [
+            ({"session_id": 42}, 400, "invalid_body"),
+            ({"session_id": "s1", "token": "x" * (4096 + 1)}, 413, "token_too_long"),
+            ({"session_id": "missing"}, 404, "unknown_session"),
+        ],
+    )
+    async def test_complete_refusal_code_is_the_audited_reason(
+        self, body: dict, status: int, reason: str
+    ) -> None:
+        """`_log_complete` already records a fixed reason word for every refusal
+        and the response then dropped it. The code is that word, so the audit
+        trail and the API cannot drift apart."""
+        req = _make_request(registry={})
+        req.json = AsyncMock(return_value=body)
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            log = MagicMock()
+            mock_sel.return_value.log_api_access = log
+            resp = await terminal.api_terminal_complete(req)
+
+        assert resp.status == status
+        assert self._body(resp)["code"] == f"terminal_{reason}"
+        assert log.call_args.kwargs["resources"] == reason
+
+    @pytest.mark.asyncio
+    async def test_every_json_refusal_carries_a_code_and_its_prose(self):
+        """Per-file ratchet: no JSON refusal may regress to prose-only."""
+        collected = []
+
+        req = _make_request()
+        req.json = AsyncMock(return_value={"text": 42})
+        with patch.object(terminal, "_is_enabled", return_value=True):
+            collected.append(await terminal.api_terminal_redact(req))
+
+        req = _make_request(registry={})
+        req.json = AsyncMock(return_value={"session_id": "missing"})
+        with patch.object(terminal, "_is_enabled", return_value=True), \
+             patch.object(terminal, "_sel") as mock_sel:
+            mock_sel.return_value.log_api_access = MagicMock()
+            collected.append(await terminal.api_terminal_complete(req))
+
+        for resp in collected:
+            body = self._body(resp)
+            assert resp.status >= 400, body
+            assert isinstance(body.get("code"), str) and body["code"], body
+            assert isinstance(body.get("error"), str) and body["error"], body
+
+
+class TestWriteAll:
+    """The POSIX PTY write path must deliver every byte despite short writes.
+
+    ``os.write`` on a blocking PTY controller fd can accept fewer bytes than requested
+    when the tty input buffer is full. ``terminal._write_all`` loops over the
+    remaining bytes until the buffer is consumed; the previous single-write shape
+    (one ``os.write`` whose return was discarded) truncated the tail. The loop
+    writes through a private ``os.dup`` so a concurrent teardown closing (and the
+    kernel reusing) the original descriptor number cannot redirect the tail.
+    """
+
+    DUP_OFFSET = 1000
+
+    def _stub_dup(self, monkeypatch):
+        """Stub ``os.dup``/``os.close`` inside the handler module: dup returns
+        fd+DUP_OFFSET and both calls are recorded, so tests can assert writes
+        target the private dup and that it is always closed."""
+        dups: list[int] = []
+        closes: list[int] = []
+        monkeypatch.setattr(terminal.os, "dup", lambda fd: dups.append(fd) or fd + self.DUP_OFFSET)
+        monkeypatch.setattr(terminal.os, "close", lambda fd: closes.append(fd))
+        return dups, closes
+
+    def _short_write_stub(self, chunk):
+        """A fake ``os.write`` that accepts at most ``chunk`` bytes per call and
+        records everything it received (and the fd each write targeted).
+        Returns the short count, mirroring a backpressured PTY."""
+        received = bytearray()
+        fds: list[int] = []
+
+        def _write(fd, data):
+            fds.append(fd)
+            n = min(len(data), chunk)
+            received.extend(bytes(data[:n]))
+            return n
+
+        return _write, received, fds
+
+    def test_write_all_delivers_full_payload_despite_short_writes(self, monkeypatch):
+        payload = bytes(range(256)) * 40  # 10 KB, larger than the 64-byte chunk
+        fake_write, received, _fds = self._short_write_stub(64)
+        monkeypatch.setattr(terminal.os, "write", fake_write)
+        self._stub_dup(monkeypatch)
+
+        terminal._write_all(7, payload)
+
+        assert bytes(received) == payload
+
+    def test_old_single_write_shape_truncates(self, monkeypatch):
+        """Red proof: the pattern this fix replaces — a single ``os.write`` whose
+        return is discarded — loses every byte past the first short count."""
+        payload = bytes(range(256)) * 40
+        fake_write, received, _fds = self._short_write_stub(64)
+        monkeypatch.setattr(terminal.os, "write", fake_write)
+
+        # Exactly the old code shape: one write, return value ignored.
+        terminal.os.write(7, payload)
+
+        assert bytes(received) == payload[:64]
+        assert bytes(received) != payload  # truncated — the bug _write_all fixes
+
+    def test_write_all_targets_private_dup_and_always_closes_it(self, monkeypatch):
+        """The loop must never write to the raw session fd: a concurrent kill can
+        close it and the kernel can hand that NUMBER to an unrelated open(), so
+        every chunk targets the private dup, which is closed even on error."""
+        payload = bytes(range(256)) * 40
+        fake_write, _received, fds = self._short_write_stub(64)
+        monkeypatch.setattr(terminal.os, "write", fake_write)
+        dups, closes = self._stub_dup(monkeypatch)
+
+        terminal._write_all(7, payload)
+
+        assert dups == [7]
+        assert set(fds) == {7 + self.DUP_OFFSET}  # every chunk hit the dup
+        assert closes == [7 + self.DUP_OFFSET]  # and the dup was released
+
+    def test_write_all_closes_dup_when_write_raises(self, monkeypatch):
+        def _write(fd, data):
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(terminal.os, "write", _write)
+        dups, closes = self._stub_dup(monkeypatch)
+
+        with pytest.raises(OSError):
+            terminal._write_all(7, b"payload")
+        assert closes == [7 + self.DUP_OFFSET]
+
+    def test_write_all_full_write_single_call(self, monkeypatch):
+        """A backend that accepts everything at once needs exactly one write."""
+        payload = b"echo hello\n"
+        calls = []
+
+        def _write(fd, data):
+            calls.append(bytes(data))
+            return len(data)
+
+        monkeypatch.setattr(terminal.os, "write", _write)
+        self._stub_dup(monkeypatch)
+        terminal._write_all(7, payload)
+
+        assert calls == [payload]
+
+    def test_write_all_propagates_oserror(self, monkeypatch):
+        """A concurrent kill sets the session fd to -1 before close; ``os.dup``
+        on the dead fd raises and the ``OSError`` must propagate so the write
+        loop's ``except OSError: break`` still terminates the session cleanly."""
+
+        def _dup(fd):
+            raise OSError(9, "Bad file descriptor")
+
+        monkeypatch.setattr(terminal.os, "dup", _dup)
+        with pytest.raises(OSError):
+            terminal._write_all(-1, b"data after kill")
+
+    def test_write_all_empty_payload_is_noop(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(terminal.os, "write", lambda fd, data: calls.append(bytes(data)) or len(data))
+        terminal._write_all(7, b"")
+        assert calls == []
+
+
+class TestWriteSerialization:
+    """Concurrent handlers must not interleave one frame's retry chunks.
+
+    A reconnect attaches a new WS handler by assignment without waiting for the
+    old handler's write loop to exit, so two handlers can dispatch PTY writes
+    for one session at once. Each frame is written under ``sess.write_lock`` so
+    its bytes land contiguously even when ``_write_all`` needs several
+    ``os.write`` calls.
+    """
+
+    @pytest.mark.asyncio
+    async def test_concurrent_frames_stay_contiguous_under_write_lock(self, monkeypatch):
+        import threading
+
+        recorded: list[tuple[bytes, ...]] = []
+        chunks: list[bytes] = []
+        first_chunk_written = threading.Event()
+        peer_wrote = threading.Event()
+
+        def short_write(fd, data):
+            chunk = bytes(data[:4])
+            chunks.append(chunk)
+            if not first_chunk_written.is_set():
+                first_chunk_written.set()
+                # Give a concurrent (unserialized) writer every opportunity to
+                # slip a chunk in mid-frame. Under the lock this always times
+                # out because the peer cannot start until we finish.
+                peer_wrote.wait(timeout=0.3)
+            elif chunks and chunks[-1][:1] != chunks[0][:1]:
+                peer_wrote.set()
+            return len(chunk)
+
+        monkeypatch.setattr(terminal.os, "write", short_write)
+        monkeypatch.setattr(terminal.os, "dup", lambda fd: fd)
+        monkeypatch.setattr(terminal.os, "close", lambda fd: None)
+
+        lock = asyncio.Lock()
+        loop = asyncio.get_running_loop()
+
+        async def frame(payload: bytes):
+            async with lock:
+                await loop.run_in_executor(None, terminal._write_all, 7, payload)
+
+        await asyncio.gather(frame(b"A" * 12), frame(b"B" * 12))
+        recorded.append(tuple(chunks))
+
+        stream = b"".join(chunks)
+        # Each frame's 12 bytes must be contiguous: the stream is one frame
+        # then the other, never A-chunks interleaved with B-chunks.
+        assert stream in (b"A" * 12 + b"B" * 12, b"B" * 12 + b"A" * 12), recorded
+
+    def test_session_dataclass_has_write_lock(self):
+        import dataclasses
+
+        names = {f.name for f in dataclasses.fields(terminal._TerminalSession)}
+        assert "write_lock" in names

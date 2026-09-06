@@ -99,11 +99,14 @@ from kiro_crew import model_registry, platform_compat, shutdown_event
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
 from kiro_crew.acp.types import (
     ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_KIRO,
+    ACP_BACKENDS_ACP_RUNTIME,
     PROVIDER_LABEL_CLAUDE,
     PROVIDER_LABEL_DEFAULT,
 )
+from kiro_crew.acp_backends import selectable_backends
 from kiro_crew.agent import kiro_agents_dir_path
-from kiro_crew.agent_discovery import spec_model
+from kiro_crew.agent_discovery import _read_agent_spec, spec_model
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.config.loader import (
     CONTEXT_WARN_MARGIN_PCT,
@@ -210,12 +213,12 @@ def _provider_effectively_alive(provider: Any) -> bool:
     the won-race re-validate). The in-lock live fast path keeps its own inline
     copy of this decision because it also evicts the stale entry and emits
     path-specific logging; that copy must stay in sync with this helper.
+
+    Read straight off the declared ABC: ``LLMProvider.is_process_alive``
+    defaults to ``is_alive()``, so every provider answers the call and no
+    capability probe is needed (harness-parity H14).
     """
-    alive = (
-        provider.is_process_alive()
-        if hasattr(provider, "is_process_alive")
-        else provider.is_alive()
-    )
+    alive = provider.is_process_alive()
     if (
         not alive
         and ClaudeCodeProvider is not None
@@ -363,6 +366,7 @@ POOL_DECISIONS: frozenset[str] = frozenset(
         "bypass_resume",
         "bypass_stateless",
         "bypass_cwd",
+        "bypass_effort",
         "bypass_env",
         "disabled",
         "other",
@@ -370,6 +374,7 @@ POOL_DECISIONS: frozenset[str] = frozenset(
 )
 
 # Stateless session-key prefixes — skip resume across restarts.
+_WORKFLOW_AUTHOR_PREFIX = "wf-author:"
 _WORKFLOW_POOL_PREFIX = "wf-pool:"
 _STATELESS_PREFIXES = (
     "cron:",
@@ -378,6 +383,10 @@ _STATELESS_PREFIXES = (
     _CHANNEL_PREFIX,
     "secretary:",
     _SIDE_PREFIX,
+    # Workflow authoring sessions are one-request scratch contexts. Explicit
+    # destruction reaps the provider; stateless classification additionally
+    # prevents a resume lookup or map write before that teardown completes.
+    _WORKFLOW_AUTHOR_PREFIX,
     # Warm workflow-pool workers (workflows/agent_pool.py) are per-run ephemeral
     # sessions reset between tasks via provider.new_conversation(); they must
     # NEVER persist a session_map entry or resume a prior transcript. Without
@@ -403,6 +412,22 @@ _MAX_CONCURRENT_COLD_STARTS = 4
 # consumer reading ``sess.agent`` (e.g. ``runtime_pids``) saw the background
 # session as agent-less.
 BACKGROUND_AGENT = "kirocrew-lite"
+
+
+# Backends the _bg runtime path may spawn under: runtime-capable AND
+# operator-selectable. Identical sets today, so the intersection is pure
+# defense-in-depth — a future runtime-capable preview harness that is not yet
+# selectable must not be spawnable by the background path from a config object
+# that skipped the loader's _normalize_acp_backend.
+#
+# Computed per call, not frozen at import: selectability lives in the
+# ``acp_backends`` registry, which an edition extends during boot via
+# ``register_selectable_backend`` — strictly after this module is imported. A
+# module-level intersection would snapshot the baseline and permanently exclude
+# a backend the operator did register.
+def _bg_runtime_backends() -> frozenset[str]:
+    return ACP_BACKENDS_ACP_RUNTIME & selectable_backends()
+
 
 # Heartbeat session key — used by HeartbeatService.  Spawned with the full
 # ``kirocrew`` agent so polled tasks can call read-only MCP tools (CR/ticket
@@ -1151,6 +1176,14 @@ class SessionManager:
         # Guards lazy creation of _bg_runtime so concurrent callers don't each
         # spawn a runtime and leak all but the last (orphaned subprocesses).
         self._bg_runtime_lock = asyncio.Lock()
+        # Runtimes displaced from _bg_runtime by a backend switch while they
+        # still had live handles. Parked here they can never receive a NEW
+        # session (only _bg_runtime is offered to callers), their in-flight
+        # work finishes untouched, and _reap_drained_bg_runtimes_locked kills
+        # each one once its last handle drains. Bounded in practice: a switch
+        # parks at most one runtime and every _bg call reap-checks the list.
+        # Mutated only under _bg_runtime_lock.
+        self._draining_bg_runtimes: list["AcpRuntime"] = []
 
         # ── Per-session subagent runtimes (session sharing) ──
         # Maps parent_session_key → shared AcpRuntime for that session's
@@ -1181,6 +1214,7 @@ class SessionManager:
                 CleanupHook("orphan_mcp", self._orphan_mcp_hook),
                 CleanupHook("rss_threshold", self._rss_threshold_check),
                 CleanupHook("stuck_turn", self._stuck_turn_check),
+                CleanupHook("bg_drain_reap", self._bg_drain_reap_hook),
             ]
         )
 
@@ -1198,7 +1232,10 @@ class SessionManager:
         their responses. The warm pool IS drained, because a pre-warmed provider
         was constructed by the old factory and would hand the stale default to
         the very next session — and unlike a live session, a pooled provider has
-        no conversation to lose.
+        no conversation to lose. The shared background runtime is retired when
+        its ``agent.acp_backend`` no longer matches the re-read config: killed
+        if idle, parked to drain if it has live handles (see
+        :meth:`_retire_stale_backend_bg_runtime`).
         """
         cfg = KiroCrewConfig.load()
         async with self._pool_fill_lock:
@@ -1221,6 +1258,13 @@ class SessionManager:
             self._pool_health_task.cancel()
             self._pool_health_task = None
         await self.start_pool(blocking=False)
+        # A backend switch also strands the shared background runtime: it
+        # captured agent.acp_backend at spawn, lives outside the session map,
+        # and is shielded from the orphan-PID sweep, so nothing else ever
+        # retires it. Idle → retired here; busy → left to drain (killing it
+        # would abort an in-flight title generation) and retired by the next
+        # trigger.
+        await self._retire_stale_backend_bg_runtime()
         logger.info(
             "Session defaults refreshed: model=%s effort=%r (live sessions untouched)",
             cfg.agent.model,
@@ -1313,7 +1357,7 @@ class SessionManager:
     async def _ensure_background(self) -> None:
         """Create the persistent background session if it doesn't exist."""
         async with self._lock:
-            if BACKGROUND_KEY in self._sessions:
+            if self._closing or BACKGROUND_KEY in self._sessions:
                 return
         # Create outside lock
         if not self._provider_factory:
@@ -1326,7 +1370,10 @@ class SessionManager:
             logger.warning("Failed to create background session", exc_info=True)
             return
         async with self._lock:
-            if BACKGROUND_KEY not in self._sessions:
+            # _closing is rechecked because the start above spans the window
+            # in which close_all takes its session snapshot: registering now
+            # would leak this provider past graceful shutdown.
+            if not self._closing and BACKGROUND_KEY not in self._sessions:
                 sess = _Session(
                     provider=provider,
                     first_turn=FirstTurnState.NOTHING_ARMED,
@@ -1334,39 +1381,229 @@ class SessionManager:
                 )
                 self._sessions[BACKGROUND_KEY] = sess
                 logger.info("Background session created")
-            else:
-                await provider.shutdown()
+                return
+        # Racing registration lost, or shutdown began while we were starting:
+        # tear the fresh provider down instead of registering it.
+        await provider.shutdown()
 
     # ── Warm Pool ──
 
-    def _bg_provider_is_kiro(self) -> bool:
-        """True when the ``kirocrew-lite`` ``_bg`` agent resolves to the kiro
-        (``acp``) backend — the only backend the multiplexed ``AcpRuntime``
-        supports. For non-kiro backends ``_bg`` falls back to the provider-backed
-        ``_Session`` path serialized by ``Semaphore(1)``.
+    def _configured_bg_backend_raw(self) -> str | None:
+        """The ``agent.acp_backend`` the config currently declares, or ``None``
+        when the config cannot answer (a raising property, a non-string test
+        double). ``None`` means "unknown", never "kiro": the displacement sites
+        skip on it, so an unreadable probe can never assert a backend it did
+        not read and displace a correctly-configured runtime.
         """
         try:
-            prov = getattr(self._cfg.agent, "provider", "acp") or "acp"
+            backend = getattr(self._cfg.agent, "acp_backend", ACP_BACKEND_KIRO)
         except Exception:
-            prov = "acp"
-        return prov == "acp"
+            logger.warning(
+                "agent.acp_backend is unreadable; treating the _bg backend as unknown",
+                exc_info=True,
+            )
+            return None
+        return backend if isinstance(backend, str) else None
+
+    def _configured_bg_backend(self) -> str:
+        """The ``agent.acp_backend`` background runtimes must spawn under.
+
+        Degrades an unknown reading to the default (kiro) backend — losing chat
+        titles and consolidation to a config edge is worse than running the
+        floor backend, and the loader has already normalized any persisted
+        value (``_normalize_acp_backend``). Displacement decisions use
+        :meth:`_configured_bg_backend_raw` instead, so the degrade can spawn
+        conservatively but never destroys an existing runtime.
+        """
+        backend = self._configured_bg_backend_raw()
+        return backend if backend is not None else ACP_BACKEND_KIRO
+
+    def _bg_backend_supports_runtime(self) -> bool:
+        """True when the configured ``agent.acp_backend`` is one the multiplexed
+        ``AcpRuntime`` can serve — positive membership in
+        ``ACP_BACKENDS_ACP_RUNTIME``, never an inequality (harness-parity). A
+        backend outside that set falls through to the provider-backed
+        ``_Session`` path serialized by ``Semaphore(1)``.
+        """
+        return self._configured_bg_backend() in _bg_runtime_backends()
+
+    async def _reap_drained_bg_runtimes_locked(self) -> None:
+        """Kill and drop parked runtimes whose last live handle has drained.
+
+        Caller MUST hold ``_bg_runtime_lock``. A runtime that is still busy
+        stays parked for the next pass; a failed kill also stays parked so the
+        process is retried rather than orphaned (its PID shield in
+        ``_companion_runtime_pids`` holds until it is reaped). ``kill()`` is
+        called even on an already-dead runtime — it releases the PID tracking
+        and sweep-protection bookkeeping.
+        """
+        remaining: list["AcpRuntime"] = []
+        for runtime in self._draining_bg_runtimes:
+            try:
+                busy = runtime.is_alive() and runtime.has_active_or_initializing_sessions()
+            except Exception:
+                # Fail toward preserving work, not toward recycling — a probe
+                # that cannot answer must not kill a runtime whose handles may
+                # be live. The runtime stays parked and is probed again next
+                # pass.
+                busy = True
+            if busy:
+                remaining.append(runtime)
+                continue
+            try:
+                await runtime.kill(expected=True)  # drained backend-switch teardown
+                logger.info("Reaped a drained _bg runtime spawned under the previous backend")
+            except Exception:
+                logger.warning("Failed to reap a drained _bg runtime; will retry", exc_info=True)
+                remaining.append(runtime)
+        self._draining_bg_runtimes = remaining
+
+    async def _displace_bg_runtime_locked(
+        self, runtime: "AcpRuntime", cached_backend: str, configured_backend: str
+    ) -> None:
+        """Displace *runtime* from the ``_bg_runtime`` slot after a backend switch.
+
+        Caller MUST hold ``_bg_runtime_lock`` and have established that
+        ``cached_backend != configured_backend``. The ONE implementation of the
+        displacement policy — ``get_bg_session`` and
+        ``_retire_stale_backend_bg_runtime`` both route through it so the two
+        paths cannot drift. An idle runtime is killed; a busy one (or one whose
+        kill failed) is parked on ``_draining_bg_runtimes`` — an in-flight title
+        generation belongs to a caller unrelated to the switch, and aborting it
+        trades a stale backend for a lost result. Either way the slot is freed,
+        so the next spawn runs under the configured backend. The busy probe
+        fails toward preserving work, not toward recycling: a raising probe
+        parks rather than kills.
+        """
+        try:
+            busy = runtime.has_active_or_initializing_sessions()
+        except Exception:
+            busy = True
+        if busy:
+            logger.info(
+                "Parking the _bg runtime (PID %s, backend %r) to drain after a "
+                "switch to backend %r",
+                runtime.pid,
+                cached_backend,
+                configured_backend,
+            )
+            self._draining_bg_runtimes.append(runtime)
+            if len(self._draining_bg_runtimes) > 1:
+                # Each entry is a live agent process shielded from the orphan
+                # sweep; more than one parked at a time means backend flapping
+                # is outpacing the drain, which should be visible, not silent.
+                logger.warning(
+                    "%d _bg runtimes are parked draining after backend switches",
+                    len(self._draining_bg_runtimes),
+                )
+        else:
+            logger.info(
+                "Recycling the _bg runtime (PID %s) spawned under backend %r; "
+                "configured backend is now %r",
+                runtime.pid,
+                cached_backend,
+                configured_backend,
+            )
+            try:
+                await runtime.kill(expected=True)  # deliberate backend-switch teardown
+            except Exception:
+                logger.warning(
+                    "Backend-switch kill failed; parking the runtime for the reaper",
+                    exc_info=True,
+                )
+                self._draining_bg_runtimes.append(runtime)
+        self._bg_runtime = None
+
+    async def _retire_stale_backend_bg_runtime(self) -> None:
+        """Retire a cached ``_bg_runtime`` spawned under a different backend.
+
+        The runtime captures ``agent.acp_backend`` at spawn, so after a backend
+        switch the cached process would keep serving background work (chat
+        titles, suggestions, consolidation) on the previous backend
+        indefinitely — it lives outside the session map and is shielded from
+        the orphan-PID sweep. The displacement policy itself lives in
+        :meth:`_displace_bg_runtime_locked`.
+
+        Runs whenever :meth:`refresh_defaults` re-reads config and from both
+        branches of ``get_bg_session`` — there is currently no dashboard edit
+        surface for ``agent.acp_backend`` (a file/CLI edit lands at the next
+        gateway start, where ``_cfg`` is fresh), so these calls are what pick
+        up a backend change on any gateway that DID observe one, and any
+        future edit surface gets the retirement by routing through
+        ``refresh_defaults`` like the other ``agent.*`` defaults.
+
+        Fails toward preserving work on a holder that does not declare a
+        string ``acp_backend`` (a test double, a future holder): it is left in
+        place rather than recycled on a backend it may never have had.
+
+        Takes ``_bg_runtime_lock`` for the same reason
+        ``_retire_kiro_bg_runtime`` does: creation is serialized by that lock,
+        so a lazy creation racing this check can neither install a runtime
+        mid-retirement nor be discarded half-installed.
+        """
+        async with self._bg_runtime_lock:
+            # close_all's locked detach may already have run; parking into the
+            # cleared list after it would strand a shielded process until the
+            # next-startup orphan reaper. One gate here covers every park this
+            # helper (and its refresh_defaults / provider-path callers) can do.
+            if self._closing:
+                return
+            await self._reap_drained_bg_runtimes_locked()
+            runtime = self._bg_runtime
+            if runtime is None:
+                return
+            cached_backend = getattr(runtime, "acp_backend", None)
+            if not isinstance(cached_backend, str):
+                return
+            configured = self._configured_bg_backend_raw()
+            if configured is None or cached_backend == configured:
+                return
+            await self._displace_bg_runtime_locked(runtime, cached_backend, configured)
+
+    async def _provider_backed_bg_session(self) -> "_ProviderBgSession":
+        """The ``_bg`` fallback for a backend the multiplexed runtime cannot
+        serve: a ``_ProviderBgSession`` over the shared ``BACKGROUND_KEY``
+        ``_Session``, serialized by its ``Semaphore(1)``."""
+        if self._closing:
+            # Typed for the same reason as get_bg_session's gates: a shutdown
+            # racing this path must classify as shutdown, not as the missing-
+            # session error below (which _ensure_background's own _closing
+            # no-op would otherwise surface as).
+            raise SessionClosingError("session manager is closing; no background session")
+        await self._ensure_background()
+        sess = self._sessions.get(BACKGROUND_KEY)
+        if sess is None:
+            raise RuntimeError("background session unavailable for non-kiro _bg provider")
+        return _ProviderBgSession(sess)
 
     async def get_bg_session(self) -> "AcpSessionHandle | _ProviderBgSession":
-        """Acquire a ``_bg`` session handle, dispatching by provider backend.
+        """Acquire a ``_bg`` session handle, dispatching by ``agent.acp_backend``.
 
-        kiro (``acp``) → ephemeral ``AcpSessionHandle`` on the shared multiplexed
-        ``AcpRuntime`` (each caller gets its own ``sessionId``; runtime creation
-        guarded by ``_bg_runtime_lock``; respawn-once on death). non-kiro →
-        ``_ProviderBgSession`` over the shared ``BACKGROUND_KEY`` ``_Session``
-        serialized by its ``Semaphore(1)``. Caller MUST call ``session.destroy()``
-        in a finally block when done.
+        Runtime-capable backend (``ACP_BACKENDS_ACP_RUNTIME``) → ephemeral
+        ``AcpSessionHandle`` on the shared multiplexed ``AcpRuntime`` spawned
+        under the configured backend (each caller gets its own ``sessionId``;
+        runtime creation guarded by ``_bg_runtime_lock``; respawn-once on
+        death). Any other backend → ``_ProviderBgSession`` over the shared
+        ``BACKGROUND_KEY`` ``_Session`` serialized by its ``Semaphore(1)``.
+        Caller MUST call ``session.destroy()`` in a finally block when done.
+
+        Raises :class:`SessionClosingError` during gateway shutdown — spawning
+        or parking past ``close_all``'s locked detach would leak a process
+        until the next-startup orphan reaper.
         """
-        if not self._bg_provider_is_kiro():
-            await self._ensure_background()
-            sess = self._sessions.get(BACKGROUND_KEY)
-            if sess is None:
-                raise RuntimeError("background session unavailable for non-kiro _bg provider")
-            return _ProviderBgSession(sess)
+        if self._closing:
+            # The typed error (not a bare RuntimeError) lets the handlers that
+            # special-case shutdown classify a restart-time title generation
+            # as a recognized shutdown rather than a generic failure.
+            raise SessionClosingError("session manager is closing; no background session")
+
+        if not self._bg_backend_supports_runtime():
+            # A cached runtime spawned under a previous runtime-capable backend
+            # is unreachable from the branch below, so no later runtime-path
+            # call can complete a retirement refresh_defaults() deferred while
+            # handles were live. Finish it here once those handles drain.
+            await self._retire_stale_backend_bg_runtime()
+            return await self._provider_backed_bg_session()
 
         # circular import: session -> acp.runtime -> acp.client -> session
         from kiro_crew.acp.runtime import AcpRuntime, AcpRuntimeDead
@@ -1374,7 +1611,33 @@ class SessionManager:
         max_retries = 1
         for attempt in range(max_retries + 1):
             async with self._bg_runtime_lock:
+                # Paired with close_all()'s locked detach: once _closing is
+                # set, spawning or parking here would install a runtime the
+                # shutdown sweep has already run past, leaking the process
+                # until the next-startup orphan reaper.
+                if self._closing:
+                    raise SessionClosingError("session manager is closing; no background session")
+                await self._reap_drained_bg_runtimes_locked()
                 runtime = self._bg_runtime
+                # Resolved ONCE per lock hold so the recycle decision and the
+                # spawn below cannot see two different values across awaits.
+                # The raw form gates displacement — an unreadable probe must
+                # never displace a correctly-configured runtime — while the
+                # degraded form feeds the capability recheck and the spawn.
+                configured_backend_raw = self._configured_bg_backend_raw()
+                configured_backend = (
+                    configured_backend_raw
+                    if configured_backend_raw is not None
+                    else ACP_BACKEND_KIRO
+                )
+                # Revalidated under the lock: the config can move to a backend
+                # the runtime cannot serve between the dispatch check above and
+                # this lock acquisition (dormant in the public edition, where
+                # every selectable backend is runtime-capable). Constructing a
+                # runtime under such a backend would misapply its credential /
+                # sandbox classification, so that caller is served through the
+                # provider path below instead.
+                runtime_capable = configured_backend in _bg_runtime_backends()
                 # Recycle a healthy-but-stale runtime (aged out or grown past
                 # its RSS threshold — see AcpRuntime._is_stale()) before the
                 # normal is_alive() respawn check. Only recycle when zero
@@ -1388,8 +1651,28 @@ class SessionManager:
                 # then raises AcpRuntimeDead and is backstopped by the
                 # max_retries respawn loop below (it costs one extra respawn, not
                 # a dropped prompt — a mid-prompt session is always registered).
-                if runtime is not None and runtime.is_alive():
-                    if not runtime.has_active_sessions():
+                if runtime_capable and runtime is not None and runtime.is_alive():
+                    # A runtime spawned under a previous agent.acp_backend must
+                    # not serve NEW background work after a switch — checked
+                    # BEFORE the busy branch, because under sustained load a
+                    # busy runtime never reaches a zero-session window and the
+                    # switch would otherwise never take effect. The displacement
+                    # policy (kill idle / park busy, always free the slot) lives
+                    # in _displace_bg_runtime_locked. Fails toward preserving
+                    # work on a holder that does not declare a string backend (a
+                    # test double) — it falls through to the staleness check
+                    # rather than being recycled on a backend it may never have
+                    # had.
+                    cached_backend = getattr(runtime, "acp_backend", None)
+                    if (
+                        configured_backend_raw is not None
+                        and isinstance(cached_backend, str)
+                        and cached_backend != configured_backend_raw
+                    ):
+                        await self._displace_bg_runtime_locked(
+                            runtime, cached_backend, configured_backend_raw
+                        )
+                    elif not runtime.has_active_sessions():
                         reason = await runtime._is_stale()
                         if reason:
                             logger.info(
@@ -1413,7 +1696,9 @@ class SessionManager:
                             len(runtime._session_queues),
                         )
 
-                if self._bg_runtime is None or not self._bg_runtime.is_alive():
+                if runtime_capable and (
+                    self._bg_runtime is None or not self._bg_runtime.is_alive()
+                ):
                     # Reap the dead runtime before replacing it — kill() releases
                     # its PID tracking + sweep-protection shield. Overwriting
                     # without kill would leak the process and its protected-PID.
@@ -1435,6 +1720,11 @@ class SessionManager:
                     runtime = AcpRuntime(
                         agent="kirocrew-lite",
                         sandbox_mode=getattr(self._cfg.agent, "sandbox", "auto"),
+                        # The runtime defaults to the kiro backend, so omitting
+                        # this pins background work (chat titles, suggestions,
+                        # tips, nav links, the model picker, consolidation) to
+                        # kiro-cli regardless of the configured backend.
+                        acp_backend=configured_backend,
                         # kirocrew-lite's config is written by Kiro Crew itself
                         # with an empty mcpServers map, so no MCP server can
                         # ever report on this runtime. Opting out keeps hot
@@ -1445,8 +1735,21 @@ class SessionManager:
                     )
                     await runtime.spawn()
                     self._bg_runtime = runtime
+                # Pinned under the lock: the selection made here must be the
+                # runtime this caller uses, whatever a concurrent displacement
+                # does to the slot afterwards — dereferencing self._bg_runtime
+                # outside the lock would turn that race into an AttributeError
+                # instead of the AcpRuntimeDead the retry loop handles.
+                selected = self._bg_runtime if runtime_capable else None
+            if selected is None:
+                # The capability recheck under the lock found a backend the
+                # runtime cannot serve. Displace the cached runtime through the
+                # retire helper (park/kill under its own lock hold), then serve
+                # this caller on the provider path.
+                await self._retire_stale_backend_bg_runtime()
+                return await self._provider_backed_bg_session()
             try:
-                return await self._bg_runtime.create_session(agent="kirocrew-lite")
+                return await selected.create_session(agent="kirocrew-lite")
             except AcpRuntimeDead:
                 if attempt >= max_retries:
                     raise
@@ -1719,12 +2022,16 @@ class SessionManager:
         own the runtime (and the key is not the runtime's parent key),
         ``reset`` terminates only this session — the shared runtime survives and
         is freed once via ``release_subagent_runtime(parent_session_key)`` at run
-        end/cancel.
+        end/cancel. Descriptor-bound macOS runtimes are the exception: a step
+        requesting a different exact cwd uses a dedicated provider, because ACP's
+        string-only cwd cannot safely name a later descendant through the fd the
+        shared child inherited.
 
         Returns ``(provider, is_new, resumed)`` mirroring ``get_or_create``.
         Acquires the per-session semaphore; the caller MUST ``release`` it.
         """
         # circular import: session -> acp.session_provider -> acp.client -> session
+        from kiro_crew.acp.runtime import AcpWorkspaceBindingError
         from kiro_crew.acp.session_provider import AcpSessionProvider
 
         # Fork: with a claude_code backend there is no shared AcpRuntime to
@@ -1775,7 +2082,20 @@ class SessionManager:
         # I/O (get_subagent_runtime spawn + create_session) is kept OUTSIDE the
         # global lock to avoid pinning it across subprocess/RPC work.
         runtime = await self._get_or_bootstrap_run_runtime(parent_session_key, agent=agent, cwd=cwd)
-        handle = await runtime.create_session(cwd=cwd or None, agent=agent or None)
+        try:
+            handle = await runtime.create_session(cwd=cwd or None, agent=agent or None)
+        except AcpWorkspaceBindingError:
+            # A macOS runtime passes an exact workspace descriptor to its child
+            # at spawn.  ACP accepts only a cwd string, so a later descendant
+            # cannot be represented without reopening mutable pathname lookup.
+            # Preserve the requested cwd by using the normal dedicated-provider
+            # path, which spawns and binds a runtime at that exact directory.
+            return await self.get_or_create(
+                key,
+                agent=agent,
+                approval_policy=approval_policy,
+                cwd=cwd,
+            )
         provider = AcpSessionProvider(handle, runtime)
 
         dup: LLMProvider | None = None
@@ -2011,7 +2331,7 @@ class SessionManager:
             still_alive = platform_compat.pid_exists(pid)
         else:
             try:
-                still_alive = hasattr(provider, "is_process_alive") and provider.is_process_alive()
+                still_alive = provider.is_process_alive()
             except Exception:
                 still_alive = False
         if still_alive:
@@ -2089,9 +2409,7 @@ class SessionManager:
                 # healthy provider is routine (INFO); one that also died before
                 # aging out is a genuine anomaly and keeps WARNING.
                 try:
-                    ttl_alive = (
-                        hasattr(provider, "is_process_alive") and provider.is_process_alive()
-                    )
+                    ttl_alive = provider.is_process_alive()
                 except Exception:
                     ttl_alive = False
                 ttl_log = logger.info if ttl_alive else logger.warning
@@ -2108,9 +2426,9 @@ class SessionManager:
             # which has a 600s stale-activity threshold.  Pool processes are
             # expected to be idle (no I/O after init) so the stale check would
             # falsely discard healthy processes after ~10 min.
-            alive = hasattr(provider, "is_process_alive") and provider.is_process_alive()
+            alive = provider.is_process_alive()
             if not alive:
-                rc = provider.exit_code if hasattr(provider, "exit_code") else None
+                rc = provider.exit_code
                 logger.warning(
                     "Warm pool: claimed provider is dead (returncode=%s), discarding", rc
                 )
@@ -2172,9 +2490,11 @@ class SessionManager:
         - ``self._subagent_runtimes`` — companion runtimes multiplexing a parent
           session's subagents (alive for the parent's whole lifetime).
         - ``self._bg_runtime`` — the background runtime backing ``get_bg_session``
-          (kirocrew-lite title-gen / memory consolidation).
+          (kirocrew-lite title-gen / memory consolidation), plus any
+          ``_draining_bg_runtimes`` displaced by a backend switch while their
+          handles finish — killing one mid-drain is exactly what parking avoids.
 
-        Both are shielded from the sweep by unioning their live PIDs into the
+        All are shielded from the sweep by unioning their live PIDs into the
         active set here (mirrors ``_pool_pids``/``_in_flight_pids``). Only alive
         runtimes contribute — a dead entry SHOULD be reaped. Returns a copy.
         """
@@ -2185,12 +2505,12 @@ class SessionManager:
                     pids.add(runtime.pid)
             except Exception:
                 logger.debug("companion runtime pid probe failed", exc_info=True)
-        bg = self._bg_runtime
-        try:
-            if bg is not None and bg.is_alive() and isinstance(bg.pid, int):
-                pids.add(bg.pid)
-        except Exception:
-            logger.debug("bg runtime pid probe failed", exc_info=True)
+        for bg in [self._bg_runtime, *self._draining_bg_runtimes]:
+            try:
+                if bg is not None and bg.is_alive() and isinstance(bg.pid, int):
+                    pids.add(bg.pid)
+            except Exception:
+                logger.debug("bg runtime pid probe failed", exc_info=True)
         return pids
 
     _POOL_HEALTH_INTERVAL = 30  # seconds between health sweeps
@@ -2240,9 +2560,7 @@ class SessionManager:
                     # anomaly: keep the pre-existing WARNING for it (same
                     # message, same discard path — severity only).
                     try:
-                        ttl_alive = (
-                            hasattr(provider, "is_process_alive") and provider.is_process_alive()
-                        )
+                        ttl_alive = provider.is_process_alive()
                     except Exception:
                         ttl_alive = False
                     ttl_log = logger.info if ttl_alive else logger.warning
@@ -2255,11 +2573,11 @@ class SessionManager:
                     to_shutdown.append(provider)
                     continue
                 try:
-                    alive = hasattr(provider, "is_process_alive") and provider.is_process_alive()
+                    alive = provider.is_process_alive()
                 except Exception:
                     alive = False
                 if not alive:
-                    rc = provider.exit_code if hasattr(provider, "exit_code") else None
+                    rc = provider.exit_code
                     logger.warning(
                         "Pool health: dead provider (pid=%s, returncode=%s, age=%.0fs), discarding",
                         pid,
@@ -2448,8 +2766,9 @@ class SessionManager:
           mtime, so entries also expire after ``_AGENT_MODEL_CACHE_TTL`` seconds
           and are re-resolved.
         """
+        agents_dir = kiro_agents_dir_path()
         try:
-            dir_mtime = kiro_agents_dir_path().stat().st_mtime
+            dir_mtime = agents_dir.stat().st_mtime
         except OSError:
             dir_mtime = 0.0
         now = time.monotonic()
@@ -2466,20 +2785,20 @@ class SessionManager:
 
         model = "auto"
         try:
-            import json as _json
-
-            for af in kiro_agents_dir_path().glob("*.json"):
-                try:
-                    ad = _json.loads(af.read_text(encoding="utf-8"))
-                except (ValueError, OSError):
+            # Use the SAME directory as the cache stamp and preserve the former
+            # native-order, first-match scan.  This runs on the event-loop
+            # thread, so a match must stop all later spec reads rather than
+            # building a full map on every cache miss / TTL expiry.
+            for agent_file in agents_dir.glob("*.json"):
+                data = _read_agent_spec(
+                    agent_file,
+                    operation="resolve_agent_model",
+                    source="unknown",
+                )
+                if data is None:
                     continue
-                if ad.get("name") == agent or af.stem == agent:
-                    # Coerced, not raw: this method is annotated ``-> str`` and
-                    # its result is CACHED, fed to ``/api/sessions/context``
-                    # (where the dashboard calls ``.replace()`` on it) and
-                    # compared/translated as a model id in ``claim_pooled``. A
-                    # foreign spec's ``{"id": ...}`` would poison all three.
-                    model = spec_model(ad)
+                if data.get("name") == agent or agent_file.stem == agent:
+                    model = spec_model(data)
                     break
         except Exception:
             pass
@@ -2723,10 +3042,9 @@ class SessionManager:
                     # with is_new=True — ensuring full context re-injection.
                     # Use process-level check, not is_alive() which has a 600s
                     # stale-activity threshold that falsely kills idle sessions.
-                    if hasattr(sess.provider, "is_process_alive"):
-                        _alive = sess.provider.is_process_alive()
-                    else:
-                        _alive = sess.provider.is_alive()
+                    # The ABC defaults is_process_alive to is_alive(), so the
+                    # direct call needs no capability probe.
+                    _alive = sess.provider.is_process_alive()
                     if not _alive:
                         # CC per_session: process died but session state is on
                         # disk — reconnect transparently instead of removing.
@@ -2912,6 +3230,17 @@ class SessionManager:
             pool_decision = "bypass_stateless"
         elif cwd_blocks_pool:
             pool_decision = "bypass_cwd"
+        elif extra_factory_kwargs.get("reasoning_effort_override"):
+            # A requested reasoning effort is applied by the provider factory
+            # at construction (the cli.json overlay is written from
+            # effort_per_model at spawn); a pre-warmed provider was built
+            # without the override, and the post-claim fixups re-key and switch
+            # model but never touch effort. Bypass the pool so the override
+            # always reaches the factory — which both delivers the level and
+            # keeps the factory's effort gate the single drop authority
+            # (#6186). Same rationale as the subagent path forcing the
+            # dedicated-process route for a per-spawn effort.
+            pool_decision = "bypass_effort"
         elif extra_env:
             pool_decision = "bypass_env"
         else:
@@ -4504,13 +4833,20 @@ class SessionManager:
         companion-runtime sweep carries: creation of this runtime is serialized by
         the same ``_bg_runtime_lock`` held here, so none can be installed during it.
 
-        Returns True when no kiro-backed background runtime remains.
+        Returns True when no kiro-backed background runtime remains — including
+        the ``_draining_bg_runtimes`` displaced by a backend switch: an idle one
+        is reaped here, and one still draining holds the old account alive, so
+        it blocks completeness the same way a busy ``_bg_runtime`` does.
         """
 
         async with self._bg_runtime_lock:
+            await self._reap_drained_bg_runtimes_locked()
+            complete = not any(
+                _provider_uses_kiro_identity_store(rt) for rt in self._draining_bg_runtimes
+            )
             runtime = self._bg_runtime
             if runtime is None or not _provider_uses_kiro_identity_store(runtime):
-                return True
+                return complete
             if runtime.has_active_or_initializing_sessions():
                 return False
             try:
@@ -4525,7 +4861,7 @@ class SessionManager:
             # reference in place rather than orphaning a live process.
             self._bg_runtime = None
             logger.info("Retired the background runtime started under the previous account")
-            return True
+            return complete
 
     async def remove_if_unclaimed(self, key: str) -> bool:
         """Remove *key* only if its speculative session is still unclaimed.
@@ -4791,12 +5127,23 @@ class SessionManager:
         # or warm-pool providers), so the session-shutdown loop below does not
         # cover them; without this they survive a graceful shutdown until the
         # next-startup orphan reaper.
-        if self._bg_runtime is not None:
-            try:
-                await self._bg_runtime.kill(expected=True)  # graceful shutdown
-            except Exception:
-                logger.debug("close_all: _bg_runtime kill failed", exc_info=True)
+        # Detach BOTH background-runtime holders under their lock so a
+        # get_bg_session racing shutdown can neither install nor park a
+        # runtime into a snapshot this sweep has already run past (its own
+        # _closing gate refuses once the flag is up), and no concurrent reap
+        # can rebind the list mid-iteration. Kills run on the detached
+        # snapshot outside the lock so a wedged kill cannot hold it.
+        async with self._bg_runtime_lock:
+            _bg_doomed = [
+                rt for rt in (self._bg_runtime, *self._draining_bg_runtimes) if rt is not None
+            ]
             self._bg_runtime = None
+            self._draining_bg_runtimes = []
+        for _bg_rt in _bg_doomed:
+            try:
+                await _bg_rt.kill(expected=True)  # graceful shutdown
+            except Exception:
+                logger.debug("close_all: _bg runtime kill failed", exc_info=True)
         for _key in list(self._subagent_runtimes):
             try:
                 await self.release_subagent_runtime(_key)
@@ -4856,7 +5203,7 @@ class SessionManager:
             # shutdown durability point: await the off-loop flush so a wedged
             # filesystem cannot hold the loop past the shutdown deadline.
             try:
-                await self._session_map.aflush()
+                await self._session_map.aclose()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -5234,10 +5581,10 @@ class SessionManager:
         if sess is None:
             return None
         # Use process-level check, not is_alive() which has a 600s
-        # stale-activity threshold that falsely kills idle sessions.
-        if hasattr(sess.provider, "is_process_alive"):
-            return sess.provider.is_process_alive()
-        return sess.provider.is_alive()
+        # stale-activity threshold that falsely kills idle sessions. The ABC
+        # defaults is_process_alive to is_alive(), so the direct call needs
+        # no capability probe.
+        return sess.provider.is_process_alive()
 
     def get_approval_policy(self, key: str) -> str:
         """Return the approval policy for a session, or empty string."""
@@ -5503,9 +5850,6 @@ class SessionManager:
         """Highest persisted DM generation for a session bucket (see SessionMap)."""
         return self._session_map.max_generation(bucket)
 
-    def delete_session_map_entry(self, key: str) -> None:
-        self._session_map.delete(key)
-
     async def set_thread(self, key: str, thread_ts: str) -> None:
         """Set thread for a session. Prefer set_slack_link for new code."""
         _, channel_id = self.get_slack_link(key)
@@ -5732,6 +6076,26 @@ class SessionManager:
             await self._expire_idle(self._idle_timeout)
         except Exception:
             logger.exception("Cleanup loop: _expire_idle crashed; continuing")
+
+    async def _bg_drain_reap_hook(self) -> None:
+        """Periodic backstop for parked backend-switch runtimes.
+
+        Every other reap trigger (``get_bg_session``, ``refresh_defaults``, the
+        identity sweep) requires someone to CALL it; on an otherwise idle
+        gateway a parked runtime whose last handle drained would sit shielded
+        from the orphan sweep indefinitely. Cheap no-op when nothing is parked
+        (the common case) — the lock is only taken when the list is non-empty.
+        """
+        if not self._draining_bg_runtimes:
+            return
+        try:
+            async with self._bg_runtime_lock:
+                await self._reap_drained_bg_runtimes_locked()
+        except Exception:
+            # CleanupHook contract: the hook owns its error handling. The
+            # dispatcher's backstop logs at debug only, which would hide a
+            # permanently failing reap — the one case this hook exists for.
+            logger.warning("bg_drain_reap hook failed; will retry next tick", exc_info=True)
 
     async def _orphan_mcp_hook(self) -> None:
         """Sweep MCP servers orphaned by crashed/expired sessions. Preserves the
@@ -5999,7 +6363,7 @@ class SessionManager:
                 )
                 if sandbox_removed:
                     logger.info(
-                        "Periodic sweep: removed %d stale sandbox launchers",
+                        "Periodic sweep: removed %d stale sandbox artifacts",
                         sandbox_removed,
                     )
             except Exception as exc:

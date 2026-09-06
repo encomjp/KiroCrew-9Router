@@ -34,6 +34,7 @@ import { grantConsent, getStoredConsent, revokeConsent } from '../utils/themeCon
 // active theme's manifest sounds (message-received / notification triggers).
 import { MC_THEME_SOUND_EVENT, type ThemeSoundDetail } from '../hooks/themeSound'
 import { MC_NOTIFICATION_EVENT } from '../hooks/notificationEvent'
+import { useIsNarrowViewport } from '../hooks/useIsMobile'
 
 import { i18nT } from '../i18n/t'
 // postMessage types accepted from theme iframes — everything else is ignored.
@@ -56,8 +57,6 @@ const OVERLAY_Z_MAX = 45
 // window (agent-chosen default; the overlay may also self-hide via
 // `theme:visibility` sooner, which the router already honours).
 const ACTIVATE_ONCE_MS = 8000
-// Topbar hidden below this width when the manifest sets `hideOnMobile`.
-const MOBILE_MQ = '(max-width: 767px)'
 
 const OVERLAY_POSITIONS: ReadonlySet<ThemeOverlayPosition> = new Set<ThemeOverlayPosition>([
   'top', 'bottom', 'left', 'right',
@@ -255,12 +254,9 @@ export default function ThemeExperienceLayer() {
 
   const [reduced, setReduced] = useState(readReducedMotion)
   const [muted, setMuted] = useState(() => localStorage.getItem(MUTE_KEY) === '1')
-  const [isNarrow, setIsNarrow] = useState(
-    () =>
-      typeof window !== 'undefined' &&
-      typeof window.matchMedia === 'function' &&
-      window.matchMedia(MOBILE_MQ).matches === true,
-  )
+  // NOT useIsMobile: this layer mounts above the router on every route, embed included,
+  // so the hook's `/embed/` always-false carve-out would un-hide a hideOnMobile topbar.
+  const isNarrow = useIsNarrowViewport()
   // Overlay trigger bookkeeping: ids of idle-overlays currently visible, and ids
   // of `activate`+`once` overlays whose one-shot window has elapsed.
   const [idleOverlayIds, setIdleOverlayIds] = useState<ReadonlySet<string>>(new Set())
@@ -497,15 +493,6 @@ export default function ThemeExperienceLayer() {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
     const mql = window.matchMedia('(prefers-reduced-motion: reduce)')
     const handler = () => setReduced(mql.matches)
-    mql.addEventListener('change', handler)
-    return () => mql.removeEventListener('change', handler)
-  }, [])
-
-  // Track the mobile breakpoint for topbar `hideOnMobile`.
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
-    const mql = window.matchMedia(MOBILE_MQ)
-    const handler = () => setIsNarrow(mql.matches)
     mql.addEventListener('change', handler)
     return () => mql.removeEventListener('change', handler)
   }, [])

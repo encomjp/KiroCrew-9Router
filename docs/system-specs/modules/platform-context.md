@@ -26,8 +26,7 @@ interface, the public edition is complete standalone.
 
 ## PlatformContext
 
-`kiro_crew.platform.context.PlatformContext` is a frozen dataclass built once at
-boot holding the chosen adapter for every extension point, plus three carriers:
+`kiro_crew.platform.context.PlatformContext` is an immutable dataclass holding the chosen adapter for every extension point, plus four carriers. Boot installs the initial context once; a validated central-governance refresh replaces the active context only to carry a new `governance` value. `policy_distribution.apply_ceiling` performs that replacement through `set_context`, and `governance_generation()` makes dependent profile snapshots refresh rather than serving a profile composed against a retired ceiling:
 
 | Field | Kind | Default adapter | Companion supplies |
 |-------|------|-----------------|--------------------|
@@ -41,6 +40,7 @@ boot holding the chosen adapter for every extension point, plus three carriers:
 | `sandbox` | settings | `DefaultSandboxPolicy` (`_STRICT_DIRS`/`_CC_DIRS`) | additional edition-specific credential dirs |
 | `credentials` | adapter | `DefaultCredentialPolicy` (AKIA/ASIA redaction; `exempt_exact_hosts()` → `frozenset()`) | internal token regexes + trusted-tenant exempt hosts |
 | `security` | **concrete** | `PolicyAuthority()` (baseline only) | `PolicyAuthority(overlay=…)` ADD-only |
+| `governance` | **concrete carrier** | `load_security_policy()` result or `None` | bundled Level-1 ceiling |
 | `slack_gate` | adapter | `DefaultSlackEnterpriseGate` (default-open) | fail-closed enterprise allowlist |
 | `identity` | adapter | `DefaultIdentityProvider` (`sso_status.py` stub; `whoami`/`issuer` **RESERVED**) | enterprise SSO / directory |
 | `embeddings` | adapter | **RESERVED** — `DefaultEmbeddingSource`; the public runtime is the bundled in-process llama-cpp model, so no method is consumed (swap via `embeddings.register_embedding_backend`) | — (slot inert) |
@@ -55,7 +55,7 @@ boot holding the chosen adapter for every extension point, plus three carriers:
 | `package_manager` | adapter | **RESERVED** — `DefaultPackageManager`; installs are inline in `cli_doctor.py` (use `CapabilityManager`) | — (slot inert) |
 | `knowledge` | adapter | `DefaultKnowledgeProvider` (no extra connectors) | enterprise doc connector (`extra_connectors`) |
 | `tunnel` | adapter | `DefaultTunnelProvider` (no-op) | internal tunnel supervisor |
-| `telemetry` | adapter | `DefaultTelemetryProvider` (no-op, RUM off) | RUM/Cognito config |
+| `telemetry` | adapter | `DefaultTelemetryProvider` (no-op, RUM off; OTLP destination from `telemetry.otlp_endpoint`) | RUM/Cognito config + its own OTLP collector |
 | `dashboard` | adapter | `DefaultDashboardContributor` (no routes/services, no login handler) | secretary/taskkeeper routes + enterprise SSO PTY login |
 | `jail` | adapter | `DefaultJailProvider` (no-op, never jails) | enterprise process isolation |
 | `feature_apps` | tuple | **RESERVED** — `()`; apps register via `apps_loader` (provenance record only) | — (slot inert) |
@@ -116,12 +116,11 @@ ctx = boot_platform(cfg)      # platform/bootstrap.py (idempotent)
 `boot_platform` is the single idempotent entry point — `cli.main` and
 `run_gateway` both call it; only the first call resolves the profile and
 installs the context. `bootstrap_context`:
-1. `build_default_context(cfg, profile=resolve_profile(...))` — all `Default*`.
-2. If profile != standalone: `discover_companion_context` (fail-closed).
-3. Validate `contract_version` and the security floor; `set_context`.
+1. `build_default_context(cfg, profile=resolve_profile(...))` composes all `Default*` adapters and selects the applicable Level-1 governance ceiling through `load_security_policy`.
+2. If profile != standalone: `discover_companion_context` (fail-closed), then validate `contract_version` and the ADD-only security floor.
+3. `assert_governance_paths_protected`, `assert_policy_signature_satisfied`, and `assert_profiles_within_ceiling` validate the final context before `set_context`; these gates prevent an agent-writable trust root, an absent required signature, or a profile looser than its ceiling from becoming active.
 4. `ctx.providers.register_acp_backends()` once (Default no-op).
-5. `ctx.publish.register_publish_providers()` once (Default no-op → the
-   `publish_provider` registry stays empty and publishing is unavailable).
+5. `ctx.publish.register_publish_providers()` once (Default no-op → the `publish_provider` registry stays empty and publishing is unavailable).
 
 ## Profile resolution
 
@@ -154,6 +153,18 @@ once loaded.
 `bootstrap_context` then asserts `contract_version` match and runs
 `assert_security_floor` before installing the companion context.
 
+## Level-1 governance ceiling and distribution
+
+`PlatformContext.governance` is the optional Level-1 `GovernanceCeiling` that enforcement chokepoints read through `current_context()`. `governance.load_security_policy` selects the first available source: an explicit local policy, a centrally distributed policy, a companion-bundled policy, then the data-home policy; no source leaves editable standalone defaults. The local source remains first so an operator can roll back a bad fleet-wide publication without waiting for the central control plane.
+
+`policy_distribution.resolve_distribution` accepts the central source from fleet environment settings or the `distribution` declaration of an already-selected lower-tier policy, with environment settings taking precedence individually. A declared distribution source cannot carry credentials; request headers remain host-local and `cache_only()` prevents child processes from receiving the means to contact the fleet control plane.
+
+`governance._parse_controls` rejects every unknown governed key, including an unrecognised `sandbox` child. Only documented non-governed sandbox flags are accepted in the reserved internal scope. This fails closed instead of recording a misspelled sandbox floor as a valid but unenforced policy control.
+
+`policy_distribution.load_distributed_policy` serves a validated last-known-good cache when the source is unavailable, and its unavailable disposition decides the no-cache case. `refresh_now` rejects an invalid live candidate and retains the running ceiling; `validate_ceiling` applies the same signature and profile-floor checks as installation before `apply_ceiling` replaces the active context. This asymmetry is load-bearing: a transient outage cannot remove governance, and a malformed central update cannot weaken or interrupt a governed running host.
+
+The cache is covered by `assert_governance_paths_protected` and is therefore part of the sensitive-path trust root: write access would let an agent substitute both policy bytes and provenance. `register_policy_fetcher` is append-only, so an edition can add a transport without shadowing a built-in fetcher or bypassing shared validation and cache handling. `distribution_posture` exposes operational state without returning the control-plane URL or request credentials. `governance_profiles.ProfileStore._ceiling_token` includes `governance_generation()` so a profile snapshot is never reused after `apply_ceiling` installs a replacement ceiling.
+
 ## ADD-only security floor
 
 `PolicyAuthority` (concrete class in `security_authority.py`) is the deny-floor
@@ -173,7 +184,7 @@ remove or weaken the floor — is enforced structurally:
 - The actual evaluation (two-pass, git-publish verb anchoring, SEL audit) is
   reused verbatim from `security.is_denied` via the `extra_patterns` parameter.
 
-**`BASELINE_DENY` is now `()` — the floor redefinition.** The built-in
+**`BASELINE_DENY` is `()` — the floor definition.** The built-in
 denied-command patterns are **default-ON but user-DISABLEABLE** (Settings →
 Security; see `security.md`), so they can no longer be an unconditional compiled
 `BASELINE_DENY = tuple(security.BUILTIN_DENY_PATTERNS)` — that would re-apply
@@ -306,21 +317,6 @@ added pre-launch landed under this same `1`, with no bump:
 
 Start incrementing only after the first public release, when a separately-built
 companion can pin against a frozen contract.
-
-**2026-07-18 governance-seam re-triage.** A re-triage of the CPP seam against the
-16 upstream commit groups landed four of the above seam additions on this branch,
-each in its own commit — `IdentityProvider.preflight_checks()` (G1, "Preflight
-checks" below), `CredentialPolicy.exempt_exact_hosts()` (G3, "Exfil exact-host
-heuristic exemption" below), `TunnelProvider.register_callbacks` /
-`status_snapshot` (G2, "tunnel/manager.py" below), and
-`IdentityProvider.credential_watch_paths()` (G6, blue-green pooled-backend drain
-on credential rotation, "mcp_gateway/manager.py" below) — plus the metadata-only
-`interaction` telemetry event (G8, "Telemetry record_event sites" below, no
-Protocol change). All are v1 additions with **no `CONTRACT_VERSION` bump**. G6
-was first built on the stacked branch `feat/govseam-post-pr18` (it depends on
-PR #18's `mcp_gateway/` reshape) and was consolidated onto this branch once that
-work merged. The re-triage added **no new Protocols and no new `SCOPE_CATALOG`
-rows**; the full per-SHA verdict record is kept with the upstream sync tooling.
 
 ## Companion packaging
 
@@ -631,6 +627,30 @@ is byte-identical) with no `CONTRACT_VERSION` bump.
   winner's identity. Merged at the
   consumption sites, never inside `KiroCrewConfig`, so a config save can never
   persist an edition default into the operator's file. Default `[]`.
+- `TelemetryProvider.otlp_destinations(cfg) -> Sequence[OtlpDestination]` — the
+  OTLP collectors this edition sends telemetry to. Read by
+  `metrics/provider.py::_otlp_destinations` once per recorder build (through
+  `safe_context_call`, fallback `()`), which attaches one
+  `PeriodicExportingMetricReader` per destination naming the `"metrics"` signal,
+  AFTER the built-in local JSONL reader. ADD-only: an edition can add a
+  destination but can never remove or replace the local sink, relax consent or
+  attribute sanitisation, or set the export cadence. `OtlpDestination` carries
+  `name` (non-secret, log-safe — the endpoint value is never logged), `endpoint`,
+  `signals`, and an optional authenticated `session`; the session is the seam a
+  ROTATING credential composes against, since `requests` re-evaluates
+  `Session.auth` per export where `OTEL_EXPORTER_OTLP_HEADERS` freezes at
+  construction (static per-destination headers ride on `Session.headers`).
+  Must be cheap and side-effect-free per call: it is read once per recorder build
+  AND on every egress-posture read (Privacy panel status, each `telemetry.enabled`
+  write), so an edition builds its transport once rather than minting a credential
+  inside it. A provider that does not implement the method answers "no
+  destinations" rather than "unknown", so a pre-seam edition keeps the two
+  surfaces agreeing. Signal-agnostic on purpose: the OTLP metric, span and log
+  exporters take the same constructor arguments, so a later core that emits traces
+  or logs reads the same descriptor instead of needing another method. Deny-by-
+  default — an empty `endpoint`, or a signal this core does not emit, is dropped.
+  Default: one destination for a non-empty `telemetry.otlp_endpoint`, none
+  otherwise (byte-identical to the endpoint-only exporter it replaced).
 - `DashboardContributor.on_user_message(app, message)` — fired once per user
   message by `dashboard/chat_handlers.py::api_chat` before the turn, inside a
   fail-safe `safe_context_call`. OBSERVER only. Default no-op.

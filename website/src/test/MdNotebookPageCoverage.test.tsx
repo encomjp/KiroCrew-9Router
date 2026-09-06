@@ -133,13 +133,19 @@ function pending<T>(): Promise<T> {
   return new Promise<T>(() => undefined)
 }
 
-/** A promise whose resolution this test controls, for ordering two reads. */
-function deferred<T>(): { promise: Promise<T>; settle: (value: T) => void } {
+/** A promise whose outcome this test controls, for ordering async operations. */
+function deferred<T>(): {
+  promise: Promise<T>
+  settle: (value: T) => void
+  reject: (reason?: unknown) => void
+} {
   let settle!: (value: T) => void
-  const promise = new Promise<T>(resolve => {
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolve, rejectPromise) => {
     settle = resolve
+    reject = rejectPromise
   })
-  return { promise, settle }
+  return { promise, settle, reject }
 }
 
 /** An ESTALE rejection, the shape the save guard recognises. */
@@ -791,17 +797,34 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     expect(api.moveNote).not.toHaveBeenCalled()
   })
 
-  it('refuses to move a note whose pending save was rejected', async () => {
-    await mountDirty()
-    api.saveNote.mockRejectedValueOnce(staleRejection())
-    // Back to the rendered pane so the row action bar is reachable.
-    await userEvent.click(screen.getByRole('button', { name: 'Rendered' }))
-    rowAction('One', 'Rename note')
-    const field = await screen.findByRole('textbox', { name: 'Note name' })
-    await userEvent.clear(field)
-    await userEvent.type(field, 'Renamed{Enter}')
+  it('joins an active debounced save and refuses to move when that save fails', async () => {
+    const save = deferred<{ ok: boolean; mtime: number }>()
+    api.saveNote.mockImplementationOnce(() => save.promise)
+    await mountWithNote()
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    vi.useFakeTimers()
+    fireEvent.change(rawEditor(), { target: { value: '# Hello\n\nunsaved rename' } })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
 
-    await waitFor(() => expect(api.saveNote).toHaveBeenCalled())
+    // Rename while the debounce save is still unresolved. This second save
+    // barrier must JOIN the active request instead of issuing a competing save
+    // whose success could hide the first request's failure.
+    fireEvent.click(screen.getByRole('button', { name: 'Rendered' }))
+    rowAction('One', 'Rename note')
+    const field = screen.getByRole('textbox', { name: 'Note name' })
+    fireEvent.change(field, { target: { value: 'Renamed' } })
+    fireEvent.keyDown(field, { key: 'Enter', code: 'Enter' })
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      save.reject(staleRejection())
+      await save.promise.catch(() => undefined)
+    })
+    vi.useRealTimers()
+    expect(await screen.findByText('This note changed on disk since you opened it.')).toBeTruthy()
     // Renaming would retarget the editor without ever reconciling its content.
     expect(api.moveNote).not.toHaveBeenCalled()
   })
@@ -963,6 +986,144 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
     expect(dirty.defaultPrevented).toBe(true)
   })
 
+  it('flushes a pending autosave once when the page unmounts', async () => {
+    const view = await mountOnFakeTimersWithNote()
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    fireEvent.change(rawEditor(), { target: { value: 'unsaved work' } })
+
+    view.unmount()
+    expect(api.saveNote).toHaveBeenCalledWith('v1', 'One.md', 'unsaved work', 4)
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+
+    // The cancelled debounce must not fire a second, post-unmount save.
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
+  })
+
+  it('waits for an active autosave before flushing the final edit on unmount', async () => {
+    const first = deferred<{ ok: boolean; mtime: number }>()
+    const second = deferred<{ ok: boolean; mtime: number }>()
+    const third = deferred<{ ok: boolean; mtime: number }>()
+    api.saveNote
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+      .mockImplementationOnce(() => third.promise)
+
+    const view = await mountOnFakeTimersWithNote()
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    fireEvent.change(rawEditor(), { target: { value: 'first edit' } })
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+
+    fireEvent.change(rawEditor(), { target: { value: 'second edit' } })
+    await act(async () => first.settle({ ok: true, mtime: 5 }))
+    expect(api.saveNote).toHaveBeenNthCalledWith(2, 'v1', 'One.md', 'second edit', 5)
+
+    fireEvent.change(rawEditor(), { target: { value: 'third edit' } })
+    await act(async () => second.settle({ ok: true, mtime: 6 }))
+    expect(api.saveNote).toHaveBeenNthCalledWith(3, 'v1', 'One.md', 'third edit', 6)
+
+    // Change the buffer during the final bounded retry. Teardown must not race
+    // that request with the old mtime; it waits, then saves the latest snapshot.
+    fireEvent.change(rawEditor(), { target: { value: 'final edit' } })
+    view.unmount()
+    expect(api.saveNote).toHaveBeenCalledTimes(3)
+
+    await act(async () => third.settle({ ok: true, mtime: 7 }))
+    expect(api.saveNote).toHaveBeenNthCalledWith(4, 'v1', 'One.md', 'final edit', 7)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+    expect(api.saveNote).toHaveBeenCalledTimes(4)
+  })
+
+  it('cannot dirty a note whose delete is in flight, so unmount has nothing to resurrect', async () => {
+    // What keeps the unmount flush from writing a note back to disk after the
+    // user deleted it. The flush itself carries a `targetsSameNote` guard, but
+    // the reason that guard is unreachable is THIS invariant, so it is the one
+    // worth pinning: `edit` refuses while the open note's delete is in flight,
+    // so no content is committed and no debounce is ever armed to flush.
+    const del = deferred<{ ok: boolean }>()
+    api.deleteNote.mockImplementationOnce(() => del.promise)
+
+    const view = await mountWithNote()
+    await userEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    // Delete the OPEN note and hold the request open, so the editor stays
+    // mounted for the round trip with `deletingRef` armed.
+    await confirmDelete('One')
+    expect(api.deleteNote).toHaveBeenCalledTimes(1)
+
+    fireEvent.change(rawEditor(), { target: { value: 'typed during the delete' } })
+    expect(api.saveNote).not.toHaveBeenCalled()
+
+    // Unmount inside what would have been the debounce window.
+    view.unmount()
+    expect(api.saveNote).not.toHaveBeenCalled()
+
+    await act(async () => del.settle({ ok: true }))
+  })
+
+  it('flushes on unmount after a failed save left the buffer dirty', async () => {
+    // A failed save is the one state with no timer and nothing tracked but an
+    // unpersisted edit: `flushSave` clears the debounce on entry and releases its
+    // tracking in `finally`, and only a keystroke re-arms the debounce. Teardown
+    // still has to write, or navigating away after a transient failure loses the
+    // edit exactly as the leaked timer used to.
+    const view = await mountOnFakeTimersWithNote()
+    fireEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    fireEvent.change(rawEditor(), { target: { value: 'survives a failed save' } })
+
+    api.saveNote.mockRejectedValueOnce(new Error('no space left on device'))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    })
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
+
+    view.unmount()
+    expect(api.saveNote).toHaveBeenNthCalledWith(2, 'v1', 'One.md', 'survives a failed save', 4)
+  })
+
+  it('waits for an in-flight move before flushing, so the edit lands on the new path', async () => {
+    // A move retargets `pathRef` only when its response comes back, so between
+    // request and reply the open note's path names a file the server has already
+    // moved away. Writing there on unmount would send the edit to the old path
+    // and lose it to a swallowed ESTALE, so teardown has to wait for the move
+    // the same way it waits for an in-flight save.
+    const move = deferred<{ ok: boolean; path: string }>()
+    api.moveNote.mockImplementationOnce(() => move.promise)
+
+    const view = await mountWithNote()
+    await userEvent.click(screen.getByRole('button', { name: 'Markdown source' }))
+    rowAction('One', 'Rename note')
+    const field = await screen.findByRole('textbox', { name: 'Note name' })
+    await userEvent.clear(field)
+    await userEvent.type(field, 'Renamed{Enter}')
+    await waitFor(() => expect(api.moveNote).toHaveBeenCalledWith('v1', 'One.md', 'Renamed.md'))
+
+    // Type while the move is still in flight: `pathRef` still says One.md.
+    fireEvent.change(rawEditor(), { target: { value: 'typed during the move' } })
+    view.unmount()
+    // Nothing may be written to the path the move is vacating.
+    expect(api.saveNote).not.toHaveBeenCalled()
+
+    await act(async () => move.settle({ ok: true, path: 'Renamed.md' }))
+    // Once the move retargets `pathRef`, the edit goes to the NEW path. Both
+    // writes below target it: the flush, and then the move's own reopen, which
+    // goes through `openNote` and flushes the outgoing note first. That second
+    // write is relocate's pre-existing behaviour, not something teardown adds --
+    // it carries the same bytes to the same path and the backend refuses it on
+    // mtime. What matters, and what regressed before this fix, is that NEITHER
+    // of them is addressed to the path the move vacated.
+    expect(api.saveNote).toHaveBeenCalledWith('v1', 'Renamed.md', 'typed during the move', 4)
+    expect(api.saveNote).toHaveBeenCalledTimes(2)
+    expect(api.saveNote.mock.calls.every(c => c[1] === 'Renamed.md')).toBe(true)
+  })
+
   // ── panel ─────────────────────────────────────────────────────────────────
 
   it('drags the notes panel wider and remembers the width', async () => {
@@ -1085,12 +1246,16 @@ describe('MdNotebookPage — settings, guarded mutations and editor keys', () =>
 
     // The alert's presence IS the proof the Sync path consumed the rejection:
     // had the debounced autosave consumed it instead, runSync's setError(null)
-    // would have erased the banner before this query could see it. A saveNote
-    // call-count assertion would NOT be a stronger pin — earlier tests in this
-    // file leave real 1000ms debounce timers running past their own teardown,
-    // and one landing here inflates the shared mock's count nondeterministically.
+    // would have erased the banner before this query could see it.
     const alert = await screen.findByRole('alert', { timeout: 5_000 })
     expect(alert.textContent).toContain('no space left on device')
+    // And now the count, which #2964 could not assert: earlier tests in this
+    // file left real 1000ms debounce timers running past their own teardown, and
+    // one landing here inflated the shared mock nondeterministically. The page
+    // cancels that timer on unmount now, so exactly one save reached the mock —
+    // a stronger pin than the alert alone, because it rules out a second call
+    // having consumed the single staged rejection.
+    expect(api.saveNote).toHaveBeenCalledTimes(1)
   })
 
   it('reopens the open note when the change poll reports it was modified', async () => {

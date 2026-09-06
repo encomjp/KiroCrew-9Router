@@ -173,7 +173,11 @@ function BulkActions({ selectedIds, items, onDone }: { selectedIds: Set<string>;
   )
 }
 
-export default function KnowledgePage() {
+/** `embedded` — hosted as a pane inside Agent Capabilities' SidePanelLayout,
+ *  which already renders the tab's label + description as the pane header, so
+ *  the page's own title block would duplicate it. The Help affordance moves
+ *  into the internal tab strip instead of disappearing with the header. */
+export default function KnowledgePage({ embedded = false }: { embedded?: boolean } = {}) {
   const ime = useImeGuard()
   const queryClient = useQueryClient()
   const [tab, setTab] = useState<Tab>('list')
@@ -508,17 +512,19 @@ export default function KnowledgePage() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="flex items-start sm:items-end justify-between gap-3 sm:gap-4 px-4 md:px-6 pt-2 pb-3">
-        <div className="min-w-0">
-          <div className="text-xl sm:text-2xl font-bold tracking-tight text-text-strong flex items-center gap-2">
-            <BookOpen size={22} className="shrink-0" /> {i18nT('pages.knowledge.index.knowledge_library')}
+      {!embedded && (
+        <div className="flex items-start sm:items-end justify-between gap-3 sm:gap-4 px-4 md:px-6 pt-2 pb-3">
+          <div className="min-w-0">
+            <div className="text-xl sm:text-2xl font-bold tracking-tight text-text-strong flex items-center gap-2">
+              <BookOpen size={22} className="shrink-0" /> {i18nT('pages.knowledge.index.knowledge_library')}
+            </div>
+            <div className="text-muted text-[13px] sm:text-sm mt-1">{i18nT('pages.knowledge.index.search_explore_and_manage_your_knowledge_base')}</div>
           </div>
-          <div className="text-muted text-[13px] sm:text-sm mt-1">{i18nT('pages.knowledge.index.search_explore_and_manage_your_knowledge_base')}</div>
+          <div className="shrink-0">
+            <Btn onClick={() => setShowHelp(true)}><HelpCircle size={14} /> {i18nT('pages.knowledge.index.help')}</Btn>
+          </div>
         </div>
-        <div className="shrink-0">
-          <Btn onClick={() => setShowHelp(true)}><HelpCircle size={14} /> {i18nT('pages.knowledge.index.help')}</Btn>
-        </div>
-      </div>
+      )}
 
       {showHelp && (
         <Clickable className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50" onClick={e => { if (!e || e.target === e.currentTarget) setShowHelp(false) }}>
@@ -554,6 +560,11 @@ export default function KnowledgePage() {
             {TAB_ICON[t]} {i18nT(TAB_LABEL_KEY[t])}
           </button>
         ))}
+        {embedded && (
+          <span className="ml-auto self-center shrink-0 pb-0.5">
+            <Btn onClick={() => setShowHelp(true)}><HelpCircle size={14} /> {i18nT('pages.knowledge.index.help')}</Btn>
+          </span>
+        )}
       </div>
 
       <div className={`flex-1 px-4 md:px-6 py-4 min-h-0 ${tab === 'graph' ? 'flex flex-col' : 'overflow-y-auto'}`} ref={listContainerRef}>
@@ -671,19 +682,26 @@ export default function KnowledgePage() {
 
       {/* Stats bar */}
       {stats && (
+        // Each entry is a DIV, not a SPAN, so the render-time i18n scanner reads
+        // them as separate inline runs. Its run walk treats any <span> as inline
+        // by tag name even when flex blockifies it, so span siblings grade as one
+        // run assembled from several catalog keys — the signal for a sentence
+        // spliced across keys, which a translator cannot reorder. These are four
+        // independent counts, not one sentence, and as flex items they are
+        // already block-level; the tag is what says so. Rendering is unchanged.
         <div className="border-t border-border px-4 md:px-6 py-2 flex gap-x-3 gap-y-0.5 sm:gap-4 flex-wrap text-[11px] sm:text-[12px] text-muted shrink-0">
-          <span className="whitespace-nowrap">{stats.items} {i18nT('pages.knowledge.index.items_2')}</span>
-          <span className="whitespace-nowrap">{stats.entities} {i18nT('pages.knowledge.index.entities')}</span>
-          <span className="whitespace-nowrap">{stats.relations} {i18nT('pages.knowledge.index.relations')}</span>
-          <span className="whitespace-nowrap">{stats.sources} {i18nT('pages.knowledge.index.sources')}</span>
+          <div className="whitespace-nowrap">{i18nT('pages.knowledge.index.stats_items', { count: stats.items })}</div>
+          <div className="whitespace-nowrap">{i18nT('pages.knowledge.index.stats_entities', { count: stats.entities })}</div>
+          <div className="whitespace-nowrap">{i18nT('pages.knowledge.index.stats_relations', { count: stats.relations })}</div>
+          <div className="whitespace-nowrap">{i18nT('pages.knowledge.index.stats_sources', { count: stats.sources })}</div>
           {stats.embeddings?.enabled ? (
-            <span className={`whitespace-nowrap ${stats.embeddings.available ? 'text-ok' : 'text-warn'}`} title={stats.embeddings.available ? `${stats.embeddings.model} — ${stats.embeddings.embedded_items} embedded` : i18nT('pages.knowledge.index.embedding_model_loading', { name: stats.embeddings.model })}>
+            <div className={`whitespace-nowrap ${stats.embeddings.available ? 'text-ok' : 'text-warn'}`} title={stats.embeddings.available ? `${stats.embeddings.model} — ${stats.embeddings.embedded_items} embedded` : i18nT('pages.knowledge.index.embedding_model_loading', { name: stats.embeddings.model })}>
               ● {stats.embeddings.available ? i18nT('pages.knowledge.index.embeddings_count', { value: stats.embeddings.embedded_items }) : i18nT('pages.knowledge.index.embeddings_loading')}
-            </span>
+            </div>
           ) : (
-            <span className="text-muted whitespace-nowrap" title={i18nT('pages.knowledge.index.embedding_model_is_downloading_in_the_background')}>{i18nT('pages.knowledge.index.embeddings_initializing')}</span>
+            <div className="text-muted whitespace-nowrap" title={i18nT('pages.knowledge.index.embedding_model_is_downloading_in_the_background')}>{i18nT('pages.knowledge.index.embeddings_initializing')}</div>
           )}
-          {tab === 'list' && <span className="ml-auto text-[10px] hidden sm:inline">{i18nT('pages.knowledge.index.to_search_esc_to_back_to_page')}</span>}
+          {tab === 'list' && <div className="ml-auto text-[10px] hidden sm:block">{i18nT('pages.knowledge.index.to_search_esc_to_back_to_page')}</div>}
         </div>
       )}
     </div>

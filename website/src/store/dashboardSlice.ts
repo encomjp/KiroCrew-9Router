@@ -199,6 +199,13 @@ const dashboardSlice = createSlice({
         state.updateProgress = action.payload.update_progress
       }
     },
+    // A slots frame carries only the live YOLO boolean, not a status snapshot.
+    // Keep the last authoritative status intact so fields such as yolo_duration
+    // remain available to the approval-mode confirmation copy.
+    sseYolo(state, action: PayloadAction<boolean>) {
+      if (state.status) state.status.yolo = action.payload
+      state.approvalMode = action.payload ? 'yolo' : (state.approvalMode === 'yolo' ? 'normal' : state.approvalMode)
+    },
     sseConnected(state) { state.connected = true; state.slotsLoaded = false; state.subagentRunning = {}; state.subagentDetails = {}; state.subagentText = {} },
     sseDisconnected(state) { state.connected = false },
     sseSlots(state, action: PayloadAction<ChatSlot[]>) {
@@ -436,7 +443,7 @@ const dashboardSlice = createSlice({
   },
 })
 
-export const { sseStatus, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
+export const { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, setSidebarOrder, sseTodoUpdate, touchSlotActivity, setChannelTrusted, sseSlotTitle, addSlotOptimistic, removeSlotOptimistic, updateSlot, updateSlotFolder, updateSlotPin, triggerRefresh, markSlotUnread, markSlotRead, setUpdateProgress,
   setDesktopUpdateAvailable, sseSubagentStatus, sseSubagentText, sseSlotColor, setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity, setEnabledAppIds, patchSlotSourceLinks, patchSlotLink } = dashboardSlice.actions
 
 /**

@@ -152,7 +152,8 @@ explicitly sets an OTLP endpoint.**
   key through `PATCH /api/config/kirocrew` (`telemetry.enabled` is in
   `_EDITABLE_CONFIG`). That route refuses `true` with **HTTP 409** when
   `telemetry.otlp_endpoint` is set: `_build_recorder` attaches an OTLP reader
-  whenever an endpoint is configured, so enabling from a switch offered as
+  whenever the active telemetry provider supplies a destination — which the public
+  default does for any non-empty endpoint — so enabling from a switch offered as
   local-only would start network egress. The endpoint is chosen in the config
   file, so that is where enabling on such a host is done. Disabling is always
   allowed — a narrower local choice always composes. An unreadable config also
@@ -171,10 +172,41 @@ lifecycle & threading"). The gateway process is where the session/turn/HTTP
 metrics are recorded; other kirocrew processes pick the value up on their own
 recheck or at their next start.
 
-**External OTLP egress (opt-in, off by default):** setting `otlp_endpoint` adds a
-second `PeriodicExportingMetricReader` alongside the local JSONL sink
-(`provider._build_otlp_reader`). Install support with
-`pip install "kirocrew[otlp]"`. If the endpoint is set but the package extra is
+**External OTLP egress (opt-in, off by default):** egress destinations are
+**pluggable**. `_build_recorder` asks the active `TelemetryProvider` for them via
+`otlp_destinations(cfg)` and attaches one `PeriodicExportingMetricReader` per
+returned destination that names the `"metrics"` signal (`provider._otlp_destinations`
+resolves, `provider._build_otlp_reader` builds one reader). The public
+`DefaultTelemetryProvider` turns a non-empty `otlp_endpoint` into exactly one
+destination and returns none when it is empty, so a standalone build behaves as it
+did when this module constructed that exporter itself. Readers are appended AFTER
+the local JSONL sink, so an edition can add destinations but can never remove or
+replace the sink the dashboard reads, and it supplies no cadence — the export
+interval stays `telemetry.export_interval_seconds`.
+
+A destination carries `name` (a non-secret label used in logs, because the
+endpoint value never is), `endpoint`, `signals`, and optionally an
+authenticated `session`. The session is why the seam exists: `requests`
+re-evaluates `Session.auth` per request, so a credential that rotates during
+process lifetime (an OIDC/SSO id_token, STS credentials) is re-read on every
+export, where `OTEL_EXPORTER_OTLP_HEADERS` — the only injection point before this
+seam — freezes into the exporter's session at construction and starts returning
+401 once it rotates. Static per-destination headers ride on `Session.headers` and
+need no field of their own.
+
+The method must be cheap and side-effect-free per call: it is read once per
+recorder build AND on every egress-posture read (the Privacy panel's status, and
+each `telemetry.enabled` config write), so an edition must build its transport
+once rather than acquiring a credential inside it.
+
+Filtering is deny-by-default: a destination with an empty `endpoint`, or one aimed
+at a signal this core does not emit, is dropped rather than trusted. A provider
+that raises contributes nothing and is reported at WARNING, and telemetry keeps
+working local-only; the same is true when the platform context cannot be composed,
+because for an egress seam "no destinations" is the closed state.
+
+Install support with `pip install "kirocrew[otlp]"`. If a destination is supplied
+but the package extra is
 not installed, telemetry
 degrades to local-only with a warning instead of crashing. The OTLP exporter
 sees the same data points as the local sink: the `MetricsRecorder` facade
@@ -251,7 +283,7 @@ presence without the endpoint string),
 | Metric | Type | Attrs | Site |
 |--------|------|-------|------|
 | `kirocrew.session.startup.duration` | histogram (ms) | `outcome` (`ready` / `auth_required` / `error`), `spawned` (bool), `backend` (`kiro`) + `phase` (`total` / `spawn_init` / `session_new` / `session_load` / `set_model`), `channel` (conversation source), `resumed` (bool) on the kiro path | Two sites. **claude**: `acp/client.py::AcpClient.ensure_ready()` — times cold-start (spawn + session init) and emits in a `finally` so every exit path is measured, with no `phase` attr. **kiro** (default): `providers/acp.py::_emit_kiro_startup_metric` — one `phase=total` point PLUS one point per internal phase; `spawned` is unconditionally `True` because `_start_kiro_runtime_impl` always spawns a fresh runtime (the warm fast-path returns before reaching either site and is NOT measured). `outcome` defaults to `"error"` so an unexpected exception is never mislabeled `"ready"`. Consumers MUST treat only the end-to-end point (`phase` absent or `total`) as a startup — the phase points are components of one startup. `channel` comes from `messaging.link::telemetry_channel_of`, a closed label set (an unrecognised key classifies as `other`, never the key itself) answering WHICH surface paid the cost; `resumed` separates the `session/load` path from `session/new`. `session_load` is recorded only when a resume was attempted, and `session_new` only when `create_session` actually ran, so a resumed startup never reports a near-zero `session_new`. |
-| `kirocrew.session.pool.decision` | counter | `outcome` (`hit` / `miss_empty` / `bypass_resume` / `bypass_stateless` / `bypass_cwd` / `bypass_env` / `disabled` / `other`), `channel` | `session.py::SessionManager._record_pool_decision`, one point per `get_or_create` warm-pool decision. Exactly one reason is reported per decision — the disqualifiers form a disjunction, so branch order picks the reported reason, not the outcome. Deliberately a counter rather than an attribute on the startup histogram: "was the pool used" and "how long did startup take" are separate questions, and crossing them would multiply every phase series. `bypass_resume` quantifies how often a `resume_sid` disqualifies a session from the pool. Values are pinned by `session.POOL_DECISIONS`. |
+| `kirocrew.session.pool.decision` | counter | `outcome` (`hit` / `miss_empty` / `bypass_resume` / `bypass_stateless` / `bypass_cwd` / `bypass_effort` / `bypass_env` / `disabled` / `other`), `channel` | `session.py::SessionManager._record_pool_decision`, one point per `get_or_create` warm-pool decision. Exactly one reason is reported per decision — the disqualifiers form a disjunction, so branch order picks the reported reason, not the outcome. Deliberately a counter rather than an attribute on the startup histogram: "was the pool used" and "how long did startup take" are separate questions, and crossing them would multiply every phase series. `bypass_resume` quantifies how often a `resume_sid` disqualifies a session from the pool. Values are pinned by `session.POOL_DECISIONS`. |
 | `kirocrew.session.resume.outcome` | counter | `outcome` (`loaded` / `fallback_replay` / `no_session_file`), `channel` | `providers/acp.py::_emit_kiro_startup_metric`, emitted only when a resume was attempted. Distinguishes a lossless native resume from the degraded fallback (fresh `session/new` plus history replay on the Kiro Crew side, taken when `session/load` exhausts `_RESUME_MAX_ATTEMPTS` against a stale lock) and from a resume skipped because the session file was gone. |
 | `kirocrew.turn.duration` | histogram (ms) | `outcome` (`ok` / `timeout` / `tool_stall` / `stale_recover` / `stall_exhausted` / `error`), `session_source` (via `validation.infer_use_case`) | `dashboard/chat_runner.py::_emit_turn_metric`, called at EVENT_COMPLETE after `persist_token_record_async`. `_turn_outcome` maps stop_reason (`""`/`end_turn`/`stop`/`completed` → ok; the two watchdog stop reasons map to their own outcomes — checked BEFORE the `timeout` substring — so a recovered stall is never counted as a generic fault and the stall population stays visible; a stall arriving with its 3-attempt recovery budget already spent, or on a NESTED turn (`_prompt_depth > 0`, which the recovery branches never re-queue — it dies with "please retry"), labels `stall_exhausted` instead — the emit site reads the slot budgets and the depth — which IS a terminal fault to the aggregator, so the recovered-stall exclusion cannot hide a session that dies needing user action). One histogram powers turn latency p50/p90 AND fault rate. The value is `duration_ms or elapsed_ms`: the acp provider always reports `TurnUsage.duration_ms == 0` (only claude_code fills it), so the caller must pass the locally measured wall clock as `elapsed_ms` or nothing is ever emitted. A still-zero value skips the emit deliberately — absence renders as "no data", whereas a recorded 0 would render as a plausible 0ms p50. **What it measures:** the wall clock starts at turn start, so a turn parked on an interactive tool-approval prompt counts operator thinking time. No finer-grained source exists on the acp path, so this is "turn wall-clock", not pure model latency — a high p90 can mean slow approvals rather than a slow model. |
 | `kirocrew.watchdog.action` | counter | `action` (`deferral` / `probe` / `cancel`), `verdict` (`working` / `dead` / `unknown` / `stuck_input`), `evidence_class` (`established_flat` / `mcp_flat` / `shell` / `shell_absent` / `wait` / `degraded`), `window` (`narrowed` / `extended` / `standard`), `agent_override` (bool) | `acp/session_handle.py::AcpSessionHandle._emit_watchdog_metric`, one point per watchdog DECISION in `_dispatch_events`: `deferral` from `_log_working_deferral` (rides its 10-min rate limit, so an hours-long WORKING build contributes a bounded handful of points, not one per tick), `probe` at the stale-probe send, `cancel` before `_end_stalled_tool`. `evidence_class` is `_watchdog_evidence_class` — a prefix/shape bucket of the free-form oracle evidence (pids/deltas/commands never emitted). `window` encodes the effective window selection: `narrowed` = a tool-branch evidence TAG reduced the suspect window below the build-scale default (1h) — `established_flat` to the model-silent budget (minutes), `shell_absent` to the ordinary silence budget (`stale_window_secs`, 300s) because the shell command has no process to its name; `extended` = model-wait-branch `established_flat` extended the stale window from 300s (`stale_window_secs`) to 900s (`model_silent_probe_secs`) for a non-streamed server-side think; `standard` = ordinary window in all other cases. `agent_override` is the per-agent watchdog-override BOOLEAN from the `WatchdogSettings` snapshot — deliberately NOT the agent name (free-form ⇒ cardinality bomb; per-agent joins happen via the row store's `agent` + `stop_reason` fields below). Guardrail query: `action=cancel, evidence_class=mcp_flat, window=standard` must not increase — the narrowed window may only affect `established_flat` and `shell_absent`. |
@@ -267,7 +299,7 @@ presence without the endpoint string),
 
 | `kirocrew.process.threads.python` | gauge | — | `metrics/process_gauges.py::register_process_gauges`, callbacks run only at reader collection (no polling threads). `threading.active_count()`. |
 | `kirocrew.process.threads.os` | gauge | — | Same module; `platform_compat.process_thread_count(os.getpid())` — OS-level count that catches native pools (ggml, grpc) invisible to `threading`. Linux-only; None elsewhere (gap, not zero). |
-| `kirocrew.process.open_fds` | gauge | — | Same module; `/proc/self/fd` or `/dev/fd` entry count minus the enumeration fd. |
+| `kirocrew.process.open_fds` | gauge | — | Same module; delegates to `platform_compat.count_open_fds` (shared with gatewayd's zombie-diagnostic `fd_count`): `/proc/self/fd` or `/dev/fd` entry count minus the enumeration fd; Windows reports the kernel handle count (platform-dependent semantics). |
 | `kirocrew.process.memory.rss_bytes` / `.peak_rss_bytes` | gauge (By) | — | Same module; delegate to `platform_compat.proc_rss_bytes` (current) / `proc_peak_rss_bytes` (high-water mark), both cross-platform. A 0 return maps to None: gap, never a fake zero sample. |
 | `kirocrew.process.cpu.seconds` | counter (s) | — | Same module; `platform_compat.proc_cpu_seconds` cumulative user+system CPU, exported CUMULATIVE (rebuild-idempotent; see exporter row). |
 | `kirocrew.process.gc.collections` / `.collected` / `.uncollectable` | counter | `generation` (`0`/`1`/`2`) | Same module; `gc.get_stats()` per generation. Rules GC in/out of a leak diagnosis (rising uncollectable = reference cycles; flat collected with rising RSS = native leak). |

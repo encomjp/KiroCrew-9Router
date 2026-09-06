@@ -637,7 +637,7 @@ class TestAcpClientSessionKey:
         with (
             patch(
                 "kiro_crew.acp.client._resolve_claude_acp_bin",
-                return_value=["/usr/bin/node", "/x/acp.js"],
+                return_value=(["/usr/bin/node", "/x/acp.js"], ""),
             ),
             patch(
                 "kiro_crew.acp.client.wrap_argv",
@@ -660,6 +660,93 @@ class TestAcpClientSessionKey:
             assert env["CLAUDE_CONFIG_DIR"] == iso
             # Bedrock flag must ride alongside (regression guard).
             assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+
+        await _stop_stderr_drain(client)
+
+    @pytest.mark.asyncio
+    async def test_spawn_gives_each_process_its_own_browser_session(self, tmp_path):
+        """Two agent processes must not address the same playwright-cli browser.
+
+        Sharing the CLI's ``default`` session lets one process navigate or close
+        the other's page; the name is per PROCESS, so two spawns differ even for
+        the same session key (a pooled process is spawned before it is claimed).
+        """
+        names = []
+        caller_sockets = str(tmp_path / "caller-controlled-sockets")
+        caller_daemons = str(tmp_path / "caller-controlled-daemons")
+
+        def _lifecycle_env(resolved_env):
+            assert resolved_env.get("PWTEST_SOCKETS_DIR") != caller_sockets
+            assert resolved_env.get("PWTEST_DAEMON_SESSION_DIR") != caller_daemons
+            assert resolved_env["PLAYWRIGHT_CLI_SESSION"].startswith("kc-")
+            return {}
+
+        for _ in range(2):
+            client = AcpClient(
+                work_dir=tmp_path,
+                session_key="same-key",
+                extra_env={
+                    "PWTEST_SOCKETS_DIR": caller_sockets,
+                    "PWTEST_DAEMON_SESSION_DIR": caller_daemons,
+                },
+            )
+            with (
+                patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
+                patch(
+                    "kiro_crew.acp.client.wrap_argv",
+                    return_value=(["/usr/bin/kiro-cli", "acp"], None),
+                ),
+                patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+                patch("kiro_crew.acp.client.browser_socket_env", side_effect=_lifecycle_env),
+                patch("kiro_crew.session._track_pid"),
+                patch("kiro_crew.session._track_session_pid"),
+            ):
+                mock_proc = MagicMock()
+                mock_proc.pid = 12345
+                mock_proc.returncode = None
+                mock_exec.return_value = mock_proc
+
+                await client._spawn()
+
+                call_kwargs = mock_exec.call_args
+                env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
+                assert env is not None
+                assert env["PLAYWRIGHT_CLI_SESSION"].startswith("kc-")
+                names.append(env["PLAYWRIGHT_CLI_SESSION"])
+
+            await _stop_stderr_drain(client)
+
+        assert names[0] != names[1]
+
+    @pytest.mark.asyncio
+    async def test_spawn_keeps_an_operator_set_browser_session(self, tmp_path, monkeypatch):
+        """An operator who named a session means that one browser."""
+        monkeypatch.setenv("PLAYWRIGHT_CLI_SESSION", "chrome")
+        monkeypatch.delenv("PWTEST_SOCKETS_DIR", raising=False)
+        monkeypatch.delenv("PWTEST_DAEMON_SESSION_DIR", raising=False)
+        client = AcpClient(work_dir=tmp_path, session_key="k")
+        with (
+            patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
+            patch(
+                "kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/kiro-cli", "acp"], None)
+            ),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.pid = 12345
+            mock_proc.returncode = None
+            mock_exec.return_value = mock_proc
+
+            await client._spawn()
+
+            call_kwargs = mock_exec.call_args
+            env = call_kwargs.kwargs.get("env") or call_kwargs[1].get("env")
+            assert env is not None
+            assert env["PLAYWRIGHT_CLI_SESSION"] == "chrome"
+            assert "PWTEST_SOCKETS_DIR" not in env
+            assert "PWTEST_DAEMON_SESSION_DIR" not in env
 
         await _stop_stderr_drain(client)
 
@@ -815,6 +902,87 @@ class TestSpawnStderrDrainCleanup:
         assert task.cancelled() or task.exception() is not None
 
 
+@pytest.mark.asyncio
+async def test_unbound_client_session_cwd_is_the_spawn_pathname(tmp_path):
+    """Off macOS nothing binds, so there is no descriptor to re-verify."""
+    client = AcpClient(work_dir=tmp_path)
+
+    assert client._bound_workspace_fd is None
+    assert await client._session_work_dir() == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_bound_client_session_cwd_is_read_off_the_descriptor(tmp_path, monkeypatch):
+    """The sibling of AcpRuntime._session_work_dir: same rule, same reason.
+
+    session/new and session/load carry a cwd STRING the peer re-resolves, so the
+    bind-time spelling -- the one a symlink swap controls -- is re-verified and
+    replaced with the descriptor's own name before it is handed over.
+    """
+    client = AcpClient(work_dir=tmp_path)
+    client._bound_workspace_fd = 81
+    client._spawn_work_dir = str(tmp_path)
+    target = AsyncMock(return_value="/canonical/workspace")
+    monkeypatch.setattr(acp_client, "resolve_bound_session_workspace", target)
+
+    assert await client._session_work_dir() == "/canonical/workspace"
+    target.assert_awaited_once_with(81, str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_bound_client_session_cwd_fails_rather_than_handing_over_the_spelling(
+    tmp_path, monkeypatch
+):
+    """A workspace that no longer names the bound identity is not a fallback."""
+    client = AcpClient(work_dir=tmp_path)
+    client._bound_workspace_fd = 82
+    client._spawn_work_dir = str(tmp_path)
+    monkeypatch.setattr(
+        acp_client,
+        "resolve_bound_session_workspace",
+        AsyncMock(side_effect=acp_client.BoundWorkspaceMismatch("not-bound")),
+    )
+
+    with pytest.raises(AcpError, match="exact workspace"):
+        await client._session_work_dir()
+
+
+@pytest.mark.asyncio
+async def test_bound_client_session_cwd_fails_when_the_name_cannot_be_read(tmp_path, monkeypatch):
+    """Fail closed, for the same reason bound_agent_workspace_target raises."""
+    client = AcpClient(work_dir=tmp_path)
+    client._bound_workspace_fd = 83
+    client._spawn_work_dir = str(tmp_path)
+    monkeypatch.setattr(
+        acp_client,
+        "resolve_bound_session_workspace",
+        AsyncMock(side_effect=OSError("no F_GETPATH here")),
+    )
+
+    with pytest.raises(AcpError, match="Cannot verify"):
+        await client._session_work_dir()
+
+
+@pytest.mark.asyncio
+async def test_failed_live_spawn_cleanup_releases_workspace_when_kill_is_cancelled(tmp_path):
+    client = AcpClient(work_dir=tmp_path)
+    client._bound_workspace_fd = 74
+    client._spawn_work_dir = "/dev/fd/74"
+    client._kill_process = AsyncMock(side_effect=asyncio.CancelledError())
+    released: list[int] = []
+
+    async def record_release(descriptor):
+        released.append(descriptor)
+
+    with patch("kiro_crew.acp.client.release_bound_agent_workspace", side_effect=record_release):
+        with pytest.raises(asyncio.CancelledError):
+            await client._cleanup_failed_live_spawn()
+
+    assert released == [74]
+    assert client._bound_workspace_fd is None
+    assert client._spawn_work_dir == str(tmp_path)
+
+
 class TestAcpClientBackendSelection:
     """Verify the right backend binary is launched for kiro vs claude."""
 
@@ -848,7 +1016,10 @@ class TestAcpClientBackendSelection:
         with (
             patch(
                 "kiro_crew.acp.client._resolve_claude_acp_bin",
-                return_value=["/usr/local/bin/node", "/usr/local/lib/claude-agent-acp/index.js"],
+                return_value=(
+                    ["/usr/local/bin/node", "/usr/local/lib/claude-agent-acp/index.js"],
+                    "",
+                ),
             ),
             patch("kiro_crew.acp.client._resolve_kiro_bin", return_value="/usr/bin/kiro-cli"),
             patch(
@@ -878,58 +1049,53 @@ class TestAcpClientBackendSelection:
     async def test_spawn_claude_backend_missing_bin_raises(self, tmp_path):
         client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
         with (
-            patch("kiro_crew.acp.client._resolve_claude_acp_bin", return_value=None),
+            patch("kiro_crew.acp.client._resolve_claude_acp_bin", return_value=(None, "")),
             patch("asyncio.create_subprocess_exec", new_callable=AsyncMock),
         ):
             with pytest.raises(AcpError, match="claude-agent-acp not found"):
                 await client._spawn()
 
     @pytest.mark.asyncio
-    async def test_spawn_opencode_backend_is_not_wrapped_as_kiro_cli(self, tmp_path):
-        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
-        client._write_opencode_provider_config = MagicMock()
-        with (
-            patch("kiro_crew.acp.client._resolve_opencode_bin", return_value=["/usr/bin/opencode"]),
-            patch("kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)) as wrap,
-            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
-            patch("kiro_crew.session._track_pid"),
-            patch("kiro_crew.session._track_session_pid"),
-        ):
-            mock_proc = MagicMock()
-            mock_proc.pid = 12345
-            mock_proc.returncode = None
-            mock_proc.stderr = None
-            mock_exec.return_value = mock_proc
+    async def test_spawn_claude_missing_bin_reports_the_cached_search_path(
+        self, tmp_path, monkeypatch
+    ):
+        searched = os.pathsep.join((str(tmp_path / "node-bin"), str(tmp_path / "npm-bin")))
+        later = str(tmp_path / "later-path")
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_CLAUDE)
+        with patch(
+            "kiro_crew.acp.client._resolve_claude_acp_bin",
+            return_value=(None, searched),
+        ) as resolve:
+            with pytest.raises(AcpError) as first:
+                await client._spawn()
 
-            await client._spawn()
+            monkeypatch.setenv("PATH", later)
+            with pytest.raises(AcpError) as second:
+                await client._spawn()
 
-        assert wrap.call_args.kwargs["is_kiro_cli"] is False
+        resolve.assert_called_once_with()
+        for error in (str(first.value), str(second.value)):
+            assert str(tmp_path / "node-bin") in error
+            assert str(tmp_path / "npm-bin") in error
+            assert later not in error
 
     @pytest.mark.asyncio
-    async def test_spawn_opencode_backend_isolates_user_config(self, tmp_path):
-        """OpenCode spawn must set OPENCODE_CONFIG_CONTENT to suppress user
-        plugins and MCP servers that would stall the ACP session."""
-        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
-        client._write_opencode_provider_config = MagicMock()
+    async def test_spawn_kiro_missing_bin_reports_only_resolver_search_dirs(self, tmp_path):
+        searched = [str(tmp_path / "managed-bin"), str(tmp_path / "path-bin")]
+        unsearched = str(tmp_path / "never-checked")
+        client = AcpClient(work_dir=tmp_path)
         with (
-            patch("kiro_crew.acp.client._resolve_opencode_bin", return_value=["/usr/bin/opencode"]),
-            patch("kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)),
-            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
-            patch("kiro_crew.session._track_pid"),
-            patch("kiro_crew.session._track_session_pid"),
+            patch("kiro_crew.acp.client._resolve_kiro_bin", return_value=None),
+            patch("kiro_crew.acp.client.known_kiro_cli_dirs", return_value=searched),
         ):
-            mock_proc = MagicMock()
-            mock_proc.pid = 12345
-            mock_proc.returncode = None
-            mock_proc.stderr = None
-            mock_exec.return_value = mock_proc
+            with pytest.raises(AcpError) as raised:
+                await client._spawn()
 
-            await client._spawn()
-
-        spawn_env = mock_exec.call_args.kwargs.get("env", {})
-        assert spawn_env.get("HOME", "").endswith("kirocrew-customapi/opencode-home"), (
-            "OpenCode spawn must set HOME to an isolated directory"
-        )
+        error = str(raised.value)
+        assert "searched 2 directories" in error
+        assert searched[0] in error
+        assert searched[1] in error
+        assert unsearched not in error
 
     @pytest.mark.asyncio
     async def test_spawn_kiro_backend_unchanged(self, tmp_path):
@@ -961,7 +1127,7 @@ class TestAcpClientBackendSelection:
 
     @pytest.mark.asyncio
     async def test_initialize_protocol_version_per_backend(self, tmp_path):
-        """Kiro expects a date string; Claude and OpenCode expect an integer."""
+        """kiro expects a date string; claude-agent-acp expects an integer."""
         from kiro_crew.acp.client import (
             PROTOCOL_VERSION,
             PROTOCOL_VERSION_CLAUDE,
@@ -981,7 +1147,7 @@ class TestAcpClientBackendSelection:
                     _sent.update(params)
                 return 1
 
-            async def fake_wait(_req_id, timeout=0):
+            async def fake_wait(_req_id, timeout=0, *, method="", expected_mcp=None):
                 return {"protocolVersion": expected, "agentCapabilities": {}}
 
             client._send_request = fake_send_request  # type: ignore[assignment]
@@ -1009,9 +1175,9 @@ class TestResolveClaudeAcpBin:
         bin_path.chmod(0o755)
         monkeypatch.setenv("CLAUDE_AGENT_ACP_BIN", str(bin_path))
         monkeypatch.setattr(client_mod, "_mise_which", lambda tool: None)
-        result = _resolve_claude_acp_bin()
-        assert result is not None
-        assert str(bin_path) in result
+        argv, _search_path = _resolve_claude_acp_bin()
+        assert argv is not None
+        assert str(bin_path) in argv
 
     @_POSIX_EXEC_PATHS_ONLY
     def test_path_lookup(self, tmp_path, monkeypatch):
@@ -1031,9 +1197,9 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: str(bin_path) if name == "claude-agent-acp" else None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result is not None
-        assert str(bin_path) in result
+        argv, _search_path = client_mod._resolve_claude_acp_bin()
+        assert argv is not None
+        assert str(bin_path) in argv
 
     @_POSIX_EXEC_PATHS_ONLY
     def test_mise_which_preferred(self, tmp_path, monkeypatch):
@@ -1054,8 +1220,8 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result == [str(script)]
+        argv, _search_path = client_mod._resolve_claude_acp_bin()
+        assert argv == [str(script)]
 
     @_POSIX_EXEC_PATHS_ONLY
     def test_mise_installed_script_resolves_node(self, tmp_path, monkeypatch):
@@ -1082,8 +1248,8 @@ class TestResolveClaudeAcpBin:
         monkeypatch.setenv("CLAUDE_AGENT_ACP_BIN", str(script))
         monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
         monkeypatch.setattr(client_mod, "_mise_which", lambda tool: None)
-        result = _resolve_claude_acp_bin()
-        assert result == [str(node_bin), str(script.resolve())]
+        argv, _search_path = _resolve_claude_acp_bin()
+        assert argv == [str(node_bin), str(script.resolve())]
 
     def test_non_executable_script_falls_back_to_path_node(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
@@ -1110,8 +1276,8 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: str(node_bin) if name == "node" else None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result == [str(node_bin), str(script.resolve())]
+        argv, _search_path = client_mod._resolve_claude_acp_bin()
+        assert argv == [str(node_bin), str(script.resolve())]
 
     @_POSIX_EXEC_PATHS_ONLY
     def test_mise_glob_fallback(self, tmp_path, monkeypatch):
@@ -1136,8 +1302,8 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result == [str(node_bin), str(acp_script.resolve())]
+        argv, _search_path = client_mod._resolve_claude_acp_bin()
+        assert argv == [str(node_bin), str(acp_script.resolve())]
 
     def test_returns_none_when_not_found(self, tmp_path, monkeypatch):
         from kiro_crew.acp import client as client_mod
@@ -1153,8 +1319,9 @@ class TestResolveClaudeAcpBin:
             "which",
             lambda name, path=None: None,
         )
-        result = client_mod._resolve_claude_acp_bin()
-        assert result is None
+        argv, search_path = client_mod._resolve_claude_acp_bin()
+        assert argv is None
+        assert search_path == client_mod.augmented_path(os.environ.get("PATH", ""))
 
 
 class TestResolveClaudeCodeExecutable:
@@ -2194,33 +2361,6 @@ class TestAcpClientTrackUsageUpdate:
         assert stats.context_window_tokens == 200000
         # A real usage_update marks the counts authoritative.
         assert stats.context_tokens_from_usage is True
-
-    def test_sdk_200k_default_overridden_for_known_1m_router_model(self, tmp_path):
-        """Fork: claude-agent-acp reports its 200K default for router models it
-        does not know (deepseek-v4-flash serves at 1M). A known model's usage
-        update must prefer the central registry window over the SDK default so
-        the context meter does not read 200K for a 1M model."""
-        client = AcpClient(work_dir=tmp_path)
-        client._model = "cmc/deepseek-v4-flash"
-        client._resolved_model_id = "deepseek-v4-flash"
-        client._track_usage_update(self._usage_msg(100_000, 200_000))
-        stats = client.last_prompt_stats
-        # 100K of a 1M window → 10%, not 50% of a false 200K.
-        assert stats.context_window_tokens == 1_000_000
-        assert stats.context_pct == 10.0
-        assert stats.context_used_tokens == 100_000
-        assert stats.context_tokens_from_usage is True
-
-    def test_unknown_model_keeps_sdk_window(self, tmp_path):
-        """A model the registry does not know keeps the SDK-reported window —
-        the override must never invent a window."""
-        client = AcpClient(work_dir=tmp_path)
-        client._model = "cmc/unknown-model"
-        client._resolved_model_id = "unknown-model"
-        client._track_usage_update(self._usage_msg(50_000, 200_000))
-        stats = client.last_prompt_stats
-        assert stats.context_window_tokens == 200_000
-        assert stats.context_pct == 25.0
 
     def test_metadata_pct_does_not_clobber_authoritative_tokens(self, tmp_path):
         """Regression: a real usage_update (408K/1000K → 40.8%) followed by a
@@ -3345,6 +3485,42 @@ class TestEnsureReadyRetryOnAcpError:
         assert client._session_id == "sess-ok"
         client._kill_process.assert_called_once_with(force=True)
 
+    @pytest.mark.asyncio
+    async def test_cancel_during_retry_kill_releases_bound_workspace(self, tmp_path, monkeypatch):
+        client = AcpClient(work_dir=tmp_path)
+        kill_entered = asyncio.Event()
+        released: list[int] = []
+
+        async def fake_spawn():
+            client._process = MagicMock(returncode=None, pid=123)
+            client._bound_workspace_fd = 77
+            client._spawn_work_dir = "/dev/fd/77"
+
+        async def fake_init():
+            raise AcpError("init failed")
+
+        async def stalled_kill(*, force=False):
+            kill_entered.set()
+            await asyncio.Event().wait()
+
+        async def record_release(descriptor):
+            released.append(descriptor)
+
+        client._spawn = fake_spawn
+        client._initialize_session = fake_init
+        client._kill_process = stalled_kill
+        monkeypatch.setattr(acp_client, "release_bound_agent_workspace", record_release)
+
+        task = asyncio.create_task(client.ensure_ready())
+        await kill_entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert released == [77]
+        assert client._bound_workspace_fd is None
+        assert client._spawn_work_dir == str(tmp_path)
+
 
 class TestEnsureReadyRecreatesWorkDir:
     @pytest.mark.asyncio
@@ -3420,7 +3596,9 @@ class TestDeriveEditDiff:
     def test_create_content_becomes_addition_diff(self):
         from kiro_crew.acp._dispatch import derive_edit_diff
 
-        diff = derive_edit_diff({"path": "/a/new.py", "command": "create", "fileText": "x = 1\ny = 2\n"})
+        diff = derive_edit_diff(
+            {"path": "/a/new.py", "command": "create", "fileText": "x = 1\ny = 2\n"}
+        )
         assert "+x = 1" in diff
         assert "+y = 2" in diff
         assert "+++ /a/new.py" in diff
@@ -3447,8 +3625,16 @@ class TestDeriveEditDiff:
         letting a TypeError out of difflib abort the whole dispatch mid-turn."""
         from kiro_crew.acp._dispatch import derive_edit_diff
 
-        assert derive_edit_diff({"path": 42, "command": "strReplace", "oldStr": "a", "newStr": "b"}) == ""
-        assert derive_edit_diff({"path": "/a/b", "command": "strReplace", "oldStr": {"x": 1}, "newStr": "b"}) == "--- /a/b\n+++ /a/b\n@@ -0,0 +1 @@\n+b"
+        assert (
+            derive_edit_diff({"path": 42, "command": "strReplace", "oldStr": "a", "newStr": "b"})
+            == ""
+        )
+        assert (
+            derive_edit_diff(
+                {"path": "/a/b", "command": "strReplace", "oldStr": {"x": 1}, "newStr": "b"}
+            )
+            == "--- /a/b\n+++ /a/b\n@@ -0,0 +1 @@\n+b"
+        )
         assert derive_edit_diff({"path": ["/a"], "command": "create", "fileText": "x"}) == ""
         assert derive_edit_diff({"path": "/a/b", "command": "create", "fileText": 7}) == ""
 
@@ -4329,7 +4515,7 @@ class TestInitializeSession:
             2: {"sessionId": "sess-abc"},
         }
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             return responses.get(req_id, {})
 
         client._wait_for_response = AsyncMock(side_effect=fake_wait)
@@ -4358,7 +4544,7 @@ class TestInitializeSession:
             2: {"modes": ["chat"]},  # load success
         }
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             return responses.get(req_id, {})
 
         client._wait_for_response = AsyncMock(side_effect=fake_wait)
@@ -4386,7 +4572,7 @@ class TestInitializeSession:
 
         call_idx = [0]
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             call_idx[0] += 1
             if call_idx[0] == 1:
                 return {"protocolVersion": "2025-08-22", "agentCapabilities": {"loadSession": True}}
@@ -4418,7 +4604,7 @@ class TestInitializeSession:
 
         call_idx = [0]
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             call_idx[0] += 1
             if call_idx[0] == 1:
                 return {"protocolVersion": "2025-08-22", "agentCapabilities": {"loadSession": True}}
@@ -4440,7 +4626,7 @@ class TestInitializeSession:
 
         send_calls = []
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             if req_id == 1:
                 return {"protocolVersion": "2025-08-22", "agentCapabilities": {}}
             if req_id == 2:
@@ -4471,7 +4657,7 @@ class TestInitializeSession:
 
         send_calls = []
 
-        async def fake_wait(req_id, timeout=50.0):
+        async def fake_wait(req_id, timeout=50.0, *, method="", expected_mcp=None):
             if req_id == 1:
                 return {"protocolVersion": "2025-08-22", "agentCapabilities": {}}
             if req_id == 2:
@@ -5463,8 +5649,46 @@ class TestBuildPermissionEvent:
         )
         event = client._build_permission_event(msg)
         assert "rm -rf" in event.tool_input
-        # Cache consumed
-        assert "tc-6" not in client._tool_call_inputs
+        # Retained through same-call re-prompts; per-turn clear owns cleanup.
+        assert "tc-6" in client._tool_call_inputs
+
+    def test_cached_tool_input_carries_redaction_provenance(self):
+        """A secret removed before the permission event must leave a boolean
+        provenance bit; the original bytes must not be copied onto the event."""
+        client = AcpClient()
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        tool = JsonRpcMessage(
+            params={
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "title": "Run Command",
+                    "kind": "execute",
+                    "toolCallId": "tc-secret",
+                    "rawInput": {"command": "echo AKIAIOSFODNN7EXAMPLE"},
+                }
+            }
+        )
+        client._extract_tool_event(tool)
+        assert client._tool_call_input_redacted["tc-secret"] is True
+
+        permission = JsonRpcMessage(
+            id=111,
+            method="session/requestPermission",
+            params={
+                "toolCall": {"title": "Run Command", "toolCallId": "tc-secret"},
+                "options": [{"id": "allow_once", "label": "Allow"}],
+            },
+        )
+        event = client._build_permission_event(permission)
+
+        assert event.tool_input_redacted is True
+        assert "AKIAIOSFODNN7EXAMPLE" not in event.tool_input
+        assert "[REDACTED: credential]" in event.tool_input
+        assert client._tool_call_input_redacted["tc-secret"] is True
+        repeated = client._build_permission_event(permission)
+        assert repeated.tool_input_redacted is True
+        assert repeated.tool_input == event.tool_input
 
     def test_fallback_input_from_tool_call(self):
         client = AcpClient()
@@ -5906,9 +6130,7 @@ class TestFormatCommandResult:
         assert '"key"' in result
 
     def test_agent_model_filtered(self):
-        result = format_command_result(
-            {"data": {"agent": "x", "model": "y"}, "message": ""}
-        )
+        result = format_command_result({"data": {"agent": "x", "model": "y"}, "message": ""})
         # Only agent/model → display is empty → falls through to message
         assert result == ""
 
@@ -7080,6 +7302,74 @@ class TestCaptureAvailableModels:
         )
         assert c.available_models()[0]["modelId"] == "m1"
 
+    def test_capture_matches_canonical_parser(self):
+        """Drift-pin (#6382): the client-side capture normalizes exactly like
+        ``parse_advertised_models`` — hard-coded expectation so a regression
+        inside the canonical parser (name fallback, description default,
+        value-as-id, non-dict skip) fails this pin too."""
+        resp = {
+            "models": {
+                "currentModelId": "m1",
+                "availableModels": [
+                    {"modelId": "m1", "name": "M1", "description": "d"},
+                    {"value": "m2"},
+                    {"name": "no id — skipped"},
+                    "not-a-dict",
+                ],
+            }
+        }
+        c = self._client()
+        c._capture_available_models(resp)
+        assert c.available_models() == [
+            {"modelId": "m1", "name": "M1", "description": "d"},
+            {"modelId": "m2", "name": "m2", "description": ""},
+        ]
+
+    def test_capture_delegates_to_canonical_parser(self, monkeypatch):
+        """Anti-re-fork pin (#6382): the list must be SOURCED from
+        ``parse_advertised_models`` AND called with the gated envelope
+        ``{"models": models}`` — a restored inline walk, a whole-response
+        re-resolution, or a wrong envelope all fail this pin.
+
+        Depends on the function-local import in ``_capture_available_models``;
+        if that import is ever hoisted to module scope, patch
+        ``kiro_crew.acp.client.parse_advertised_models`` instead.
+        """
+        from kiro_crew.acp import session_handle as sh
+
+        sentinel = [
+            {"modelId": "sentinel-a", "name": "A", "description": ""},
+            {"modelId": "sentinel-b", "name": "B", "description": ""},
+        ]
+        calls: list = []
+
+        def _fake(resp):
+            calls.append(resp)
+            return list(sentinel)
+
+        monkeypatch.setattr(sh, "parse_advertised_models", _fake)
+        c = self._client()
+        c._capture_available_models({"models": {"availableModels": [{"modelId": "real"}]}})
+        assert c.available_models() == sentinel
+        assert calls == [{"models": {"availableModels": [{"modelId": "real"}]}}]
+
+    def test_malformed_later_response_keeps_prior_snapshot(self):
+        """The non-empty assignment guard survives the consolidation: a later
+        malformed response must not clear an already-captured list."""
+        c = self._client()
+        c._capture_available_models({"models": {"availableModels": [{"modelId": "m1"}]}})
+        assert [m["modelId"] for m in c.available_models()] == ["m1"]
+        c._capture_available_models({"models": {"availableModels": "nope"}})
+        assert [m["modelId"] for m in c.available_models()] == ["m1"]
+
+    def test_empty_models_object_ignores_top_level_available_models(self):
+        """An EMPTY (falsy) ``models`` object must not let the parser's
+        dict-or-list fallback source the list from a top-level
+        ``availableModels`` key the dict gate never saw (#6382)."""
+        c = self._client()
+        c._capture_available_models({"models": {}, "availableModels": [{"modelId": "x"}]})
+        assert c.available_models() == []
+
 
 def _scripted_process(lines, *, returncode=None):
     """Build a mock subprocess whose stdout.readline yields *lines* in order.
@@ -7187,6 +7477,34 @@ class TestWaitForResponseDeferral:
         m1 = client._buffer.popleft()
         assert m0.method == "session/request_permission"
         assert m1.id == 88
+
+    def test_session_timeout_progress_names_missing_failed_and_oauth_servers(self, tmp_path):
+        from kiro_crew.acp.types import JsonRpcMessage
+
+        client = AcpClient(work_dir=tmp_path)
+        client._mcp_notifications = [
+            JsonRpcMessage(
+                method="_kiro.dev/mcp/server_initialized", params={"serverName": "ready"}
+            ),
+            JsonRpcMessage(
+                method="_kiro.dev/mcp/server_init_failure",
+                params={
+                    "serverName": "broken",
+                    "error": "aws_secret_access_key=supersecret connection failed",
+                },
+            ),
+            JsonRpcMessage(method="_kiro.dev/mcp/oauth_request", params={"serverName": "oauth"}),
+        ]
+
+        progress = client._mcp_timeout_progress(
+            [{"name": "ready"}, {"name": "broken"}, {"name": "silent"}]
+        )
+
+        assert "2/3 MCP server(s) reported" in progress
+        assert "no report from silent" in progress
+        assert "failed: broken" in progress
+        assert "supersecret" not in progress
+        assert "awaiting authorization: oauth" in progress
 
 
 class TestWaitForResponseActivityDeadline:
@@ -7322,12 +7640,12 @@ class TestProcessMessageUnknownServerRequest:
 
 
 class TestFormatAcpError:
-    """Tests for _format_acp_error — provider-aware error rewriting.
+    """Tests for _format_acp_error — Bedrock-aware error rewriting.
 
     Covers the bug filed at task 86089e43: ACP backend errors used
     to be surfaced as the raw JSON-RPC dict (`Prompt error: {'code': -32603,
     ...}`), which dead-ends users when the picker can't expose a valid
-    alternative. The helper rewrites known backend failures into actionable
+    alternative. The helper rewrites known Bedrock failures into actionable
     text while preserving the request_id for support correlation, and scrubs
     embedded credentials / exfiltration URLs as defense-in-depth.
 
@@ -7494,67 +7812,6 @@ class TestFormatAcpError:
         out = _format_acp_error(err)
         assert "throttling" in out.lower()
 
-    def test_openai_rate_limit_error_is_throttle(self):
-        """OpenAI/Cursor's `type: rate_limit_error` must classify as a throttle.
-
-        Regression: a plain `rate.?limit` word-boundary pattern fails to match
-        `rate_limit_error` (the `_error` suffix continues the word past the
-        `t` of `limit`, so the `\b` never fires), which dropped these bodies
-        into the raw-dict fallback — the user saw the entire JSON-RPC blob
-        instead of an actionable message.
-        """
-        err = {
-            "code": -32603,
-            "message": "Request rejected (429)",
-            "data": (
-                '{"error":{"message":"Update Required","type":"rate_limit_error",'
-                '"code":"ERROR_GPT_4_VISION_PR (reset after 4m 30s)"}}'
-            ),
-        }
-        out = _format_acp_error(err)
-        assert "throttling" in out.lower()
-        # Not raw JSON-RPC dict.
-        assert '{"error"' not in out
-        # The provider's reset window is surfaced, not a vague "wait".
-        assert "4m 30s" in out
-        assert "sonnet" not in out.lower()
-        # Retryable verdict must agree with the wording.
-        assert _is_transient_raw_error(err) is True
-
-    def test_cursor_rate_limit_error_with_full_reset_window(self):
-        """A compound reset window ("3m 6s") is captured whole, not truncated."""
-        err = {
-            "code": -32603,
-            "message": "Internal error",
-            "data": (
-                '{"error":{"message":"Update Required","type":"rate_limit_error",'
-                '"code":"ERROR_GPT_4_VISION_PR (reset after 3m 6s)"}}'
-            ),
-        }
-        out = _format_acp_error(err)
-        assert "3m 6s" in out
-        assert "throttling" in out.lower()
-
-    def test_bedrock_throttle_stays_retryable_and_provider_neutral(self):
-        """The Bedrock-named branch reads the same as any other provider.
-
-        No "Bedrock" or "sonnet" in the message: the user's picker may not
-        even offer a Bedrock model, and naming one would be actively wrong on
-        a Cursor/OpenAI endpoint.
-        """
-        err = {
-            "code": -32603,
-            "message": "Internal error",
-            "data": "ThrottlingException: Too many requests (request_id: aaaa-bbbb)",
-        }
-        out = _format_acp_error(err)
-        assert "throttling" in out.lower()
-        assert "bedrock" not in out.lower()
-        assert "sonnet" not in out.lower()
-        assert _is_transient_raw_error(err) is True
-        # Request id is still preserved for correlation.
-        assert "aaaa-bbbb" in out
-
     def test_credentials_in_data_are_redacted(self):
         """AWS access keys embedded in upstream errors must not leak to the UI.
 
@@ -7712,6 +7969,67 @@ class TestFormatAcpError:
         }
         out = _format_acp_error(err)
         assert "throttling" in out.lower()
+
+    def test_openai_rate_limit_error_is_throttle(self):
+        """OpenAI/Cursor's `type: rate_limit_error` must classify as a throttle.
+
+        Regression: a plain `rate.?limit` word-boundary pattern fails to match
+        `rate_limit_error` (the `_error` suffix continues the word past the
+        `t` of `limit`, so the `\b` never fires), which dropped these bodies
+        into the raw-dict fallback — the user saw the entire JSON-RPC blob
+        instead of an actionable message.
+        """
+        err = {
+            "code": -32603,
+            "message": "Request rejected (429)",
+            "data": (
+                '{"error":{"message":"Update Required","type":"rate_limit_error",'
+                '"code":"ERROR_GPT_4_VISION_PR (reset after 4m 30s)"}}'
+            ),
+        }
+        out = _format_acp_error(err)
+        assert "throttling" in out.lower()
+        # Not raw JSON-RPC dict.
+        assert '{"error"' not in out
+        # The provider's reset window is surfaced, not a vague "wait".
+        assert "4m 30s" in out
+        assert "sonnet" not in out.lower()
+        # Retryable verdict must agree with the wording.
+        assert _is_transient_raw_error(err) is True
+
+    def test_cursor_rate_limit_error_with_full_reset_window(self):
+        """A compound reset window ("3m 6s") is captured whole, not truncated."""
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": (
+                '{"error":{"message":"Update Required","type":"rate_limit_error",'
+                '"code":"ERROR_GPT_4_VISION_PR (reset after 3m 6s)"}}'
+            ),
+        }
+        out = _format_acp_error(err)
+        assert "3m 6s" in out
+        assert "throttling" in out.lower()
+
+    def test_bedrock_throttle_stays_retryable_and_provider_neutral(self):
+        """The Bedrock-named branch reads the same as any other provider.
+
+        No "Bedrock" or "sonnet" in the message: the user's picker may not
+        even offer a Bedrock model, and naming one would be actively wrong on
+        a Cursor/OpenAI endpoint.
+        """
+        err = {
+            "code": -32603,
+            "message": "Internal error",
+            "data": "ThrottlingException: Too many requests (request_id: aaaa-bbbb)",
+        }
+        out = _format_acp_error(err)
+        assert "throttling" in out.lower()
+        assert "bedrock" not in out.lower()
+        assert "sonnet" not in out.lower()
+        assert _is_transient_raw_error(err) is True
+        # Request id is still preserved for correlation.
+        assert "aaaa-bbbb" in out
         assert "transient error" not in out.lower()
 
     def test_non_transient_minus_32603_falls_through_to_fallback(self):
@@ -8035,15 +8353,11 @@ class TestIsTransientRawError:
         # Session expiry with a co-occurring 5xx token: the session-expiry
         # branch must win (checked first).
         assert (
-            _is_transient_raw_error(
-                {"data": "DispatchFailure: session expired", "message": ""}
-            )
+            _is_transient_raw_error({"data": "DispatchFailure: session expired", "message": ""})
             is False
         )
         assert (
-            _is_transient_raw_error(
-                {"data": "ConnectionResetError: not logged in", "message": ""}
-            )
+            _is_transient_raw_error({"data": "ConnectionResetError: not logged in", "message": ""})
             is False
         )
         # A bare 401/403 — the shape an expired session actually arrives in.
@@ -8354,6 +8668,9 @@ class TestResolveKiroBinEnvOverride:
             ),
             patch.object(client_module, "wrap_argv", side_effect=capture_wrap),
             patch.object(
+                client_module, "assert_voice_runtime_outside_agent_workspace"
+            ) as voice_guard,
+            patch.object(
                 client_module,
                 "cgroup_scope_argv",
                 side_effect=lambda argv: ["/usr/bin/cgroup-wrapper", *argv],
@@ -8376,6 +8693,7 @@ class TestResolveKiroBinEnvOverride:
             "strip_python_env": True,
             "is_kiro_cli": True,
         }
+        voice_guard.assert_called_once_with(client._work_dir)
         spawn_call = mock_exec.await_args
         assert strip_spawn_shim(spawn_call.args) == (
             "/usr/bin/cgroup-wrapper",
@@ -9041,7 +9359,7 @@ class TestSubstitutionFollow:
         # _wait_for_response does. Second wait: real session on the substitute.
         calls = {"n": 0}
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 client._last_substitution_model = "global.anthropic.claude-sonnet-4-6[1m]"
@@ -9073,7 +9391,7 @@ class TestSubstitutionFollow:
             sent.append(method)
             return len(sent)
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"sessionId": "sess-ok"}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9101,7 +9419,7 @@ class TestSubstitutionFollow:
             sent.append(method)
             return len(sent)
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             client._last_substitution_model = None  # unparseable
             return {}
 
@@ -9129,7 +9447,7 @@ class TestSubstitutionFollow:
             sent.append(method)
             return len(sent)
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             client._last_substitution_model = "global.anthropic.claude-sonnet-4-6[1m]"
             return {}
 
@@ -9164,7 +9482,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9195,7 +9513,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9226,7 +9544,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9273,7 +9591,7 @@ class TestSubstitutionWrappersAndRedaction:
 
         wait_calls = {"n": 0}
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             wait_calls["n"] += 1
             if wait_calls["n"] == 1:
                 client._last_substitution_model = url_shaped
@@ -9327,7 +9645,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9386,7 +9704,7 @@ class TestSubstitutionWrappersAndRedaction:
         async def _send(method, params):
             return 1
 
-        async def _wait(req_id, timeout=0.0):
+        async def _wait(req_id, timeout=0.0, *, method="", expected_mcp=None):
             return {"protocolVersion": 1, "agentCapabilities": {"loadSession": False}}
 
         client._send_request = _send  # type: ignore[assignment]
@@ -9571,6 +9889,129 @@ class TestAcpClientIsShellSignal:
         perm = client._build_permission_event(self._permission_msg())
         assert perm.tool_name == "list_intakes"
         assert perm.mcp_server_name == "beehive:beehive-mcp"
+
+    def test_permission_event_does_not_promote_title_on_identity_cache_miss(self, tmp_path):
+        """Legacy per-session transport fails closed without ``_meta.kiro``."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import JsonRpcMessage
+        from kiro_crew.trust_patterns import approval_command
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "mcp__beehive:beehive-mcp__list_intakes",
+                        "kind": "other",
+                        "rawInput": {},
+                    }
+                },
+            )
+        )
+
+        perm = client._build_permission_event(self._permission_msg())
+
+        assert perm.tool_name == ""
+        assert perm.mcp_server_name == ""
+        assert (
+            approval_command(
+                perm.tool_input,
+                is_shell=perm.is_shell,
+                tool_name=perm.tool_name,
+                mcp_server_name=perm.mcp_server_name,
+            )
+            == ""
+        )
+
+    def test_structured_non_shell_reprompt_keeps_argument_provenance(self, tmp_path):
+        """A repeated MCP permission retains both display and raw provenance."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import JsonRpcMessage
+        from kiro_crew.trust_patterns import approval_command
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "Looking up the record",
+                        "kind": "other",
+                        "rawInput": {"record_id": "sensitive-record"},
+                        "_meta": {
+                            "kiro": {
+                                "toolName": "read_record",
+                                "mcpServerName": "records:primary",
+                            }
+                        },
+                    }
+                },
+            )
+        )
+
+        first = client._build_permission_event(self._permission_msg())
+        repeated = client._build_permission_event(self._permission_msg())
+
+        assert first.tool_input
+        assert repeated.tool_input == first.tool_input
+        assert repeated.raw_tool_params == {"record_id": "sensitive-record"}
+        assert (
+            approval_command(
+                repeated.tool_input,
+                is_shell=repeated.is_shell,
+                tool_name=repeated.tool_name,
+                mcp_server_name=repeated.mcp_server_name,
+                raw_tool_params=repeated.raw_tool_params,
+            )
+            == ""
+        )
+
+    @pytest.mark.parametrize("raw_input", ["/etc/secret", ["/etc/secret"]])
+    def test_non_dict_non_shell_reprompt_cannot_become_durable_tool_trust(
+        self, tmp_path, raw_input
+    ):
+        """String/list rawInput must not become argument-free after one prompt."""
+        from kiro_crew.acp.client import AcpClient
+        from kiro_crew.acp.types import JsonRpcMessage
+        from kiro_crew.trust_patterns import approval_command
+
+        client = AcpClient(work_dir=tmp_path)
+        client._extract_tool_event(
+            JsonRpcMessage(
+                method="session/update",
+                params={
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-1",
+                        "title": "Reading a path",
+                        "kind": "read",
+                        "rawInput": raw_input,
+                        "_meta": {"kiro": {"toolName": "read_path", "mcpServerName": "files"}},
+                    }
+                },
+            )
+        )
+
+        first = client._build_permission_event(self._permission_msg())
+        repeated = client._build_permission_event(self._permission_msg())
+
+        assert repeated.tool_input == first.tool_input
+        assert repeated.tool_input
+        assert (
+            approval_command(
+                repeated.tool_input,
+                is_shell=repeated.is_shell,
+                tool_name=repeated.tool_name,
+                mcp_server_name=repeated.mcp_server_name,
+                raw_tool_params=repeated.raw_tool_params,
+            )
+            == ""
+        )
 
     def test_end_to_end_long_shell_title_passes_validation(self, tmp_path):
         """The full regression: a 400-char shell title validates only because
@@ -9917,6 +10358,33 @@ class TestCompactionResetsContextStats:
         assert stats.context_used_tokens == 150_000
         assert stats.context_tokens_from_usage is True
 
+    def test_sdk_200k_default_overridden_for_known_1m_router_model(self, tmp_path):
+        """Fork: claude-agent-acp reports its 200K default for router models it
+        does not know (deepseek-v4-flash serves at 1M). A known model's usage
+        update must prefer the central registry window over the SDK default so
+        the context meter does not read 200K for a 1M model."""
+        client = AcpClient(work_dir=tmp_path)
+        client._model = "cmc/deepseek-v4-flash"
+        client._resolved_model_id = "deepseek-v4-flash"
+        client._track_usage_update(self._usage_msg(100_000, 200_000))
+        stats = client.last_prompt_stats
+        # 100K of a 1M window → 10%, not 50% of a false 200K.
+        assert stats.context_window_tokens == 1_000_000
+        assert stats.context_pct == 10.0
+        assert stats.context_used_tokens == 100_000
+        assert stats.context_tokens_from_usage is True
+
+    def test_unknown_model_keeps_sdk_window(self, tmp_path):
+        """A model the registry does not know keeps the SDK-reported window —
+        the override must never invent a window."""
+        client = AcpClient(work_dir=tmp_path)
+        client._model = "cmc/unknown-model"
+        client._resolved_model_id = "unknown-model"
+        client._track_usage_update(self._usage_msg(50_000, 200_000))
+        stats = client.last_prompt_stats
+        assert stats.context_window_tokens == 200_000
+        assert stats.context_pct == 25.0
+
     def test_post_compaction_metadata_reapplies(self, tmp_path, monkeypatch):
         """Load-bearing: with the reset reverted, context_tokens_from_usage
         stays True and this fresh metadata percentage would be ignored,
@@ -10226,8 +10694,7 @@ class TestMiseNodeInstallsDir:
 
         monkeypatch.setenv("MISE_DATA_DIR", str(tmp_path / "custom-mise"))
         assert (
-            client_mod._mise_node_installs_dir()
-            == tmp_path / "custom-mise" / "installs" / "node"
+            client_mod._mise_node_installs_dir() == tmp_path / "custom-mise" / "installs" / "node"
         )
 
     def test_xdg_data_home_is_honoured(self, tmp_path, monkeypatch):
@@ -10235,8 +10702,7 @@ class TestMiseNodeInstallsDir:
 
         monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "xdg"))
         assert (
-            client_mod._mise_node_installs_dir()
-            == tmp_path / "xdg" / "mise" / "installs" / "node"
+            client_mod._mise_node_installs_dir() == tmp_path / "xdg" / "mise" / "installs" / "node"
         )
 
     @_POSIX_EXEC_PATHS_ONLY
@@ -10265,3 +10731,463 @@ class TestMiseNodeInstallsDir:
         script.write_text("#!/usr/bin/env node\n")
 
         assert client_mod._resolve_node_for_script(str(script)) is None
+
+
+class TestCompactionFailureTurnBudget:
+    """A `failed` compaction must FAIL THE TURN, not hang it.
+
+    kiro-cli can report compaction `failed` and then abandon the prompt it was
+    compacting for: no session/prompt response and no end_turn ever arrive, so
+    the read loop drained in silence to the caller's full prompt ceiling
+    (hours) while the slot stayed occupied — the user waited it out or pressed
+    Stop (issue #3583). The budget bounds that wait and the turn ends with
+    STOP_REASON_COMPACTION_FAILED. No retry is attempted: compaction stays
+    kiro-cli's, this only makes its failure fail cleanly.
+    """
+
+    def _failed_msg(self, params: dict | None = None):
+        from kiro_crew.acp.types import METHOD_COMPACTION_STATUS, JsonRpcMessage
+
+        return JsonRpcMessage(
+            method=METHOD_COMPACTION_STATUS,
+            params=params if params is not None else {"status": {"type": "failed"}},
+        )
+
+    def _silent_after(self, frames: list):
+        """_read_message double: drain `frames`, then stay silent forever."""
+
+        async def _read(timeout: float = 0.0):
+            return frames.pop(0) if frames else None
+
+        return _read
+
+    @pytest.mark.asyncio
+    async def test_silent_turn_after_failure_ends_at_budget(self, tmp_path, monkeypatch):
+        """Armed by the failed status, the loop stops reading at the budget and
+        marks the turn so the caller can terminate it explicitly."""
+        from kiro_crew.acp import client as acp_client
+
+        monkeypatch.setattr(acp_client, "_COMPACTION_FAILED_TURN_BUDGET", 0.2)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+
+        client = AcpClient(work_dir=tmp_path)
+        client._turn_done.clear()
+        # Neither existing watchdog can save this turn: no text streamed and no
+        # tool dispatched, so only the 2h prompt ceiling applied before the fix.
+        client._stale_eligible = False
+        client._tool_dispatched = False
+        client._is_process_alive = lambda: True
+        client._read_message = self._silent_after([self._failed_msg()])
+
+        actions = []
+        t0 = time.monotonic()
+        async for action, msg in client._prompt_loop(req_id=1, timeout=30.0):
+            actions.append(action)
+            if action == "compaction":
+                # What _dispatch_events does with the frame — the arming site.
+                client._handle_compaction_status(msg)
+        elapsed = time.monotonic() - t0
+
+        assert actions == ["compaction"]
+        assert client._compaction_failed_turn is True
+        assert client._turn_done.is_set()
+        # Prove the budget ended it, not the 30s outer deadline.
+        assert elapsed < 5.0, f"loop ran too long ({elapsed:.2f}s) — budget did not fire"
+
+    @pytest.mark.asyncio
+    async def test_failed_status_then_silence_completes_the_stream(self, tmp_path, monkeypatch):
+        """Full path, the reported hang: a `failed` status arrives, the backend
+        never answers the prompt, and the stream still terminates — with the
+        compaction stop reason, well inside the 30s turn ceiling."""
+        from kiro_crew.acp import client as acp_client
+        from kiro_crew.acp.types import (
+            EVENT_COMPACTION_STATUS,
+            EVENT_COMPLETE,
+            STOP_REASON_COMPACTION_FAILED,
+            AcpEvent,
+        )
+
+        monkeypatch.setattr(acp_client, "_COMPACTION_FAILED_TURN_BUDGET", 0.2)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+
+        client = AcpClient(work_dir=tmp_path)
+        client.ensure_ready = AsyncMock()
+        client._send_prompt = AsyncMock(return_value=1)
+        client._is_process_alive = lambda: True
+        client._read_message = self._silent_after(
+            [self._failed_msg({"status": {"type": "failed", "error": "context too large"}})]
+        )
+
+        events: list[AcpEvent] = []
+        t0 = time.monotonic()
+        async for ev in client.stream_events("hello", timeout=30.0):
+            events.append(ev)
+        elapsed = time.monotonic() - t0
+
+        assert [e.kind for e in events] == [EVENT_COMPACTION_STATUS, EVENT_COMPLETE]
+        assert events[0].title == "context too large"
+        assert events[-1].stop_reason == STOP_REASON_COMPACTION_FAILED
+        assert elapsed < 5.0, f"turn ran too long ({elapsed:.2f}s) — the hang is back"
+
+    @pytest.mark.asyncio
+    async def test_budget_is_disarmed_without_a_failure(self, tmp_path, monkeypatch):
+        """No failed status → no budget: the loop runs to its own deadline, so
+        an ordinary silent turn keeps its existing watchdog behavior."""
+        from kiro_crew.acp import client as acp_client
+
+        monkeypatch.setattr(acp_client, "_COMPACTION_FAILED_TURN_BUDGET", 0.05)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+
+        client = AcpClient(work_dir=tmp_path)
+        client._turn_done.clear()
+        client._stale_eligible = False
+        client._tool_dispatched = False
+        client._read_message = AsyncMock(return_value=None)
+        client._is_process_alive = lambda: True
+
+        t0 = time.monotonic()
+        async for _action, _msg in client._prompt_loop(req_id=1, timeout=0.4):
+            pass
+        elapsed = time.monotonic() - t0
+
+        assert client._compaction_failed_turn is False
+        assert elapsed >= 0.35, "loop exited early — the budget fired unarmed"
+
+    @pytest.mark.asyncio
+    async def test_completed_status_disarms_the_budget(self, tmp_path):
+        """A retried compaction that succeeds must clear the armed failure, or
+        the next silent stretch of a healthy turn would end it."""
+        client = AcpClient(work_dir=tmp_path)
+        client._handle_compaction_status(self._failed_msg())
+        assert client._compaction_failed_at is not None
+
+        client._handle_compaction_status(
+            self._failed_msg({"status": {"type": "completed"}, "summary": "ok"})
+        )
+        assert client._compaction_failed_at is None
+
+    @pytest.mark.asyncio
+    async def test_frames_after_the_failure_defer_the_budget(self, tmp_path, monkeypatch):
+        """The budget measures BACKEND SILENCE: a backend that keeps sending
+        frames after a failed compaction is not reaped by it."""
+        from kiro_crew.acp import client as acp_client
+        from kiro_crew.acp.types import METHOD_METADATA, JsonRpcMessage
+
+        monkeypatch.setattr(acp_client, "_COMPACTION_FAILED_TURN_BUDGET", 0.3)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+
+        client = AcpClient(work_dir=tmp_path)
+        client._turn_done.clear()
+        client._is_process_alive = lambda: True
+        client._handle_compaction_status(self._failed_msg())
+
+        async def _steady_stream(timeout: float = 0.0):
+            await asyncio.sleep(0.05)
+            return JsonRpcMessage(method=METHOD_METADATA, params={})
+
+        client._read_message = _steady_stream
+
+        actions = []
+        async for action, _msg in client._prompt_loop(req_id=1, timeout=0.6):
+            actions.append(action)
+
+        # Ran to its own deadline while frames kept arriving.
+        assert actions and all(a == "metadata" for a in actions)
+        assert client._compaction_failed_turn is False
+
+    @pytest.mark.asyncio
+    async def test_dispatch_ends_turn_with_compaction_stop_reason(self):
+        """The abandoned turn terminates with the explicit stop reason instead
+        of raising the generic timeout, so the runner releases the slot."""
+        from kiro_crew.acp.types import (
+            EVENT_COMPLETE,
+            STOP_REASON_COMPACTION_FAILED,
+            AcpEvent,
+        )
+
+        client = AcpClient()
+
+        async def fake_prompt_loop(req_id, timeout):
+            # The budget fired: the loop stops reading with no `complete`.
+            client._compaction_failed_turn = True
+            if False:  # pragma: no cover - keeps this an async generator
+                yield "complete", None
+
+        client.ensure_ready = AsyncMock()
+        client._send_prompt = AsyncMock(return_value=1)
+        client._prompt_loop = fake_prompt_loop
+
+        events: list[AcpEvent] = []
+        async for ev in client.stream_events("test"):
+            events.append(ev)
+
+        assert [e.kind for e in events] == [EVENT_COMPLETE]
+        assert events[0].stop_reason == STOP_REASON_COMPACTION_FAILED
+        # Single-shot: the marker must not leak into the next turn.
+        assert client._compaction_failed_turn is False
+
+    @pytest.mark.asyncio
+    async def test_streamed_text_still_reports_compaction_failure(self):
+        """A turn that streamed text before the failure must NOT be finalized as
+        a normal end_turn by the stale-turn branch — the cause is the failure."""
+        from kiro_crew.acp.types import (
+            EVENT_COMPLETE,
+            STOP_REASON_COMPACTION_FAILED,
+            AcpEvent,
+        )
+
+        client = AcpClient()
+
+        async def fake_prompt_loop(req_id, timeout):
+            client._stale_eligible = True
+            client._compaction_failed_turn = True
+            if False:  # pragma: no cover - keeps this an async generator
+                yield "complete", None
+
+        client.ensure_ready = AsyncMock()
+        client._send_prompt = AsyncMock(return_value=1)
+        client._prompt_loop = fake_prompt_loop
+
+        events: list[AcpEvent] = []
+        async for ev in client.stream_events("test"):
+            events.append(ev)
+
+        assert [e.kind for e in events] == [EVENT_COMPLETE]
+        assert events[0].stop_reason == STOP_REASON_COMPACTION_FAILED
+
+    @pytest.mark.asyncio
+    async def test_failed_event_title_carries_the_reason(self):
+        """The notice reads AcpEvent.title. kiro-cli leaves `summary` empty on
+        failure, which collapsed the row to "unknown error" — the raw
+        notification's own reason now rides the title instead."""
+        from kiro_crew.acp.types import (
+            EVENT_COMPACTION_STATUS,
+            METHOD_COMPACTION_STATUS,
+            AcpEvent,
+            JsonRpcMessage,
+        )
+
+        client = AcpClient()
+        compact_msg = JsonRpcMessage(
+            method=METHOD_COMPACTION_STATUS,
+            params={
+                "status": {"type": "failed", "error": "context window exceeded"},
+                "summary": "",
+            },
+        )
+        complete_msg = JsonRpcMessage(id=1, result={"stopReason": "end_turn"})
+
+        async def fake_prompt_loop(req_id, timeout):
+            yield "compaction", compact_msg
+            yield "complete", complete_msg
+
+        client.ensure_ready = AsyncMock()
+        client._send_prompt = AsyncMock(return_value=1)
+        client._prompt_loop = fake_prompt_loop
+
+        events: list[AcpEvent] = []
+        async for ev in client.stream_events("test"):
+            events.append(ev)
+
+        assert events[0].kind == EVENT_COMPACTION_STATUS
+        assert events[0].text == "failed"
+        assert events[0].title == "context window exceeded"
+
+    @pytest.mark.asyncio
+    async def test_consumer_park_is_not_charged_to_the_budget(self, tmp_path, monkeypatch):
+        """A human approval parks the whole generator chain at _prompt_loop's
+        single yield. That interval is CONSUMER time (mirrors the
+        AcpSessionHandle park accounting): without the exclusion, the resume
+        computes idle = the park length and reaps a live turn whose backend
+        was only ever waiting for the approval answer."""
+        from kiro_crew.acp import client as acp_client
+        from kiro_crew.acp.types import METHOD_METADATA, JsonRpcMessage
+
+        monkeypatch.setattr(acp_client, "_COMPACTION_FAILED_TURN_BUDGET", 0.2)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+
+        client = AcpClient(work_dir=tmp_path)
+        client._turn_done.clear()
+        client._stale_eligible = False
+        client._tool_dispatched = False
+        client._is_process_alive = lambda: True
+        client._read_message = self._silent_after(
+            [self._failed_msg(), JsonRpcMessage(method=METHOD_METADATA, params={})]
+        )
+
+        parked = False
+        resumed_at = None
+        async for action, msg in client._prompt_loop(req_id=1, timeout=30.0):
+            if action == "compaction":
+                client._handle_compaction_status(msg)
+            elif action == "metadata" and not parked:
+                # The consumer holds this frame past the WHOLE budget — the
+                # shape of a human answering an approval card slowly.
+                parked = True
+                await asyncio.sleep(0.3)
+                resumed_at = time.monotonic()
+        ended_at = time.monotonic()
+
+        # The budget still ends the (genuinely) silent turn — but measured
+        # from the resume, not from the frame before the park.
+        assert client._compaction_failed_turn is True
+        assert parked and resumed_at is not None
+        assert ended_at - resumed_at >= 0.15, (
+            f"turn ended {ended_at - resumed_at:.2f}s after the consumer resumed - "
+            "the park was charged to the backend-silence budget"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_tool_in_flight_suspends_the_budget(self, tmp_path, monkeypatch):
+        """kiro-cli can recover from a failed compaction and dispatch a tool. A
+        legitimately silent long tool (a build, a spawned subagent) must NOT be
+        reaped at the compaction budget — that would cancel valid work the
+        tool-stall watchdog already governs on its own longer budget."""
+        from kiro_crew.acp import client as acp_client
+
+        monkeypatch.setattr(acp_client, "_COMPACTION_FAILED_TURN_BUDGET", 0.05)
+        monkeypatch.setattr(acp_client, "_TOOL_STALL_TIMEOUT", 30.0)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+
+        client = AcpClient(work_dir=tmp_path)
+        client._turn_done.clear()
+        client._is_process_alive = lambda: True
+        client._read_message = self._silent_after([self._failed_msg()])
+
+        async def _drive(timeout: float) -> None:
+            async for action, msg in client._prompt_loop(req_id=1, timeout=timeout):
+                if action == "compaction":
+                    client._handle_compaction_status(msg)
+                    # The turn recovers and dispatches a tool, exactly as
+                    # _dispatch_events would mark it.
+                    client._tool_dispatched = True
+
+        t0 = time.monotonic()
+        await _drive(0.4)
+        elapsed = time.monotonic() - t0
+
+        # Ran to its own deadline: the budget stayed suspended for the whole of
+        # the tool's silence, and the turn was not marked compaction-failed.
+        assert client._compaction_failed_turn is False
+        assert elapsed >= 0.35, f"loop exited at {elapsed:.2f}s — the budget reaped a live tool"
+        # Still armed, so the budget re-fires once the tool resolves.
+        assert client._compaction_failed_at is not None
+
+    @pytest.mark.asyncio
+    async def test_spawn_opencode_backend_is_not_wrapped_as_kiro_cli(self, tmp_path):
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
+        client._write_opencode_provider_config = MagicMock()
+        with (
+            patch("kiro_crew.acp.client._resolve_opencode_bin", return_value=["/usr/bin/opencode"]),
+            patch("kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)) as wrap,
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.pid = 12345
+            mock_proc.returncode = None
+            mock_proc.stderr = None
+            mock_exec.return_value = mock_proc
+
+            await client._spawn()
+
+        assert wrap.call_args.kwargs["is_kiro_cli"] is False
+
+    @pytest.mark.asyncio
+    async def test_spawn_opencode_backend_isolates_user_config(self, tmp_path):
+        """OpenCode spawn must set OPENCODE_CONFIG_CONTENT to suppress user
+        plugins and MCP servers that would stall the ACP session."""
+        client = AcpClient(work_dir=tmp_path, acp_backend=ACP_BACKEND_OPENCODE)
+        client._write_opencode_provider_config = MagicMock()
+        with (
+            patch("kiro_crew.acp.client._resolve_opencode_bin", return_value=["/usr/bin/opencode"]),
+            patch("kiro_crew.acp.client.wrap_argv", return_value=(["/usr/bin/opencode", "acp"], None)),
+            patch("asyncio.create_subprocess_exec", new_callable=AsyncMock) as mock_exec,
+            patch("kiro_crew.session._track_pid"),
+            patch("kiro_crew.session._track_session_pid"),
+        ):
+            mock_proc = MagicMock()
+            mock_proc.pid = 12345
+            mock_proc.returncode = None
+            mock_proc.stderr = None
+            mock_exec.return_value = mock_proc
+
+            await client._spawn()
+
+        spawn_env = mock_exec.call_args.kwargs.get("env", {})
+        assert spawn_env.get("HOME", "").endswith("kirocrew-customapi/opencode-home"), (
+            "OpenCode spawn must set HOME to an isolated directory"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_budget_re_arms_when_the_tool_resolves(self, tmp_path, monkeypatch):
+        """Suspension is not a permanent disarm: once the tool resolves and the
+        backend goes silent again, the abandoned turn is still ended."""
+        from kiro_crew.acp import client as acp_client
+        from kiro_crew.acp.types import METHOD_METADATA, JsonRpcMessage
+
+        monkeypatch.setattr(acp_client, "_COMPACTION_FAILED_TURN_BUDGET", 0.1)
+        monkeypatch.setattr(acp_client, "_READ_TIMEOUT", 0.02)
+
+        client = AcpClient(work_dir=tmp_path)
+        client._turn_done.clear()
+        client._is_process_alive = lambda: True
+        # A failed status, then one more frame standing in for the tool's own
+        # traffic — after which the backend goes silent for good.
+        client._read_message = self._silent_after(
+            [self._failed_msg(), JsonRpcMessage(method=METHOD_METADATA, params={})]
+        )
+
+        t0 = time.monotonic()
+        async for action, msg in client._prompt_loop(req_id=1, timeout=30.0):
+            if action == "compaction":
+                client._handle_compaction_status(msg)
+                client._tool_dispatched = True
+            elif action == "metadata":
+                # The tool resolved (what _dispatch_events does on its result).
+                client._tool_dispatched = False
+        elapsed = time.monotonic() - t0
+
+        assert client._compaction_failed_turn is True
+        assert elapsed < 5.0, f"loop ran {elapsed:.2f}s — the budget did not re-arm"
+
+
+class TestCompactionFailureDetail:
+    """`compaction_failure_detail` is what stops the notice collapsing to
+    "unknown error": it prefers a named reason and otherwise surfaces the raw
+    shape, redacted, because it lands on a chat row."""
+
+    def test_prefers_a_named_reason(self):
+        from kiro_crew.acp.client import compaction_failure_detail
+
+        assert (
+            compaction_failure_detail({"status": {"type": "failed", "reason": "too large"}})
+            == "too large"
+        )
+
+    def test_reads_a_nested_error_object(self):
+        from kiro_crew.acp.client import compaction_failure_detail
+
+        detail = compaction_failure_detail(
+            {"status": {"type": "failed"}, "error": {"message": "throttled"}}
+        )
+        assert detail == "throttled"
+
+    def test_falls_back_to_the_raw_shape(self):
+        from kiro_crew.acp.client import compaction_failure_detail
+
+        detail = compaction_failure_detail({"status": {"type": "failed"}})
+        assert "no reason reported" in detail
+        assert "failed" in detail
+
+    def test_is_bounded_and_redacted(self):
+        from kiro_crew.acp.client import _COMPACTION_DETAIL_MAX_CHARS, compaction_failure_detail
+
+        detail = compaction_failure_detail({"status": {"type": "failed", "error": "x" * 5000}})
+        assert len(detail) == _COMPACTION_DETAIL_MAX_CHARS
+
+        secret = compaction_failure_detail(
+            {"status": {"type": "failed", "error": "aws_secret_access_key=AKIAIOSFODNN7EXAMPLE"}}
+        )
+        assert "AKIAIOSFODNN7EXAMPLE" not in secret

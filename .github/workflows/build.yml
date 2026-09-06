@@ -26,6 +26,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -88,6 +90,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -144,6 +148,8 @@ jobs:
       os: ${{ steps.compute.outputs.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         if: github.event_name == 'pull_request'
@@ -153,7 +159,13 @@ jobs:
               - 'website/electron/**'
               - 'website/package.json'
               - 'website/package-lock.json'
-              - 'build-desktop.sh'
+              # Path-qualified: the script lives in packaging/, and the bare name
+              # matched nothing, so every change to the one file that BUILDS the
+              # macOS app left the macos-15 leg uninstantiated on a PR. `ci.yml`'s
+              # own filter has the qualified form; this copy had drifted.
+              - 'packaging/build-desktop.sh'
+              # Also run by that script, so it is a packaging input too.
+              - 'scripts/stamp-distribution.sh'
               - 'Makefile'
               - 'pyproject.toml'
               - 'setup.cfg'
@@ -189,6 +201,8 @@ jobs:
         os: ${{ fromJSON(needs.desktop-matrix.outputs.os) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:

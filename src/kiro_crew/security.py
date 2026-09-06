@@ -30,7 +30,9 @@ from typing import TYPE_CHECKING, NamedTuple
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 
 from kiro_crew.executors import maintenance_executor
+from kiro_crew.identity_stores import fenced_home_dirs
 from kiro_crew.sel import SecurityEvent, SecurityEventLog
+from kiro_crew.trust_patterns import ENV_ASSIGNMENT_RE
 from kiro_crew.vector_memory_constants import _contains_injection
 
 # NB: kiro_crew.vector_memory is imported lazily inside scan_memory() rather than
@@ -2063,8 +2065,9 @@ def is_safe_user_regex(pattern: str) -> bool:
     reject/skip a pattern that fails this check so a catastrophic user regex can
     never freeze the synchronous PreToolUse gate.
 
-    The known-safe linearized aws flag run is stripped before the structural
-    check so the (harmless) built-in construct is never misflagged.
+    The known-safe aws flag runs are stripped before the structural check only
+    when the complete pattern is a built-in.  A user pattern wrapping the same
+    fragment receives no exemption.
 
     A pattern with a TOP-LEVEL alternation (``a|b``) is also rejected: it cannot
     be split on ``.*`` for the linear full-length fragment matcher, so it would
@@ -2078,7 +2081,11 @@ def is_safe_user_regex(pattern: str) -> bool:
         re.compile(pattern)
     except re.error:
         return False
-    scrubbed = pattern.replace(_DANGEROUS_AWS_FLAG_RUN, "").replace(_LINEARIZED_AWS_FLAG_RUN, "")
+    scrubbed = pattern
+    if pattern in BUILTIN_DENY_PATTERNS:
+        scrubbed = pattern.replace(_DANGEROUS_AWS_FLAG_RUN, "").replace(
+            _LINEARIZED_AWS_FLAG_RUN, ""
+        )
     if _redos_prone(scrubbed):
         return False
     return not _has_top_level_alternation(scrubbed)
@@ -2812,8 +2819,6 @@ _DATA_CONSUMER_PROGRAMS = frozenset(
 # Control operators that end one command and begin another.  Used to find the
 # program in a run that ``shlex`` handed over as a single word.
 _CONTROL_OPERATOR_RE = re.compile(r"[;&|\n]+")
-# ``VAR=value`` prefixes a command rather than being the command.
-_ENV_ASSIGN_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*=")
 # An EMPTY substitution expands to nothing, so ``p$()kill`` runs ``pkill`` -- the
 # same glue-evasion as the empty-quote form (``ca""t`` -> ``cat``) that
 # ``normalize_shell_command`` already undoes, but spelled with a substitution and
@@ -3168,7 +3173,7 @@ def _argv_programs(tokens: "list[str]") -> "list[str]":
     current = ""
     expect_program = True
     for token in tokens:
-        if expect_program and token and not _ENV_ASSIGN_RE.match(token):
+        if expect_program and token and not ENV_ASSIGNMENT_RE.match(token):
             current = _program_basename(token)
             expect_program = False
         programs.append(current)
@@ -4794,16 +4799,21 @@ _SENSITIVE_HOME_DIRS: list[str] = [
     # The internal reader opens the DB read-only + SEL-audited (NOT via
     # is_sensitive_path), so it still works; the sandbox bind-mount list
     # (sandbox.py) is SEPARATE, so kiro-cli's own auth is unaffected.
-    ".local/share/kiro-cli",
-    ".local/share/amazon-q",
-    "Library/Application Support/kiro-cli",
-    "Library/Application Support/amazon-q",
-    # Windows layout of the same stores (%APPDATA% defaults to
-    # ~/AppData/Roaming). This matcher is home-anchored, so a Roaming profile
-    # redirected outside the home directory is not covered — the default
-    # location is what agent file tools can reach by a fixed relative path.
-    "AppData/Roaming/kiro-cli",
-    "AppData/Roaming/amazon-q",
+    # The identity-store directories come from the single canonical table
+    # (``identity_stores.IDENTITY_STORE_ROOTS``) so this fence and the five other
+    # readers cannot drift apart (#6352). The splice emits all eight in table
+    # order (``.local/share`` -> ``Library/Application Support`` ->
+    # ``AppData/Local`` -> ``AppData/Roaming``, kiro-cli before amazon-q), which
+    # is the exact order this list carried before the refactor -- a golden test
+    # freezes that the final list is unchanged.
+    #
+    # Windows layouts: current kiro-cli writes the local, non-roaming app-data
+    # directory (%LOCALAPPDATA% defaults to ~/AppData/Local); the Roaming entries
+    # cover layouts that used %APPDATA% (defaults to ~/AppData/Roaming). These
+    # matchers are home-anchored, so a profile redirected outside the home
+    # directory is not covered -- the default location is what agent file tools
+    # can reach by a fixed relative path.
+    *fenced_home_dirs(),
 ]
 
 # ── KiroCrew's own data-home secrets & governance trust-root ──
@@ -4894,6 +4904,22 @@ _CREW_SECRET_LEAVES: list[str] = [
     # HMAC-gated ``PUT /api/settings``; the app's own backend opens the file
     # directly rather than through this gate, so it keeps working.
     "workspace/md-notebook/settings.json",
+    # The AWS Control builtin's app data directory. ``backup.json`` in here holds
+    # ``nightly``, the bit that AUTHORIZES the app's startup loop to upload the
+    # gateway's memory and workspace to S3 unattended, so a prompt-injected agent
+    # that could write it would schedule an owner-billed export the owner never
+    # asked for -- routing around the owner-only HTTP surface that is supposed to
+    # be the only way to turn it on. Exactly the ``autoSync`` escalation above,
+    # one app over.
+    #
+    # Classified as the whole DIRECTORY, not that one file, for the reason the
+    # ``whatsapp`` entry above is: an atomic write goes through a temporary in the
+    # same directory and is then renamed, so fencing only the final name leaves a
+    # writable path to the same bytes. Its siblings (the cost cache, the library
+    # ledger) have no legitimate file-tool reader either -- the app's own backend
+    # opens every one of them directly rather than through this gate, so the app
+    # keeps working and future state files are covered without a new entry.
+    "apps/aws-control/data",
     "browser-cookies.txt",
     "playwright-storage-state.json",
     # Per-session work ledgers (session_ledger.py). Not credentials, but each
@@ -4922,6 +4948,14 @@ _CREW_SECRET_LEAVES: list[str] = [
     # dir is gated (like ``profiles``/``run``) so future trust-root material is
     # covered without a new entry. sel.py opens the key directly, not through
     # this gate.
+    #
+    # Spec Builder's decision record (``trust/spec-builder-decisions.json``) relies
+    # on that whole-directory gating. The app refuses a second answer for a decision
+    # it has recorded, so an agent able to write the file could erase an entry to
+    # make a settled decision answerable again, or forge one to lock a decision the
+    # user never answered. Gating the leaf alone was not enough: its parent under
+    # ``workspace/`` was itself replaceable with one ``ln -s``, and the app opens the
+    # path directly (as keystone writers must), so it would have followed the link.
     "trust",
     "security_events.jsonl",
     # Rotated SEL segments. sel.py closes the live log at a size cap and renames
@@ -4935,6 +4969,18 @@ _CREW_SECRET_LEAVES: list[str] = [
     "app_admission.json",
     "security_policy.json",
     "profiles",
+    # The centrally-distributed ceiling's last-known-good cache
+    # (``platform/policy_distribution.py``). Gated as a DIRECTORY, and the reason
+    # is not just that it holds a copy of the policy: the sidecar metadata records
+    # the SOURCE the copy came from, and the loader honours that source when
+    # deciding whether the cache is this host's last-known-good. An agent able to
+    # write here could publish itself a ceiling AND the provenance to make the next
+    # boot adopt it — a full escape from ``security_policy.json`` being unwritable,
+    # around the side. Read matters as much as write: the cache is a verbatim copy
+    # of the policy the trust-root entry above exists to keep unreadable, so
+    # leaving it open would hand over the exact deny patterns an evasion needs.
+    # policy_distribution.py opens both files directly, not through this gate.
+    "policy_cache",
     "admission_policy.json",
     "denied_commands.json",
     # The cron store. It holds access-control state, not just scheduling data:
@@ -4957,6 +5003,13 @@ _CREW_SECRET_LEAVES: list[str] = [
     # treatment ``webhooks`` and ``profiles`` already get.
     "crons.json",
     "cron-history",
+    # Saved workflow definitions are executable capabilities whose presence is
+    # authorized only by an explicit dashboard action. Same-UID owner-only file
+    # modes do not stop an agent file tool from planting or rewriting a valid
+    # definition, so fence the whole directory, including atomic-write temp
+    # files. The dashboard and workflow service open it directly and remain able
+    # to create, list, update, and execute definitions.
+    "workflow_library",
     # The operator's OAuth consent-endpoint extension
     # ({additional_authorization_endpoints: [{host, path}]}). Each entry widens
     # the banner-only OAuth entropy carve-out (_OAUTH_AUTHORIZATION_ENDPOINTS),
@@ -4978,6 +5031,21 @@ _CREW_SECRET_LEAVES: list[str] = [
     # gateway's own startup reader opens it directly rather than through this
     # gate, so both keep working.
     "live_target.json",
+    # Holds `backup/redaction.json`, the switch that decides whether a bundle
+    # leaving this machine is redacted first. An agent that could write it would
+    # turn redaction off and every later upload would carry the operator's
+    # secrets verbatim; an agent that could read it learns whether the memory
+    # store is currently being scrubbed. Flipping it is the attack and reading it
+    # is reconnaissance, so this needs read AND write protection, not just write.
+    #
+    # The DIRECTORY is classified, not just the leaf inside it. Naming only the
+    # leaf leaves the container writable, and a writable container is the same
+    # hole one level up: replace `backup/` with a symlink and the protected leaf
+    # now resolves somewhere unprotected, where the switch can be rewritten at
+    # will. Restore's rollback copies live at `pre-restore-<ts>/`, not here, so
+    # nothing legitimate is shut out, and the product's own reader opens the file
+    # directly rather than through this gate.
+    "backup",
     # The computer-use primary enable ({enabled, allowed_apps, extra_denied_apps}).
     # Same class of control as ``denied_commands.json`` directly above, and here
     # for the same reason: flipping ``enabled`` grants full desktop observation
@@ -5124,6 +5192,17 @@ _CREW_SECRET_LEAVES: list[str] = [
     # #2351). The verb-independent sensitive-path backstop covers a scripted
     # ``python -c "open('~/.kiro/crew/.vault/...')"`` too.
     ".vault",
+    # KAS-mode auth token store. In the KAS-embedded runtime Kiro Crew performs the
+    # Kiro OIDC lifecycle itself (there is no kiro-cli), and persists the resulting
+    # access/refresh tokens as ``0600`` files under this dir. They are live bearer
+    # credentials for the model service, so — like every other credential store —
+    # they sit behind the shared read+write floor: an auto-approved or sandboxed
+    # agent must not be able to read the token back or overwrite it. The auth
+    # module's own store opens these paths directly rather than through this gate,
+    # so login/refresh keep working. Fence the whole ``kas`` dir (not just
+    # ``kas/auth``): fencing only the leaf would let the agent rename ``kas`` and
+    # then read the relocated token store from outside the fence.
+    "kas",
 ]
 _SENSITIVE_HOME_DIRS += [
     f"{prefix}/{leaf}" for prefix in _CREW_HOME_PREFIXES for leaf in _CREW_SECRET_LEAVES
@@ -5218,6 +5297,29 @@ _WRITE_PROTECTED_HOME_PATHS += [
     for prefix in _CREW_HOME_PREFIXES
 ]
 _WRITE_PROTECTED_HOME_PATHS += [
+    # Downloaded MODEL WEIGHTS (speech recognition and embeddings both land here).
+    # WRITE-protected as a whole directory, not read+write sensitive: the weights hold
+    # no secret, and the settings surface and `kirocrew doctor` both read the directory
+    # to report what is installed.
+    #
+    # They are an INPUT TO A TRUST DECISION. Each store verifies its file against a
+    # pinned sha256 and then hands the PATH to a native loader, so a writable directory
+    # leaves a window between the digest and the open in which the bytes can be
+    # swapped -- and no amount of re-hashing closes it, because the loader re-opens by
+    # name. Removing the writability removes the window instead: the agent cannot
+    # modify the file at all, so the verified bytes are the loaded bytes. A poisoned
+    # model is persistent and invisible, and for speech it means the user's own words
+    # reaching the agent as something they did not say.
+    #
+    # Kiro Crew's own downloaders write here directly and do not route through this
+    # gate, so first-run fetches, re-downloads after a failed check and the embedding
+    # model install all keep working; only the agent's file-edit and shell tools are
+    # refused. Paired with the same entry in _WRITE_PROTECTED_BASH_LEAVES -- protected
+    # on one path only is not protected.
+    f"{prefix}/models"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
     # The Connections tool-alias OWNERSHIP RECORD, third instance of the same class as the
     # two above and with the same read/write asymmetry. It holds no secret and the rebuild
     # reads it on every run, so classifying it sensitive would break the feature — but it is
@@ -5238,6 +5340,45 @@ _WRITE_PROTECTED_HOME_PATHS += [
     # through this gate, so both record writes still work; only the agent's own file-edit and
     # shell tools are refused.
     f"{prefix}/connections-tool-aliases.json"
+    for prefix in _CREW_HOME_PREFIXES
+]
+_WRITE_PROTECTED_HOME_PATHS += [
+    # The app-sources checkout root — the persistent tree every installed app
+    # EXECUTES from (``apps.registry.app_source_dir``). This is a whole DIRECTORY
+    # rather than a leaf, which the shared matcher already supports: it compares a
+    # resolved path against the entry and its ``entry + os.sep`` prefix, so every
+    # file under every checkout is covered without enumerating them.
+    #
+    # It is the strongest instance of the write-protection class, because the
+    # protected file IS the executed code rather than an input to a decision about
+    # it: an agent session with ordinary file-write tools could edit an installed
+    # app's source, and that source then runs with the app's privileges on the
+    # app's next launch. Nothing downstream neutralizes it — unlike ``config.json``,
+    # whose inflated values the loader clamps at load time, a modified checkout is
+    # simply run. Provenance does not catch it either: ``install_from_registry``
+    # records ``_resolved_clone_commit`` (the tree's real ``HEAD``), and an agent
+    # write dirties the worktree without moving ``HEAD``, so a modified tree still
+    # reports the pinned SHA.
+    #
+    # Write-only, NOT ``_SENSITIVE_HOME_DIRS``, and the asymmetry is load-bearing:
+    # app source carries no secret and is legitimately READ all the time — the
+    # dashboard file viewer lists ``app-sources`` as a browsable root
+    # (``apps.builtins.file_explorer.server``), knowledge indexing walks it, and
+    # reading an installed app's code is how anyone debugs one. Classifying it
+    # read+write sensitive would break those.
+    #
+    # Deliberately NOT added to ``_WRITE_PROTECTED_BASH_LEAVES`` below: that
+    # matcher blocks on a command NAMING the path, which denies bash reads too.
+    # That is harmless for the marker and the two Ops Mission Control files, whose
+    # only legitimate readers are Python; it is not harmless here, where reading
+    # app source with ``grep``/``cat`` is routine. Shell writes therefore sit on
+    # the same footing as ``config.json``'s, with the file-edit tool gate as the
+    # enforcement point.
+    #
+    # The gateway's own installer is unaffected: ``_clone_build_app`` clones,
+    # builds and prunes through direct Python/subprocess calls, which are not
+    # agent tool calls and never reach ``hooks.on_tool_call``.
+    f"{prefix}/app-sources"
     for prefix in _CREW_HOME_PREFIXES
 ]
 
@@ -5363,6 +5504,12 @@ _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
     # re-converges it. The residual ``cd``-relative form is the low-severity case
     # the scope note already accepts on purpose.
     "playwright-cli-config.json",
+    # Downloaded model weights, paired with the same entry in
+    # _WRITE_PROTECTED_HOME_PATHS so the file-edit and shell paths agree. A directory
+    # rather than a leaf: the trailing separator the pattern already accepts makes this
+    # cover everything beneath it, which is what the trust decision needs (any file the
+    # loader might open, not one filename).
+    "models",
 )
 
 # ── Anchor-INDEPENDENT leaf matching ──
@@ -5391,6 +5538,28 @@ _WRITE_PROTECTED_BASH_LEAVES: tuple[str, ...] = (
 # distinctive at all (their distinguishing part is the ``apps/.../data/``
 # subpath) and must stay anchored.
 _BARE_TOKEN_PROTECTED_LEAVES: tuple[str, ...] = ("connections-tool-aliases.json",)
+
+# Whisper weight files, matched as a NAME with no anchor, for the same reason as the
+# alias record above: the filename IS the grant. `stt.models` verifies a file's sha256
+# and then hands its PATH to a native loader that re-opens it by name, so the bytes a
+# C++ GGML parser actually consumes are whatever sits at ``ggml-<model>.bin`` at open
+# time, not the bytes that were hashed. The ``models`` entry in
+# _WRITE_PROTECTED_BASH_LEAVES fences the crew-home spelling of that path and is what
+# the file tools go through, but an anchored pattern falls to a single ``cd``:
+# ``cd ~/.kiro/crew/models; cp evil.bin ggml-base.bin`` names no home, no crew prefix
+# and no separator. Anchoring cannot be part of this contract, so it is not.
+#
+# A pattern rather than the four catalog filenames, so a model row added to
+# ``stt.models.CATALOG`` later is fenced without a second edit here -- a new row is
+# exactly the change nobody would think to mirror into this module.
+#
+# The SCOPE test above is met and the cost is stated rather than assumed: ``ggml-``
+# plus ``.bin`` is the whisper.cpp/llama.cpp artifact convention and appears in no
+# ordinary command line, but it is deliberately wider than the crew home, so an
+# unrelated checkout of someone else's GGML weights cannot be copied or renamed from
+# the agent's SHELL either. That is a denial rather than a grant, and the file tools
+# are untouched, which is the affordable direction for the trade.
+_WHISPER_WEIGHT_NAME = r"ggml-[A-Za-z0-9][A-Za-z0-9._-]*\.bin"
 
 # Regex for bash commands that read sensitive paths.
 # Matches: cat, head, tail, less, more, strings, xxd, base64, cp, scp, open,
@@ -5440,8 +5609,9 @@ def _build_sensitive_regex() -> re.Pattern[str]:
       3. a write-protected LEAF under the crew home, in POSIX and in
          Windows-native spelling, matched verb-independently;
       4. an anchor-INDEPENDENT bare path SEGMENT for the distinctive leaves in
-         ``_BARE_TOKEN_PROTECTED_LEAVES`` — the only strategy that survives a
-         ``cd`` into the crew home followed by a relative filename.
+         ``_BARE_TOKEN_PROTECTED_LEAVES``, and for a whisper weight filename
+         (``_WHISPER_WEIGHT_NAME``) — the only strategy that survives a ``cd``
+         into the crew home followed by a relative filename.
     The home anchor accepts ``~`` / ``$HOME`` / the literal ``Path.home()`` AND a
     generic ``/home/<user>`` / ``/Users/<user>`` literal so an unexpanded
     ``/home/$USER/...`` or another user's literal path is still caught.
@@ -5455,7 +5625,18 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     home_alts = f"(?:{home}|{tilde}|{home_var}|{generic_home})"
     escaped_dirs = [re.escape(d) for d in _SENSITIVE_HOME_DIRS]
     dirs_pattern = "|".join(escaped_dirs)
-    sensitive_path = rf"{home_alts}/(?:{dirs_pattern})(?:/|\s|$|['\"])"
+    # What may TERMINATE a sensitive path token. A path is very often the last thing
+    # before a shell metacharacter, and accepting only whitespace, a quote, ``/`` or
+    # end-of-string let punctuation defeat the gate outright: ``cd ~/.aws;`` and
+    # ``cd ~/.kiro/crew/models;`` were allowed, while the same commands written with
+    # ``&&`` were blocked -- for no better reason than that ``&&`` is preceded by a
+    # space and ``;`` is not. The asymmetry is the tell; nothing about a semicolon
+    # makes the path less named. So the class is every character a shell itself treats
+    # as the end of a word. Widening a DENY boundary can only ever deny more, which is
+    # the safe direction for this gate, and the rule it enforces is unchanged: naming a
+    # fenced path is the signal.
+    path_end = r"(?:/|\s|$|['\"]|[;&|()<>,:`])"
+    sensitive_path = rf"{home_alts}/(?:{dirs_pattern}){path_end}"
     # Write-protected leaves (e.g. the on-call schedule): a full home-anchored
     # path to a specific leaf file, matched verb-INDEPENDENTLY (below) so no
     # write form can bypass it. See _WRITE_PROTECTED_BASH_LEAVES for why reads
@@ -5466,7 +5647,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # trailing ``/`` is included so a ``mkdir -p <home>/<crew-prefix>/<leaf>/x``
         # (which also MATERIALISES the leaf as a directory) is caught, not just
         # the exact-leaf forms.
-        rf"{home_alts}/(?:{wp_prefixes})/(?:{wp_leaves})(?:/|\s|$|['\"])"
+        rf"{home_alts}/(?:{wp_prefixes})/(?:{wp_leaves}){path_end}"
     )
     # Windows-native spellings of the same fenced dirs, matched in the RAW
     # command text. POSIX shlex consumes unquoted backslashes during
@@ -5505,9 +5686,14 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # shell's spelling) is the same home by definition.
     userprofile = (
         r"(?:%USERPROFILE(?::[^%\s]*)?%"
+        # cmd.exe delayed expansion (`cmd /V:ON`) names the same home as the `%…%`
+        # form, exactly as it does for `%APPDATA%` below. Without it every
+        # home-anchored branch here missed `!USERPROFILE!\.kiro\crew\…`.
+        r"|!USERPROFILE(?::[^!\s]*)?!"
         rf"|{re.escape('$env:USERPROFILE')}"
         rf"|{re.escape('${env:USERPROFILE}')}"
         r"|%HOMEDRIVE(?::[^%\s]*)?%%HOMEPATH(?::[^%\s]*)?%"
+        r"|!HOMEDRIVE(?::[^!\s]*)?!!HOMEPATH(?::[^!\s]*)?!"
         rf"|{re.escape('$env:HOMEDRIVE$env:HOMEPATH')}"
         rf"|{re.escape('${env:HOMEDRIVE}${env:HOMEPATH}')})"
     )
@@ -5528,6 +5714,9 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # by their remainder.
     appdata_var = (
         r"(?:%APPDATA(?::[^%\s]*)?%"
+        # cmd.exe delayed expansion (`cmd /V:ON`): `!APPDATA!` names the same
+        # location as `%APPDATA%`, with the same expansion modifiers.
+        r"|!APPDATA(?::[^!\s]*)?!"
         rf"|{re.escape('$env:APPDATA')}"
         rf"|{re.escape('${env:APPDATA}')})"
     )
@@ -5541,6 +5730,32 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     appdata_sensitive_path = (
         rf"{appdata_var}(?:{win_sep}\.\.{win_sep}Roaming)*"
         rf"{win_gsep}(?:{appdata_remainders})(?:{win_sep}|\s|$|['\"])"
+    )
+    # ``%LOCALAPPDATA%`` is the same shape one directory over: it points INTO
+    # ``AppData\Local``, so ``%LOCALAPPDATA%\kiro-cli\data.sqlite3`` names a
+    # fenced store without the ``AppData\Local`` text the home-anchored branch
+    # requires. Without this branch the shell tier would not cover the very
+    # spelling that names the CURRENT kiro-cli store on Windows, while the
+    # tuple in ``kiro_usage_api._CLI_SQLITE_DBS`` treats that store as a trust
+    # anchor — the fence the trust claim rests on must hold at this tier too.
+    localappdata_var = (
+        r"(?:%LOCALAPPDATA(?::[^%\s]*)?%"
+        # cmd.exe delayed expansion (`cmd /V:ON`): `!LOCALAPPDATA!` names the
+        # same location as `%LOCALAPPDATA%`, with the same expansion modifiers.
+        r"|!LOCALAPPDATA(?::[^!\s]*)?!"
+        rf"|{re.escape('$env:LOCALAPPDATA')}"
+        rf"|{re.escape('${env:LOCALAPPDATA}')})"
+    )
+    localappdata_remainders = "|".join(
+        win_gsep.join(re.escape(part) for part in d.split("/")[2:])
+        for d in _SENSITIVE_HOME_DIRS
+        if d.startswith("AppData/Local/")
+    )
+    # ``%LOCALAPPDATA%`` ends in ``Local`` by definition, so ``\..\Local``
+    # right after it is this anchor's canonical no-op.
+    localappdata_sensitive_path = (
+        rf"{localappdata_var}(?:{win_sep}\.\.{win_sep}Local)*"
+        rf"{win_gsep}(?:{localappdata_remainders})(?:{win_sep}|\s|$|['\"])"
     )
     # Windows-native spelling of the write-protected leaves. The POSIX leaf
     # branch above anchors on ``/`` separators, so on Windows the resolved home
@@ -5561,6 +5776,62 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     win_write_protected_path = (
         rf"{win_home_alts}{win_gsep}(?:{win_wp_prefixes}){win_gsep}"
         rf"(?:{win_wp_leaves})(?:{win_sep}|\s|$|['\"])"
+    )
+    # A native spelling whose LEAF is an expansion: ``%USERPROFILE%\.kiro\crew\%F%``
+    # names the keystone without spelling any of its literal leaves, so no branch
+    # above can match it. The token-level rule for that shape
+    # (`_sensitive_under_unresolved_var`) does catch it, but only when the path is
+    # QUOTED -- POSIX shlex consumes unquoted backslashes before that rule ever
+    # runs, which is the same blind spot every branch here exists to cover.
+    #
+    # Anchored on the keystone's PARENT directory, because the leaf being a variable
+    # means there is no literal leaf to match: naming the parent, a separator, and
+    # any expansion is the signal. Scoped to the crew trust root and NOT to every
+    # entry in `_SENSITIVE_LEAF_PARENT_DIRS`, since that list also holds
+    # ``AppData/Roaming`` and ``Library/Application Support`` -- directories whose
+    # variable-leaf spellings (``%APPDATA%\%APP%``) are ordinary and constant.
+    win_crew_leaf_parents = "|".join(
+        win_gsep.join(re.escape(part) for part in d.split("/"))
+        for d in _SENSITIVE_LEAF_PARENT_DIRS
+        if any(d == p or d.startswith(f"{p}/") for p in _CREW_HOME_PREFIXES)
+    )
+    # Every spelling of "something that is computed at run time", because the LEAF
+    # being computed is what this branch exists to catch: the value cannot be read from
+    # the command text, so the only safe reading is that it might name a keystone file.
+    #
+    # The substitution forms are not optional. Without them
+    # ``…\.kiro\crew\$(Write-Output security_policy.json)`` read the governance
+    # policy: the token-level rule catches that shape through `_SHELL_SUBST_RE`, but
+    # only when the path is QUOTED, and this branch exists precisely for the unquoted
+    # spellings POSIX shlex destroys before any token rule runs.
+    #
+    # The bracketing forms match their OPENER and do not describe a body, which is the
+    # difference between a deny gate and a parser. This question is only ever "does an
+    # unresolved expansion start here", and any answer that has to model the contents
+    # can be out-nested: a body permitting one level missed
+    # ``$(a $(b $(c)))``, and `${[^}\s]+}` missed ``${My Var}`` because a PowerShell
+    # variable name may legally contain a space. Matching the opener cannot be
+    # out-nested, and it can only ever deny MORE -- which for the keystone directory
+    # costs nothing, since a resolvable leaf there is fenced by name anyway.
+    #
+    # The delimited forms below keep their closers on purpose: an unterminated ``%``,
+    # ``!`` or backtick is a LITERAL to cmd, PowerShell and sh respectively, so it
+    # names no expansion and matching it would refuse ordinary filenames.
+    any_expansion = (
+        r"(?:%[A-Za-z_][A-Za-z0-9_]*(?::[^%\s]*)?%"
+        r"|![A-Za-z_][A-Za-z0-9_]*(?::[^!\s]*)?!"
+        rf"|{re.escape('$')}\{{?env:[A-Za-z_][A-Za-z0-9_]*\}}?"
+        # PowerShell subexpression / POSIX command substitution, PowerShell's
+        # array-subexpression sibling, and the brace-delimited variable form.
+        r"|\$\{"
+        r"|\$\("
+        r"|@\("
+        # POSIX backtick substitution.
+        r"|`[^`]*`"
+        r"|\$[A-Za-z_][A-Za-z0-9_]*)"
+    )
+    win_crew_var_leaf_path = (
+        rf"{win_home_alts}{win_gsep}(?:{win_crew_leaf_parents}){win_sep}{any_expansion}"
     )
     # ── ~/.kiro/agents WRITE-protection (a whole DIRECTORY, not a leaf) ──
     # A spec under this dir becomes a KIROCREW_MCP_TARGET_<SERVER> command the
@@ -5596,7 +5867,7 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     kiro_home_var = r"(?:\$KIRO_HOME|\$\{KIRO_HOME\})"
     agents_write_path = (
         rf"(?:{home_alts}/(?:{agents_dir_alt})"
-        rf"|{kiro_home_var}/(?:{agents_leaf_alt}))(?:/|\s|$|['\"])"
+        rf"|{kiro_home_var}/(?:{agents_leaf_alt})){path_end}"
     )
     win_agents_dir_alt = win_gsep.join(
         re.escape(part) for part in _KIRO_AGENTS_DIR.split("/")
@@ -5632,6 +5903,11 @@ def _build_sensitive_regex() -> re.Pattern[str]:
     # blocks on naming alone.
     bare_leaves = "|".join(re.escape(leaf) for leaf in _BARE_TOKEN_PROTECTED_LEAVES)
     bare_protected_path = rf"(?<![\w.\-])(?:{bare_leaves})(?![\w\-])"
+    # Same token boundaries, and for the same reasons: the lookbehind keeps a name that
+    # merely ENDS with one of these out (``my-ggml-base.bin`` stays allowed), while a
+    # trailing ``.`` or separator still matches, so ``ggml-base.bin.tmp`` and the
+    # mkdir-as-directory form are covered.
+    bare_weight_path = rf"(?<![\w.\-]){_WHISPER_WEIGHT_NAME}(?![\w\-])"
     return re.compile(
         # (1) verb/redirect-anchored, OR (2) verb-independent: the sensitive path
         # appears anywhere as a token.  The token anchor accepts start-of-string
@@ -5649,14 +5925,17 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         rf"|(?:^|.*[\s'\"=:,;]){write_protected_path}"
         # (4) Windows-native spelling, verb-independent (same token anchor):
         # covers quoted backslash paths AND embedded-script literals that the
-        # tokenizing passes cannot see. (5) the %APPDATA% alias of the fenced
-        # Roaming stores. (6) the write-protected leaves in that same native
-        # spelling, which branch (3) cannot see. (7) the distinctive leaves as a
-        # bare path SEGMENT, with no anchor at all, because branches (3) and (6)
-        # both fall to a ``cd`` plus a relative name.
+        # tokenizing passes cannot see. (5) the %APPDATA% / %LOCALAPPDATA%
+        # aliases of the fenced Roaming/Local stores. (6) the write-protected
+        # leaves in that same native spelling, which branch (3) cannot see.
+        # (7) the distinctive leaves as a bare path SEGMENT, with no anchor at
+        # all, because branches (3) and (6) both fall to a ``cd`` plus a
+        # relative name.
         rf"|(?:^|.*[\s'\"=:,;]){win_sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){appdata_sensitive_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){localappdata_sensitive_path}"
         rf"|(?:^|.*[\s'\"=:,;]){win_write_protected_path}"
+        rf"|(?:^|.*[\s'\"=:,;]){win_crew_var_leaf_path}"
         # (8) ~/.kiro/agents (POSIX and Windows-native spelling, plus the
         # ``$KIRO_HOME`` override), matched verb-INDEPENDENTLY with the same token
         # anchor as (2)/(3): naming the dir is the signal, so ``curl -o``/``wget
@@ -5666,7 +5945,11 @@ def _build_sensitive_regex() -> re.Pattern[str]:
         # only); tool-path reads stay allowed.
         rf"|(?:^|.*[\s'\"=:,;]){agents_write_path}"
         rf"|(?:^|.*[\s'\"=:,;]){win_agents_write_path}"
-        rf"|{bare_protected_path})",
+        # (10) whisper weight FILENAMES, also with no anchor, because the digest the
+        # model store checks only binds the bytes if the name it then loads cannot be
+        # rewritten by a ``cd``-relative command.
+        rf"|{bare_protected_path}"
+        rf"|{bare_weight_path})",
         re.IGNORECASE,
     )
 
@@ -6099,6 +6382,136 @@ _EXTRACT_INTO_TRUST_ROOT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The destination half above is deliberately left as the DEFAULT verdict, and
+# this carve-out is the only thing that overrides it.  That direction is the
+# whole design: ``-d`` is also ``ls``'s "show the directory entry itself, not its
+# contents", so the flag-only rule refused a read-only listing of the crew home
+# (issue #6021) while the same read spelled ``-l``, ``-lt``, a grep or a Python
+# ``open`` stayed allowed -- the flag character was never the boundary.
+#
+# Two earlier attempts tried to name the WRITERS instead (an archive-program
+# word, then that word in "command position").  Both were rejected because the
+# set of programs that write through ``-c``/``-C``/``-d``/``-D`` is open-ended,
+# so every program not enumerated became a silent permit against the old rule:
+# ``patch -d``, ``git -C ... apply`` and ``make -C`` were re-admitted into the
+# governance trust root, and a quote-split ``t""ar`` defeated the word match.
+# Enumerating writers fails OPEN, which is the wrong direction for this gate.
+#
+# So the exoneration is an allow-list of READ-ONLY listers instead, and it is
+# narrow by construction: a command qualifies only if it has no shell
+# composition at all AND its program is one of these.  Anything else -- an
+# unknown program, a pipeline, a quoted subshell, a redirection -- keeps the
+# destination-half verdict byte-for-byte, so a shape nobody anticipated
+# over-blocks rather than opening the trust root.
+#
+# Every entry here must be a program that cannot WRITE to the directory it is
+# given.  Do not add a program because it "usually" reads: ``find -delete`` and
+# ``install -d`` are why this is a hand-audited list and not a heuristic.
+_TRUST_ROOT_READ_LISTERS: frozenset[str] = frozenset(
+    {
+        "ls",  # -d: the directory entry itself, the reported false positive
+        "stat",
+        "du",
+        "readlink",
+        "basename",
+        "dirname",
+        "wc",
+    }
+)
+# ``file`` is deliberately ABSENT.  It looks like a pure reader but it is not:
+# ``file -C`` compiles a magic database, and ``file -C <crewhome> -m
+# <crewhome>/evil.magic`` writes ``evil.magic.mgc`` INTO the trust root while the
+# destination half matches on the ``-C`` argument.  That is a real write this
+# carve-out would have exonerated.  Every candidate for this set has to be
+# checked for a compile/output mode, not just for its usual reading role.
+
+# The exonerated shape is validated POSITIVELY: every character of the command
+# must come from a set that carries no meaning to any shell.  This replaced a
+# deny-list of metacharacters (``| & ; newline CR backtick < > ( )`` and
+# ``$(``), which lost four rounds in a row -- each review found one more spelling
+# the screen did not enumerate (a quoted program, an ``&`` inside a quoted
+# filename, a bare CR, then a PowerShell parenthesised group that RUNS in
+# argument position with no ``$`` sigil).  Enumerating what is dangerous cannot
+# terminate against an untrusted string and an unknown target shell; enumerating
+# what is INERT does, because a character absent from this set is refused whether
+# or not anyone has thought of a way to abuse it.
+#
+# So the set is deliberately tiny: letters, digits, and the punctuation a path or
+# a flag actually needs.  Everything else is out, including quotes, ``$``,
+# backslash, glob characters and every bracket -- a bare read listing needs none
+# of them.
+#
+# ``$HOME`` is the ONE exception, stripped before the check, because the
+# destination half of this rule enumerates that spelling itself
+# (``_EXTRACT_INTO_TRUST_ROOT_RE`` matches ``$HOME`` alongside ``~``), so
+# refusing it here would leave half of #6021 unfixed.  It is matched only when
+# followed by ``/``, whitespace or end of string, so ``$HOMEX``, ``${HOME}`` and
+# ``$(...)`` all keep their ``$`` and are refused.
+#
+# The residual cost is over-blocking a read whose PATH contains an excluded
+# character -- ``ls -d ~/.kiro/crew/foo(1)``, or a quoted path with a space.
+# Those keep the destination-half refusal exactly as they did at base: an
+# unfixed false positive of the #6021 family, not a new one. Fixing them would
+# mean telling a literal parenthesis from a grouping one inside an untrusted
+# string, which is the inference this rule has stopped making.
+# Named distinctly on purpose: this module already binds ``_HOME_VAR_RE`` further
+# down for the normalizer, with different semantics (it also accepts
+# ``${HOME}``, case-insensitively).  Reusing that name here silently redefined
+# it -- harmless only by accident of definition order -- so this rule carries its
+# own anchored spelling and cannot be moved out from under by an edit to the
+# other one.
+_TRUST_ROOT_HOME_VAR_RE = re.compile(r"\$HOME(?=[/\s]|\Z)")
+_SHELL_INERT_COMMAND_RE = re.compile(r"\A[A-Za-z0-9_@%+=:,./~^ \t-]+\Z")
+
+
+def _is_bare_trust_root_read(command: str) -> bool:
+    """True for a single simple command whose program only READS its argument.
+
+    Fails closed on anything it does not recognise, because the caller treats a
+    False here as "keep the destination-half refusal".
+    """
+    # Positive validation first: if the command carries a character that could
+    # mean anything to a shell, nothing below is trustworthy.
+    if not _SHELL_INERT_COMMAND_RE.match(_TRUST_ROOT_HOME_VAR_RE.sub("", command)):
+        return False
+    # Past that gate the string provably holds no quote, backslash or
+    # metacharacter, so a plain whitespace split IS the tokenisation -- there is
+    # no shlex-versus-shell disagreement left to exploit.
+    tokens = command.split()
+    if not tokens:
+        return False
+    program = tokens[0]
+    # A PATHNAME is never classified, because a basename says nothing about what
+    # the binary is: ``/tmp/ls`` and ``./ls`` end in ``ls`` and can write the
+    # trust root, so accepting them for the convenience of ``/bin/ls`` would
+    # exonerate an attacker-placed executable.  Only a bare command word counts;
+    # a path falls through to the destination-half refusal, which over-blocks a
+    # legitimate ``/bin/ls`` and is the direction this gate must fail in.
+    # A backslash cannot survive the charset above, so only ``/`` needs testing.
+    if "/" in program:
+        return False
+    # A bare word still resolves through PATH at execution time, so this
+    # carve-out cannot pin WHICH binary runs -- no string matcher can.  That is
+    # not a boundary this rule ever held: a planted shim named ``ls`` in an
+    # agent-writable PATH entry executes through every spelling this matcher
+    # never sees (``ls``, ``ls -l <crewhome>``), so refusing exactly the
+    # ``-d <crewhome>`` form defends nothing against it.  PATH integrity is the
+    # write-path policy's boundary, not this matcher's.
+    return program.lower() in _TRUST_ROOT_READ_LISTERS
+
+
+def _extracts_into_trust_root(command: str) -> bool:
+    """True when a command writes INTO the crew data home via a dest flag.
+
+    The destination match (:data:`_EXTRACT_INTO_TRUST_ROOT_RE`) is the verdict;
+    :func:`_is_bare_trust_root_read` is the single narrow exoneration for the
+    read-only listing that flag spelling made indistinguishable from a write.
+    """
+    if not _EXTRACT_INTO_TRUST_ROOT_RE.search(command):
+        return False
+    return not _is_bare_trust_root_read(command)
+
+
 # ── Symlink-staging to a sensitive target via RELATIVE traversal ──
 # The home-anchored ~/$HOME/absolute forms of ``ln -sf ~/.aws/credentials link``
 # are already caught by _build_sensitive_regex (the sensitive path appears as an
@@ -6211,7 +6624,7 @@ def is_sensitive_bash_command(command: str) -> str | None:
     # ── Pass 1: regex fast-path ──
     if _get_sensitive_re().search(command):
         return "Blocked: command accesses sensitive credential path"
-    if _EXTRACT_INTO_TRUST_ROOT_RE.search(command):
+    if _extracts_into_trust_root(command):
         return "Blocked: command extracts into the governance trust-root directory"
     # Block ANY command referencing a sensitive path via relative traversal,
     # regardless of verb.  The home-anchored/absolute forms are already caught
@@ -6265,6 +6678,24 @@ _SHELL_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(\+?)=(.*)$", re.DOTALL
 _SHELL_VAR_REF_RE = re.compile(
     r"\$\{[!#]?([A-Za-z_][A-Za-z0-9_]*)(?:[^{}]|\$\{[^{}]*\})*\}"
     r"|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+# Windows-native spellings of an unresolved expansion: cmd.exe `%VAR%` (with the
+# expansion modifiers it tolerates), cmd.exe delayed expansion `!VAR!`, and
+# PowerShell `$env:VAR` braced or bare.
+#
+# Deliberately NOT folded into the pattern above, which also drives value
+# SUBSTITUTION: a cmd.exe or PowerShell name has no value the segment walk could
+# have tracked, so substituting it would rewrite a token on a hypothesis rather
+# than on something the command actually assigned. These names are only ever used
+# to ask "is something here unresolved", so they stay separate -- and are applied
+# FIRST, because the POSIX pattern matches `$env` on its own and would leave
+# `:USERPROFILE` behind as literal text.
+_WIN_VAR_REF_RE = re.compile(
+    r"%[A-Za-z_][A-Za-z0-9_]*(?::[^%\s]*)?%"
+    r"|![A-Za-z_][A-Za-z0-9_]*!"
+    r"|\$\{env:[A-Za-z_][A-Za-z0-9_]*\}"
+    r"|\$env:[A-Za-z_][A-Za-z0-9_]*"
 )
 
 #: Shell keywords whose whole job is to assign. The name they set persists just as
@@ -6327,9 +6758,11 @@ _CHDIR_VERBS: frozenset[str] = frozenset(
 #: ``%HOMEDRIVE%`` plus a stray tail.
 _WINDOWS_HOME_ANCHOR_RE = re.compile(
     r"^(?:%HOMEDRIVE(?::[^%\s]*)?%%HOMEPATH(?::[^%\s]*)?%"
+    r"|!HOMEDRIVE(?::[^!\s]*)?!!HOMEPATH(?::[^!\s]*)?!"
     r"|\$\{env:HOMEDRIVE\}\$\{env:HOMEPATH\}"
     r"|\$env:HOMEDRIVE\$env:HOMEPATH"
     r"|%USERPROFILE(?::[^%\s]*)?%"
+    r"|!USERPROFILE(?::[^!\s]*)?!"
     r"|\$\{env:USERPROFILE\}"
     r"|\$env:USERPROFILE)",
     re.IGNORECASE,
@@ -6780,6 +7213,33 @@ def _brace_operand_reading(token: str) -> str | None:
     return rewritten if count else None
 
 
+def _mark_unresolved(token: str) -> str:
+    """Replace every expansion that cannot be resolved from the command text with NUL.
+
+    Shared by the two rules below rather than spelled out in each, because they ask
+    different questions of the SAME marking: a spelling one of them recognizes and
+    the other does not is a bypass of whichever rule missed it, and nothing about
+    either rule's own tests would show it.
+    """
+    marked = _SHELL_SUBST_RE.sub("\x00", token)
+    marked = _WIN_VAR_REF_RE.sub("\x00", marked)
+    return _SHELL_VAR_REF_RE.sub("\x00", marked)
+
+
+def _parent_dir_either_separator(path: str) -> str:
+    """The directory part of *path*, cutting at the last separator of EITHER kind.
+
+    Cutting on ``/`` alone read ``<home>\\.kiro\\crew\\`` as the single directory
+    ``/Users`` -- everything after the anchor being backslash-separated -- so the
+    keystone's own directory never reached `_dir_holds_sensitive_leaf` and a
+    variable leaf beneath it was allowed through. Windows accepts either
+    separator, and this gate fences on naming alone, so honouring both is the
+    same fail-safe direction the native-spelling patterns already take.
+    """
+    cut = max(path.rfind("/"), path.rfind("\\"))
+    return path[:cut] if cut > 0 else ""
+
+
 def _unresolved_home_hypothesis(token: str) -> str | None:
     """Rewrite the first unresolved expansion in *token* as a home reference.
 
@@ -6796,8 +7256,7 @@ def _unresolved_home_hypothesis(token: str) -> str | None:
     Returns the hypothesis, or None when the token carries nothing unresolved or
     the hypothesis is not home-anchored.
     """
-    marked = _SHELL_SUBST_RE.sub("\x00", token)
-    marked = _SHELL_VAR_REF_RE.sub("\x00", marked)
+    marked = _mark_unresolved(token)
     if "\x00" not in marked:
         return None
     hypothesis = marked.replace("\x00", "~", 1).replace("\x00", "")
@@ -6855,6 +7314,13 @@ def _dir_holds_sensitive_leaf(directory: str) -> bool:
     taint pass, which tainted nothing because ``~/.kiro/crew`` is not itself
     sensitive.
     """
+    # A Windows spelling names the same directory with the other separator, and on
+    # POSIX neither `normpath` nor `realpath` rewrites it, so the comparison below
+    # -- whose targets are built with ``/`` -- never matched a native spelling.
+    # Folding is the safe direction: a genuine POSIX filename that happens to
+    # contain a backslash folds to a directory holding no protected leaf and stays
+    # clean, while a backslash spelling OF a keystone parent starts matching.
+    directory = directory.replace("\\", "/")
     probe = os.path.expanduser(directory) if directory.startswith("~") else directory
     if not probe:
         return False
@@ -6890,8 +7356,7 @@ def _sensitive_under_unresolved_var(token: str) -> bool:
     hypothesis = _unresolved_home_hypothesis(token)
     if hypothesis is not None and is_sensitive_path(hypothesis):
         return True
-    marked = _SHELL_SUBST_RE.sub("\x00", token)
-    marked = _SHELL_VAR_REF_RE.sub("\x00", marked)
+    marked = _mark_unresolved(token)
     if "\x00" not in marked:
         return False
     # An unset variable expands to nothing, so the empty reading is a real
@@ -6901,15 +7366,21 @@ def _sensitive_under_unresolved_var(token: str) -> bool:
     empty_reading = marked.replace("\x00", "")
     if empty_reading != token and is_sensitive_path(empty_reading):
         return True
-    # The variable sits in the leaf: block when the literal directory prefix --
-    # everything up to the first unresolved expansion -- is a directory whose
-    # sensitivity lives in its leaves, since the variable could name one. This
-    # runs even when the home hypothesis is None, because `${HOME}/.kiro/crew/$F`
-    # normalizes to an ABSOLUTE prefix (not `~`-anchored) yet is the same attack.
-    literal_prefix = marked.split("\x00", 1)[0]
-    directory = literal_prefix.rsplit("/", 1)[0] if "/" in literal_prefix else ""
-    if directory and _dir_holds_sensitive_leaf(directory):
-        return True
+    # The variable sits in the leaf: block when the directory before it is one whose
+    # sensitivity lives in its leaves, since the variable could name one. Two
+    # spellings of that directory are tested, and both are needed:
+    #
+    # * The LITERAL prefix -- everything up to the first unresolved expansion --
+    #   covers a path already anchored absolutely, because `${HOME}/.kiro/crew/$F`
+    #   normalizes to an absolute prefix rather than a `~`-anchored one.
+    # * The HYPOTHESIS covers the shape where the ANCHOR is itself an expansion, so
+    #   the literal prefix is empty and the rule above sees no directory at all.
+    #   That is every native spelling of the keystone -- `%USERPROFILE%\.kiro\crew\%F%`,
+    #   `$env:USERPROFILE\.kiro\crew\$F` -- each of which read it unchallenged.
+    for candidate in (marked.split("\x00", 1)[0], hypothesis or ""):
+        directory = _parent_dir_either_separator(candidate)
+        if directory and _dir_holds_sensitive_leaf(directory):
+            return True
     return False
 
 
@@ -8898,13 +9369,23 @@ _CREDENTIAL_PATTERNS = re.compile(
     r"|pypi-[A-Za-z0-9_-]{16,}"  # PyPI API token
     r"|do[opr]_v1_[A-Za-z0-9]{40,}"  # DigitalOcean PAT/OAuth/refresh
     r"|GOCSPX-[A-Za-z0-9_-]{20,}"  # Google OAuth client secret
-    # DB connection URIs with embedded credentials — redact the
-    # ``scheme://user:pass@`` prefix (the password lives here).
-    r"|(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis(?:s)?|amqp(?:s)?)"
+    # Connection/fetch URIs with embedded credentials — redact the
+    # ``scheme://user:pass@`` prefix (the password lives here). http(s)/ftp(s)
+    # are included because URL userinfo is a credential wherever it appears
+    # (e.g. a token-bearing artifact CDN base quoted by an update-failure
+    # message); the user:pass@ shape cannot false-positive on a bare URL — a
+    # port (``:8080``) is never followed by ``@`` within the authority.
+    r"|(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis(?:s)?|amqp(?:s)?"
+    r"|https?|ftps?)"
     # User portion is `*` (not `+`): empty-user connection strings (e.g. MongoDB
     # Atlas IAM `mongodb+srv://:secret@…`) still redact the password (ported
     # from the upstream project).
-    r"://[^\s:/@]*:[^\s/@]+@"
+    # Password segment allows ``@`` (``[^\s/]`` not ``[^\s/@]``): an unencoded
+    # ``@`` inside a password is common, and stopping the match at the FIRST
+    # ``@`` would redact only the head and leak the rest (``…ss@host``) to
+    # logs. ``/`` still bounds the authority, so greedy ``+`` consumes through
+    # the FINAL ``@`` — the real userinfo/host separator — and never past it.
+    r"://[^\s:/@]*:[^\s/]+@"
     # ── JWT / JWE / OAuth Bearer tokens ──
     # `eyJ` is the base64url encoding of every JWT header's `{"` prefix; a signed
     # JWT (JWS) is three `.`-separated base64url segments (header.payload.sig), an

@@ -305,9 +305,12 @@ def schemas() -> list[dict[str, Any]]:
             "name": "file_send",
             "description": (
                 "Send a file to the user. Copies the file to the outbox and "
-                "notifies the dashboard/Slack with a download link. Use when "
-                "you've generated a report, export, artifact, or any file the "
-                "user should receive."
+                "notifies the dashboard with a download link. When this "
+                "session is linked to a Telegram conversation the file is "
+                "also delivered there natively; otherwise it uploads to "
+                "Slack when the caller's Slack identity permits it. Use "
+                "when you've generated a report, export, artifact, or any "
+                "file the user should receive."
             ),
             "inputSchema": {
                 "type": "object",
@@ -737,6 +740,39 @@ def file_send(name: str, args: dict[str, Any]) -> str:
     )
     if d.get("error"):
         return f"Error: {d['error']}"
+    # Native channel delivery first: when the caller's session is linked to a
+    # non-Slack conversation with a document-capable transport (a Telegram
+    # chat today), the file belongs THERE — the user who asked for it is
+    # reading that surface, and the dashboard card is the fallback, not the
+    # delivery. The endpoint resolves the destination exclusively from the
+    # caller's session map entry (this tool cannot name a conversation) and
+    # answers ``delivered: false`` for every "no destination here" case — in
+    # which case the Slack leg below runs exactly as it always has.
+    #
+    # The caller is resolved STRICTLY and pinned on the wire. The default
+    # lenient resolution includes a /proc ancestor walk, under which an
+    # unidentified subagent resolves to its PARENT slot — and the file would
+    # deliver into the parent's linked conversation. No verified identity, no
+    # native delivery; the Slack leg keeps its own three-state classifier.
+    #
+    # An EXPLICIT ``channel`` argument names a destination the caller chose,
+    # so the session-link inference must stand down entirely: running the
+    # native leg first would reroute the file to the linked chat instead of
+    # the named Slack channel.
+    channel_warning = ""
+    strict_key = mcp_core._resolve_session_key_strict()
+    if strict_key and not args.get("channel"):
+        channel_resp = mcp_core._post(
+            "/api/channel/upload-file",
+            {"file_path": str(dest), "filename": dest.name, "description": desc},
+            session_key=strict_key,
+        )
+        if channel_resp.get("delivered"):
+            via = channel_resp.get("channel_type") or "channel"
+            msg = f"File sent: {dest.name} ({desc})" if desc else f"File sent: {dest.name}"
+            return f"{msg} (delivered to {via})"
+        if channel_resp.get("error"):
+            channel_warning = f" (channel upload failed: {channel_resp['error']})"
     # Also upload to Slack when the caller's Slack identity permits it.
     #
     # Resolve identity as a THREE-state result (see
@@ -781,7 +817,7 @@ def file_send(name: str, args: dict[str, Any]) -> str:
         if slack_resp.get("error"):
             slack_warning = f" (Slack upload failed: {slack_resp['error']})"
     msg = f"File sent: {dest.name} ({desc})" if desc else f"File sent: {dest.name}"
-    return msg + slack_warning
+    return msg + channel_warning + slack_warning
 
 
 HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {

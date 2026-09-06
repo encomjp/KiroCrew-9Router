@@ -33,6 +33,8 @@ production would deliver it. Event-driven; no sleeps.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Coroutine
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -103,9 +105,16 @@ async def test_a_cancel_that_merely_times_out_still_destroys(tmp_path, monkeypat
     handle.cancel = _slow_cancel
     provider = AcpSessionProvider(handle, runtime, owns_runtime=False)
     monkeypatch.setattr("kiro_crew.acp.session_handle.kiro_sessions_dir", lambda: sessions)
+
+    async def _timeout(awaitable: Coroutine[Any, Any, None], *, timeout: float) -> None:
+        """Model ``wait_for`` taking ownership before its timeout fires."""
+        assert timeout == 5.0
+        awaitable.close()
+        raise asyncio.TimeoutError
+
     monkeypatch.setattr(
         "kiro_crew.acp.session_provider.asyncio.wait_for",
-        AsyncMock(side_effect=asyncio.TimeoutError()),
+        _timeout,
     )
 
     await provider.shutdown()

@@ -63,18 +63,17 @@ def test_os_thread_count_matches_proc_when_available():
     assert count >= threading.active_count()
 
 
-def test_open_fds_positive_and_excludes_probe_fd():
-    count = pg.read_open_fds()
-    if count is None:
-        pytest.skip("no fd directory on this platform")
-    # stdin/stdout/stderr at minimum; the enumeration fd itself is excluded.
-    assert count >= 3
+def test_open_fds_delegates_to_the_shared_probe():
+    # The probe's behavior (fd-dir correction, Windows handle count) is pinned
+    # in test_platform_compat_coverage.py; here only the delegation matters.
+    with patch.object(pg.platform_compat, "count_open_fds", return_value=17):
+        assert pg.read_open_fds() == 17
 
 
 def test_readers_return_none_not_raise_when_proc_missing():
     with patch.object(pg.platform_compat, "process_thread_count", return_value=None):
         assert pg.read_os_threads() is None
-    with patch.object(pg.os, "listdir", side_effect=OSError("no proc")):
+    with patch.object(pg.platform_compat, "count_open_fds", return_value=None):
         assert pg.read_open_fds() is None
 
 

@@ -67,6 +67,7 @@ from typing import Any
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import aws_consent_path
+from kiro_crew.constants import AWS_PROFILE_FIRST_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -75,12 +76,22 @@ logger = logging.getLogger(__name__)
 #: again) rather than silently authorizing the wrong service.
 SERVICE_POLLY = "polly"
 SERVICE_TRANSCRIBE = "transcribe"
-GATED_SERVICES: frozenset[str] = frozenset({SERVICE_POLLY, SERVICE_TRANSCRIBE})
+#: AWS Control's paid services (spec: docs/system-specs/features/aws-control.md).
+#: Declared ahead of the first billable call — S3 backs the cloud drive (P1),
+#: Cost Explorer backs the bill page (~$0.01 per query) — so the consent cards
+#: can be confirmed per account before either capability ships.
+SERVICE_S3 = "s3"
+SERVICE_COST_EXPLORER = "ce"
+GATED_SERVICES: frozenset[str] = frozenset(
+    {SERVICE_POLLY, SERVICE_TRANSCRIBE, SERVICE_S3, SERVICE_COST_EXPLORER}
+)
 
 #: Human-facing service names for the confirmation surfaces and the log lines.
 SERVICE_LABELS: dict[str, str] = {
     SERVICE_POLLY: "Amazon Polly",
     SERVICE_TRANSCRIBE: "Amazon Transcribe",
+    SERVICE_S3: "Amazon S3 (cloud drive storage)",
+    SERVICE_COST_EXPLORER: "AWS Cost Explorer",
 }
 
 #: Lock filename beside the consent file -- NOT the file itself, because
@@ -94,7 +105,16 @@ _LOCK_FILENAME = ".aws_consent.lock"
 #: apply, but a leading dash would still let a value be read as an OPTION
 #: rather than as the value of the option before it. Constrain both to the
 #: charset AWS itself allows and require a leading alphanumeric.
-_PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@=+-]{0,127}$")
+#:
+#: DELIBERATE semantic differences from ``constants.AWS_PROFILE_NAME_RE``
+#: (#6063), so this derives its class from the shared fragment instead of
+#: aliasing the compiled pattern: the first char is alphanumeric only
+#: (stricter), and the continuation class additionally admits ``@`` and ``=``
+#: (IAM entity charset; existing configs may carry them). ``\Z`` (not ``$``)
+#: so a trailing newline in a config-sourced value cannot slip past, matching
+#: #6055 at the four sibling sites. ``-`` stays last so the class is a
+#: literal, never a range.
+_PROFILE_RE = re.compile(rf"^[A-Za-z0-9][{AWS_PROFILE_FIRST_CHARS}@=-]{{0,127}}\Z")
 _REGION_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
 #: How long an identity probe result stays usable. The probe is only run by the
@@ -545,6 +565,15 @@ async def probe_identity(profile: str, region: str, *, use_cache: bool = True) -
     ``run_aws`` is synchronous, so it goes to a thread: this is called from the
     gateway's event loop.
     """
+    # Deliberately NO probe-local strip/normalization. Both values come from
+    # live config, and the paid consumers (``boto3.Session(profile_name=...)``,
+    # the ``--profile`` argv sites) use that same raw value — a probe that
+    # validated a normalized COPY could record consent for a target the real
+    # request never uses. A whitespace-padded value instead fails the shape
+    # gate below (the charset admits no whitespace and ``\Z`` rejects a
+    # trailing newline, #6063), so the probe refuses it, consent is never
+    # granted, and every consumer sees the same verdict. Fix the value in
+    # config; nothing here rewrites it.
     key = (profile, region)
     now = asyncio.get_running_loop().time()
     if use_cache:

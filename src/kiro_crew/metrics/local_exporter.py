@@ -225,7 +225,7 @@ class JsonlMetricExporter(MetricExporter):
         rotated = target.with_name(f"{target.stem}-{time.time_ns()}{target.suffix}")
         try:
             target.replace(rotated)
-            self._chmod(rotated, 0o600)
+            self._restrict_file(rotated)
         except OSError as exc:
             # Retention is best-effort and must never make a successful metric
             # serialization fail. A later export retries rotation/pruning.
@@ -243,7 +243,7 @@ class JsonlMetricExporter(MetricExporter):
             if lock_fd.tell() == 0:
                 lock_fd.write(b"\0")
                 lock_fd.flush()
-            self._chmod(lock_path, 0o600)
+            self._restrict_file(lock_path)
             acquired = platform_compat.try_acquire_lock(lock_fd.fileno(), exclusive=True)
             if not acquired:
                 yield False
@@ -254,12 +254,38 @@ class JsonlMetricExporter(MetricExporter):
                 platform_compat.release_lock(lock_fd.fileno())
 
     @staticmethod
-    def _chmod(path: Path, mode: int) -> None:
-        """Best-effort private-perm enforcement; never fail the export on it."""
+    def _restrict_file(path: Path) -> None:
+        """Best-effort owner-only lockdown of a telemetry FILE.
+
+        ``restrict_to_owner`` rather than ``os.chmod(0o600)``: on Windows chmod
+        only toggles the read-only attribute and leaves the inherited DACL
+        intact, so the "telemetry stays private" contract in this module's
+        docstring held on POSIX and silently did not on Windows.
+
+        Kept best-effort (the helper is fail-loud, so the except stays): an
+        exporter must never make a successful metric serialization fail, and a
+        readable telemetry shard is a smaller harm than a dropped metric.
+        Separate from :meth:`_restrict_dir` because ``restrict_to_owner`` is
+        file-shaped -- its grants carry no inheritance flags, so handing it a
+        directory leaves files created inside on the creating token's DACL.
+        """
         try:
-            os.chmod(path, mode)
+            platform_compat.restrict_to_owner(path)
         except OSError as exc:
-            logger.debug("chmod %s -> %o failed: %s", path, mode, exc)
+            logger.debug("owner-only lockdown of file %s failed: %s", path, exc)
+
+    @staticmethod
+    def _restrict_dir(path: Path) -> None:
+        """Best-effort owner-only lockdown of the telemetry DIRECTORY.
+
+        The directory counterpart of :meth:`_restrict_file`: it applies the
+        inheritable DACL, so shards created inside it later are owner-only from
+        birth rather than at the moment the export happens to chmod them.
+        """
+        try:
+            platform_compat.restrict_dir_to_owner(path)
+        except OSError as exc:
+            logger.debug("owner-only lockdown of dir %s failed: %s", path, exc)
 
     def export(
         self,
@@ -273,8 +299,9 @@ class JsonlMetricExporter(MetricExporter):
             encoded = (line + "\n").encode("utf-8")
             self._dir.mkdir(parents=True, exist_ok=True)
             # ~/.kiro/crew convention: telemetry stays private (dir 0o700, file
-            # 0o600). mkdir/open modes are masked by umask, so chmod explicitly.
-            self._chmod(self._dir, 0o700)
+            # 0o600). mkdir/open modes are masked by umask, and on Windows the
+            # mode bits do nothing at all, so lock both down explicitly.
+            self._restrict_dir(self._dir)
             # Per-PID shards have one writer, so append + rotation need no
             # directory-wide lock. Keeping this path lock-free prevents
             # phase-aligned exporters from permanently dropping DELTA cycles.
@@ -282,7 +309,7 @@ class JsonlMetricExporter(MetricExporter):
             self._rotate_target_if_needed(target, len(encoded))
             with target.open("ab") as fh:
                 fh.write(encoded)
-            self._chmod(target, 0o600)
+            self._restrict_file(target)
             # Retention is separately serialized and best-effort. A contended
             # prune is skipped without discarding the export that just landed.
             self._maybe_prune()

@@ -1,5 +1,5 @@
 /**
- * Screenshot harness for the Apps page (hybrid Discover + Library).
+ * Screenshot harness for the Apps page (split Discover page and standalone Library page).
  *
  * Runs the REAL built SPA (website/dist) on a tiny static server with SPA
  * fallback, with every /api/** call and the /api/ws websocket intercepted by
@@ -13,7 +13,9 @@
  *   discover.png           spotlight + feature duo + category rail + rows
  *   discover-category.png  category-filtered view (editorial layer collapses)
  *   sources.png            Sources popover (registries + install from path)
- *   library.png            Library tab with pending-updates banner
+ *   library.png            Library page with the updates hint row
+ *   updates.png            Discover Updates sub-tab with a pending update row
+ *   updates-empty.png      Updates sub-tab everything-up-to-date state
  *
  * Usage: node scripts/capture-apps.mjs <outDir>
  */
@@ -21,10 +23,11 @@ import { chromium } from 'playwright'
 import { mkdirSync, readFileSync, existsSync, statSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { extname, join, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const OUT = process.argv[2] || '/tmp/apps-shots'
 const PORT = 6811
-const DIST = new URL('../dist', import.meta.url).pathname
+const DIST = fileURLToPath(new URL('../dist', import.meta.url))
 mkdirSync(OUT, { recursive: true })
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.woff2': 'font/woff2', '.json': 'application/json' }
@@ -97,6 +100,27 @@ const installedApps = [
   I('secretary', 'Secretary', 'registry'),
   I('auto-research', 'Research Lab', 'builtin', { manifest: { ...I('auto-research', 'Research Lab', 'builtin').manifest, ui: { pages: [{ route: '/research', label: 'Research', icon: 'Search' }] } } }),
   I('workflows', 'Workflows', 'builtin', { manifest: { ...I('workflows', 'Workflows', 'builtin').manifest, ui: { pages: [{ route: '/workflows', label: 'Workflows', icon: 'Zap' }] } } }),
+  // A DISABLED builtin with no published catalog row -- the case this fixture
+  // exists to show. It was listed in neither tab before, so Library carrying its
+  // row with an Enable button is the whole visible delta.
+  I('aws-control', 'AWS Control', 'builtin', {
+    enabled: false,
+    manifest: {
+      name: 'aws-control', version: '1.0.0', displayName: 'AWS Control', author: 'kirocrew',
+      description: 'Your cloud accounts, in plain language, with an S3-backed drive.',
+      tags: ['aws', 'storage'],
+      ui: { pages: [{ route: '/aws-control', label: 'AWS Control', icon: 'Cloud' }] },
+    },
+  }),
+  // A HIDDEN disabled builtin, which stays withheld: `hidden` means the product
+  // does not offer the app at all, so no row appears for it in either tab.
+  I('channels', 'Channels', 'builtin', {
+    enabled: false,
+    manifest: {
+      name: 'channels', version: '1.0.0', displayName: 'Channels', author: 'kirocrew',
+      description: 'Messaging channel configuration.', tags: ['channels'], hidden: true,
+    },
+  }),
 ]
 
 // Apps that ship hero art (the rest exercise the gradient fallback).
@@ -186,10 +210,32 @@ await page.screenshot({ path: `${OUT}/sources.png` })
 await page.keyboard.press('Escape')
 await settle(600)
 
-// ---- Library (pending updates banner)
-await page.getByText('Library').first().click()
+// ---- Library (standalone page after the split; updates hint row)
+await page.goto(`http://127.0.0.1:${PORT}/apps/library`, { waitUntil: 'domcontentloaded' })
 await settle(1400)
 await page.screenshot({ path: `${OUT}/library.png` })
+
+// ---- Updates sub-tab (deep link; secretary fixture has 1.0.0 -> 1.1.0 pending)
+await page.goto(`http://127.0.0.1:${PORT}/apps/-/updates`, { waitUntil: 'domcontentloaded' })
+await settle(1600)
+await page.screenshot({ path: `${OUT}/updates.png` })
+
+// ---- Updates empty state (drain the pending update from the fixtures, then reload)
+const secretaryReg = registryApps.find(a => a.name === 'secretary')
+secretaryReg.updateAvailable = false
+secretaryReg.installedVersion = '1.1.0'
+await page.goto(`http://127.0.0.1:${PORT}/apps/-/updates`, { waitUntil: 'domcontentloaded' })
+await settle(1400)
+await page.screenshot({ path: `${OUT}/updates-empty.png` })
+secretaryReg.updateAvailable = true
+secretaryReg.installedVersion = '1.0.0'
+
+// ---- legacy migration: a stored library tab redirects /apps -> /apps/library
+await page.evaluate(() => sessionStorage.setItem('appstore-tab', 'library'))
+await page.goto(`http://127.0.0.1:${PORT}/apps`, { waitUntil: 'domcontentloaded' })
+await settle(1600)
+console.log('legacy redirect landed on:', page.url())
+await page.screenshot({ path: `${OUT}/legacy-redirect.png` })
 
 console.log('unmatched /api paths:', [...unmatched].join(', ') || 'none')
 await context.close()

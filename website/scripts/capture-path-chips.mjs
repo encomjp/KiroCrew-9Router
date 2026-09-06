@@ -65,8 +65,24 @@ const EXPECTED_CITED = [
   [`${NOTES}:10-16`, 'file', NOTES, '10'],
 ]
 
+/**
+ * Unicode paths (issue #6483), in document order. The three paths must
+ * classify as files (rooted CJK, NFD-decomposed accented, home-relative
+ * Devanagari) and the two slash-separated prose spans must stay plain — so
+ * this can never quietly emit a screenshot where prose became clickable or a
+ * Unicode path stayed inert.
+ */
+const EXPECTED_UNICODE = [
+  [`${PROJECT}/产品文档/发布说明.md`, 'file'],
+  [`${PROJECT}/cafe\u0301-menu\u0308/notes.md`, 'file'],
+  ['~/दस्तावेज़/रिपोर्ट.md', 'file'],
+  ['要么这样/要么那样', 'plain'],
+  ['и/или', 'plain'],
+]
+
 const SCENES = [
   { scene: 'chips', marker: 'code[data-path-kind="dir"]', note: 'directory chip resolved; git refs inert' },
+  { scene: 'unicode', marker: 'code[data-path-kind="file"]', note: 'Unicode paths (CJK/NFD/Devanagari) classify; prose stays plain' },
   { scene: 'cited', marker: 'code[data-path-line="447"]', note: 'file:line chips live; bare :line inert' },
   // Waits on the DECORATION, not just the editor: the marker is the highlight
   // itself, so a reveal that scrolled but failed to paint fails the run.
@@ -74,9 +90,22 @@ const SCENES = [
   // The marker only proves SOME line was painted; the assertion block below counts
   // the painted lines, which is what would catch a first-line-only reveal.
   { scene: 'range', marker: '.mc-line-reveal', note: 'panel revealed the whole 10-16 span' },
-  { scene: 'folder', marker: 'text=website', note: 'folder tab body lists dirs then files' },
+  { scene: 'folder', marker: '[role="treeitem"]', note: 'project folder tab renders the shared workspace tree' },
+  { scene: 'folder-flow', marker: '[role="tablist"]', note: 'tree opens a separate file tab and preserves expansion' },
   { scene: 'markdown-link', marker: 'a[href*="release-notes.md"]', note: 'Markdown file link opened the file panel' },
 ]
+
+const requestedScenes = new Set(
+  (process.env.CAPTURE_SCENES || '').split(',').map(s => s.trim()).filter(Boolean),
+)
+const selectedScenes = requestedScenes.size
+  ? SCENES.filter(({ scene }) => requestedScenes.has(scene))
+  : SCENES
+if (requestedScenes.size && selectedScenes.length !== requestedScenes.size) {
+  const known = new Set(SCENES.map(({ scene }) => scene))
+  const unknown = [...requestedScenes].filter(scene => !known.has(scene))
+  throw new Error(`Unknown CAPTURE_SCENES: ${unknown.join(', ')}`)
+}
 
 const run = async () => {
   const browser = await chromium.launch(
@@ -86,7 +115,7 @@ const run = async () => {
   )
   let failed = 0
   for (const theme of ['dark', 'light']) {
-    for (const { scene, marker, note } of SCENES) {
+    for (const { scene, marker, note } of selectedScenes) {
       const ctx = await browser.newContext({
         viewport: { width: 900, height: 500 },
         deviceScaleFactor: 2,
@@ -132,9 +161,9 @@ const run = async () => {
           continue
         }
       }
-      if (scene === 'chips' || scene === 'cited') {
+      if (scene === 'chips' || scene === 'cited' || scene === 'unicode') {
         const cited = scene === 'cited'
-        const expected = cited ? EXPECTED_CITED : EXPECTED_KINDS
+        const expected = cited ? EXPECTED_CITED : scene === 'unicode' ? EXPECTED_UNICODE : EXPECTED_KINDS
         const actual = await page.$$eval('code', (els, withPath) =>
           els.map(e => withPath
             ? [e.textContent, e.dataset.pathKind ?? 'plain', e.dataset.path, e.dataset.pathLine]
@@ -149,8 +178,46 @@ const run = async () => {
         }
       }
       const target = await page.$('[data-capture-root]')
-      await target.screenshot({ path: `${OUT}/${theme}-${scene}.png` })
-      console.log(`  ${theme}/${scene} -> ${note}`)
+      if (scene === 'folder') {
+        const src = page.getByRole('treeitem', { name: 'src' })
+        await src.waitFor()
+        await page.getByText('Parent folder').waitFor()
+        await target.screenshot({ path: `${OUT}/${theme}-${scene}-collapsed.png` })
+        await src.click()
+        await page.getByRole('treeitem', { name: 'overview.md' }).waitFor()
+        await target.screenshot({ path: `${OUT}/${theme}-${scene}-expanded.png` })
+        const search = page.getByLabel('Search files')
+        await search.fill('head')
+        await page.getByText('includes subfolders').waitFor()
+        await target.screenshot({ path: `${OUT}/${theme}-${scene}-search.png` })
+        await search.fill('')
+        console.log(`  ${theme}/${scene} -> ${note}; collapsed + expanded + search` )
+      } else if (scene === 'folder-flow') {
+        const src = page.getByRole('treeitem', { name: 'src' })
+        await src.waitFor()
+        await page.getByText('Parent folder').waitFor()
+        await target.screenshot({ path: `${OUT}/${theme}-${scene}-initial.png` })
+        await src.click()
+        const overview = page.getByRole('treeitem', { name: 'overview.md' })
+        await overview.waitFor()
+        await target.screenshot({ path: `${OUT}/${theme}-${scene}-expanded.png` })
+        await overview.click()
+        await page.getByRole('tab', { name: 'overview.md' }).waitFor()
+        await page.getByText('This file opened in a separate tab.').waitFor()
+        await target.screenshot({ path: `${OUT}/${theme}-${scene}-file-tab.png` })
+        await page.getByRole('tab', { name: 'Project tree' }).click()
+        if (await src.getAttribute('aria-expanded') !== 'true') {
+          console.error(`  FAIL ${theme}/${scene}: tree expansion state was not preserved`)
+          failed += 1
+          await ctx.close()
+          continue
+        }
+        await target.screenshot({ path: `${OUT}/${theme}-${scene}-returned.png` })
+        console.log(`  ${theme}/${scene} -> ${note}; file tab + returned tree`)
+      } else {
+        await target.screenshot({ path: `${OUT}/${theme}-${scene}.png` })
+        console.log(`  ${theme}/${scene} -> ${note}`)
+      }
       await ctx.close()
     }
   }

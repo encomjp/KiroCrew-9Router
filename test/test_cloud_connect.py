@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from kiro_crew import platform_compat as pc
@@ -484,3 +486,97 @@ class TestRegistryIntegration:
 
         assert connect.unregister_instance("i-0abc") is True
         assert not any(i.ssh_host == "i-0abc" for i in reg.list())
+
+
+class TestIsLaunchedInstance:
+    """Unit coverage for is_launched_instance() — the #3387 correlation check
+    handlers_instances.py uses to lock PATCH's addressing fields."""
+
+    def _store(self, monkeypatch, tmp_path):
+        import kiro_crew.cloud.launch_job as ljmod
+
+        store = ljmod.LaunchJobStore(root=tmp_path / "launch-jobs")
+        monkeypatch.setattr(ljmod, "LaunchJobStore", lambda *a, **k: store)
+        return store
+
+    def test_empty_target_is_not_launched(self):
+        assert connect.is_launched_instance("") is False
+
+    def test_matching_job_is_launched(self, monkeypatch, tmp_path):
+        store = self._store(monkeypatch, tmp_path)
+        job = store.create(profile="dev", region="us-west-2", size_key="light")
+        job.instance_id = "i-0abc1234"
+        store.save(job)
+
+        assert connect.is_launched_instance("i-0abc1234") is True
+
+    def test_unrelated_target_is_not_launched(self, monkeypatch, tmp_path):
+        # A hand-added SSM record whose ssm_target happens to look like an EC2 id
+        # but was never provisioned by a Kiro Crew launch job.
+        store = self._store(monkeypatch, tmp_path)
+        job = store.create(profile="dev", region="us-west-2", size_key="light")
+        job.instance_id = "i-0abc1234"
+        store.save(job)
+
+        assert connect.is_launched_instance("i-neverlaunched") is False
+
+    def test_no_jobs_at_all_is_not_launched(self, monkeypatch, tmp_path):
+        self._store(monkeypatch, tmp_path)
+        assert connect.is_launched_instance("i-0abc1234") is False
+
+    def test_malformed_job_file_fails_closed(self, monkeypatch, tmp_path):
+        # Fails CLOSED on a job file that cannot be PARSED. This is the failure
+        # mode LaunchJobStore.list() hides: list() defers to get(), which logs
+        # and returns None for an unparseable file, so the job drops out of the
+        # result entirely — a corrupted record for the very instance being
+        # edited would read as "no such launch job" and unlock the addressing
+        # fields this check exists to freeze. Reading the files directly is
+        # what keeps the refusal reachable.
+        store = self._store(monkeypatch, tmp_path)
+        job = store.create(profile="dev", region="us-west-2", size_key="light")
+        job.instance_id = "i-0abc1234"
+        store.save(job)
+        (store.root / f"{job.id}.json").write_text("{not json", encoding="utf-8")
+
+        with pytest.raises(ValueError):
+            connect.is_launched_instance("i-0abc1234")
+
+    def test_unreadable_job_file_fails_closed(self, monkeypatch, tmp_path):
+        # Same guarantee for an I/O failure rather than a parse failure: the
+        # OSError propagates so api_instances_update answers 503 and persists
+        # nothing, instead of treating an unverifiable correlation as absent.
+        store = self._store(monkeypatch, tmp_path)
+        store.root.mkdir(parents=True, exist_ok=True)
+        # A directory where a job file is expected: read_text() raises OSError
+        # on every platform (IsADirectoryError on POSIX, PermissionError on
+        # Windows), without depending on chmod semantics or the test user.
+        (store.root / "00000000000000000000000000000000.json").mkdir()
+
+        with pytest.raises(OSError):
+            connect.is_launched_instance("i-0abc1234")
+
+    def test_vanished_job_file_is_skipped(self, monkeypatch, tmp_path):
+        # The one benign case: a concurrent `cloud destroy` removing a job
+        # between the glob and the read. An instance whose launch record is
+        # gone is no longer correlated to anything, so the scan continues to
+        # the remaining jobs rather than refusing the edit.
+        store = self._store(monkeypatch, tmp_path)
+        gone = store.create(profile="dev", region="us-west-2", size_key="light")
+        gone.instance_id = "i-vanishing"
+        store.save(gone)
+        keep = store.create(profile="dev", region="us-west-2", size_key="light")
+        keep.instance_id = "i-stillhere"
+        store.save(keep)
+
+        victim = store.root / f"{gone.id}.json"
+        real_read_text = Path.read_text
+
+        def _read_text(self, *a, **k):
+            if self == victim:
+                raise FileNotFoundError(str(victim))
+            return real_read_text(self, *a, **k)
+
+        monkeypatch.setattr(Path, "read_text", _read_text)
+
+        assert connect.is_launched_instance("i-stillhere") is True
+        assert connect.is_launched_instance("i-vanishing") is False

@@ -14,6 +14,7 @@ import { issueRadarApi, type InvestigationResponse, type PullRequest, RepoRef } 
 import { useReviewPr } from '../lib/review'
 import AgentSessionButton from './AgentSessionButton'
 import { providerTerms, repoScopeKey } from '../lib/links'
+import { itemKey } from '../lib/agentSession'
 
 import { i18nT } from '../../../i18n/t'
 export default function ReviewButton({
@@ -33,22 +34,30 @@ export default function ReviewButton({
     staleTime: 30_000,
   })
   const record = recordQuery.data?.investigation ?? null
-  const { reviewPr, busy, error } = useReviewPr()
+  const { reviewPr, busy, error, concludedFor } = useReviewPr()
   // A pending or FAILED lookup is indistinguishable from "no record", and acting
   // on that would start a second session and overwrite the existing record's slot
   // link — orphaning the review the user already has. So the button waits for a
   // definite answer and reports a failed lookup instead of guessing.
   const unresolved = !recordQuery.isSuccess
 
-  const onClick = async () => {
+  // Wired even though the review agent records nothing, so a review record does
+  // not reach a concluded status on its own: the concluded guard lives in the
+  // SHARED openSession, so a record that somehow carries one (recorded against
+  // this number by the MCP tool) would otherwise decline the click and render
+  // nothing — a dead button, which is worse than either outcome it replaces.
+  const run = async (force: boolean) => {
     if (busy || unresolved) return
-    const saved = await reviewPr(repoRef, pull, record)
+    const saved = await reviewPr(repoRef, pull, record, force)
     if (saved) {
       queryClient.setQueryData<InvestigationResponse>(key, {
         owner, repo, number: pull.number, kind: 'pull', investigation: saved,
       })
     }
   }
+
+  const onClick = () => { void run(false) }
+  const onStartOver = () => { void run(true) }
 
   return (
     <AgentSessionButton
@@ -59,6 +68,8 @@ export default function ReviewButton({
       disabled={unresolved}
       error={error ?? (recordQuery.error as Error | null) ?? null}
       onClick={onClick}
+      concluded={concludedFor === itemKey(repoRef, pull.number, 'pull')}
+      onStartOver={onStartOver}
       startHint={
         recordQuery.isError
           ? 'Could not check for an existing review session — retrying on refresh'

@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -384,14 +385,11 @@ def test_watchdog_dump_file_param_custom_callback(dumps_dir: Path) -> None:
         assert dump_targets == ["called"]
 
 
-def test_watchdog_dump_file_default_dump(dumps_dir: Path) -> None:
-    """Verify dump_file receives real faulthandler output when NO custom dump is set.
-
-    This is the real wiring test: construct LoopStallWatchdog with dump_file and
-    NO custom dump callback, beat, advance past stall_after, call check(), flush,
-    and assert the file contains thread-stack markers from faulthandler.
-    """
-    from kiro_crew.dashboard.loop_watchdog import LoopStallWatchdog
+def test_watchdog_soft_only_dump_is_written_to_discoverable_file(
+    dumps_dir: Path, monkeypatch
+) -> None:
+    """Without a hard timer, the soft dump must remain visible to doctor."""
+    from kiro_crew.dashboard import loop_watchdog
 
     class _Clock:
         def __init__(self) -> None:
@@ -404,33 +402,127 @@ def test_watchdog_dump_file_default_dump(dumps_dir: Path) -> None:
             self.t += dt
 
     clock = _Clock()
+    targets: list[object] = []
+    monkeypatch.setattr(
+        loop_watchdog.faulthandler,
+        "dump_traceback",
+        lambda *, file, all_threads: targets.append(file),
+    )
 
     with opened_dump_file(dumps_dir) as dump_file:
-        wd = LoopStallWatchdog(
+        wd = loop_watchdog.LoopStallWatchdog(
             stall_after=30.0,
             exit_after=None,
             now=clock,
             dump_file=dump_file,
-            # NO custom dump — exercises _default_dump(dump_file)
             arm_later=lambda t: None,  # disable armed timer
             cancel_later=lambda: None,
+            enrich=lambda _silence: [],
             log=logging.getLogger("test.loop_watchdog"),
         )
         wd.beat()
         clock.advance(31.0)
         assert wd.check() is True
-        dump_file.flush()
+        assert targets == [dump_file, sys.stderr]
 
-        # Read the file content — should contain faulthandler thread stack output
-        dump_path = list(dumps_dir.iterdir())[0]
-        content = dump_path.read_text(encoding="utf-8", errors="replace")
-        # faulthandler.dump_traceback writes a thread marker ("Thread 0x..." when
-        # multiple threads exist, "Current thread 0x..." for a single thread) —
-        # match case-insensitively so the assertion holds whether the run is
-        # multi-threaded (free-threaded CPython) or single-threaded.
-        assert "thread" in content.lower(), (
-            f"Expected thread stacks in dump file, got: {content!r}"
+
+def test_watchdog_armed_soft_dump_leaves_crash_sentinel_untouched(
+    dumps_dir: Path, monkeypatch
+) -> None:
+    """A recovered managed-service stall must not look like a fatal crash."""
+    from kiro_crew.dashboard import loop_watchdog
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.t = 1000.0
+
+        def __call__(self) -> float:
+            return self.t
+
+        def advance(self, dt: float) -> None:
+            self.t += dt
+
+    clock = _Clock()
+    targets: list[object] = []
+    monkeypatch.setattr(
+        loop_watchdog.faulthandler,
+        "dump_traceback",
+        lambda *, file, all_threads: targets.append(file),
+    )
+
+    with opened_dump_file(dumps_dir) as dump_file:
+        wd = loop_watchdog.LoopStallWatchdog(
+            stall_after=30.0,
+            exit_after=90.0,
+            poll_interval=60.0,
+            now=clock,
+            dump_file=dump_file,
+            arm_later=lambda _timeout: None,
+            cancel_later=lambda: None,
+            enrich=lambda _silence: [],
+            log=logging.getLogger("test.loop_watchdog"),
         )
+        wd.start()
+        try:
+            clock.advance(31.0)
+            assert wd.check() is True
+            assert targets == [sys.stderr]
+        finally:
+            wd.stop()
+
+
+def test_watchdog_rearm_failure_restores_discoverable_soft_dump(
+    dumps_dir: Path, monkeypatch
+) -> None:
+    """A cancelled timer that cannot re-arm must degrade to the file fallback."""
+    from kiro_crew.dashboard import loop_watchdog
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.t = 1000.0
+
+        def __call__(self) -> float:
+            return self.t
+
+        def advance(self, dt: float) -> None:
+            self.t += dt
+
+    clock = _Clock()
+    targets: list[object] = []
+    arm_count = 0
+
+    def _arm(_timeout: float) -> None:
+        nonlocal arm_count
+        arm_count += 1
+        if arm_count > 1:
+            raise RuntimeError("re-arm failed")
+
+    monkeypatch.setattr(
+        loop_watchdog.faulthandler,
+        "dump_traceback",
+        lambda *, file, all_threads: targets.append(file),
+    )
+
+    with opened_dump_file(dumps_dir) as dump_file:
+        wd = loop_watchdog.LoopStallWatchdog(
+            stall_after=30.0,
+            exit_after=90.0,
+            poll_interval=60.0,
+            now=clock,
+            dump_file=dump_file,
+            arm_later=_arm,
+            cancel_later=lambda: None,
+            enrich=lambda _silence: [],
+            log=logging.getLogger("test.loop_watchdog"),
+        )
+        wd.start()
+        try:
+            wd.beat()
+            clock.advance(31.0)
+            assert wd.check() is True
+            assert targets == [dump_file, sys.stderr]
+        finally:
+            wd.stop()
 
 
 # ── fd stability (regression for #1571) ──

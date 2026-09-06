@@ -150,3 +150,32 @@ def test_no_call_site_pins_a_shorter_wait():
         "Compaction wait shorter than the shared budget reintroduced (delete "
         f"the timeout argument so the shared default applies): {offenders}"
     )
+
+
+# ── Post-failure turn budget (issue #3583) ──────────────────────────────────
+#
+# A DIFFERENT budget with a different job: the constant above bounds how long a
+# caller waits for compaction to finish, this one bounds how long a turn waits
+# for the backend after compaction reported `failed`. It exists because that
+# wait was previously unbounded in practice — the read loop drained to the
+# caller's full prompt ceiling and never released the slot.
+
+
+def test_post_failure_budget_is_one_constant_for_both_dispatch_paths():
+    """The dedicated-process client and the shared-runtime handle must reap an
+    abandoned post-compaction turn on the same schedule; a second literal would
+    let one path keep hanging after the other was tuned."""
+    from kiro_crew.acp import client, session_handle
+
+    assert session_handle._COMPACTION_FAILED_TURN_BUDGET is client._COMPACTION_FAILED_TURN_BUDGET
+
+
+def test_post_failure_budget_is_bounded_by_the_ordinary_silence_window():
+    """A turn the backend has already reported a failure for must not outlive an
+    ordinary silent turn — otherwise the hang it fixes just gets shorter."""
+    from kiro_crew.acp.client import (
+        _COMPACTION_FAILED_TURN_BUDGET,
+        _STALE_TURN_TIMEOUT,
+    )
+
+    assert 0 < _COMPACTION_FAILED_TURN_BUDGET <= _STALE_TURN_TIMEOUT

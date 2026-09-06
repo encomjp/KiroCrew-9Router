@@ -70,7 +70,7 @@ from kiro_crew.config.paths import kiro_sessions_dir
 # move _append_unflushed_tail and its collaborators down to chat_persistence
 # first rather than creating the cycle.
 from kiro_crew.dashboard.chat_handlers import _append_unflushed_tail
-from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+from kiro_crew.dashboard.chat_persistence import save_slot_off_loop, session_was_deleted
 from kiro_crew.dashboard.chat_utils import (
     _sync_dashboard_slots,
     effective_session_key,
@@ -612,16 +612,25 @@ async def build_transfer_bundle_async(
             # across this await and spend an attempt rather than trusting it.
             gen_before_save = slot._dirty_gen
             try:
-                await save_slot_off_loop(state, slot, best_effort=False)
+                saved = await save_slot_off_loop(state, slot, best_effort=False)
             except Exception as exc:
                 logger.warning(
                     "session_transfer: could not persist slot=%s before bundling",
                     slot.key,
                     exc_info=True,
                 )
-                raise SnapshotUnstable(
-                    "the session could not be persisted before copying"
-                ) from exc
+                raise SnapshotUnstable("the session could not be persisted before copying") from exc
+            if not saved:
+                # Delete-won: the session was permanently deleted while the
+                # flush awaited the lock. Bundling would ship the destroyed
+                # conversation to the peer (or an empty shell of it), so the
+                # transfer fails instead of answering success.
+                logger.warning(
+                    "session_transfer: slot=%s was permanently deleted during "
+                    "the pre-bundle flush; refusing the transfer",
+                    slot.key,
+                )
+                raise SnapshotUnstable("the session was permanently deleted")
             if slot._dirty_gen != gen_before_save:
                 continue
             _guard_snapshot(slot)
@@ -640,6 +649,19 @@ async def build_transfer_bundle_async(
         # kept because this snapshot has already been wrong twice by assuming a
         # single field told the whole story.
         count_before = len(slot.messages)
+        # Direct delete check, independent of the flush arm above: if the
+        # periodic 5s flush hit the delete-won guard first, it cleared
+        # ``_dirty``, the flush arm here never ran, and the disk read below
+        # would assemble a bundle from a permanently deleted session (its
+        # in-memory tail plus an empty transcript). The ``saved``-check above
+        # only covers a delete observed by THIS builder's own flush.
+        if session_was_deleted(state, slot):
+            logger.warning(
+                "session_transfer: slot=%s belongs to a permanently deleted "
+                "session; refusing the transfer",
+                slot.key,
+            )
+            raise SnapshotUnstable("the session was permanently deleted")
         # Snapshot the unpersisted tail (and the slot fields the bundle needs) ON
         # THE LOOP, so the thread below never touches the slot while the loop
         # could be appending to it. Everything past this point is plain data.
@@ -675,6 +697,18 @@ async def build_transfer_bundle_async(
         # while ``_disk_window_len`` stays put, which would otherwise read as
         # "stable" and copy turns the user just discarded.
         _guard_snapshot(slot)
+        # The deletion check too: the assembly read above is the longest await
+        # in this builder (redaction regexes over the whole transcript), so a
+        # permanent delete can complete inside it — after the pre-read probe
+        # passed — and the bundle in hand is the destroyed conversation. A
+        # delete is permanent, so this is a refusal, not a retry.
+        if session_was_deleted(state, slot):
+            logger.warning(
+                "session_transfer: slot=%s was permanently deleted during "
+                "bundle assembly; refusing the transfer",
+                slot.key,
+            )
+            raise SnapshotUnstable("the session was permanently deleted")
         if (
             slot._dirty_gen == gen_before
             and slot._disk_window_len == boundary_before
@@ -685,9 +719,7 @@ async def build_transfer_bundle_async(
             "session_transfer: slot %s flushed during the transcript read; retrying",
             slot.key,
         )
-    raise SnapshotUnstable(
-        f"transcript snapshot did not settle in {_SNAPSHOT_ATTEMPTS} attempts"
-    )
+    raise SnapshotUnstable(f"transcript snapshot did not settle in {_SNAPSHOT_ATTEMPTS} attempts")
 
 
 def _guard_snapshot(slot: _ChatSlot) -> None:
@@ -711,8 +743,7 @@ def _guard_snapshot(slot: _ChatSlot) -> None:
     # not.)
     if slot._disk_window_len > len(slot.messages):
         raise SnapshotUnstable(
-            "the persisted boundary is ahead of the resident window "
-            "(a flush landed mid-stream)"
+            "the persisted boundary is ahead of the resident window " "(a flush landed mid-stream)"
         )
 
 
@@ -1191,9 +1222,7 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
             # Files in a thread (blocking IO), join on the loop (the live map's
             # whole-file write is unsynchronised against concurrent session
             # starts). See _write_layer_b_files / _join_layer_b.
-            written_sid = await asyncio.to_thread(
-                _write_layer_b_files, layer_b, new_slot.agent
-            )
+            written_sid = await asyncio.to_thread(_write_layer_b_files, layer_b, new_slot.agent)
             layer_b_sid = written_sid or ""
             resumable = bool(layer_b_sid) and _join_layer_b(sessions, sm_key, layer_b_sid)
             if not resumable:
@@ -1283,8 +1312,11 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
                 exc_info=True,
             )
             sel().log_api_access(
-                caller=caller, operation="chat.slot_import", outcome="error",
-                source="dashboard", resources=f"to={new_slot.key}",
+                caller=caller,
+                operation="chat.slot_import",
+                outcome="error",
+                source="dashboard",
+                resources=f"to={new_slot.key}",
                 error="durable save failed",
             )
             return web.json_response(

@@ -46,10 +46,21 @@ const RELEASE_NOTES = `${PROJECT}/release-notes.md`
 const OVERVIEW = `${PROJECT}/src/overview.md`
 
 const DIRS = new Set([PROJECT, WORKSPACE])
+
+/** Unicode paths — issue #6483: none of these classified before PATH_SHAPE_RE
+ *  gained `\p{L}\p{M}\p{N}` + the `u` flag, so the probe was never issued. The
+ *  NFD constant is written with escapes (e + U+0301) exactly as macOS returns
+ *  decomposed filenames. */
+const CJK_DOC = `${PROJECT}/产品文档/发布说明.md`
+const NFD_NOTES = `${PROJECT}/cafe\u0301-menu\u0308/notes.md`
+const DEVANAGARI_REPORT = '~/दस्तावेज़/रिपोर्ट.md'
 const FILES = new Set([
   `${PROJECT}/README.md`,
   OVERVIEW,
   RELEASE_NOTES,
+  CJK_DOC,
+  NFD_NOTES,
+  DEVANAGARI_REPORT,
 ])
 
 const realFetch = globalThis.fetch.bind(globalThis)
@@ -84,6 +95,21 @@ api.browseFiles = (async (p?: string) => ({
     { name: 'Makefile', path: '/x/Makefile', mtime: 0 },
   ],
 })) as typeof api.browseFiles
+
+// A project-root folder tab uses the same real Pierre tree as the dashboard.
+// Only the transport is stubbed; expand/collapse and row rendering stay real.
+api.projectTree = (async () => ({
+  root: PROJECT,
+  paths: [
+    'README.md',
+    'docs/getting-started.md',
+    'src/overview.md',
+    'src/components/Header.tsx',
+    'website/package.json',
+  ],
+  repo: false,
+})) as typeof api.projectTree
+api.projectGitStatus = (async () => ({ repo: false, files: [] })) as typeof api.projectGitStatus
 
 // The reveal scene mounts the real MarkdownPanel, which asks whether this path is
 // already tracked as an artifact. Answer "no" rather than let it hit the dev
@@ -203,7 +229,70 @@ function MarkdownLinkScene() {
   )
 }
 
+function FolderFlowScene() {
+  const [active, setActive] = useState<'tree' | 'file'>('tree')
+  const [opened, setOpened] = useState<string | null>(null)
+  const openFile = (path: string) => {
+    setOpened(path)
+    setActive('file')
+  }
+  return (
+    <div data-capture-root style={{ width: 720, height: 420 }} className="flex flex-col bg-bg">
+      <div className="flex items-center gap-1 h-[38px] px-2 shrink-0 border-b border-border" role="tablist">
+        <button
+          role="tab"
+          aria-selected={active === 'tree'}
+          onClick={() => setActive('tree')}
+          className={`h-7 px-2 rounded-md text-[12px] border-none cursor-pointer ${active === 'tree' ? 'bg-border text-accent' : 'bg-transparent text-muted'}`}
+        >Project tree</button>
+        {opened && (
+          <button
+            role="tab"
+            aria-selected={active === 'file'}
+            onClick={() => setActive('file')}
+            className={`h-7 px-2 rounded-md text-[12px] border-none cursor-pointer ${active === 'file' ? 'bg-border text-accent' : 'bg-transparent text-muted'}`}
+          >{opened.split('/').pop()}</button>
+        )}
+      </div>
+      <div className="relative flex-1 min-h-0">
+        <div className="absolute inset-0" style={{ display: active === 'tree' ? 'block' : 'none' }}>
+          <FolderPanel
+            path={PROJECT}
+            projectDir={PROJECT}
+            onClose={() => {}}
+            onFileOpen={openFile}
+          />
+        </div>
+        {opened && (
+          <div className="absolute inset-0" style={{ display: active === 'file' ? 'block' : 'none' }}>
+            <MarkdownPanel
+              embedded
+              filePath={opened}
+              content={'# Project overview\n\nThis file opened in a separate tab. The Project tree stays intact.'}
+              onContentChange={() => {}}
+              onSave={async () => {}}
+              onClose={() => setActive('tree')}
+            />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** Unicode transcript for issue #6483: rooted CJK, NFD-decomposed accented,
+ *  and home-relative Devanagari paths must classify; slash-separated prose
+ *  must stay plain. */
+const UNICODE = [
+  'The launch doc lives at `' + CJK_DOC + '`,',
+  'the macOS notes folder holds `' + NFD_NOTES + '` (NFD-decomposed),',
+  'and the report is at `' + DEVANAGARI_REPORT + '`.',
+  '',
+  'Prose stays plain: `要么这样/要么那样` and `и/или` are not paths.',
+].join('\n')
+
 function Scene() {
+  if (scene === 'folder-flow') return <FolderFlowScene />
   if (scene === 'markdown-link') return <MarkdownLinkScene />
   if (scene === 'range') return <RangeScene />
   if (scene === 'reveal') {
@@ -230,6 +319,7 @@ function Scene() {
       <div data-capture-root style={{ width: 420, height: 340 }} className="bg-bg">
         <FolderPanel
           path={PROJECT}
+          projectDir={PROJECT}
           onClose={() => {}}
           onFileOpen={() => {}}
         />
@@ -239,7 +329,7 @@ function Scene() {
   return (
     <div data-capture-root className="bg-bg p-5" style={{ width: 720 }}>
       <MarkdownRenderer
-        content={scene === 'cited' ? CITED : TRANSCRIPT}
+        content={scene === 'cited' ? CITED : scene === 'unicode' ? UNICODE : TRANSCRIPT}
         onFileOpen={() => {}}
         onFolderOpen={() => {}}
       />

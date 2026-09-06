@@ -27,7 +27,10 @@ import { useNavigate } from 'react-router-dom'
 import { useAppDispatch } from '../../../store'
 import { createSlot, switchSlot, deleteSlot } from '../../../store/chatSlice'
 import { api } from '../../../api/client'
+import { readSendReceipt } from '../../../utils/sendDelivery'
+import { isMissingSlotError } from '../../../utils/thunkError'
 import { issueRadarApi, type InvestigationRecord, type ItemKind, RepoRef } from '../api'
+import { repoScopeKey } from './links'
 
 /** One folder per connected repo groups all its sessions. */
 const FOLDER_PREFIX = 'Issue Radar - '
@@ -49,12 +52,19 @@ async function resolveFolderId(repo: string): Promise<string> {
   return created.id
 }
 
-/** One request to open (or resume) a session for one provider item. */
-/** True when an error means the slot no longer exists (a 404 from the slot
- * detail fetch), as opposed to a transient failure reaching the gateway. */
-function isMissingSlot(e: unknown): boolean {
-  const msg = e instanceof Error ? e.message : String(e ?? '')
-  return /\b404\b/.test(msg) || /not found/i.test(msg)
+/** Identity of one investigable item, for state that must not follow the user to
+ * a different one.
+ *
+ * The detail pane is NOT keyed by the selected item (`Workspace.tsx` renders
+ * `<IssueDetail issue={activeIssue} />` with no `key`), so selecting another issue
+ * re-renders the SAME component instance with a new prop. A bare boolean "this
+ * click was declined" therefore survives the switch, and the next item would
+ * render its re-run affordance and force past the guard on a first click -- on an
+ * item nobody declined. Storing WHICH item was declined and comparing at render
+ * closes that without an effect, so there is no window where the wrong label is
+ * painted. */
+export function itemKey(repoRef: RepoRef, number: number, kind: ItemKind = 'issue'): string {
+  return `${repoScopeKey(repoRef)}#${kind}:${number}`
 }
 
 export interface OpenSessionArgs {
@@ -71,14 +81,40 @@ export interface OpenSessionArgs {
   prompt: string
   /** The item's existing record, when it has one (drives resume). */
   existing: InvestigationRecord | null
+  /** Open a replacement session even though the item's work already CONCLUDED.
+   *
+   * Off by default, and that default is the point: a concluded record whose
+   * session has been closed must not silently start the work over (see the
+   * concluded branch below). The UI sets this only from a second, explicit
+   * click, so re-doing finished work is always something the user asked for. */
+  force?: boolean
 }
 
 export interface UseAgentSession {
   /** Open (or resume) the session, then navigate to /chat. Returns the linked
-   * record, or null on failure. */
+  /** Open (or resume) the session, then navigate to /chat. Returns the linked
+   * record, or null on failure.
+   *
+   * A DECLINED click also returns a record -- the freshly-read one -- because the
+   * callers' only use of the return value is to write it into their query cache,
+   * and a decline is precisely the moment their cached copy has been proven
+   * stale. So null-ness does not mean "declined": `concludedFor` is the decline
+   * signal, and it is what the button reads to offer Start over. */
   openSession: (args: OpenSessionArgs) => Promise<InvestigationRecord | null>
   busy: boolean
   error: Error | null
+  /** `itemKey` of the item whose click was DECLINED because its work had already
+   * concluded and its session is gone — or null when the last click was not
+   * declined. Not an error: nothing failed and there is nothing to retry.
+   *
+   * An IDENTITY rather than a boolean, because the detail pane is reused across
+   * items (see `itemKey`), so a flag would follow the user to the next one and
+   * force past the guard there on a first click. Callers compare it against their
+   * own item.
+   *
+   * Cleared by the next `openSession` rather than by a separate resetter: every
+   * call clears it on entry, so a click declined again simply re-sets it. */
+  concludedFor: string | null
 }
 
 export function useAgentSession(): UseAgentSession {
@@ -86,36 +122,128 @@ export function useAgentSession(): UseAgentSession {
   const navigate = useNavigate()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<Error | null>(null)
+  const [concludedFor, setConcludedFor] = useState<string | null>(null)
 
   const openSession = useCallback(
-    async ({ repoRef, number, kind = 'issue', title, prompt, existing }: OpenSessionArgs): Promise<InvestigationRecord | null> => {
+    async ({ repoRef, number, kind = 'issue', title, prompt, existing, force = false }: OpenSessionArgs): Promise<InvestigationRecord | null> => {
       setBusy(true)
       // Set once a slot exists but is not yet linked to an investigation record;
       // cleared on success. See the rollback in the catch below.
       let createdSlotKey: string | null = null
       setError(null)
+      setConcludedFor(null)
       try {
-        // ── Resume: reattach to a still-live session. switchSlot fetches the
-        // slot detail; a deleted slot 404s (the api client throws), so we fall
-        // through to open a fresh one.
-        if (existing?.slot_key) {
-          // Only a slot that is genuinely GONE justifies opening a replacement.
-          // Catching everything here turned any transient failure (network blip,
-          // 500) into "the session was deleted", so a live session got orphaned
-          // and its record overwritten. And saveInvestigation stays OUTSIDE this
-          // fallback: a failed timestamp touch is not a reason to re-create the
-          // session the user just resumed.
-          let resumed = false
+        // ── Resume: reattach to a still-live session, else fall through and open
+        // a fresh one.
+        //
+        // PROBE before dispatching. `switchSlot.pending` mutates a lot of state
+        // synchronously -- it assigns `activeSlot`, caches the outgoing slot's
+        // activity, writes its message page, and pushes it onto the MRU
+        // `slotHistory` -- and its rejected reducer unwinds almost none of that.
+        // Undoing it from out here took three attempts and produced a new defect
+        // each time: a key left pointing at a deleted session, then a restore that
+        // raced a user switching chats, then a deleted key left in the Alt+`
+        // history. So nothing is dispatched until the slot is known to be live,
+        // and a decline touches the store not at all.
+        //
+        // The cost is one slot read on the resume path, duplicating what
+        // `switchSlot` fetches when the session is in fact alive. That is the
+        // right trade against unwinding shared chat state from a feature hook.
+        const resumeIfLive = async (slotKey: string) => {
           try {
-            await dispatch(switchSlot(existing.slot_key)).unwrap()
-            resumed = true
+            await api.chatSlotDetail(slotKey, 1)
           } catch (e) {
-            if (!isMissingSlot(e)) throw e
+            // Only a slot that is genuinely GONE justifies declining or opening a
+            // replacement. Treating every failure as "deleted" is what orphaned
+            // live sessions before, so a transient blip or a 500 still throws.
+            if (!isMissingSlotError(e)) throw e
+            return null
           }
-          if (resumed) {
-            const res = await issueRadarApi.saveInvestigation(repoRef, number, {}, kind)
-            navigate('/chat')
-            return res.investigation
+          // The probe said live, so a missing-slot rejection HERE means the
+          // session was deleted in the intervening moment. That is a genuine race
+          // and it throws rather than falling through: falling through could reach
+          // the decline below, which is only safe because nothing has been
+          // dispatched. One retry re-probes and takes the honest branch.
+          await dispatch(switchSlot(slotKey)).unwrap()
+          // `saveInvestigation` stays outside the probe's error handling: a failed
+          // timestamp touch is not a reason to re-create the session just resumed.
+          const res = await issueRadarApi.saveInvestigation(repoRef, number, {}, kind)
+          navigate('/chat')
+          return res.investigation
+        }
+
+        if (existing?.slot_key) {
+          const reattached = await resumeIfLive(existing.slot_key)
+          if (reattached) return reattached
+
+          // The slot this client knew about is gone. Before concluding anything,
+          // re-read the record.
+          //
+          // The cached one is not good enough to decide this. It is read
+          // cache-first with a 30s `staleTime` (InvestigateButton), and the
+          // window that matters is exactly the one where it goes stale: the
+          // agent records its verdict through the MCP tool, the session closes,
+          // and the user clicks Resume -- all without the client necessarily
+          // refetching. A record still reading `investigating` on this side
+          // would then fall through to a silent re-run, which is the very
+          // defect this guard exists to prevent, arriving by another route.
+          //
+          // Re-read only HERE: the happy path must not pay for it, and a stale
+          // status is only dangerous once we know the session is unrecoverable.
+          // A failed re-read deliberately propagates rather than falling back to
+          // the cached value -- the same rule the probe follows for a transient
+          // failure. Guessing "investigating" from a stale cache is what spends
+          // an agent run and overwrites a verdict; guessing "concluded" would
+          // show a finished-work message that may be false. Not knowing is
+          // retryable, and neither guess is.
+          const fresh = await issueRadarApi.getInvestigation(repoRef, number, kind)
+          const current = fresh.investigation ?? existing
+
+          // The record may name a DIFFERENT session than the one this client
+          // cached -- another tab started over, so the investigation already has a
+          // live replacement. The probe above says nothing about that slot, and
+          // treating it as gone would open a THIRD session and overwrite the live
+          // one's link, orphaning a session that is running. So try it too.
+          if (current.slot_key && current.slot_key !== existing.slot_key) {
+            const reattachedFresh = await resumeIfLive(current.slot_key)
+            if (reattachedFresh) return reattachedFresh
+          }
+
+
+          // Whether a gone slot justifies opening a replacement depends on
+          // whether the work was FINISHED when the session was closed, and the
+          // record says so: the recording tool defaults `status` to `resolved`,
+          // so a record still reading `investigating` never wrote a verdict.
+          //
+          // Only work still in progress earns a silent replacement. Closing the
+          // session is how a user marks an investigation done, so re-seeding a
+          // full investigation there would re-do finished work, spend a fresh
+          // agent run, and overwrite the verdict already on the record -- all
+          // from a button that reads "Resume". Say so instead, and let a second
+          // explicit click (`force`) start over.
+          //
+          // The test is `present AND not investigating` rather than a list of
+          // concluded statuses, so it fails CLOSED on a status this build does
+          // not know: `archived` is today's third, and a fourth added later
+          // declines the silent re-run rather than inheriting it.
+          //
+          // An ABSENT status is deliberately NOT concluded. The store normalizes
+          // every record it writes (`status` falls back to `investigating` when
+          // missing or unrecognised), so a record with no status never comes
+          // from the API -- and absence is not evidence of finished work to
+          // protect, so mirroring the store's own default is the honest reading.
+          // Treating it as concluded would instead re-break the dead end this
+          // fallback exists to fix.
+          const concludedBefore = !!current.status && current.status !== 'investigating'
+          if (!force && concludedBefore) {
+            setConcludedFor(itemKey(repoRef, number, kind))
+            // Return the REFRESHED record, not null. Both callers use the return
+            // value for exactly one thing -- writing it into their query cache --
+            // so handing back `current` repairs the stale read that sent us down
+            // this path. Returning null instead left the pane showing "Start over"
+            // beside a pill still claiming the investigation was running, which is
+            // the same staleness this branch exists to correct, left on screen.
+            return current
           }
         }
 
@@ -140,16 +268,43 @@ export function useAgentSession(): UseAgentSession {
         const seedInFlight = api.sendChat(prompt, slot.key)
         createdSlotKey = null
         const seeded = await seedInFlight
-        if (seeded && typeof seeded === 'object' && 'ok' in seeded && !(seeded as Response).ok) {
-          // Rejected outright, so nothing is running: the empty slot is safe (and
-          // wrong) to remove.
-          await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
-          throw new Error(`could not seed the session (HTTP ${(seeded as Response).status})`)
+        // A REFUSAL, not merely a non-2xx: `/api/chat` also declines inside a 200
+        // by answering `{ok:false}`, and a status-only check passed that as a
+        // success -- recording and navigating to exactly the empty session this
+        // guard exists to prevent. `readSendReceipt` owns that distinction for
+        // every send site. An UNREADABLE 2xx receipt deliberately does NOT land
+        // here: the request was accepted, so the seed may be running, and
+        // deleting the slot would cancel real work over a mangled reply.
+        if (seeded && typeof seeded === 'object' && 'ok' in seeded) {
+          const { body, outcome } = await readSendReceipt(seeded as Response)
+          if (outcome === 'refused') {
+            // Rejected outright, so nothing is running: the empty slot is safe
+            // (and wrong) to remove.
+            await dispatch(deleteSlot(slot.key)).unwrap().catch(() => {})
+            const reason = typeof body.error === 'string' && body.error
+              ? body.error
+              : `HTTP ${(seeded as Response).status}`
+            throw new Error(`could not seed the session (${reason})`)
+          }
         }
         const res = await issueRadarApi.saveInvestigation(repoRef, number, {
           slot_key: slot.key,
           folder_id: folderId,
           status: 'investigating',
+          // NOT `findings: null` here, deliberately. Clearing at this point would
+          // destroy the stored verdict the moment the replacement session opens,
+          // before the new run has produced anything -- and the record is the only
+          // copy, so an abandoned or failed Start over would lose it permanently.
+          // That is worse than what it fixes, and worse specifically on the path
+          // this PR documents as unprotected (a user who does not read the relabel
+          // and clicks again).
+          //
+          // The prior verdict therefore survives, which leaves a real defect: the
+          // replacement's own `record_investigation` MERGES per key, so a new
+          // verdict that omits a key inherits the old one's. Fixing that belongs
+          // where the transition is atomic -- store-side, replacing rather than
+          // merging on the first record of a new run -- not at session open. Filed
+          // separately; this path is unchanged from before the PR.
         }, kind)
         await dispatch(switchSlot(slot.key)).unwrap().catch(() => {})
         navigate('/chat')
@@ -171,5 +326,5 @@ export function useAgentSession(): UseAgentSession {
     [dispatch, navigate],
   )
 
-  return { openSession, busy, error }
+  return { openSession, busy, error, concludedFor }
 }

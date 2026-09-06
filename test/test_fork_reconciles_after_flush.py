@@ -319,6 +319,7 @@ async def test_a_boundary_ahead_of_the_window_does_not_duplicate_persisted_turns
         flushes["n"] += 1
         s._disk_window_len = len(s.messages)
         s._dirty = False
+        return True
 
     monkeypatch.setattr("kiro_crew.dashboard.chat_fork.save_slot_off_loop", fake_flush)
 
@@ -859,8 +860,8 @@ async def test_a_rewind_landing_during_the_pending_rewrite_save_is_not_erased(
             # flag -- including the rewind's, which it never owned.
             await real_save(state_, slot_, stale_snapshot, rewrite=True, best_effort=False)
             slot_._pending_rewrite = False
-            return
-        await real_save(state_, slot_, *a, **kw)
+            return True
+        return await real_save(state_, slot_, *a, **kw)
 
     monkeypatch.setattr(chat_fork_mod, "save_slot_off_loop", _save_with_a_rewind_landing_inside)
 
@@ -1047,8 +1048,8 @@ async def test_the_pending_rewrite_retry_still_archives_the_discarded_turns(tmp_
             slot_._pending_rewrite = True
             await real_save(state_, slot_, stale_snapshot, rewrite=True, best_effort=False)
             slot_._pending_rewrite = False
-            return
-        await real_save(state_, slot_, *a, **kw)
+            return True
+        return await real_save(state_, slot_, *a, **kw)
 
     monkeypatch.setattr(chat_fork_mod, "save_slot_off_loop", _save_with_a_rewind_landing_inside)
 

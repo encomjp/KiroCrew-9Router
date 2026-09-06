@@ -18,7 +18,8 @@ import type { SettingEntry } from '../settingsTypes'
  *
  * Backs the **Settings** tab. Searches over the codegen'd SETTINGS_REGISTRY
  * (label, description, keywords, tab name) using the shared fuzzy matcher.
- * Activation navigates to `/settings?tab=<tab>&highlight=<id>`.
+ * Activation navigates to `/settings/<tab>?highlight=<id>` (second-level
+ * selections ride as the second path segment).
  *
  * ## Tab filter syntax
  *

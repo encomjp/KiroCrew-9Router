@@ -106,7 +106,27 @@ export default function SideChat({ slot }: { slot: string }) {
   )
 
   /** Derived from the same helper the main chat uses, so "options only after the answer
-   *  settles" and "a later user message clears them" behave identically. */
+   *  settles" and "a later user message clears them" behave identically.
+   *
+   *  `followUpIsPlan` is DELIBERATELY dropped here (#6754; sibling issue #6057 covers
+   *  the same drop in ChatEmbed): this side panel is not a plan-capable host, so a
+   *  plan-shaped chip stays on the composer-draft path instead of dispatching
+   *  POST /api/chat/slots/{slot}/plan-action. Why that is a recorded exclusion rather
+   *  than a live mis-dispatch:
+   *  - A side turn runs as an aside to the parent session, never as an orchestrator
+   *    turn, so a plan-shaped answer in the side buffer is conversational output, not
+   *    a plan awaiting dispatch; `useComposerDraft` owning the chip (pick → edits the
+   *    draft, amendable before send) is therefore the correct behaviour, not a
+   *    fallback.
+   *  - The dispatch path gates on the HOST slot's mode (ChatPage reads
+   *    `effectiveMode === 'orchestrator'` off the slot record before dispatching).
+   *    This panel does not read the host slot's mode today — its transcript is the
+   *    side buffer, a private mini-conversation beside the parent slot — and wiring
+   *    `usePlanActionMutation` in would first need that mode selector added, gating
+   *    on the PARENT's mode for a conversation that is not the parent's.
+   *  - An unconditional dispatch (no mode gate) would let any plan-shaped side
+   *    answer cancel or advance the parent's real plan.
+   *  Pinned by src/test/SideChat.planExclusion.test.tsx. */
   const { followUpOptions } = useMemo(
     () => deriveFollowUpOptions(transcript, isStreaming),
     [transcript, isStreaming]
@@ -532,7 +552,7 @@ export default function SideChat({ slot }: { slot: string }) {
   return (
     <div className="flex-1 flex flex-col min-h-0">
       {showBanner && (
-        <div className={`flex items-center justify-between px-3 py-1.5 text-[12px] border-b border-border shrink-0 ${isStale ? 'bg-warning/10 text-warning' : 'bg-bg-hover/50 text-muted'}`}>
+        <div className={`flex items-center justify-between px-3 py-1.5 text-[12px] border-b border-border shrink-0 ${isStale ? 'bg-warn/10 text-warn' : 'bg-bg-hover/50 text-muted'}`}>
           <span className="italic">
             {i18nT('pages.chat.sideChat.context_from')} {i18nT('pages.chat.sideChat.turn', { count: turnsBehind })} {i18nT('pages.chat.sideChat.ago')}{age ? ` · ${age}` : ''}
           </span>

@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -33,7 +34,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.executors import subprocess_executor
+from kiro_crew.executors import configure_default_executor, subprocess_executor
+from kiro_crew.jsonl_util import rotate_jsonl_at
 from kiro_crew.mcp_caller import CallerContext, _parent_pid
 from kiro_crew.mcp_gateway import transport
 from kiro_crew.mcp_gateway.hashing import hash_command, hash_effective_env
@@ -67,6 +69,21 @@ _BRIDGE_PONG_TYPE = "pong"
 # succeeding or failing IS the signal, and it is consumed here rather than
 # forwarded, exactly like the pong frame above.
 _BRIDGE_KEEPALIVE_TYPE = "keepalive"
+# --- Reconnect budget -------------------------------------------------------
+# What the stub spends trying to re-attach after a live gateway connection dies
+# mid-session. The daemon is supervised and respawns itself with its own
+# exponential backoff, so one connect attempt would lose the race against an
+# ordinary restart -- but the budget must be finite, because a gateway that is
+# gone for good has to reach the terminal exit that tells kiro-cli this server
+# is done rather than leave the session hanging on a socket nobody will bind.
+_RECONNECT_BACKOFF_START_SECS = 0.5
+_RECONNECT_BACKOFF_MAX_SECS = 4.0
+_RECONNECT_TOTAL_BUDGET_SECS = 60.0
+# Bounds the replayed ``initialize`` on a fresh connection. The daemon answers
+# it either from its init cache or by driving a real upstream handshake, so this
+# has to cover a cold backend spawn; on timeout the reconnect is abandoned and
+# the stub takes the terminal exit.
+_REPLAY_INIT_TIMEOUT_SECS = 30.0
 # Pre-flight ``ensure_backend`` reply timeout. Must comfortably
 # exceed cold backend fork latency. On timeout the stub falls back to a
 # direct per-session exec, so an over-generous value only costs a slower
@@ -523,6 +540,41 @@ async def _safe_close(writer: asyncio.StreamWriter) -> None:
         pass
 
 
+#: Invariant fragment of gatewayd's ``_TargetUnknown`` message. This is a FROZEN
+#: WIRE CONTRACT, not an implementation detail to be tidied: the daemon that
+#: sends it may be an old surviving process whose text can never be changed, so
+#: matching is the only classifier available for it. Only the stable leading
+#: clause is matched -- the remedy clause after it names an env prefix that HAS
+#: already changed across versions (``MC_MCP_TARGET_`` -> ``KIROCREW_MCP_TARGET_``).
+#: A test pins this against the live gatewayd string so the two cannot drift.
+TARGET_UNKNOWN_REASON = "no target mapping for server"
+
+
+def must_degrade_unknown_target(reason: str) -> bool:
+    """Should an UNTAGGED rejection still be treated as fallback-eligible?
+
+    A current daemon tags an unknown target ``fallback: true`` and this never
+    fires. It exists for the daemon that CANNOT tag it, which is precisely the
+    population the tag was added for: ``GatewayManager`` adopts any process
+    answering ``pong`` with no version handshake, so a daemon that outlived a
+    package upgrade serves brand-new stubs while predating every wire field
+    added since. Its target map is frozen at its own spawn, so it is also the
+    daemon most likely to be missing a server -- the tag would arrive exactly
+    where it cannot be sent.
+
+    Without this the PR's own fix is inert for the reported case: upgrade, old
+    daemon survives, adoption, untagged target-unknown, stub exits, and the
+    server's whole tool surface disappears from the session anyway.
+
+    Deliberately narrow. It matches ONLY the unknown-target class, so a genuine
+    spawn failure stays terminal and does not become a per-session crash-loop --
+    which is the reason the terminal path exists. Same shape as
+    :func:`must_degrade_unshareable`: the stub cannot verify the daemon's
+    version, so it reasons from what the daemon said.
+    """
+    return TARGET_UNKNOWN_REASON in (reason or "")
+
+
 def must_degrade_unshareable(poolable: bool, capabilities: list[str]) -> bool:
     """Should this connection abandon the gateway rather than risk being pooled?
 
@@ -591,16 +643,144 @@ async def handshake(
     raise FallbackRequestedError(f"unexpected handshake reply: type={msg_type!r}")
 
 
-class BridgeLivenessFailure:
-    """Returned by :func:`run_bridge` when the peer stops responding to
-    liveness pings while requests are outstanding. Contains the IDs of
-    the requests that were still pending so the caller can emit JSON-RPC
-    error frames before degrading."""
+class StubSession:
+    """Per-STUB state that must outlive any single gateway connection.
 
-    __slots__ = ("outstanding_ids",)
+    A connection dies with the daemon; the stub does not. Everything a reconnect
+    needs therefore lives here rather than inside :func:`run_bridge`'s frame,
+    which is scoped to one socket:
 
-    def __init__(self, outstanding_ids: list) -> None:  # noqa: D107
-        self.outstanding_ids = outstanding_ids
+    * **the stdin reader thread and its queue.** This is why a reconnect cannot
+      simply call ``run_bridge`` again on a fresh socket. The reader used to be
+      created per call, so a second call would put two threads on fd 0 --
+      splitting kiro-cli's lines between two consumers -- while any line the
+      first one had already dequeued died with the old frame.
+    * **the ``initialize`` frame.** The stdin pump consumes and forwards it
+      once and kiro-cli never re-sends it, so without a copy here a fresh daemon
+      would hold a never-initialized backend that rejects every later call --
+      the reason the liveness path deliberately does not exec a replacement.
+    * **the ``initialize`` result**, so a reconnect can refuse a daemon
+      generation that would answer this session differently from the toolset it
+      froze at ``session/new``.
+    * **why the last bridge ended**, which is what decides reconnect vs exit.
+    """
+
+    #: Bridge endings a reconnect may follow. Everything else is a real
+    #: shutdown -- kiro-cli closed stdin, a signal arrived, or kiro-cli's own
+    #: reader died -- where re-attaching would serve nobody.
+    RECONNECTABLE = frozenset({"peer_dead", "socket_eof", "socket_write_failed"})
+
+    def __init__(self) -> None:  # noqa: D107
+        #: Why the most recent bridge ended; see :attr:`RECONNECTABLE`.
+        self.reason: str = ""
+        #: Request IDs still unanswered when that bridge ended.
+        self.outstanding_ids: list = []
+        #: Verbatim ``initialize`` line as kiro-cli sent it.
+        self.captured_init: Optional[bytes] = None
+        #: The ``result`` object this session was told at handshake time.
+        self.init_result: Optional[dict] = None
+        #: Successful reconnects so far, for logging and the audit record.
+        self.reconnects: int = 0
+        self._subscribed: bool = False
+        self._line_q: Optional["asyncio.Queue[bytes]"] = None
+
+    def note_outbound(self, line: bytes, msg: dict) -> None:
+        """Record what a forwarded frame means for a future reconnect."""
+        method = msg.get("method")
+        if self.captured_init is None and method == "initialize":
+            # Bounded by construction: one frame, replaced never, and only the
+            # handshake matches -- so this cannot grow with session traffic.
+            self.captured_init = line if line.endswith(b"\n") else line + b"\n"
+        elif method == "resources/subscribe":
+            # Latched on the REQUEST and never released. Counting on the request
+            # is deliberate: a subscribe this session believes it holds is what
+            # must not be dropped silently, and over-counting only costs a
+            # reconnect that would have been safe.
+            #
+            # Never released even on ``resources/unsubscribe``, which is the
+            # subtler half: that too is only a request, so an unsubscribe the
+            # server REJECTED would clear the flag while the subscription stayed
+            # live upstream -- and the reconnect would then be allowed for a
+            # session whose resource updates are about to stop with nothing
+            # said. Confirming it would mean tracking responses per id, which is
+            # more machinery than the recovery is worth while replaying
+            # subscriptions is still a follow-up.
+            self._subscribed = True
+
+    def has_live_subscriptions(self) -> bool:
+        """Has this session asked for resource subscriptions a restart loses?
+
+        The daemon's subscription table lives in its process and dies with it, so
+        a reconnect that replayed only ``initialize`` would come back looking
+        healthy while resource updates never arrived again. That is a silent
+        degradation this fix must not introduce, so a subscribed session is
+        refused the reconnect and takes the pre-existing terminal exit instead --
+        the same outcome it had before, rather than a new quiet one.
+        """
+        return self._subscribed
+
+    def note_init_result(self, msg: dict) -> None:
+        """Remember the handshake result the FIRST daemon gave this session."""
+        if self.init_result is None and isinstance(msg.get("result"), dict):
+            self.init_result = msg["result"]
+
+    def captured_init_id(self) -> Any:
+        """The request id of the captured handshake, or ``None``."""
+        if self.captured_init is None:
+            return None
+        try:
+            msg = json.loads(self.captured_init)
+        except (ValueError, TypeError):
+            return None
+        return msg.get("id") if isinstance(msg, dict) else None
+
+    async def next_line(self) -> bytes:
+        """One line from the real ``sys.stdin``, via a single reader thread.
+
+        The read runs on a DEDICATED DAEMON thread and hands lines over through
+        a bounded queue. A daemon thread is never joined at interpreter or
+        asyncio shutdown, so a ``readline`` still blocked because kiro-cli holds
+        stdin open cannot hang graceful SIGTERM -- the older
+        ``run_in_executor(readline)`` used the default executor, which
+        ``asyncio.run()`` joins via ``shutdown_default_executor()``.
+        """
+        if self._line_q is None:
+            self._line_q = self._start_reader()
+        return await self._line_q.get()
+
+    def _start_reader(self) -> "asyncio.Queue[bytes]":
+        loop = asyncio.get_running_loop()
+        # Bounded + backpressured: the reader thread blocks on put() (via
+        # run_coroutine_threadsafe) when the queue is full, so a stalled
+        # writer.drain() (gatewayd slow to accept) cannot let the reader keep
+        # draining stdin into an unbounded queue and balloon RSS.
+        line_q: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=256)
+
+        def _blocking_reader() -> None:
+            fh = sys.stdin.buffer
+            try:
+                while True:
+                    chunk = fh.readline()
+                    # Block this thread until the queue has room. .result()
+                    # waits on the loop; if the loop has stopped (shutdown) it
+                    # raises and the daemon thread simply exits.
+                    asyncio.run_coroutine_threadsafe(
+                        line_q.put(chunk), loop
+                    ).result()
+                    if not chunk:
+                        return
+            except Exception:  # pragma: no cover — defensive
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        line_q.put(b""), loop
+                    ).result(timeout=1.0)
+                except Exception:
+                    pass
+
+        threading.Thread(
+            target=_blocking_reader, name="stub-stdin", daemon=True
+        ).start()
+        return line_q
 
 
 async def run_bridge(
@@ -613,7 +793,8 @@ async def run_bridge(
     ping_interval: float = _BRIDGE_PING_INTERVAL_SECS,
     ping_max_misses: int = _BRIDGE_PING_MAX_MISSES,
     peer_supports_ping: bool = False,
-) -> Optional[BridgeLivenessFailure]:
+    session: StubSession,
+) -> None:
     """Pump stdin ↔ socket until either side closes or ``stop_event`` fires.
 
     ``stdin``/``stdout_writer`` are dependency-injected so tests can drive
@@ -621,11 +802,16 @@ async def run_bridge(
     ``sys.stdin``/``sys.stdout``. On clean stdin EOF an ``Unregister``
     frame is sent so gatewayd detaches without waiting on refcount.
 
-    Returns ``None`` on normal termination. Returns a
-    :class:`BridgeLivenessFailure` when the gateway stopped answering
-    liveness pings while requests were outstanding — the caller should
-    emit JSON-RPC errors for the listed IDs and fall back to a direct
-    exec.
+    ``session`` is the SINGLE channel this reports through, and it carries the
+    state that must survive THIS connection so the caller can re-attach to a
+    restarted gateway: pass the same :class:`StubSession` across successive calls
+    and the stdin reader, the captured handshake and the ending all persist.
+    ``session.reason`` names the ending precisely -- which is what distinguishes
+    a transport loss worth reconnecting from a real shutdown -- and
+    ``session.outstanding_ids`` lists what was left unanswered. It is required
+    rather than defaulted because there is deliberately no return value: a
+    caller without a session would learn nothing, and a second spelling of "why
+    the bridge ended" would have to be kept in step with the first forever.
     """
 
     # Writer-thread liveness signals. The real bridge hands stdout frames to a
@@ -638,6 +824,11 @@ async def run_bridge(
     # call_soon_threadsafe from the writer thread, wakes a dedicated bridge task
     # so teardown never depends on upstream traffic.
     bridge_loop = asyncio.get_running_loop()
+    # Per-CONNECTION fields, cleared so a reconnect is not judged on the last
+    # connection's ending. The captured handshake and the stdin reader are
+    # deliberately NOT cleared: those are what a reconnect exists to reuse.
+    session.reason = ""
+    session.outstanding_ids = []
     # stdin_pump and _recaller_loop both write this shared stub->gateway socket;
     # serialize their write+drain through one lock (mirrors gatewayd/backend).
     if getattr(writer, "_mc_write_lock", None) is None:
@@ -661,68 +852,38 @@ async def run_bridge(
     _peer_dead_evt = asyncio.Event()
 
     async def stdin_pump() -> None:
-        # Inbound line source. Tests inject an in-process StreamReader; the
-        # real stub reads sys.stdin on a DEDICATED DAEMON THREAD and hands
-        # lines over via a queue. A daemon thread is never joined at
-        # interpreter/asyncio shutdown, so a readline still blocked because
-        # kiro-cli holds stdin open can no longer hang graceful SIGTERM — the
-        # old run_in_executor(readline) used the default executor, which
-        # asyncio.run() joins via shutdown_default_executor().
-        loop = asyncio.get_running_loop()
-        # Bounded + backpressured: the reader thread blocks on put() (via
-        # run_coroutine_threadsafe) when the queue is full, so a stalled
-        # writer.drain() (gatewayd slow to accept) can no longer let the reader
-        # keep draining stdin into an unbounded queue and balloon RSS.
-        line_q: "asyncio.Queue[bytes]" = asyncio.Queue(maxsize=256)
-        if stdin is None:
-            def _blocking_reader() -> None:
-                fh = sys.stdin.buffer
-                try:
-                    while True:
-                        chunk = fh.readline()
-                        # Block this thread until the queue has room. .result()
-                        # waits on the loop; if the loop has stopped (shutdown)
-                        # it raises and the daemon thread simply exits.
-                        asyncio.run_coroutine_threadsafe(
-                            line_q.put(chunk), loop
-                        ).result()
-                        if not chunk:
-                            return
-                except Exception:  # pragma: no cover — defensive
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            line_q.put(b""), loop
-                        ).result(timeout=1.0)
-                    except Exception:
-                        pass
-
-            threading.Thread(
-                target=_blocking_reader, name="stub-stdin", daemon=True
-            ).start()
-
+        # Inbound line source. Tests inject an in-process StreamReader; the real
+        # stub reads sys.stdin through the SESSION, which owns exactly one
+        # reader thread per process. Owning it here instead would put a second
+        # thread on fd 0 the moment a reconnect ran this pump again, splitting
+        # kiro-cli's lines between two consumers (see StubSession).
         async def _next_line() -> bytes:
             if stdin is not None:
                 try:
                     return await stdin.readuntil(b"\n")
                 except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
                     return b""
-            return await line_q.get()
+            return await session.next_line()
 
         while True:
             line = await _next_line()
             if not line:
+                session.reason = session.reason or "stdin_eof"
                 try:
                     await _write_frame(writer, {"type": "unregister"})
                 except Exception:
                     pass
                 return
-            # Track outbound JSON-RPC request IDs (have "method" + "id").
+            # Track outbound JSON-RPC request IDs (have "method" + "id"), and
+            # let the session keep whatever a reconnect will need.
             # Best-effort: parse failures are silently ignored — the frame is
             # still forwarded verbatim.
             try:
                 msg = json.loads(line)
-                if isinstance(msg, dict) and "method" in msg and "id" in msg:
-                    _outstanding_ids.add(msg["id"])
+                if isinstance(msg, dict):
+                    session.note_outbound(line, msg)
+                    if "method" in msg and "id" in msg:
+                        _outstanding_ids.add(msg["id"])
             except (ValueError, TypeError):
                 pass
             try:
@@ -738,6 +899,7 @@ async def run_bridge(
                     writer.write(line if line.endswith(b"\n") else line + b"\n")
                     await writer.drain()
             except (ConnectionError, BrokenPipeError):
+                session.reason = session.reason or "socket_write_failed"
                 return
 
     async def stdout_pump() -> None:
@@ -803,8 +965,10 @@ async def run_bridge(
                 try:
                     line = await reader.readuntil(b"\n")
                 except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
+                    session.reason = session.reason or "socket_eof"
                     return
                 if not line:
+                    session.reason = session.reason or "socket_eof"
                     return
                 # Intercept control frames (gateway liveness reply, gateway
                 # keepalive) and track response IDs to clear outstanding
@@ -827,6 +991,12 @@ async def run_bridge(
                             # A response (has id, no method) — clear from
                             # outstanding set.
                             _outstanding_ids.discard(msg["id"])
+                            if msg["id"] == session.captured_init_id():
+                                # What this session was told at handshake time.
+                                # A later daemon generation answering the
+                                # replayed handshake differently must not be
+                                # passed off as the same server.
+                                session.note_init_result(msg)
                 except (ValueError, TypeError):
                     pass
                 # Control frames are gateway<->stub only; never forward to
@@ -836,6 +1006,7 @@ async def run_bridge(
                 try:
                     await _emit(line)
                 except (ConnectionError, BrokenPipeError):
+                    session.reason = session.reason or "writer_failed"
                     return
         finally:
             # Best-effort stop signal; the daemon thread is never joined, so
@@ -930,7 +1101,6 @@ async def run_bridge(
                 _liveness_monitor(), name="kirocrew-mcp-stub-liveness"
             )
         )
-    result: Optional[BridgeLivenessFailure] = None
     try:
         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     finally:
@@ -939,11 +1109,315 @@ async def run_bridge(
                 t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         await _safe_close(writer)
-        # If the peer-dead event fired, report a liveness failure so the
-        # caller can emit JSON-RPC errors and degrade.
-        if _peer_dead_evt.is_set() and _outstanding_ids:
-            result = BridgeLivenessFailure(list(_outstanding_ids))
-    return result
+        # Ending reason, most authoritative cause first. A dead peer also breaks
+        # the stdin pump's next write, so the pump-set reason must not mask it;
+        # and a deliberate stop outranks every transport symptom it produces.
+        if stop_event.is_set():
+            session.reason = "stop"
+        elif _peer_dead_evt.is_set():
+            session.reason = "peer_dead"
+        elif writer_failed.is_set():
+            session.reason = "writer_failed"
+        elif not session.reason:
+            # No pump claimed an ending. Unknown is deliberately NOT
+            # reconnectable: re-attaching on a cause nobody can name is how a
+            # recoverable outage turns into a session that answers wrongly.
+            session.reason = "unknown"
+        session.outstanding_ids = list(_outstanding_ids)
+
+
+async def _emit_error_frames(req_ids: list, message: str, *, pool_label: str) -> None:
+    """Answer abandoned requests so the caller is never left parked.
+
+    The write runs on a worker thread and is bounded by
+    ``_ERROR_EMIT_TIMEOUT_SECS``: a blocked kiro-cli reader (full stdout pipe)
+    must not wedge the very path whose job is to unwedge the caller, which is
+    the defect this path exists to prevent.
+    """
+    if not req_ids:
+        return
+
+    def _write() -> None:
+        for req_id in req_ids:
+            err_frame = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32603, "message": message},
+            }
+            sys.stdout.buffer.write(
+                json.dumps(err_frame, separators=(",", ":")).encode("utf-8") + b"\n"
+            )
+        sys.stdout.buffer.flush()
+
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(_write), timeout=_ERROR_EMIT_TIMEOUT_SECS
+        )
+    except (asyncio.TimeoutError, OSError, ValueError):
+        # Nothing better to do: the reader is gone or wedged. Exiting still
+        # closes stdout, which is what tells kiro-cli this server is done.
+        logger.warning("could not emit error frames pool=%s", pool_label)
+
+
+#: Replay outcomes. The distinction is the whole point: a REFUSAL will answer the
+#: same way on every later attempt, so retrying it only delays the terminal exit;
+#: a transport loss says nothing about the answer, and giving up on one would
+#: waste the reconnect budget in exactly the case it exists for -- a supervisor
+#: respawn, where the daemon this stub reaches may still be starting up or may
+#: itself die again mid-replay.
+_REPLAY_OK = "ok"
+_REPLAY_RETRY = "retry"
+_REPLAY_REFUSE = "refuse"
+
+
+async def _replay_initialize(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    session: StubSession,
+) -> tuple[str, Optional[bytes], str]:
+    """Re-establish the MCP handshake for a reconnected stub.
+
+    kiro-cli sends ``initialize`` exactly once and never repeats it, and the
+    daemon held the captured copy in per-connection memory that died with it. So
+    the stub replays its own copy: the fresh daemon either answers from a
+    backend's init cache or drives a real upstream handshake, and either way the
+    connection ends up in the state the session already believes it is in.
+    Replaying more than once is safe for the same reason -- a backend that is
+    already handshake-complete answers a later stub from that cache.
+
+    Returns ``(status, forward, detail)`` where status is one of
+    :data:`_REPLAY_OK`, :data:`_REPLAY_RETRY` or :data:`_REPLAY_REFUSE`.
+    ``forward`` is a line the caller must write to kiro-cli -- non-empty ONLY
+    when the original handshake never got its answer, in which case this reply is
+    the one kiro-cli is still waiting for. When the session DID get an answer,
+    the reply is compared against it and swallowed: kiro-cli already holds a
+    response for that id, and a second one for the same id is a protocol
+    violation.
+    """
+    if session.captured_init is None:
+        return _REPLAY_REFUSE, None, "no_captured_initialize"
+    init_id = session.captured_init_id()
+    try:
+        await _write_frame(writer, json.loads(session.captured_init))
+    except (OSError, ConnectionError) as exc:
+        return _REPLAY_RETRY, None, f"replay_write_failed: {exc}"
+    except (ValueError, TypeError) as exc:
+        # Our own captured frame does not parse; no connection will fix that.
+        return _REPLAY_REFUSE, None, f"captured_initialize_malformed: {exc}"
+
+    async def _await_reply() -> tuple[str, Optional[bytes], str]:
+        while True:
+            line = await reader.readuntil(b"\n")
+            if not line:
+                return _REPLAY_RETRY, None, "closed_during_replay"
+            try:
+                msg = json.loads(line.decode("utf-8", errors="replace"))
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("type") in (_BRIDGE_PONG_TYPE, _BRIDGE_KEEPALIVE_TYPE):
+                continue
+            if msg.get("id") != init_id or "method" in msg:
+                # Anything else on a connection whose only traffic so far is our
+                # own replay is not addressed to this session's handshake.
+                continue
+            if "error" in msg:
+                return _REPLAY_REFUSE, None, f"replay_rejected: {msg['error']}"
+            if session.init_result is None:
+                # The first handshake never completed, so kiro-cli is still
+                # waiting: this reply is genuinely its answer, not a duplicate.
+                return _REPLAY_OK, line, "forwarded_first_answer"
+            if msg.get("result") != session.init_result:
+                # Fail CLOSED, and terminally. A daemon generation whose
+                # configuration moved on can answer with a different server than
+                # the one whose tools this session froze at session/new; carrying
+                # on would turn a recoverable outage into a session that answers
+                # wrongly, which is strictly worse than the terminal exit. It is
+                # also not worth retrying: that generation owns the endpoint.
+                return _REPLAY_REFUSE, None, "handshake_result_changed"
+            return _REPLAY_OK, None, "result_matched"
+
+    try:
+        return await asyncio.wait_for(
+            _await_reply(), timeout=_REPLAY_INIT_TIMEOUT_SECS
+        )
+    except asyncio.TimeoutError:
+        return _REPLAY_RETRY, None, "replay_timeout"
+    except (
+        asyncio.IncompleteReadError,
+        asyncio.LimitOverrunError,
+        OSError,
+        ConnectionError,
+    ) as exc:
+        return _REPLAY_RETRY, None, f"replay_read_failed: {exc}"
+
+
+def _split_abandoned_ids(session: StubSession) -> tuple[list, Any]:
+    """Which in-flight ids to fail now, and which single one to defer.
+
+    An id answered twice is a protocol violation, not a belt-and-braces retry,
+    so every id gets exactly one response. Calls are failed retryably because the
+    stub cannot know whether the dead daemon forwarded them upstream before it
+    died, and replaying them could double a side effect.
+
+    An unanswered ``initialize`` is the one exception. The replay on a fresh
+    connection can still answer it for real, so erroring it here would either
+    contradict that success or duplicate the error the terminal path emits. It is
+    deferred and resolved once -- by the replay if that works, by the terminal
+    path if it does not. An ``initialize`` this session ALREADY has a result for
+    is not deferred: the replay swallows that reply as a duplicate, so nobody
+    downstream would ever answer the id.
+    """
+    deferred: Any = None
+    if session.captured_init is not None and session.init_result is None:
+        init_id = session.captured_init_id()
+        if init_id is not None and init_id in session.outstanding_ids:
+            deferred = init_id
+    return [i for i in session.outstanding_ids if i != deferred], deferred
+
+
+async def _reconnect(
+    socket_path: str,
+    payload: dict,
+    session: StubSession,
+    stop_event: asyncio.Event,
+    *,
+    poolable: bool,
+    pool_label: str,
+) -> Optional[tuple[asyncio.StreamReader, asyncio.StreamWriter, dict, str]]:
+    """Re-attach to a restarted gateway, or give up within a finite budget.
+
+    Retries the Register handshake because the daemon's supervisor respawns it
+    with its own backoff, so the endpoint is typically absent for a moment
+    rather than gone -- and retries a handshake replay that lost its connection
+    for the same reason, since the daemon reached first may still be starting or
+    may die again. What is NOT retried is a refusal: an older daemon will not
+    grow the ``poolable_ack`` capability, and a generation that answers the
+    handshake differently will keep answering that way, so retrying either only
+    delays the terminal exit.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _RECONNECT_TOTAL_BUDGET_SECS
+    delay = _RECONNECT_BACKOFF_START_SECS
+
+    async def _pause() -> bool:
+        """Burn one backoff step. False means a stop arrived; give up."""
+        nonlocal delay
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+            return False
+        except asyncio.TimeoutError:
+            pass
+        delay = min(delay * 2, _RECONNECT_BACKOFF_MAX_SECS)
+        return True
+
+    while not stop_event.is_set() and loop.time() < deadline:
+        # A fresh handle per ATTEMPT, not merely per reconnect. The daemon keys
+        # attach, refcount and the private-backend map on this uuid, and an
+        # attempt that died mid-replay may leave its registration in place for a
+        # moment -- so retrying under the same uuid would let the predecessor's
+        # teardown remove the replacement's backend, which is the very collision
+        # a per-registration handle exists to avoid. Minted here rather than by
+        # the caller because only this loop knows how many attempts there were.
+        payload = {**payload, "stub_uuid": str(uuid.uuid4())}
+        try:
+            reader, writer, _uuid, registered = await asyncio.wait_for(
+                handshake(socket_path, payload), timeout=_HANDSHAKE_TIMEOUT_SECS
+            )
+        except (asyncio.TimeoutError, FallbackRequestedError) as exc:
+            logger.info(
+                "stub reconnect: gateway not back yet (%s) pool=%s", exc, pool_label
+            )
+            if not await _pause():
+                return None
+            continue
+
+        _caps = registered.get("capabilities") if isinstance(registered, dict) else None
+        _caps = _caps if isinstance(_caps, list) else []
+        # The same check the cold-start handshake makes, for the same reason and
+        # with more force here: the endpoint a reconnect binds to need not be
+        # the generation this stub first registered with, and the manager adopts
+        # anything answering ``pong`` with no version handshake. A daemon
+        # predating the ``poolable`` field ignores it and routes this register
+        # through the shared index, co-tenanting a server the operator never
+        # allowlisted. Cold start degrades to a per-session exec; here that is
+        # not available (``initialize`` is long consumed), so the honest move is
+        # to refuse this generation and take the terminal exit. Refusal is
+        # terminal, not retried -- an older daemon will not grow the capability
+        # on the next attempt.
+        if must_degrade_unshareable(poolable, _caps):
+            await _safe_close(writer)
+            logger.warning(
+                "stub reconnect: the new gateway generation does not honour the "
+                "poolable field and this server is not shareable; refusing "
+                "rather than risk being pooled pool=%s",
+                pool_label,
+            )
+            return None
+
+        status, forward, detail = await _replay_initialize(reader, writer, session)
+        if status == _REPLAY_RETRY:
+            # The connection died mid-replay, which says nothing about what the
+            # answer would have been -- and this is the likeliest shape of a
+            # supervisor respawn, where the daemon reached first may still be
+            # starting or may die again. Spend a backoff step and try a fresh
+            # connection rather than burning the session here.
+            await _safe_close(writer)
+            logger.info(
+                "stub reconnect: lost the connection during handshake replay "
+                "(%s); retrying pool=%s",
+                detail,
+                pool_label,
+            )
+            if not await _pause():
+                return None
+            continue
+        if status != _REPLAY_OK:
+            await _safe_close(writer)
+            logger.warning(
+                "stub reconnect: refusing the new gateway generation (%s) pool=%s",
+                detail,
+                pool_label,
+            )
+            return None
+        if forward is not None:
+            # The session's original handshake never got an answer; hand this one
+            # to kiro-cli rather than swallowing it.
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(_write_stdout_line, forward),
+                    timeout=_ERROR_EMIT_TIMEOUT_SECS,
+                )
+            except (asyncio.TimeoutError, OSError, ValueError):
+                await _safe_close(writer)
+                logger.warning(
+                    "stub reconnect: could not deliver the replayed handshake "
+                    "pool=%s",
+                    pool_label,
+                )
+                return None
+            session.note_init_result(json.loads(forward))
+        session.reconnects += 1
+        logger.info(
+            "stub reconnected to a restarted gateway (%s, reconnect #%d) pool=%s",
+            detail,
+            session.reconnects,
+            pool_label,
+        )
+        return (
+            reader,
+            writer,
+            registered if isinstance(registered, dict) else {},
+            payload["stub_uuid"],
+        )
+    return None
+
+
+def _write_stdout_line(line: bytes) -> None:
+    """Write one whole line to kiro-cli's stdin, flushed."""
+    sys.stdout.buffer.write(line if line.endswith(b"\n") else line + b"\n")
+    sys.stdout.buffer.flush()
 
 
 def _fallback_log_path() -> Path:
@@ -959,11 +1433,25 @@ _FALLBACK_LOG_MAX_BYTES = 1024 * 1024
 
 
 def log_fallback(
-    reason: str, stub_uuid: str, pool_label: str, args: argparse.Namespace
+    reason: str,
+    stub_uuid: str,
+    pool_label: str,
+    args: argparse.Namespace,
+    *,
+    terminal: bool = False,
 ) -> None:
     """Append one JSON record to the fallback audit log. OS errors are
     swallowed — logging failure must never block the exec that keeps
-    kiro-cli working."""
+    kiro-cli working.
+
+    ``terminal=True`` marks a record as a stub that DIED rather than degraded.
+    Both events belong in this one log — same rotation, one place for an operator
+    to look — but they must not be added together: :func:`fallback_counts` feeds
+    gatewayd's ``stats``, and a fallback rate that silently includes terminals
+    misreports whether pooling is engaging. The split is driven by this
+    structured field, never by parsing the ``reason`` prefix, and a record
+    written before the field existed has no key and so still counts as a
+    fallback — which is what it was."""
     try:
         log_path = _fallback_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -974,41 +1462,23 @@ def log_fallback(
             "stub_uuid": stub_uuid,
             "pool_label": pool_label,
             "reason": reason,
+            "terminal": bool(terminal),
             "server": args.server,
             "agent": args.agent,
             "channel_id": args.channel_id or "",
             "target_command": args.target_command,
         }
-        # Rotation is guarded by a NON-BLOCKING try-lock on a sibling lock
-        # file: only the holder rotates, so two stubs hitting the size cap
-        # together can no longer both rotate (the second would replace ``.1``
-        # with the first's fresh live file, discarding a generation). A loser
-        # appends without rotating — never waits, so no log_fallback call can
-        # stall its stub's event loop — and the next writer rotates. Worst
-        # case the live file overshoots the cap by a few racing records.
-        lock_fd = os.open(
-            log_path.with_suffix(".jsonl.lock"), os.O_CREAT | os.O_RDWR, 0o600
-        )
-        locked = False
-        try:
-            locked = platform_compat.try_acquire_lock(lock_fd, exclusive=True)
-            if locked:
-                try:
-                    if log_path.stat().st_size >= _FALLBACK_LOG_MAX_BYTES:
-                        os.replace(log_path, log_path.with_suffix(".jsonl.1"))
-                except OSError:
-                    # Missing file (fresh boot) or a Windows sharing violation
-                    # (another process holds the log open, so the rename is
-                    # rejected). Rotation is best-effort; the append below must
-                    # still happen — letting this propagate to the outer
-                    # handler would silently DROP the record.
-                    pass
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, separators=(",", ":")) + "\n")
-        finally:
-            if locked:
-                platform_compat.release_lock(lock_fd)
-            os.close(lock_fd)
+        # Rotation (shared helper): O(1) rotate-by-rename at the cap, guarded
+        # by a non-blocking try-lock so two stubs hitting the cap together
+        # cannot both rotate, and a loser never waits — no log_fallback call
+        # can stall its stub's event loop. The helper is best-effort by
+        # contract (a missing file, a Windows sharing violation, or an
+        # unopenable lock file degrades to not rotating), so the append below
+        # always still runs; only a failure of the append itself may drop the
+        # record, caught by this function's own handler.
+        rotate_jsonl_at(log_path, _FALLBACK_LOG_MAX_BYTES)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, separators=(",", ":")) + "\n")
     except OSError:
         pass
 
@@ -1030,13 +1500,23 @@ def fallback_counts() -> dict[str, Any]:
     to read a process tree.
 
     Returns ``{"window_secs": ..., "total": n, "by_server": {name: n},
-    "by_reason": {reason: n}}``. Never raises — an unreadable or torn log
+    "by_reason": {reason: n}, "terminal_total": n,
+    "terminal_by_server": {name: n}}``. Never raises — an unreadable or torn log
     yields the counts of whatever parsed.
+
+    ``total`` / ``by_server`` / ``by_reason`` count DEGRADATIONS only. A record
+    flagged ``terminal`` is a stub that died instead of degrading, which is a
+    different event with a different remedy, so it is tallied separately rather
+    than inflating the fallback rate this function exists to report. Records
+    predating the flag have no key and count as fallbacks, which is what they
+    were.
     """
     cutoff = time.time() - _FALLBACK_COUNT_WINDOW_SECS
     total = 0
     by_server: dict[str, int] = {}
     by_reason: dict[str, int] = {}
+    terminal_total = 0
+    terminal_by_server: dict[str, int] = {}
     live = _fallback_log_path()
     for path in (live.with_suffix(".jsonl.1"), live):
         try:
@@ -1051,8 +1531,14 @@ def fallback_counts() -> dict[str, Any]:
                     ts = rec.get("ts")
                     if not isinstance(ts, (int, float)) or ts < cutoff:
                         continue
-                    total += 1
                     server = str(rec.get("server") or rec.get("pool_label") or "?")
+                    if rec.get("terminal") is True:
+                        terminal_total += 1
+                        terminal_by_server[server] = (
+                            terminal_by_server.get(server, 0) + 1
+                        )
+                        continue
+                    total += 1
                     by_server[server] = by_server.get(server, 0) + 1
                     reason = str(rec.get("reason") or "?")
                     by_reason[reason] = by_reason.get(reason, 0) + 1
@@ -1063,11 +1549,18 @@ def fallback_counts() -> dict[str, Any]:
         "total": total,
         "by_server": by_server,
         "by_reason": by_reason,
+        "terminal_total": terminal_total,
+        "terminal_by_server": terminal_by_server,
     }
 
 
 async def alog_fallback(
-    reason: str, stub_uuid: str, pool_label: str, args: argparse.Namespace
+    reason: str,
+    stub_uuid: str,
+    pool_label: str,
+    args: argparse.Namespace,
+    *,
+    terminal: bool = False,
 ) -> None:
     """Run :func:`log_fallback` in a worker thread.
 
@@ -1076,7 +1569,11 @@ async def alog_fallback(
     it runs off the event loop, and awaiting it guarantees the record is on
     disk before the caller proceeds to ``fallback_exec`` (which replaces the
     process image and would otherwise race the write)."""
-    await asyncio.to_thread(log_fallback, reason, stub_uuid, pool_label, args)
+    await asyncio.to_thread(
+        functools.partial(
+            log_fallback, reason, stub_uuid, pool_label, args, terminal=terminal
+        )
+    )
 
 
 def fallback_exec(args: argparse.Namespace) -> None:
@@ -1200,6 +1697,13 @@ async def _recaller_loop(
 
 
 async def _amain(argv: Optional[list[str]] = None) -> int:
+    # ── Name the default executor ──
+    # asyncio.to_thread and run_in_executor(None, ...) route onto the loop's
+    # default executor, which Python names threads anonymously.  This names
+    # them ``mc-default`` so profilers like py-spy can attribute blocking work
+    # to this stub.  Must run BEFORE any to_thread offload.
+    configure_default_executor()
+
     # An invalid MC_MCP_LOG (e.g. "verbose") would make basicConfig raise
     # "Unknown level" and kill the stub BEFORE its fallback-to-per-session-exec
     # path can run. Fall back to WARNING on any unrecognised level.
@@ -1303,12 +1807,34 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
                 isinstance(ready, dict)
                 and ready.get("type") == "rejected"
                 and not ready.get("fallback")
+                # A legacy daemon cannot send the tag, so an untagged
+                # target-unknown is routed to the fallback-exec path below
+                # rather than killing the server. See
+                # ``must_degrade_unknown_target``.
+                and not must_degrade_unknown_target(str(ready.get("reason") or ""))
             ):
-                # Terminal rejection (unknown target / genuine spawn failure):
-                # the gateway says this server cannot run. Surface the failure
-                # instead of exec'ing — matches the lazy path and avoids
-                # per-session crash-loops of a broken backend.
+                # Terminal rejection (genuine spawn failure): the gateway says
+                # this server cannot run. Surface the failure instead of
+                # exec'ing — matches the lazy path and avoids per-session
+                # crash-loops of a broken backend.
+                #
+                # Audited BEFORE returning, and this is the whole point of the
+                # record. A terminal exit writes no fallback record by
+                # definition, and this ``logger.error`` goes to the stub's own
+                # stderr, which kiro-cli swallows — so the pre-fix failure mode
+                # was a server whose entire tool surface vanished from a session
+                # while every durable log showed only a healthy ``registered``
+                # line. On the daemon side a terminal and a served stub were
+                # indistinguishable after the fact. The ``terminal:`` prefix
+                # keeps these separable from real fallbacks in
+                # ``stub_fallback_counts()``, which the gateway folds into its
+                # ``stats`` reply.
                 await _safe_close(writer)
+                await alog_fallback(
+                    f"terminal:{ready.get('reason') or 'ensure_backend_rejected'}",
+                    payload["stub_uuid"], pool_label, args,
+                    terminal=True,
+                )
                 logger.error(
                     "gateway terminally rejected ensure_backend (%s); not falling back pool=%s",
                     ready.get("reason"), pool_label,
@@ -1326,87 +1852,191 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
             fallback_exec(args)
             return 1  # unreachable
 
-    # Warm-pool caller repair: if we registered without a session key (the
-    # kiro-cli was pool-spawned before its session was claimed), watch for the
-    # key to materialize and re-register the caller so state-mutating tools
-    # (learn_add et al.) work for the claimed session. No-op for stubs that
-    # already had a key at register.
-    recaller_task: Optional[asyncio.Task[None]] = None
-    if not payload.get("session_key"):
-        recaller_task = asyncio.create_task(
-            _recaller_loop(writer, _resolve_channel_id(args.channel_id), stop_event),
-            name="kirocrew-mcp-stub-recaller",
-        )
-    try:
-        liveness_failure = await run_bridge(
-            reader,
-            writer,
-            stop_event,
-            peer_supports_ping=bool(
-                isinstance(capabilities, list) and "bridge_ping" in capabilities
-            ),
-        )
-    finally:
-        if recaller_task is not None:
-            if not recaller_task.done():
-                recaller_task.cancel()
-            # Always await — even a task that already finished (successfully or
-            # with an exception) must have its result/exception retrieved, or
-            # asyncio logs "Task exception was never retrieved" and hides a bug.
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await recaller_task
+    # One session across every connection this stub makes. The stdin reader, the
+    # captured handshake and the ending reason all live here precisely because a
+    # connection dies with the daemon and the stub does not.
+    session = StubSession()
+    peer_supports_ping = bool(
+        isinstance(capabilities, list) and "bridge_ping" in capabilities
+    )
+    while True:
+        # Warm-pool caller repair: if we registered without a session key (the
+        # kiro-cli was pool-spawned before its session was claimed), watch for
+        # the key to materialize and re-register the caller so state-mutating
+        # tools (learn_add et al.) work for the claimed session. No-op for stubs
+        # that already had a key at register. Re-armed per connection: the task
+        # writes THIS socket, so one that outlived its connection would write a
+        # closed writer.
+        recaller_task: Optional[asyncio.Task[None]] = None
+        if not payload.get("session_key"):
+            recaller_task = asyncio.create_task(
+                _recaller_loop(
+                    writer, _resolve_channel_id(args.channel_id), stop_event
+                ),
+                name="kirocrew-mcp-stub-recaller",
+            )
+        try:
+            # The return value is the legacy single-connection signal; this
+            # caller reads the richer ending off the session instead.
+            await run_bridge(
+                reader,
+                writer,
+                stop_event,
+                peer_supports_ping=peer_supports_ping,
+                session=session,
+            )
+        finally:
+            if recaller_task is not None:
+                if not recaller_task.done():
+                    recaller_task.cancel()
+                # Always await — even a task that already finished (successfully
+                # or with an exception) must have its result/exception
+                # retrieved, or asyncio logs "Task exception was never
+                # retrieved" and hides a bug.
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await recaller_task
 
-    # Liveness failure: the gateway stopped answering pings while requests were
-    # outstanding. Fail the outstanding calls FAST and CLEANLY instead of leaving
-    # them parked forever.
+        if session.reason not in StubSession.RECONNECTABLE:
+            break
+
+        # The transport is gone but this process, its stdin and kiro-cli's frozen
+        # toolset are not. Answer whatever was in flight, exactly once, and hold
+        # back only what the replay below can still answer for real -- see
+        # _split_abandoned_ids for why each half is treated the way it is.
+        _to_fail, deferred_init_id = _split_abandoned_ids(session)
+        await _emit_error_frames(
+            _to_fail,
+            "Gateway restarted; this call was failed so it would not hang. "
+            "Retry it.",
+            pool_label=pool_label,
+        )
+        session.outstanding_ids = (
+            [] if deferred_init_id is None else [deferred_init_id]
+        )
+
+        if session.has_live_subscriptions():
+            # Recovering the transport for a subscribed session would hand it
+            # back a connection that answers calls but never delivers another
+            # resource update: the daemon's subscription table died with the old
+            # process. That is a NEW silent degradation, and trading a visible
+            # outage for a quiet one is precisely what this fix exists to stop.
+            # Refuse, and leave replaying subscriptions to the change that can
+            # do it properly.
+            logger.warning(
+                "stub bridge ended (%s) with live resource subscriptions; "
+                "refusing to reconnect because they cannot be re-established "
+                "here pool=%s",
+                session.reason,
+                pool_label,
+            )
+            break
+
+        if session.captured_init is None:
+            # Nothing to re-prime a fresh daemon with, so a reconnect could only
+            # produce a never-initialized backend that rejects every later call.
+            logger.warning(
+                "stub bridge ended (%s) before initialize was seen; no reconnect "
+                "is possible pool=%s",
+                session.reason,
+                pool_label,
+            )
+            break
+
+        # Refresh the caller before re-registering: the session key may have
+        # materialized since the first Register (warm-pool claim), and carrying
+        # it in the new handshake is better than re-running the recaller.
+        #
+        # The uuid in this payload is a placeholder: ``_reconnect`` mints a fresh
+        # one per handshake ATTEMPT, because it is a per-REGISTRATION handle the
+        # daemon keys attach, refcount and the private backend map on. A
+        # reconnectable ending does not prove the daemon died -- a wedged peer or
+        # a broken write leaves the predecessor registration in place -- so
+        # reusing a handle would either attach twice under one or let the
+        # predecessor's teardown tear down the replacement.
+        try:
+            payload = await loop.run_in_executor(
+                subprocess_executor(), build_register_payload, args
+            )
+        except Exception as exc:  # noqa: BLE001 — never lose the reconnect to this
+            logger.warning(
+                "stub reconnect: keeping the previous register payload (%s)", exc
+            )
+
+        await alog_fallback(f"bridge_lost_{session.reason}", stub_uuid, pool_label, args)
+        attached = await _reconnect(
+            args.socket,
+            payload,
+            session,
+            stop_event,
+            poolable=bool(args.poolable),
+            pool_label=pool_label,
+        )
+        if attached is None:
+            logger.warning(
+                "stub could not re-attach to the gateway after %s; this session "
+                "loses these servers pool=%s",
+                session.reason,
+                pool_label,
+            )
+            break
+        reader, writer, registered, stub_uuid = attached
+        # The audit and log records must name the registration that is actually
+        # live: the reconnect loop mints one per ATTEMPT, so the payload this
+        # frame holds is not necessarily the one that registered.
+        capabilities = registered.get("capabilities")
+        peer_supports_ping = bool(
+            isinstance(capabilities, list) and "bridge_ping" in capabilities
+        )
+
+    # Terminal: the bridge ended for a reason no reconnect can address, or the
+    # reconnect budget ran out.
     #
     # Deliberately NOT followed by fallback_exec. The four pre-flight fallback
     # sites work because kiro-cli's ``initialize`` is still unread in fd0, so the
     # exec'd server comes up initialized. Here stdin_pump has already consumed
-    # and forwarded ``initialize``, and kiro-cli never re-sends it (see
-    # gatewayd's ``captured_init`` rationale), so an exec'd server would be a
-    # fresh, never-initialized MCP server that rejects every subsequent call.
-    # Exec would convert "wedged" into "fast-failing", not into "working" — and
-    # it would also throw away the socket a future reconnect could reuse.
-    if liveness_failure is not None:
-        def _emit_errors() -> None:
-            """Write the error frames on a worker thread.
-
-            A blocked kiro-cli reader (full stdout pipe) must not wedge the very
-            path whose job is to unwedge the caller, so the write is offloaded
-            and bounded by the caller's timeout rather than run inline.
-            """
-            for req_id in liveness_failure.outstanding_ids:
-                err_frame = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "error": {
-                        "code": -32603,
-                        "message": (
-                            "Gateway stopped responding; this call was failed so "
-                            "it would not hang. Retry it."
-                        ),
-                    },
-                }
-                sys.stdout.buffer.write(
-                    json.dumps(err_frame, separators=(",", ":")).encode("utf-8") + b"\n"
-                )
-            sys.stdout.buffer.flush()
-
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(_emit_errors), timeout=_ERROR_EMIT_TIMEOUT_SECS
-            )
-        except (asyncio.TimeoutError, OSError, ValueError):
-            # Nothing better to do: the reader is gone or wedged, and the caller
-            # is already being abandoned. Exiting still closes stdout, which is
-            # what tells kiro-cli this server is done.
-            logger.warning("could not emit liveness error frames pool=%s", pool_label)
-        await alog_fallback("bridge_liveness_dead", stub_uuid, pool_label, args)
+    # and forwarded ``initialize``, and kiro-cli never re-sends it, so an exec'd
+    # server would be a fresh, never-initialized MCP server that rejects every
+    # subsequent call. Exec would convert "wedged" into "fast-failing", not into
+    # "working" — reconnecting is what converts it into "working", and it has
+    # already been tried by the time we get here.
+    if session.outstanding_ids:
+        _abandoned = session.outstanding_ids
+        # Dropped as they are answered: this is the last writer, but leaving them
+        # listed would let any future path here emit a second response for an id
+        # kiro-cli has already been given one for.
+        session.outstanding_ids = []
+        await _emit_error_frames(
+            _abandoned,
+            "Gateway stopped responding and could not be reached again; this "
+            "call was failed so it would not hang. Start a new session to "
+            "restore these tools.",
+            pool_label=pool_label,
+        )
+        await alog_fallback(
+            f"bridge_dead_{session.reason}", stub_uuid, pool_label, args
+        )
         logger.warning(
-            "bridge peer stopped answering pings; failed %d outstanding call(s) "
+            "bridge ended (%s) with %d outstanding call(s) after %d reconnect(s) "
             "pool=%s",
-            len(liveness_failure.outstanding_ids),
+            session.reason,
+            len(_abandoned),
+            session.reconnects,
+            pool_label,
+        )
+        return 1
+    if session.reason in StubSession.RECONNECTABLE:
+        # The transport was lost with nothing in flight, so no call needs an
+        # answer — but the session still loses these servers, and that used to
+        # leave no trace at all. Record it so a degraded session is explicable
+        # afterwards instead of looking like a healthy one whose tools fail.
+        await alog_fallback(
+            f"bridge_dead_{session.reason}", stub_uuid, pool_label, args
+        )
+        logger.warning(
+            "bridge ended (%s) and could not re-attach after %d reconnect(s); "
+            "this session loses these servers pool=%s",
+            session.reason,
+            session.reconnects,
             pool_label,
         )
         return 1

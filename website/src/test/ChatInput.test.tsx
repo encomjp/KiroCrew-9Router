@@ -5,6 +5,10 @@ import { renderWithProviders } from './helpers'
 import { releaseComposerForKeyboardSwitch } from '../pages/chat/composerFocus'
 import { safeSetItem } from '../utils/safeStorage'
 import ChatInput from '../components/ChatInput'
+import { PREVIEW_STRIP_H, stubStripHeights } from './stripHeights'
+
+// The composer's own drag floor.
+const INPUT_DRAG_MIN_H = 93
 import { SlotProvider } from '../providers/SlotContext'
 import type { PasteBlock } from '../utils/pasteTokens'
 
@@ -25,6 +29,10 @@ const defaultProps = {
 
 beforeEach(() => {
   vi.restoreAllMocks()
+  // After restoreAllMocks: it would otherwise undo the layout stub. jsdom does
+  // no layout, and the composer MEASURES its strips, so a strip with no stubbed
+  // box measures 0 and reads as no strip at all.
+  stubStripHeights()
   localStorage.clear()
   touchEnv.touch = false
   mobileEnv.mobile = false
@@ -549,16 +557,17 @@ describe('ChatInput', () => {
       localStorage.setItem('mc-input-height', '150')
       const { container } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
       const wrapper = container.firstElementChild as HTMLElement
-      // With files: minHeight should be INPUT_DRAG_MIN_H (93) + FILE_PREVIEW_H (81) = 174
-      expect(wrapper.style.minHeight).toBe('174px')
+      // The drag floor plus whatever the strip MEASURED -- not a restatement of
+      // a predicted constant, which is what this used to assert.
+      expect(wrapper.style.minHeight).toBe(`${INPUT_DRAG_MIN_H + PREVIEW_STRIP_H}px`)
     })
 
     it('uses base minHeight when no files attached and manually sized', () => {
       localStorage.setItem('mc-input-height', '150')
       const { container } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={[]} />)
       const wrapper = container.firstElementChild as HTMLElement
-      // Without files: minHeight should be INPUT_DRAG_MIN_H (93)
-      expect(wrapper.style.minHeight).toBe('93px')
+      // No strip mounted, so it measures nothing and reserves nothing.
+      expect(wrapper.style.minHeight).toBe(`${INPUT_DRAG_MIN_H}px`)
     })
 
     it('wrapper uses flex-col layout for proper space distribution with file strip', () => {
@@ -573,16 +582,14 @@ describe('ChatInput', () => {
       const wrapper = screen.getByTestId('input-wrapper')
       expect(wrapper.style.height).toBe('200px')
       rerender(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
-      // 200 + FILE_PREVIEW_H (81) = 281
-      expect(wrapper.style.height).toBe('281px')
+      expect(wrapper.style.height).toBe(`${200 + PREVIEW_STRIP_H}px`)
     })
 
     it('shrinks wrapper height when files are removed with manual sizing', () => {
-      localStorage.setItem('mc-input-height', '281')
+      localStorage.setItem('mc-input-height', String(200 + PREVIEW_STRIP_H))
       const { rerender } = renderWithProviders(<ChatInput {...defaultProps} pendingFiles={['/tmp/a.png']} />)
       rerender(<ChatInput {...defaultProps} pendingFiles={[]} />)
       const wrapper = screen.getByTestId('input-wrapper')
-      // 281 - FILE_PREVIEW_H (81) = 200
       expect(wrapper.style.height).toBe('200px')
     })
   })
@@ -1712,5 +1719,55 @@ describe('ChatInput undo/redo: paste content', () => {
     fireEvent.change(ta, { target: { value: '' } })
     undo(ta)
     expect(ta.value).toBe('hello world')
+  })
+})
+
+// Expanding a collapsed-paste token in the composer differs by pointer class:
+// mouse needs a double-click (select-then-expand); touch expands on one tap,
+// because two discrete taps never coalesce into a detail>=2 click, so the
+// double-click path is unreachable under a finger.
+describe('ChatInput composer paste-token expand', () => {
+  function PasteHarness({ initial, initialBlocks }: { initial: string; initialBlocks: PasteBlock[] }) {
+    const [v, setV] = React.useState(initial)
+    const [blocks, setBlocks] = React.useState<PasteBlock[]>(initialBlocks)
+    return (
+      <ChatInput
+        {...defaultProps}
+        value={v}
+        onChange={setV}
+        pasteBlocks={blocks}
+        onPasteBlocksChange={setBlocks}
+      />
+    )
+  }
+
+  const block: PasteBlock = { id: 'p1', seq: 1, lines: 40, content: 'TRACEBACK: boom\n...40 lines...' }
+  const token = '[ Paste #1 · 40 lines ]'
+
+  it('expands the token on a single tap on a touch device (detail=1)', () => {
+    touchEnv.touch = true
+    renderWithProviders(<PasteHarness initial={token} initialBlocks={[block]} />)
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    ta.setSelectionRange(2, 2) // caret inside the token
+    fireEvent.click(ta, { detail: 1 }) // a tap is a single click, never detail>=2
+    expect(ta.value).toBe(block.content) // expanded inline on one tap
+  })
+
+  it('does NOT expand on a single mouse click (detail=1) — mouse selects first', () => {
+    touchEnv.touch = false
+    renderWithProviders(<PasteHarness initial={token} initialBlocks={[block]} />)
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    ta.setSelectionRange(2, 2)
+    fireEvent.click(ta, { detail: 1 })
+    expect(ta.value).toBe(token) // still collapsed — a second click is needed
+  })
+
+  it('expands on a mouse double-click (detail=2)', () => {
+    touchEnv.touch = false
+    renderWithProviders(<PasteHarness initial={token} initialBlocks={[block]} />)
+    const ta = screen.getByLabelText('Message input') as HTMLTextAreaElement
+    ta.setSelectionRange(2, 2)
+    fireEvent.click(ta, { detail: 2 })
+    expect(ta.value).toBe(block.content) // expanded inline
   })
 })

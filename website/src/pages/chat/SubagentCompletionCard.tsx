@@ -26,6 +26,8 @@ import {
   type ParsedSubagentCompletion,
   type SubagentOutcome,
 } from './subagentCompletion'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
+import { normalizeModelKey } from '../../lib/model'
 
 function outcomeLabel(outcome: SubagentOutcome): string {
   if (outcome === 'failed') return i18nT('pages.chat.subagentCompletionCard.failed')
@@ -100,6 +102,7 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
    *  (the embed SDK), which then render the card without the button. */
   onOpenPanel?: (parsed: ParsedSubagentCompletion) => void
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const parsed = parseSubagentCompletionMessage(message)
   const failed = parsed !== null && (parsed.kind === 'single' ? parsed.outcome === 'failed' : parsed.failed > 0)
   // A restart orphan: the run was cut short but its result survived on disk, so
@@ -197,31 +200,44 @@ const SubagentCompletionCard = memo(function SubagentCompletionCard({
             )}
           </>
         )}
-        {resolvedModel && (
-          <code
-            className={`${CHIP} font-mono max-w-[8rem] ${
-              modelDowngraded
-                ? 'bg-warn-subtle border-warn/20 text-warn'
-                : 'bg-accent/10 border-accent/20 text-accent/80'
-            }`}
-            data-testid="subagent-completion-model"
-            title={
-              modelDowngraded
-                ? i18nT('pages.chat.activityViewer.model_downgraded', {
-                    requested: requestedModel,
-                    resolved: resolvedModel,
-                  })
-                : i18nT('pages.chat.activityViewer.model_label', { model: resolvedModel })
-            }
-          >
-            {modelDowngraded && <AlertCircle size={10} aria-hidden />}
-            {/* Left-truncate: long ids share a provider prefix
-                (us.anthropic.claude-…), so clipping the END hides the one part
-                that says WHICH model. rtl+plaintext keeps the glyphs in logical
-                LTR order while the ellipsis falls on the left (UX review #3582). */}
-            <span className="truncate inline-block max-w-full [direction:rtl] [unicode-bidi:plaintext] text-left align-bottom">{resolvedModel}</span>
-          </code>
-        )}
+        {(resolvedModel || requestedModel) && (() => {
+          const resolvedKnown = !!resolvedModel
+          const displayModel = resolvedModel || requestedModel
+          // Requested-only (model not yet resolved): render a muted chip only
+          // for the 'auto' sentinel. For a concrete pinned id, render nothing —
+          // the chip appears once the model resolves. See ActivityViewer.tsx for
+          // the matching guard.
+          if (!resolvedKnown && !modelDowngraded && normalizeModelKey(displayModel) !== 'auto') return null
+          return (
+            <code
+              className={`${CHIP} font-mono max-w-[8rem] ${
+                modelDowngraded
+                  ? 'bg-warn-subtle border-warn/20 text-warn'
+                  : resolvedKnown
+                    ? 'bg-accent/10 border-accent/20 text-accent/80'
+                    : 'bg-bg-hover border-border text-muted/60'
+              }`}
+              data-testid="subagent-completion-model"
+              title={
+                modelDowngraded
+                  ? i18nT('pages.chat.activityViewer.model_downgraded', {
+                      requested: requestedModel,
+                      resolved: resolvedModel,
+                    })
+                  : resolvedKnown
+                    ? i18nT('pages.chat.activityViewer.model_label', { model: resolvedModel })
+                    : i18nT('pages.chat.activityViewer.model_effective', { model: displayModel })
+              }
+            >
+              {modelDowngraded && <AlertCircle size={10} aria-hidden />}
+              {/* Left-truncate: long ids share a provider prefix
+                  (us.anthropic.claude-…), so clipping the END hides the one part
+                  that says WHICH model. rtl+plaintext keeps the glyphs in logical
+                  LTR order while the ellipsis falls on the left (UX review #3582). */}
+              <span className="truncate inline-block max-w-full [direction:rtl] [unicode-bidi:plaintext] text-left align-bottom">{displayModel}</span>
+            </code>
+          )
+        })()}
         {parsed.kind === 'single' ? (
           <span className="text-[10px] leading-4 text-muted font-mono truncate hidden sm:inline">
             {parsed.agentId}

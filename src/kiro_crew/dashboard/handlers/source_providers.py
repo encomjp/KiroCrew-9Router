@@ -29,7 +29,7 @@ import aiohttp
 from aiohttp import web
 
 from kiro_crew import github_runner, platform_compat
-from kiro_crew.config.loader import KiroCrewConfig
+from kiro_crew.config.loader import KiroCrewConfig, config_dir, read_env_file_credential
 from kiro_crew.dashboard.handlers._shared import read_capped_response
 
 # Validation policy, well-known install dirs, and the strict-mode toggle are
@@ -49,7 +49,12 @@ from kiro_crew.github_runner import (
 from kiro_crew.github_runner import strict_provider_bins as _strict_provider_bins
 from kiro_crew.github_runner import validate_provider_executable as _validate_provider_executable
 from kiro_crew.loop_lock import LoopBoundLock
-from kiro_crew.sandbox import create_subprocess_limited, sandboxed_spawn_argv
+from kiro_crew.sandbox import (
+    create_subprocess_limited,
+    sandboxed_spawn_argv,
+    sandboxed_spawn_argv_async,
+)
+from kiro_crew.secrets import SecretVault
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 _MAX_URL_LENGTH = 2048
@@ -305,6 +310,33 @@ class SourceRef:
     # requests, so an issue ref reaching a pull-request-only path would address a
     # DIFFERENT object with the same number. See :func:`_require_change_ref`.
     kind: str = "change"
+
+
+def source_ref_label(ref: SourceRef) -> str:
+    """The provider's own short name for this object, as a chip renders it.
+
+    Every provider names its objects differently -- GitHub writes ``#123``,
+    GitLab writes ``!123`` for a merge request but ``#123`` for an issue, and
+    Jira has no bare number at all: ``PROJ-123`` is the whole identifier, the
+    number alone is meaningless outside its project.
+
+    This belongs on the side that parsed the URL. The alternative -- shipping
+    the components and letting the renderer reassemble them -- means the
+    renderer has to know each provider's convention, which is knowledge it can
+    only have about providers that already exist, and it made the payload carry
+    Jira's project key purely so a template string could put it back together.
+
+    Not a translated string: these are the provider's identifiers, not prose,
+    and ``PROJ-123`` reads the same in every locale.
+
+    An unrecognized provider falls to ``#number``, the most widely shared
+    convention, rather than borrowing the punctuation of a specific vendor.
+    """
+    if ref.provider == "jira":
+        return f"{ref.repo}-{ref.number}"
+    if ref.provider == "gitlab" and ref.kind == "change":
+        return f"!{ref.number}"
+    return f"#{ref.number}"
 
 
 _GITLAB_HOSTS_TTL_SECS = 30.0
@@ -630,16 +662,15 @@ async def _read_stream_limited(stream: asyncio.StreamReader, limit: int, label: 
 
 
 async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-    """Kill and reap a provider process tree after timeout, overflow, or cancellation."""
-    if proc.returncode is None:
-        try:
-            platform_compat.kill_process_tree(proc.pid, platform_compat.SIGKILL)
-        except (OSError, ValueError):
-            # Best-effort PID fallback if group lookup races with launcher exit.
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-    with contextlib.suppress(ProcessLookupError):
-        await proc.wait()
+    """Kill and reap a provider process tree after timeout, overflow, or cancellation.
+
+    The reap is bounded and drains the pipes: this path is reached with the
+    stdout/stderr readers already cancelled by ``wait_for``, so a killed child
+    blocked writing into a full pipe -- or a surviving descendant still holding
+    the pipes open -- would make a bare ``await proc.wait()`` hang the calling
+    task forever.
+    """
+    await platform_compat.kill_and_reap(proc)
 
 
 async def _collect_process_output(
@@ -713,12 +744,13 @@ async def _run_json(
                 _audit_provider_cli(executable, "denied", "host_not_allowlisted")
                 raise SourceProviderError("GitLab host is not allowlisted")
             gitlab_host = host
-    if platform_compat.IS_WINDOWS:
-        _audit_provider_cli(executable, "denied", "sandbox_unavailable")
-        raise SourceProviderError(
-            "Pull-request source providers are not supported on Windows because "
-            "OS-level provider sandboxing is unavailable."
-        )
+    # Windows is not refused here: it has no OS sandbox backend, so it reaches
+    # the same no-backend policy a backend-less Linux host does, and
+    # ``sandboxed_spawn_argv`` below owns that policy (fail closed unless the
+    # operator set ``agent.sandbox_allow_unsandboxed_exec``). Every other bound
+    # is platform-independent and still applies: the allowlisted executable, the
+    # validated resolved path, the strict env allowlist with a pinned PATH, the
+    # output cap, the timeout and the SEL audit.
     try:
         # Off the loop: resolution walks every candidate dir and stats the whole
         # parent chain of each hit (github_runner.validate_provider_executable),
@@ -772,8 +804,11 @@ async def _run_json(
     try:
         async with _provider_semaphore:
             try:
-                wrapped_argv, env, cleanup_path = sandboxed_spawn_argv(
-                    [resolved_executable, *argv[1:]], mode="standard", env=base_env
+                wrapped_argv, env, cleanup_path = await sandboxed_spawn_argv_async(
+                    [resolved_executable, *argv[1:]],
+                    mode="standard",
+                    env=base_env,
+                    _prepare=sandboxed_spawn_argv,
                 )
             except RuntimeError as exc:
                 _audit_provider_cli(executable, "denied", "sandbox_rejected")
@@ -2269,17 +2304,30 @@ _JIRA_MAX_COMMENTS = 50
 
 
 def _get_jira_auth(host: str) -> tuple[str, str] | None:
-    """Return (email, token) for *host* from config + .env, or None if unconfigured.
+    """Return (email, token) for *host* from config + vault/.env, or None.
 
-    Host and email come from config.json (non-sensitive metadata).
-    The token comes from the protected .env file (JIRA_API_TOKEN env var),
-    following the same credential isolation pattern as Slack/Discord/Telegram
-    tokens — never stored in the agent-readable config.json.
+    Host and email come from config.json (non-sensitive metadata). The token is
+    resolved from the encrypted vault first (successor store, populated by
+    ``kirocrew secrets import``), falling back to the protected .env file /
+    environment for installs that have not migrated — following the same
+    credential isolation pattern as Slack/Discord/Telegram tokens, never stored
+    in the agent-readable config.json.
 
     Raises ValueError on config load failures so callers can distinguish
     "config is broken" from "no credentials configured" (None).
     """
     try:
+        # Snapshot the process-environment value of JIRA_API_TOKEN BEFORE
+        # KiroCrewConfig.load() / load_credentials() runs.  load_credentials()
+        # calls os.environ.setdefault(CRED_JIRA_API_TOKEN, ...) which seeds the
+        # .env global into os.environ when no real env override is present.
+        # Reading os.environ["JIRA_API_TOKEN"] AFTER that call would treat a
+        # merely-seeded .env value as a "live env override", causing the
+        # single-host global branch to use the .env global instead of the vault
+        # for a host that has its OWN per-host token in the vault.
+        # Capturing the value here — before any setdefault — means only a real
+        # operator-set env var (present before this call) counts as an override.
+        _env_global_override = os.environ.get("JIRA_API_TOKEN")
         cfg = KiroCrewConfig.load()
         entries = cfg.dashboard.jira_auth
         # Token is resolved from .env / environment, not config.json
@@ -2298,13 +2346,99 @@ def _get_jira_auth(host: str) -> tuple[str, str] | None:
             # Injective host-to-key: hex-encode the normalized host to avoid
             # collisions (e.g. jira-a.x.com vs jira.a-x.com).
             host_key = entry_host.encode().hex().upper()
-            token = creds.get(f"JIRA_TOKEN_{host_key}", "")
+            per_host_name = f"JIRA_TOKEN_{host_key}"
+            # Resolution order: the encrypted vault first (the successor store,
+            # populated by `kirocrew secrets import`), then the legacy .env /
+            # environment value so existing installs keep working unchanged.
+            #
+            # EXCEPTION for the global `JIRA_API_TOKEN`: a nonempty PROCESS-
+            # ENVIRONMENT value overrides even the vault. `load_credentials`
+            # overlays `os.environ` over the .env for this key, so a live env
+            # var is the effective credential at runtime — and `kirocrew secrets
+            # import` deliberately SKIPS migrating the key while such an override
+            # is set, precisely so it does not get pinned into the vault. But a
+            # vault entry written by an EARLIER migration (before the override
+            # existed) would otherwise be read vault-first and silently shadow
+            # that override. Consulting the env override before the global vault
+            # entry keeps the migrate-skip and the resolve-order consistent.
+            # Per-host `JIRA_TOKEN_<HEX>` keys are NOT env-overlaid, so they are
+            # unaffected and keep their vault-first order.
+            #
+            # We use `_env_global_override` (captured BEFORE load_credentials
+            # ran) rather than a fresh os.environ read so that a value merely
+            # seeded by load_credentials' setdefault — which is NOT a real
+            # operator override — cannot masquerade as one here.
+            #
+            # HOWEVER: `GatewayOrchestrator.__init__` calls `load_credentials()`
+            # at startup, which seeds the `.env` global into `os.environ` via
+            # `setdefault` BEFORE any request handler runs. A subsequent call to
+            # `_get_jira_auth` would then capture that `.env`-seeded value as
+            # `_env_global_override`, indistinguishable from a real operator
+            # override. Fix: after ruling out secret refs, compare the captured
+            # env value against the current `.env` file value — an equal value
+            # came from `.env` (stale, do not override the vault), a different
+            # value means the operator set a distinct override at runtime (treat
+            # as authoritative). `read_env_file_credential` blocks on I/O but
+            # `_get_jira_auth` is called via `asyncio.to_thread` so that is safe.
+            token = _resolve_jira_token_from_vault(per_host_name)
             if not token and len(entries) == 1:
-                token = creds.get("JIRA_API_TOKEN", "")
+                # A `secret://` value is a vault REFERENCE, not a raw token.
+                # After `secrets import --apply` the `.env` line becomes
+                # `JIRA_API_TOKEN=secret://JIRA_API_TOKEN`, and `load_credentials`
+                # propagates that into os.environ (and `creds`) via setdefault.
+                # So an env/creds value that is a `secret://` ref must NOT be
+                # used as the token — fall through to the vault. Only a real,
+                # non-ref env value that DIFFERS from the `.env` file counts as
+                # a genuine live override that beats the global vault entry.
+                _env_file_val = read_env_file_credential("JIRA_API_TOKEN")
+                _is_genuine_override = (
+                    _env_global_override
+                    and not _is_secret_ref(_env_global_override)
+                    and _env_global_override != _env_file_val
+                )
+                if _is_genuine_override:
+                    # _is_genuine_override is truthy only when _env_global_override
+                    # is a non-empty str, so `or ""` is dead in practice — it only
+                    # narrows str | None -> str for the type checker.
+                    token = _env_global_override or ""
+                else:
+                    token = _resolve_jira_token_from_vault("JIRA_API_TOKEN")
+            if not token:
+                _c = creds.get(per_host_name, "")
+                token = _c if not _is_secret_ref(_c) else ""
+            if not token and len(entries) == 1:
+                _c = creds.get("JIRA_API_TOKEN", "")
+                token = _c if not _is_secret_ref(_c) else ""
             if not token:
                 return None
             return (entry.email or "", token)
     return None
+
+
+def _is_secret_ref(value: str) -> bool:
+    """True if *value* is a ``secret://`` vault reference rather than a raw token.
+
+    After ``secrets import --apply`` the ``.env`` line for a migrated key becomes
+    ``KEY=secret://KEY``, and ``load_credentials`` propagates that string into
+    both ``os.environ`` and the returned creds dict. Such a value is a POINTER
+    to the vault, not a usable credential, so the resolver must treat it as
+    "look in the vault" and never hand it to Jira as the token.
+    """
+    return value.startswith("secret://")
+
+
+def _resolve_jira_token_from_vault(name: str) -> str:
+    """Return the vault secret *name*, or ``""`` if absent/unavailable.
+
+    Best-effort: a missing vault, missing entry, or read error all yield the
+    empty string so the caller falls back to the legacy .env / environment
+    value rather than failing.
+    """
+    try:
+        secret = SecretVault(config_dir()).get(name)
+    except Exception:
+        return ""
+    return secret.reveal() if secret is not None else ""
 
 
 def _jira_is_cloud(host: str) -> bool:
@@ -4102,6 +4236,12 @@ _LOCAL_DASHBOARD_OWNER_SUBJECTS = frozenset({"local-app", "local-startup"})
 # way to tell "sign in again" apart from any other authorization failure.
 STALE_OWNER_SESSION_CODE = "stale_session_reauth"
 
+# The no-owner mutation denial, labeled only for signed machine-local dashboard
+# sessions (see ``_authorize_owner_request``). Reads pass for those subjects, so
+# the panel renders live mutation buttons whose clicks would otherwise dead-end
+# in a generic 403; the code lets the client say what to configure instead.
+OWNER_NOT_CONFIGURED_CODE = "owner_not_configured"
+
 
 def stale_owner_session_response(request: web.Request) -> web.Response | None:
     """The distinct denial label for a signed pre-owner bootstrap session.
@@ -4185,13 +4325,33 @@ def _authorize_owner_request(
     owner_id = str(getattr(state, "owner_id", "") or "")
     caller = str(request.get("user") or "")
     if not owner_id:
-        if (
-            allow_local_no_owner
-            and request.get("app") == ""
-            and caller in _LOCAL_DASHBOARD_OWNER_SUBJECTS
-        ):
+        is_local_dashboard = (
+            request.get("app") == "" and caller in _LOCAL_DASHBOARD_OWNER_SUBJECTS
+        )
+        if allow_local_no_owner and is_local_dashboard:
             return None
         _audit_source_api(request, operation, "denied", "owner_not_configured")
+        if is_local_dashboard:
+            # The one caller class that could legitimately reach this refusal
+            # from the UI: a signed machine-local dashboard session whose reads
+            # already succeeded, clicking a mutation button. A generic
+            # ``forbidden`` reads as a dead end, so name the remedy with a
+            # machine-readable code the client can translate into guidance.
+            # The discriminator stays reserved for signed local subjects — an
+            # unsigned, absent, or app-token caller must not learn which
+            # denial class it hit (same rule as ``stale_owner_session_response``).
+            return web.json_response(
+                {
+                    "error": (
+                        "this action needs a configured owner, which Kiro Crew"
+                        " identifies by Slack member ID; set 'Owner Slack member"
+                        " ID' in Settings → Channels → Slack, restart the"
+                        " gateway, then sign in again"
+                    ),
+                    "code": OWNER_NOT_CONFIGURED_CODE,
+                },
+                status=403,
+            )
         return web.json_response({"error": "forbidden"}, status=403)
     if "app" not in request or request["app"] != "":
         _audit_source_api(request, operation, "denied", "app_token_not_allowed")

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { withUnifiedPatchHeaders } from './unifiedPatchHeaders'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -43,6 +44,7 @@ import { Btn } from './ui'
 
 
 import { i18nT } from '../i18n/t'
+import { OWNER_SETTINGS_PATH, pullRequestErrorDetails } from '../utils/pullRequestErrors'
 import ErrorNotice from './ErrorNotice'
 const CHECK_POLL_BASE_MS = 10_000
 const CHECK_POLL_MAX_MS = 60_000
@@ -107,43 +109,6 @@ type SourceTab = 'changes' | 'description' | 'commits' | 'checks' | 'reviews'
 function age(value: string): string {
   const ms = Date.parse(value)
   return timeAgo(Number.isFinite(ms) ? ms / 1000 : 0)
-}
-
-export function pullRequestErrorDetails(error: unknown): {
-  message: string
-  loginCommand: 'gh auth login' | 'glab auth login' | ''
-  /** The server refused pending an acknowledgement the client may now offer. */
-  confirmationRequired: boolean
-  /** The gateway was at its concurrent-fetch ceiling; the same request may succeed later. */
-  sourceBusy: boolean
-} {
-  let message = error instanceof Error ? error.message : String(error || '')
-  let confirmationRequired = false
-  let sourceBusy = false
-  // ApiError already unwraps the human message, which discards every other
-  // field, so the structured marker is read from the raw body it preserves.
-  const raw = typeof (error as { body?: unknown })?.body === 'string'
-    ? (error as { body: string }).body
-    : message
-  try {
-    const payload = JSON.parse(raw) as {
-      error?: unknown
-      confirmationRequired?: unknown
-      code?: unknown
-    }
-    if (typeof payload.error === 'string') message = payload.error
-    confirmationRequired = payload.confirmationRequired === true
-    sourceBusy = payload.code === 'source_busy'
-  } catch {
-    // Provider and network errors may already be plain text.
-  }
-  const authenticationFailure = /\b(?:not logged in(?:to)?|unauthenticated|authentication (?:failed|required)|requires authentication)\b/i.test(message)
-  const loginCommand = authenticationFailure && /(?:`|\b)gh auth login(?:`|\b)/i.test(message)
-    ? 'gh auth login'
-    : authenticationFailure && /(?:`|\b)glab auth login(?:`|\b)/i.test(message)
-      ? 'glab auth login'
-      : ''
-  return { message, loginCommand, confirmationRequired, sourceBusy }
 }
 
 /** Whether a failed source read is worth another attempt.
@@ -600,6 +565,7 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
   if (!showReady && !showAutoMerge && !source.autoMerge && !error) return null
 
   return (
+    <>
     <div className="mt-2 flex flex-wrap items-center gap-2">
       {showReady && (
         <Btn
@@ -660,6 +626,20 @@ export function PullRequestActions({ source }: { source: PullRequestSource }) {
       )}
       <ErrorNotice message={error} variant="inline" askAgent />
     </div>
+    {/* The remedy link lives OUTSIDE the action row, on its own line — never
+        as a row peer, which would push the row past the two-button cap in the
+        confirm state (Cancel + Confirm are already there). */}
+    {error && errorDetails.ownerNotConfigured && (
+      <div className="mt-1.5">
+        <Link
+          to={OWNER_SETTINGS_PATH}
+          className="inline-flex items-center gap-1 text-[11px] text-accent hover:underline"
+        >
+          {i18nT('components.pullRequestPanel.open_slack_settings')} <ArrowRight className="lucide-inline" />
+        </Link>
+      </div>
+    )}
+    </>
   )
 }
 

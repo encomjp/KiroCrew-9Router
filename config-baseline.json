@@ -29,6 +29,7 @@
         "provider_base_url": "",
         "provider_api_key": "",
         "mcp_registry_mode": false,
+        "mcp_quarantine_after_failures": 3,
         "acp_backend": "",
         "provider_api_format": "",
         "model_whitelist": [],
@@ -47,6 +48,8 @@
         "sandbox_allow_unsandboxed_exec": false,
         "apps_allow_third_party": false,
         "apps_trusted": [],
+        "apps_trusted_local": [],
+        "apps_trusted_repositories": {},
         "jail": "auto",
         "dangerously_skip_permissions": false,
         "yolo_duration": "6h",
@@ -344,6 +347,20 @@
       "defaultValue": false
     },
     {
+      "path": "agent.mcp_quarantine_after_failures",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Failing-Probe Threshold",
+      "help": "Consecutive failed probes before an MCP server is reported as persistently failing on its dashboard row. A probe verdict is otherwise forgotten between rounds, so a server that failed once on a cold cache looked identical to one that has failed forty times. Counts only 'error' and 'timeout': a server asking for OAuth sign-in is working correctly and is never counted, and one success clears the count. This is a health reading only -- the server stays mounted, and the dashboard offers a one-click count reset. 0 turns it off.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 3
+    },
+    {
       "path": "agent.acp_backend",
       "kind": "core",
       "type": "string",
@@ -354,11 +371,7 @@
       "label": "ACP Backend",
       "help": "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, 'opencode' = OpenCode ACP (fork). KAS runs chat but has no native subagent progress reporting yet.",
       "hasChildren": false,
-      "enumValues": [
-        "",
-        "kas",
-        "opencode"
-      ],
+      "enumValues": null,
       "defaultValue": ""
     },
     {
@@ -618,6 +631,62 @@
     },
     {
       "path": "agent.apps_trusted.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "agent.apps_trusted_local",
+      "kind": "core",
+      "type": "array",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Trusted Local Apps",
+      "help": "App names whose per-app execution grant was explicitly reviewed as local, repository-less code. This internal grant-kind marker distinguishes current local consent from legacy name-only grants; it is effective only with the matching apps_trusted entry.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "agent.apps_trusted_local.*",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "*",
+      "help": "",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": null
+    },
+    {
+      "path": "agent.apps_trusted_repositories",
+      "kind": "core",
+      "type": "object",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Trusted App Repositories",
+      "help": "Repository coordinates captured by the per-app trust endpoint. Each key is an app name from apps_trusted and each value is the normalized repository shown at consent. Registry installation refuses if that name later resolves to a different repository. Legacy repository-backed grants without an entry require one-time re-consent before code execution.",
+      "hasChildren": true,
+      "enumValues": null,
+      "defaultValue": {}
+    },
+    {
+      "path": "agent.apps_trusted_repositories.*",
       "kind": "core",
       "type": "string",
       "required": false,
@@ -2694,19 +2763,18 @@
       "enumValues": null,
       "defaultValue": {
         "enabled": true,
-        "provider": "whisper",
-        "whisper_path": "",
-        "model": "turbo",
-        "mlx_model": "mlx-community/whisper-large-v3-turbo",
-        "parakeet_model": "mlx-community/parakeet-tdt-0.6b-v3",
-        "device": "cpu",
+        "provider": "local",
+        "model": "base",
+        "language_code": "en-US",
+        "streaming": true,
+        "silence_ms": 700,
+        "partial_interval_ms": 400,
+        "idle_evict_secs": 600,
+        "endpointing": false,
+        "dictation_panel": true,
         "timeout_secs": 300,
         "transcribe_region": "us-east-1",
-        "transcribe_profile": "",
-        "language_code": "en-US",
-        "streaming": false,
-        "endpointing": false,
-        "dictation_panel": true
+        "transcribe_profile": ""
       }
     },
     {
@@ -2718,7 +2786,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Enabled",
-      "help": "Enable voice memo transcription.",
+      "help": "Turn spoken input into text you can send.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
@@ -2732,30 +2800,14 @@
       "sensitive": false,
       "tags": [],
       "label": "Provider",
-      "help": "STT provider.",
+      "help": "Where speech is recognised. `local` runs on this machine and needs no account (it downloads one model the first time you dictate), `apple` uses the on-device recogniser built into macOS 26 and later, and `transcribe` sends your audio to AWS Transcribe, which bills your AWS account.",
       "hasChildren": false,
       "enumValues": [
-        "whisper",
-        "mlx",
+        "local",
         "apple",
-        "parakeet",
         "transcribe"
       ],
-      "defaultValue": "whisper"
-    },
-    {
-      "path": "stt.whisper_path",
-      "kind": "core",
-      "type": "string",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Whisper Path",
-      "help": "Path to whisper binary (auto-detected if empty).",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": ""
+      "defaultValue": "local"
     },
     {
       "path": "stt.model",
@@ -2766,57 +2818,113 @@
       "sensitive": false,
       "tags": [],
       "label": "Model",
-      "help": "Whisper model size.",
+      "help": "Which speech model the local provider downloads and runs. Bigger is more accurate and a longer first-time download: `tiny` on a machine short of memory, `base` for everyone, `small` when accents or jargon are being misheard, `large-v3-turbo` for the best accuracy available.",
       "hasChildren": false,
       "enumValues": [
-        "turbo"
+        "tiny",
+        "base",
+        "small",
+        "large-v3-turbo"
       ],
-      "defaultValue": "turbo"
+      "defaultValue": "base"
     },
     {
-      "path": "stt.mlx_model",
+      "path": "stt.language_code",
       "kind": "core",
       "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
-      "label": "MLX Model",
-      "help": "Hugging Face repo for the mlx_whisper model (mlx provider only).",
+      "label": "Language Code",
+      "help": "Language for speech recognition (e.g. en-US, fr-FR, es-ES).",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": "mlx-community/whisper-large-v3-turbo"
+      "defaultValue": "en-US"
     },
     {
-      "path": "stt.parakeet_model",
+      "path": "stt.streaming",
       "kind": "core",
-      "type": "string",
+      "type": "boolean",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
-      "label": "Parakeet Model",
-      "help": "Hugging Face repo for the parakeet-mlx model (parakeet provider only).",
+      "label": "Streaming",
+      "help": "Show words in the message box while you are still speaking rather than only once you stop. Every provider supports it; turning it off spends less CPU on the local provider and fewer API calls on `transcribe`.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": "mlx-community/parakeet-tdt-0.6b-v3"
+      "defaultValue": true
     },
     {
-      "path": "stt.device",
+      "path": "stt.silence_ms",
       "kind": "core",
-      "type": "string",
+      "type": "integer",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
-      "label": "Device",
-      "help": "Computation device.",
+      "label": "End-of-phrase silence",
+      "help": "How long a pause has to last, in milliseconds, before what you said is treated as a finished phrase. Raise it if you are being cut off mid-sentence; lower it if the text lags behind you.",
       "hasChildren": false,
-      "enumValues": [
-        "cpu",
-        "cuda"
-      ],
-      "defaultValue": "cpu"
+      "enumValues": null,
+      "defaultValue": 700
+    },
+    {
+      "path": "stt.partial_interval_ms",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Live update interval",
+      "help": "How often the live transcript is refreshed while you speak, in milliseconds. Lower feels more immediate and costs a little more CPU per second of speech; higher is steadier to read.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 400
+    },
+    {
+      "path": "stt.idle_evict_secs",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Release model after",
+      "help": "How long the local model stays loaded in memory after your last recording, in seconds. It holds roughly 150 MB at the default model, and reloading it takes a fraction of a second, so lower this on a machine short of memory. 0 releases it as soon as you stop speaking.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 600
+    },
+    {
+      "path": "stt.endpointing",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Semantic endpointing",
+      "help": "While dictating, run a fast background model on each finished phrase to detect when you have asked a complete question, then send it without you pressing anything. Needs streaming; off by default.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "stt.dictation_panel",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Dictation Panel",
+      "help": "Show the animated dictation panel while recording instead of the thin status bar. Ignored when the browser lacks WebGL2 or the OS requests reduced motion — both fall back to the status bar.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": true
     },
     {
       "path": "stt.timeout_secs",
@@ -2859,62 +2967,6 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
-    },
-    {
-      "path": "stt.language_code",
-      "kind": "core",
-      "type": "string",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Language Code",
-      "help": "Language for speech recognition (e.g. en-US, fr-FR, es-ES).",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": "en-US"
-    },
-    {
-      "path": "stt.streaming",
-      "kind": "core",
-      "type": "boolean",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Streaming",
-      "help": "Stream partial transcripts live to the dashboard input. Supported by the streaming providers only: `transcribe` (AWS, cloud) and `apple` (on-device, macOS 26+). The whisper/mlx CLIs have no partial-result channel.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": false
-    },
-    {
-      "path": "stt.endpointing",
-      "kind": "core",
-      "type": "boolean",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Semantic endpointing",
-      "help": "While streaming dictation, run a fast background model on each stable transcript segment to detect when you have finished a complete request, then auto-submit. Streaming providers only (transcribe, apple); off by default.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": false
-    },
-    {
-      "path": "stt.dictation_panel",
-      "kind": "core",
-      "type": "boolean",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "Dictation Panel",
-      "help": "Show the animated dictation panel while recording instead of the thin status bar. Ignored when the browser lacks WebGL2 or the OS requests reduced motion — both fall back to the status bar.",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": true
     },
     {
       "path": "computer_use",
@@ -3587,7 +3639,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Tool stall suspect (s)",
-      "help": "Idle seconds before an UNKNOWN-verdict in-flight tool is cancelled and the turn routed to tool-stall recovery (continue-nudge, no re-run of the original message). WORKING tools (e.g. a matched live build child) are never cancelled regardless of duration. Default 1h: generous enough for long builds and MCP tools on macOS, where the liveness oracle degrades (no /proc) and cannot distinguish a live build from a stall, while still landing inside the turn's own ceiling (agent.chat_turn_timeout_secs) so recovery is reachable. A window at or past that ceiling is clamped at load with a warning.",
+      "help": "Idle seconds before an UNKNOWN-verdict in-flight tool is cancelled and the turn routed to tool-stall recovery (continue-nudge, no re-run of the original message). WORKING tools (e.g. a matched live build child) are never cancelled regardless of duration. Default 1h: generous enough for long builds and MCP tools on macOS, where the liveness oracle degrades (no /proc) and cannot distinguish a live build from a stall, while still landing inside the turn's own ceiling (agent.chat_turn_timeout_secs) so recovery is reachable. Enforcement is at handle construction, not config load: a window past the headroom fraction of the transport's per-prompt timeout is clamped with a warning, while one that merely exceeds agent.chat_turn_timeout_secs is warned about but left as set, because the same handle also serves callers that pass a larger prompt timeout (review and cron turns).",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 3600.0
@@ -3601,7 +3653,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Hard cap (s)",
-      "help": "Absolute ceiling for UNKNOWN-verdict forbearance (e.g. the extended probably-thinking window). Applies ONLY to UNKNOWN verdicts — never to a WORKING session. Default 1h, bounded by the turn ceiling like the suspect window.",
+      "help": "Absolute ceiling for UNKNOWN-verdict forbearance (e.g. the extended probably-thinking window). Applies ONLY to UNKNOWN verdicts — never to a WORKING session, which is deferred before this cap is consulted and is therefore bounded only by the turn's own ceiling. Default 1h, clamped against the transport's per-prompt timeout like the suspect window.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 3600.0
@@ -3655,6 +3707,7 @@
         "command": "kirocrew",
         "forward_to_agent_callback": "",
         "trusted_bot_ids": [],
+        "trusted_bot_turn_limit": 5,
         "allowed_enterprise_ids": [],
         "reactions": {},
         "reactions_enabled": true,
@@ -3789,10 +3842,26 @@
         "slack"
       ],
       "label": "Trusted Bot IDs",
-      "help": "Bot IDs allowed to bypass the bot filter for multi-node mesh communication.",
+      "help": "Bot IDs allowed to bypass the bot filter for multi-node mesh communication. The gateway's own bot ID is never trusted, even if listed (it would reply to itself in a loop).",
       "hasChildren": true,
       "enumValues": null,
       "defaultValue": []
+    },
+    {
+      "path": "slack.trusted_bot_turn_limit",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "slack"
+      ],
+      "label": "Trusted Bot Turn Limit",
+      "help": "Maximum consecutive turns a thread may run on trusted-bot messages before a human message is required (loop guard for mutually trusted gateways). A message from an allowed human resets the count. Minimum 1; values below 1 are treated as 1.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 5
     },
     {
       "path": "slack.allowed_enterprise_ids",
@@ -4903,7 +4972,8 @@
         "allow_group": false,
         "allowed_group_ids": [],
         "soft_threshold_pct": 80,
-        "hard_threshold_pct": 95
+        "hard_threshold_pct": 95,
+        "session_folder": ""
       }
     },
     {
@@ -5029,6 +5099,22 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 95
+    },
+    {
+      "path": "feishu.session_folder",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [
+        "feishu"
+      ],
+      "label": "Session Folder",
+      "help": "Optional sidebar folder for sessions that start on this channel. Empty (the default) leaves them unfiled; any other value is the folder name, created when these settings are saved and marked with the channel's brand mark. A configured folder that no longer exists leaves conversations unfiled until the next save recreates it.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
     },
     {
       "path": "discord",
@@ -5814,16 +5900,18 @@
         },
         "restore_sessions": false,
         "qr_session_until_restart": true,
+        "qr_session_persist_across_restart": false,
         "restore_window_minutes": 30,
         "surface_channel_sessions": true,
         "bot_name": "",
         "avatar": "",
         "merge_queued_messages": false,
         "mcp_probe_timeout_secs": 15,
-        "loop_stall_exit_after_secs": 25,
+        "loop_stall_exit_after_secs": null,
         "cautious_boot": true,
         "widget_density": "more",
         "use_builtin_browser": true,
+        "browser_view_port": 0,
         "verbosity": "default",
         "link_previews": false,
         "usage_text_scrape_enabled": false,
@@ -5919,7 +6007,7 @@
       "sensitive": false,
       "tags": [],
       "label": "Trust Tailnet Identity",
-      "help": "Pin dashboard sessions arriving via `tailscale serve` to the daemon-verified tailnet peer instead of the tunnel's shared loopback address, and record that identity in the audit trail. Explicit opt-in, never inferred, and requires a non-empty allowed_logins — enabling it with an empty allowlist is refused at load. Every failure to verify a peer falls back to the ordinary token path. POSIX only. Takes effect on the next gateway start (the trust settings are read once at startup).",
+      "help": "Pin dashboard sessions arriving via `tailscale serve` to the daemon-verified tailnet peer instead of the tunnel's shared loopback address, and record that identity in the audit trail. Explicit opt-in, never inferred, and requires a non-empty allowed_logins — enabling it with an empty allowlist is refused at load. Every failure to verify a peer falls back to the ordinary token path. Takes effect on the next gateway start (the trust settings are read once at startup).",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": false
@@ -6007,6 +6095,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": true
+    },
+    {
+      "path": "dashboard.qr_session_persist_across_restart",
+      "kind": "core",
+      "type": "boolean",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Phone Sign-In Survives A Gateway Restart",
+      "help": "REQUIRES BOTH: \"Phone Sign-In Lasts Until Restart\" must also be ON, and tailnet identity trust must be configured (`dashboard.tailscale.trust_identity` with a non-empty `allowed_logins`). Without either one this setting is ignored and a warning naming the missing prerequisite is logged. Note the first requirement is NOT a contradiction: \"Lasts Until Restart\" is what issues the renewable credential, and this setting then removes the restart bound from it -- turning that one OFF instead leaves a session that expires on a fixed clock, with nothing to renew. What it does: let a scanned phone stay signed in across gateway restarts, so one scan lasts until the refresh credential's own 30-day lifetime lapses. OFF by default because a restart is otherwise a hard sign-out that needs no recorded state. The identity requirement is not optional bookkeeping: behind `tailscale serve` every request reaches the gateway from 127.0.0.1, so without a daemon-verified peer identity the session is a bearer credential any tailnet peer could replay, and outliving the process is exactly what makes that matter.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
     },
     {
       "path": "dashboard.restore_window_minutes",
@@ -6101,10 +6203,11 @@
       "sensitive": false,
       "tags": [],
       "label": "Loop-stall Hard-exit Budget (secs)",
-      "help": "Seconds the gateway's event loop may go silent before it dumps all thread stacks and exits so systemd can restart it. Raise it on a host that does heavy subprocess work (long builds, test suites, many child reaps), which can wedge the loop briefly without being genuinely dead. Clamped to 10s..300s. Note the desktop app's liveness probe kills at roughly 20s independently, so a value above that only takes effect for a headless gateway — the desktop probe wins first and the stack dump is lost.",
+      "help": "Seconds the gateway's event loop may go silent before it dumps all thread stacks and exits. Leave unset for the automatic default: 25 seconds for desktop/foreground launches and 90 seconds for a managed systemd/launchd service. An explicit value overrides both. Raise it on a host that does heavy subprocess work (long builds, test suites, many child reaps), which can wedge the loop briefly without being genuinely dead. Clamped to 10s..300s. The desktop app's liveness probe kills at roughly 20s independently, so a value above that only takes effect for a headless gateway — the desktop probe wins first and the stack dump is lost.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 25
+      "defaultValue": null,
+      "nullable": true
     },
     {
       "path": "dashboard.cautious_boot",
@@ -6152,6 +6255,20 @@
       "defaultValue": true
     },
     {
+      "path": "dashboard.browser_view_port",
+      "kind": "core",
+      "type": "integer",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Browser Live-View Port",
+      "help": "Pin the browser live-view server (playwright-cli show) to this loopback port. 0 (the default) picks a fresh OS-assigned ephemeral port on every start. Set a fixed port when the dashboard is viewed remotely through an SSH tunnel that forwards a fixed set of ports, so the Browser panel can always reach the view. The server binds loopback-only either way. A value outside 1-65535 is treated as unset. A changed pin applies the next time the view server (re)starts; an already-running server keeps its current port.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 0
+    },
+    {
       "path": "dashboard.verbosity",
       "kind": "core",
       "type": "string",
@@ -6160,12 +6277,13 @@
       "sensitive": false,
       "tags": [],
       "label": "Response Verbosity",
-      "help": "Controls how terse the agent's prose is. 'default' is normal; 'concise' injects brevity guidelines (lead with the answer, cut filler, keep code/errors verbatim); 'ultra' writes for an ADHD reader — the answer lands in a 3-sentence opening, and any detail after it must be scannable bullets rather than prose. Both levels preserve full detail for security warnings, irreversible-action confirmations, and ordered multi-step instructions.",
+      "help": "Controls how terse the agent's prose is. 'default' is normal; 'concise' injects brevity guidelines (lead with the answer, cut filler, keep code/errors verbatim); 'ultra' writes for an ADHD reader — the answer lands in a 3-sentence opening, and any detail after it must be scannable bullets rather than prose; 'answer_only' drops explanation altogether — the answer or artifact alone, with at most one sentence of context, and detail only when the user asks for it, when the decision is consequential enough (security, exposure, data loss, spend, anything hard to undo) that they cannot choose correctly without the reasoning, or as the undo path that rides along with a destructive command. At every level security warnings and irreversible-action confirmations always appear but stay brief, and ordered multi-step instructions stay complete.",
       "hasChildren": false,
       "enumValues": [
         "default",
         "concise",
-        "ultra"
+        "ultra",
+        "answer_only"
       ],
       "defaultValue": "default"
     },
@@ -7070,6 +7188,20 @@
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": 0.0
+    },
+    {
+      "path": "agents.*.session_color",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Session Color",
+      "help": "Default session color for sessions created by this agent. Accepts a CSS hex color string (#rrggbb, lowercase). Applied at render time to any session this agent started that has no color of its own, so editing it re-tints those sessions live. A color set on the session itself (a manual pick or the dashboard default-color policy) always takes precedence. Empty means no agent color.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": ""
     },
     {
       "path": "agents.*.telegram_account",

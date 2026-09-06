@@ -20,6 +20,9 @@
  */
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 
+// The shapes live in a neutral module, so the store does not depend on a page.
+import type { InstanceDraft, InstanceFormValues } from '../types/instanceForm'
+
 export interface WarmConn {
   port: number
   token: string
@@ -86,6 +89,38 @@ export interface HostModel {
   stableOrder: boolean | null
 }
 
+/**
+ * Unsaved Settings crew-form state, kept ABOVE the route that renders it.
+ *
+ * `RemoteCrewPanel` lives under `/settings/*`, so the error → agent hand-off's
+ * navigation unmounts it along with anything half-typed. Component state cannot
+ * survive that, and serialising a copy to storage answers a harder question than
+ * the one being asked: a stored draft has to be re-measured against a server
+ * record on the way back, and its slot key outlives every reload, so a crew
+ * removed and re-added under the same name (ids are name slugs) inherits a
+ * stranger's draft. State that simply never leaves memory has neither problem —
+ * the baseline travels as the same object it was captured from, and the whole
+ * thing dies with the tab.
+ *
+ * Deliberately NOT persisted: a full page reload is not the loss being fixed —
+ * the hand-off is an in-app navigation — and the browser does not restore a
+ * controlled React form across a reload either.
+ */
+interface CrewFormState {
+  /** Add-form values, or `null` when the form holds nothing but its defaults. */
+  add: InstanceFormValues | null
+  /**
+   * The crew being edited, its unsaved values and the record the edit OPENED on,
+   * plus the rebase counter the form uses as its React key.
+   *
+   * `baseline` is carried rather than re-read: the form measures "changed"
+   * against the record it opened on, so re-reading the live poll's newer copy
+   * would count someone else's concurrent change as the user's own edit and
+   * write back a field the user never touched.
+   */
+  edit: { id: string; draft: InstanceDraft; seq: number } | null
+}
+
 interface InstancesState {
   warm: Record<string, WarmConn>
   activeId: string | null
@@ -96,6 +131,7 @@ interface InstancesState {
    *  so the viewport can tell a live pane from one still loading / dead. */
   ready: Record<string, boolean>
   host: HostModel | null
+  crewForms: CrewFormState
 }
 
 const initialState: InstancesState = {
@@ -105,6 +141,7 @@ const initialState: InstancesState = {
   unread: {},
   ready: {},
   host: null,
+  crewForms: { add: null, edit: null },
 }
 
 const instancesSlice = createSlice({
@@ -153,6 +190,25 @@ const instancesSlice = createSlice({
     setHostModel(state, action: PayloadAction<HostModel | null>) {
       state.host = action.payload
     },
+    /**
+     * Hold (or drop, with `null`) the Add form's unsaved values.
+     *
+     * Written on every change rather than only when a button hands off: the
+     * navigation unmounts the whole panel, so the crew rows above the form and the
+     * viewport overlay destroy it just as thoroughly — as does a sidebar click.
+     * Making it a property of the form covers every exit instead of the one wired.
+     */
+    setCrewAddForm(state, action: PayloadAction<InstanceFormValues | null>) {
+      // Tests preload partial slices, so tolerate a missing container.
+      if (!state.crewForms) state.crewForms = { add: null, edit: null }
+      state.crewForms.add = action.payload
+    },
+    /** Hold (or drop, with `null`) the unsaved edit of one crew, with the record
+     *  it was opened on. */
+    setCrewEditForm(state, action: PayloadAction<CrewFormState['edit']>) {
+      if (!state.crewForms) state.crewForms = { add: null, edit: null }
+      state.crewForms.edit = action.payload
+    },
     clearInstances() {
       return initialState
     },
@@ -166,6 +222,8 @@ export const {
   setPaneReady,
   setUnread,
   setHostModel,
+  setCrewAddForm,
+  setCrewEditForm,
   clearInstances,
 } = instancesSlice.actions
 export default instancesSlice.reducer

@@ -1,24 +1,29 @@
 import { describe, it, expect } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
-import { MemoryRouter, useSearchParams } from 'react-router-dom'
+import { MemoryRouter, useLocation } from 'react-router-dom'
 
 import SettingsSearch from './SettingsSearch'
 
 /**
  * The in-page settings search: typing filters SETTINGS_REGISTRY, activation
- * hands off to useSettingHighlight via a FRESH set of search params (tab +
- * entry params + highlight), so stale params from the previous tab can never
- * block the target panel from mounting.
+ * hands off to useSettingHighlight via a FRESH path URL
+ * (/settings/<tab>[/<sub>]?highlight=<id>), so stale params from the previous
+ * tab can never block the target panel from mounting.
  *
  * Queries pin against long-stable registry entries (the Display tab's
  * zoom-level toggle) rather than enumerating the registry, so routine
  * regeneration does not churn this file.
  */
 
-/** Renders the live search params so assertions read what activation wrote. */
+/** Renders the live location so assertions read what activation wrote. */
 function ParamsProbe() {
-  const [params] = useSearchParams()
-  return <div data-testid="params">{params.toString()}</div>
+  const location = useLocation()
+  return (
+    <>
+      <div data-testid="pathname">{location.pathname}</div>
+      <div data-testid="params">{new URLSearchParams(location.search).toString()}</div>
+    </>
+  )
 }
 
 function setup(initialEntry = '/settings?tab=chat&channel=slack') {
@@ -41,30 +46,31 @@ describe('SettingsSearch', () => {
     expect(screen.getByText('Zoom Level')).toBeInTheDocument()
   })
 
-  it('activation writes fresh params: tab + highlight, dropping stale ones', () => {
+  it('activation writes a fresh path URL: tab segment + highlight, dropping stale params', () => {
     setup('/settings?tab=chat&channel=slack')
     fireEvent.change(input(), { target: { value: 'zoom' } })
     fireEvent.mouseDown(screen.getByText('Zoom Level'))
+    expect(screen.getByTestId('pathname').textContent).toBe('/settings/display')
     const params = new URLSearchParams(screen.getByTestId('params').textContent ?? '')
-    expect(params.get('tab')).toBe('display')
     expect(params.get('highlight')).toBe('display.zoom-level')
-    // The stale channel param from the previous tab must not ride along.
+    // The stale legacy params from the previous URL must not ride along.
+    expect(params.get('tab')).toBeNull()
     expect(params.get('channel')).toBeNull()
     // Input clears and the dropdown closes after activation.
     expect(input()).toHaveValue('')
     expect(screen.queryByRole('listbox')).not.toBeInTheDocument()
   })
 
-  it('carries an entry\u2019s own params into the deep link — translated to the canonical sub', () => {
+  it('carries an entry\u2019s own params into the deep link — as the second path segment', () => {
     setup()
     fireEvent.change(input(), { target: { value: 'auto-approve stays on' } })
     fireEvent.mouseDown(screen.getByText('How long auto-approve stays on'))
-    const params = new URLSearchParams(screen.getByTestId('params').textContent ?? '')
-    expect(params.get('tab')).toBe('security')
     // The registry entry carries the legacy `section` key; settingsRoute
-    // rewrites it to the canonical second-level param, so the navigation
-    // shell's level test sees the drill-in (one back bar, not two).
-    expect(params.get('sub')).toBe('approval')
+    // mints it as the second PATH segment, so the navigation shell's level
+    // test sees the drill-in (one back bar, not two).
+    expect(screen.getByTestId('pathname').textContent).toBe('/settings/security/approval')
+    const params = new URLSearchParams(screen.getByTestId('params').textContent ?? '')
+    expect(params.get('sub')).toBeNull()
     expect(params.get('section')).toBeNull()
     expect(params.get('highlight')).toBe('security.how-long-auto-approve-stays-on')
   })

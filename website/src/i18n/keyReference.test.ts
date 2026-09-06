@@ -411,14 +411,22 @@ export function Shadowed(KEY: string) {
 describe('scope', () => {
   it('treats a shadowed name as dynamic rather than resolving the outer binding', () => {
     const clean = run({
-      files: withPadding({ 'src/probe/Shadow.tsx': SHADOW_SOURCE }),
+      files: withPadding({
+        'src/probe/Shadow.tsx': SHADOW_SOURCE,
+        // Normal gate runs do not need test sources for their verdict, but report mode
+        // keeps scanning them so the exclusion remains visible and auditable.
+        'src/probe/ReportOnly.test.ts': `import { i18nT } from '../i18n/t'
+export const value = i18nT('probe.report_only.absent')
+`,
+      }),
       keys: [],
       baseline: { 'probe/Shadow.tsx': 1 },
-    })
+    }, ['--report'])
     expect(clean.status, `stdout:\n${clean.stdout}\nstderr:\n${clean.stderr}`).toBe(0)
     // The outer key must NOT be reported: the call site cannot reach it, and asserting a
     // key the code never asks for is how a gate loses its reader's trust.
     expect(clean.stderr).not.toContain('probe.shadow.outer')
+    expect(clean.stdout).toContain('probe.report_only.absent')
   })
 })
 
@@ -537,6 +545,14 @@ describe('the gate refuses to report a pass it cannot justify', () => {
 // ------------------------------------------------------------------ wiring
 
 describe('wiring', () => {
+  it('skips test-only sources before the normal real-tree filesystem scan', () => {
+    const source = fs.readFileSync(GATE, 'utf-8')
+    const walk = source.slice(source.indexOf('function walk('), source.indexOf('/**\n * Is a bare `t`'))
+    const skip = walk.indexOf('if (!REPORT && isTestFile(rel)) continue')
+    expect(skip).toBeGreaterThan(-1)
+    expect(skip).toBeLessThan(walk.indexOf('fs.statSync(full)'))
+  })
+
   it('is invoked by npm run i18n:check', () => {
     // The gate lives in a script, so nothing in the vitest suite would notice it being
     // dropped from the chain CI runs. `englishIdentity.test.ts` reads codemod source for

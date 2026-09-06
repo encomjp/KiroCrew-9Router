@@ -723,6 +723,23 @@ async def _fetch_usage_bg() -> None:
         # credential from a signed-out profile supplying the numbers. Fetched
         # once here and reused by both the API and text branches below.
         identity = await _fetch_whoami(kiro_bin)
+        # Fail fast on API-key auth. kiro-cli's whoami reports the AuthMethod
+        # enum variant ``ApiKey``; the compare normalizes case and strips
+        # separators so an upstream respelling (``API_KEY``, ``Api-Key``)
+        # still fails fast instead of silently regressing to the slow path —
+        # such accounts hold no SSO/OIDC bearer token, so ``fetch_usage_limits``
+        # would spend its full timeout walking credential stores that cannot
+        # contain one, and the billed text scrape is no better a source. The
+        # ``reason`` rides the existing unavailable-marker shape so the
+        # frontend can say WHY instead of hiding the pill without explanation.
+        account_type = identity.get("account_type")
+        if (
+            isinstance(account_type, str)
+            and re.sub(r"[^a-z0-9]", "", account_type.lower()) == "apikey"
+        ):
+            _publish_usage({"available": False, "reason": "api_key_auth"})
+            logger.info("Kiro usage: not available under API key auth; skipping fetch")
+            return
         raw_arn = identity.get("_profile_arn")
         expected_arn = raw_arn if isinstance(raw_arn, str) and raw_arn else None
         # Primary source: the real GetUsageLimits API. It reads the live bearer
@@ -1009,7 +1026,12 @@ async def api_sessions(request: web.Request) -> web.Response:
         offset = 0
     want_preview = (request.query.get("preview") or "").lower() in ("1", "true", "yes")
     exclude_open = (request.query.get("exclude_open") or "").lower() in ("1", "true", "yes")
-    all_sessions = state.conversation_log.list_sessions()
+    # list_sessions() globs, stats, and reads the first line of EVERY session file
+    # in the history dir — O(all sessions). At 2000 sessions, that's ~200 ms of
+    # blocking IO (measured: 208 ms / 2000 files on a dev host). Running that on
+    # the event loop freezes chat, heartbeat, and every other coroutine for the
+    # full duration. Offload to a worker thread (#3057).
+    all_sessions = await asyncio.to_thread(state.conversation_log.list_sessions)
     if exclude_open:
         open_keys = _open_slot_transcript_keys(state)
         # Fold through ``_canonical_key`` as well: ``list_sessions`` deduplicates
@@ -1032,11 +1054,17 @@ async def api_sessions(request: web.Request) -> web.Response:
         log = state.conversation_log
 
         def _attach_previews(sessions: list[dict]) -> None:
+            def _sanitize(text: str) -> str:
+                # Injected so redaction runs BEFORE the preview's length cap:
+                # a credential split by truncation leaves a partial token the
+                # patterns cannot match, letting its raw prefix through.
+                text, _ = _h.redact_exfiltration_urls(text)
+                text, _ = _h.redact_credentials(text)
+                return text
+
             for s in sessions:
-                preview = log.last_message_preview(s.get("key", ""))
+                preview = log.last_message_preview(s.get("key", ""), sanitize=_sanitize)
                 if preview:
-                    preview, _ = _h.redact_exfiltration_urls(preview)
-                    preview, _ = _h.redact_credentials(preview)
                     s["preview"] = preview
 
         # Tail reads are sync file IO — keep them off the event loop.
@@ -1391,39 +1419,35 @@ async def api_sessions_clear(request: web.Request) -> web.Response:
     if not state.conversation_log:
         return web.json_response({"error": "no conversation log"}, status=400)
 
-    # Same definition of "open as a tab" the Older-sessions list excludes on, so
-    # a session cannot be simultaneously hidden from that list and eligible for
-    # this delete.
-    protected = _open_slot_transcript_keys(state)
+    # Bind after the None guard so mypy's narrowing carries into the closure.
+    log = state.conversation_log
 
-    sessions = state.conversation_log.list_sessions()
+    # list_sessions() globs, stats, and reads the first line of EVERY session file
+    # in the history dir — O(all sessions). Offload to keep the event loop responsive.
+    all_sessions = await asyncio.to_thread(log.list_sessions)
+
     count = 0
     skipped = 0
     failed = 0
     cleanup_tasks = []
-    for s in sessions:
+    for s in all_sessions:
         key = s["key"]
-        if key in protected:
+
+        # Re-check per iteration: a resume publishing a slot during the
+        # list_sessions scan OR during an earlier delete-await now appears here.
+        if key in _open_slot_transcript_keys(state):
             skipped += 1
             continue
+
         try:
-            meta = state.conversation_log.get_metadata(key)
-        except Exception:
-            logger.warning(
-                "api_sessions_clear: unreadable metadata for %s, skipping", key, exc_info=True
-            )
-            skipped += 1
-            continue
-        if not isinstance(meta, dict):
-            skipped += 1
-            continue
-        if meta.get("pinned"):
-            skipped += 1
-            continue
-        try:
-            # delete_session enters _locked (flock + os.close) — offload off the
-            # event loop so a wedged peer can't stall the bulk clear on it.
-            if await asyncio.to_thread(state.conversation_log.delete_session, key):
+            # Offload off the event loop — delete_session enters _locked (flock).
+            # skip_pinned=True makes the pin-check-and-delete atomic so a
+            # concurrent pin cannot sneak in between the metadata read and the
+            # unlink. The invariant (lock, real test) now lives in history.py.
+            result = await asyncio.to_thread(log.delete_session, key, skip_pinned=True)
+            if result is None:
+                skipped += 1
+            elif result:
                 cleanup_tasks.append(_remove_slot_for_history_key(state, key))
                 count += 1
             else:
@@ -1452,13 +1476,15 @@ async def api_approvals(request: web.Request) -> web.Response:
 
 
 async def api_approval_resolve(request: web.Request) -> web.Response:
-    """POST /api/approvals/{id}/{action} — approve or reject."""
+    """POST /api/approvals/{id}/{action} — approve, reject, or reject_once."""
     state: DashboardState = request.app["state"]
     approval_id = request.match_info["id"]
     action = request.match_info["action"]
-    if action not in ("approve", "reject"):
+    if action not in ("approve", "reject", "reject_once"):
         return web.json_response({"error": "invalid action"}, status=400)
-    ok = state.resolve_approval(approval_id, action == "approve")
+    ok = state.resolve_approval(
+        approval_id, action == "approve", rejected_once=action == "reject_once"
+    )
     if not ok:
         return web.json_response({"error": "not found or expired"}, status=404)
     return web.json_response({"ok": True})

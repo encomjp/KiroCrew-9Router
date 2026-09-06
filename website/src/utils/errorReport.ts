@@ -38,6 +38,14 @@ export type ErrorSource =
   | 'render'
   /** An uncaught error or unhandled rejection on `window`. */
   | 'window'
+  /**
+   * A subsystem the backend reports as broken inside a SUCCESSFUL response — a
+   * remote crew whose tunnel is down, carried in a 200 status poll. Distinct
+   * from `api` because no request failed: publishing it as `api` would name a
+   * failing endpoint that in fact answered, sending a reader to audit the wrong
+   * layer.
+   */
+  | 'system'
 
 export interface ErrorReport {
   id: string
@@ -468,9 +476,15 @@ export function subscribeChatHandoff(fn: () => void): () => void {
  *
  * `hard: true` forces a full page load — for the root ErrorBoundary, where a
  * soft navigation would re-render the very tree that just threw.
+ *
+ * **Navigating is conditional on the staging having stuck.** With storage
+ * unavailable or quota-exhausted the prompt never lands, so a navigation would
+ * unmount the surface the user was on and deliver them to an empty chat — it
+ * destroys context and gains nothing. Staying put keeps the error, and whatever
+ * they had typed, on screen. Returns whether the hand-off proceeded.
  */
-export function sendErrorToChat(prompt: string, opts: { hard?: boolean } = {}): void {
-  handoffToChat(prompt)
+export function sendErrorToChat(prompt: string, opts: { hard?: boolean } = {}): boolean {
+  if (!handoffToChat(prompt)) return false
   if (!opts.hard) {
     // Notify before navigating: an already-mounted ChatPage drains here, and a
     // not-yet-mounted one drains on mount instead.
@@ -479,10 +493,11 @@ export function sendErrorToChat(prompt: string, opts: { hard?: boolean } = {}): 
     }
     if (_softNavigate) {
       _softNavigate('/chat')
-      return
+      return true
     }
   }
   try { window.location.assign('/chat') } catch { /* nothing left to try */ }
+  return true
 }
 
 /** Test seam — the seam is module state. */

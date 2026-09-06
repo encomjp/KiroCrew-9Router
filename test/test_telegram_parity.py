@@ -34,6 +34,9 @@ from kiro_crew.telegram.renderer import (
     TelegramApprovalDecider,
     TelegramRenderer,
     _display_safe,
+    _utf16_chunks,
+    _utf16_cut,
+    _utf16_len,
 )
 from kiro_crew.telegram.transport import TELEGRAM_CAPABILITIES, TelegramInboundMessage
 
@@ -294,6 +297,70 @@ class TestOutboundImages:
         renderer._buf = ["Here it is."]
         await renderer.on_done()
         assert _AWS_KEY not in "".join(text for text, _ in client.sent)
+
+    @pytest.mark.asyncio
+    async def test_recovery_of_many_failed_uploads_drops_no_reference(self) -> None:
+        # One truncated bubble used to keep only what fit under the cap: with
+        # enough failed images, every reference past it vanished silently.
+        renderer, client = _renderer()
+        renderer.authorize_upload_root("/tmp")
+        client.media_fails = True
+        files = [_png(f"chart-{i:03d}.png") for i in range(200)]
+        renderer._extract_uploads = AsyncMock(  # type: ignore[method-assign]
+            return_value=("Here they are.", files)
+        )
+        renderer._buf = ["Here they are."]
+        await renderer.on_done()
+        landed = "\n".join(text for text, _ in client.sent)
+        for item in files:
+            assert item.path in landed, f"recovery dropped {item.path}"
+        # Every recovery bubble stays within the channel budget, measured in
+        # Telegram's unit.
+        for text, _ in client.sent:
+            assert _utf16_len(text) <= renderer._limit()
+
+    @pytest.mark.asyncio
+    async def test_recovery_respects_telegram_utf16_budget(self) -> None:
+        # Telegram's cap counts UTF-16 code units; the old slice counted code
+        # points. An astral char costs 2 units, so emoji-dense alt text passed
+        # the slice while overflowing the real limit, and the send bounced.
+        renderer, client = _renderer()
+        renderer.authorize_upload_root("/tmp")
+        client.media_fails = True
+        dense = OutboundFile(
+            path="/tmp/chart.png",
+            data=b"\x89PNG\r\n\x1a\n",
+            alt="🚀" * 3000,
+            mime="image/png",
+        )
+        renderer._extract_uploads = AsyncMock(  # type: ignore[method-assign]
+            return_value=("Here.", [dense])
+        )
+        renderer._buf = ["Here."]
+        await renderer.on_done()
+        assert client.sent, "recovery bubbles must land"
+        for text, _ in client.sent:
+            assert _utf16_len(text) <= renderer._limit(), "bubble exceeds the API cap"
+        # Chunked, not truncated: no part of the alt text was dropped.
+        assert sum(text.count("🚀") for text, _ in client.sent) == 3000
+
+    def test_utf16_cut_floor_prevents_zero_progress(self) -> None:
+        # limit=1 with a leading astral char would otherwise cut at index 0
+        # forever; the floor of 2 guarantees any single char makes progress.
+        assert _utf16_cut("🚀abc", 1) >= 1
+        chunks = _utf16_chunks("🚀" * 5, 1)
+        assert "".join(chunks) == "🚀" * 5
+        assert all(_utf16_len(chunk) <= 2 for chunk in chunks)
+
+    def test_utf16_chunks_pack_lines_and_lose_nothing(self) -> None:
+        text = "\n".join(f"![a](/tmp/{i}.png)" for i in range(40))
+        chunks = _utf16_chunks(text, 100)
+        assert len(chunks) > 1, "must actually split for this to test packing"
+        assert all(_utf16_len(chunk) <= 100 for chunk in chunks)
+        # Newline-boundary packing: reassembled lines are exactly the input
+        # lines — nothing dropped, no line bisected.
+        lines = [line for chunk in chunks for line in chunk.split("\n")]
+        assert lines == text.split("\n")
 
     @pytest.mark.asyncio
     async def test_a_length_rotation_holds_a_STRADDLING_reference(self) -> None:
@@ -853,6 +920,57 @@ class TestMultipartShape:
         client._api_multipart = AsyncMock()  # type: ignore[method-assign]
         assert await client.send_media_group(1, []) == []
         client._api_multipart.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_document_takes_sendDocument_with_its_real_name(self) -> None:
+        client = TelegramClient(token="t:1")
+        seen: list[Any] = []
+
+        async def _mp(method: str, params: dict, files: Any, **kw: Any) -> Any:
+            seen.append((method, params, list(files), kw["field_names"], kw.get("filenames")))
+            return {"message_id": 9}
+
+        client._api_multipart = _mp  # type: ignore[method-assign]
+        doc = OutboundFile(
+            path="/tmp/box/report.pdf", data=b"%PDF-1.4", alt="", mime="application/pdf"
+        )
+        mid = await client.send_document(7, doc, caption="x" * 2000, message_thread_id=3)
+        assert mid == 9
+        method, params, files, names, filenames = seen[0]
+        assert method == "sendDocument" and names == ["document"]
+        # The real filename is pinned: the multipart sanitizer is aimed at
+        # LLM-authored reference paths, and rewriting this already-gated name's
+        # extension would break the receiver's file-type association.
+        assert filenames == ["report.pdf"]
+        assert params["chat_id"] == 7 and params["message_thread_id"] == 3
+        # Caption capped at Telegram's 1024; the send stays silent (the text
+        # bubble for the same turn already pinged).
+        assert len(params["caption"]) == 1024
+        assert params["disable_notification"] is True
+        assert files == [doc]
+
+    @pytest.mark.asyncio
+    async def test_the_transport_document_verb_converts_ids_and_returns_str(self) -> None:
+        # The endpoint hands the transport a str conversation id off a
+        # ChannelLink; the Bot API wants ints. The verb owns that conversion,
+        # like send_message beside it.
+        from kiro_crew.telegram.transport import TelegramTransport
+
+        client = TelegramClient(token="t:1")
+        seen: list[Any] = []
+
+        async def _send_document(chat_id: int, document: Any, **kw: Any) -> int:
+            seen.append((chat_id, document, kw))
+            return 44
+
+        client.send_document = _send_document  # type: ignore[method-assign]
+        transport = TelegramTransport(client)
+        doc = _png("report.png")
+        mid = await transport.send_document("42", doc, caption="here", thread_id="7")
+        assert mid == "44"
+        chat_id, document, kw = seen[0]
+        assert chat_id == 42 and document is doc
+        assert kw["caption"] == "here" and kw["message_thread_id"] == 7
 
     @pytest.mark.asyncio
     async def test_the_album_cap_bounds_one_call(self) -> None:

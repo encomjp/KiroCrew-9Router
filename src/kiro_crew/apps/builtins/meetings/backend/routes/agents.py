@@ -283,14 +283,59 @@ async def handle_mute_agent(request: web.Request) -> web.Response:
             {"error": "meeting not found", "code": "meeting_not_found"}, status=404
         )
 
-    session = ACTIVE.get(meeting_id)
-    if session is not None:
-        if muted:
-            session.muted_agents.add(agent_id)
-        else:
-            session.muted_agents.discard(agent_id)
+    # Under the admission lock, because a dispatch RESOLVES its recipients from
+    # this set across an awaited transcript write. Mutating it unlocked let a mute
+    # land inside that window, so the line was addressed by the mute state of a
+    # moment AFTER it was spoken — it reached the wrong agent set, and for a line
+    # held through initialization the wrong set was recorded and replayed later.
+    #
+    # The lock belongs HERE, on the one unlocked writer, rather than on the reader:
+    # both the live fan-out and the initialization hold read this set after their
+    # own `_record_line` await, so guarding a single dispatch branch would close one
+    # window and leave its twin open. Every other writer already holds this lock
+    # (`handle_toggle_agent` takes it, and `add_agent` runs inside it).
+    #
+    # Only the in-memory mutation is covered: the metadata write above is already
+    # serialized by its own transaction, and pulling it in would hold the admission
+    # lock across disk IO that dispatch does not need to wait for.
+    async with DISPATCH_LOCK:
+        session = ACTIVE.get(meeting_id)
+        if session is not None:
+            if muted:
+                session.muted_agents.add(agent_id)
+            else:
+                session.muted_agents.discard(agent_id)
 
     return web.json_response({"ok": True, "muted_agents": meta["muted_agents"]})
+
+
+async def _record_line(
+    meeting_id: str, text: str, is_chat: bool, root: Any
+) -> tuple[str, dict[str, str]]:
+    """Redact one inbound line, append it to the transcript, build the agent line.
+
+    Shared by the live fan-out and the initialization hold so the two cannot
+    drift. The transcript append happens at ARRIVAL for both, which is what keeps
+    the durable record in spoken order and complete even when the hold later
+    overflows — the overflow then costs the agents some context, never the user
+    their transcript.
+
+    Raises :class:`BadRequest` (413) when the transcript ceiling is reached, so a
+    held line is size-checked on exactly the same terms as a live one.
+    """
+    transcript_text = redact(text)
+    source = k.TRANSCRIPT_SOURCE_TYPED if is_chat else k.TRANSCRIPT_SOURCE_SPEECH
+    segment = await asyncio.to_thread(
+        store.append_transcript, meeting_id, transcript_text, source, root
+    )
+    if segment is None:
+        raise BadRequest(
+            "meeting transcript is too large",
+            status=413,
+            code="transcript_too_large",
+        )
+    line = f"{k.CHAT_PREFIX} {transcript_text}" if is_chat else transcript_text
+    return line, segment
 
 
 async def handle_dispatch_text(request: web.Request) -> web.Response:
@@ -315,8 +360,29 @@ async def handle_dispatch_text(request: web.Request) -> web.Response:
     async with DISPATCH_LOCK:
         session = ACTIVE.get_for_dispatch(meeting_id)
         if session is None:
+            # Direct fan-out is shut. Agent INITIALIZATION is the one reason to hold
+            # the line rather than refuse it (issue #4610) — a stopping, reviewing or
+            # expired meeting has nowhere to put it and still answers 409, which is
+            # the gate issue #1981 added and this must not widen.
+            starting = ACTIVE.get_for_buffering(meeting_id)
+            if starting is None:
+                return web.json_response(
+                    {"error": "no active meeting", "code": "no_active_meeting"}, status=409
+                )
+            line, segment = await _record_line(meeting_id, text, is_chat, data_root(request))
+            if not starting.buffer_during_init(line):
+                logger.warning(
+                    "meetings: init hold for %r is full at %d line(s); "
+                    "dropped the oldest and will mark the gap on drain",
+                    meeting_id,
+                    k.MAX_INIT_BUFFER_LINES,
+                )
+            # Same shape as a live dispatch that reached nobody. The hold needs no
+            # flag of its own: no client reads one, and the line is in the durable
+            # transcript either way, so `dispatched: 0` is already the whole answer
+            # to "did this land with an agent yet".
             return web.json_response(
-                {"error": "no active meeting", "code": "no_active_meeting"}, status=409
+                {"ok": True, "dispatched": 0, "text": line, "segment": segment}
             )
         if session.expired:
             # Close admission before the slow drain. A later request can then fail
@@ -325,23 +391,7 @@ async def handle_dispatch_text(request: web.Request) -> web.Response:
             ACTIVE.suspend_dispatches(session)
             expired_session = session
         else:
-            transcript_text = redact(text)
-            source = k.TRANSCRIPT_SOURCE_TYPED if is_chat else k.TRANSCRIPT_SOURCE_SPEECH
-            segment = await asyncio.to_thread(
-                store.append_transcript,
-                meeting_id,
-                transcript_text,
-                source,
-                data_root(request),
-            )
-            if segment is None:
-                raise BadRequest(
-                    "meeting transcript is too large",
-                    status=413,
-                    code="transcript_too_large",
-                )
-
-            line = f"{k.CHAT_PREFIX} {transcript_text}" if is_chat else transcript_text
+            line, segment = await _record_line(meeting_id, text, is_chat, data_root(request))
             accepted = session.broadcast(line)
 
     if expired_session is not None:

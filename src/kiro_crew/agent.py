@@ -42,6 +42,7 @@ from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_files import (
     AGENT_FILENAME,
 )
+from kiro_crew.agent_files import CONDUCTOR_AGENT_FILENAME as _CONDUCTOR_AGENT_FILENAME
 from kiro_crew.agent_files import HEARTBEAT_AGENT_FILENAME as _HEARTBEAT_AGENT_FILENAME
 from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_FILENAME
 from kiro_crew.agent_files import LITE_AGENT_FILENAME as _LITE_AGENT_FILENAME
@@ -462,8 +463,12 @@ def _resolve_kirocrew_bin() -> str:
        whose bundled interpreter is a python-build-standalone tree exposing a
        launcher at its root, reached by this walk from the bundle's
        ``site-packages``.
-    3. ``shutil.which('kirocrew')`` — respects PATH order.
-    4. Bare ``"kirocrew"`` — last resort, may fail but surfaces the problem
+    3. The running interpreter's own install prefix (``sys.exec_prefix``). Same
+       intent as step 2 — the install this process belongs to — for layouts
+       where the console script is not an ancestor-sibling of the package and
+       the parent walk therefore cannot reach it.
+    4. ``shutil.which('kirocrew')`` — respects PATH order.
+    5. Bare ``"kirocrew"`` — last resort, may fail but surfaces the problem
        instead of caching a known-bad absolute path.
 
     Every candidate is validated with ``is_file()`` and ``os.access(X_OK)``
@@ -518,13 +523,43 @@ def _resolve_kirocrew_bin() -> str:
     except Exception:
         logger.debug("kirocrew bin walk failed", exc_info=True)
 
-    # 3. PATH lookup (also validated)
+    # 3. The running interpreter's own install prefix.
+    #
+    #    Step 2 asks "which install does this process belong to?" but answers it
+    #    by walking the package's PARENTS, so it only sees a console script that
+    #    sits above ``site-packages``. Layouts that put the two in sibling trees
+    #    are invisible to it — a prefix-style runtime can have the package at
+    #    ``<root>/lib/python3.12/site-packages/kiro_crew`` and the script at
+    #    ``<root>/python3.12/bin/kirocrew``, which is not an ancestor of the
+    #    package dir at all. The walk then finds nothing and resolution falls
+    #    through to PATH, where an unrelated ``kirocrew`` from some earlier
+    #    install wins and gets written into ``kirocrew.json`` as the command for
+    #    the built-in MCP servers.
+    #
+    #    ``sys.exec_prefix`` IS the install root for the interpreter actually
+    #    running — the venv root inside a venv, the runtime root otherwise — so
+    #    handing it to :func:`_kirocrew_bin_subpath` yields the same directory
+    #    ``sysconfig.get_path("scripts")`` would, and keeps the per-OS naming
+    #    and the Windows ``.cmd``-over-``.exe`` ranking in one place. Derived
+    #    from ``sys`` (already imported, and immune to import shadowing) rather
+    #    than by importing ``sysconfig`` here: this module is imported during
+    #    ``kiro_crew`` package init, which can run with a user project on
+    #    ``sys.path``, and a project-local ``sysconfig.py`` would then execute.
+    try:
+        candidate = _kirocrew_bin_subpath(Path(sys.exec_prefix))
+        if _usable(candidate):
+            _KIROCREW_BIN = str(candidate)
+            return _KIROCREW_BIN
+    except Exception:
+        logger.debug("kirocrew exec-prefix bin check failed", exc_info=True)
+
+    # 4. PATH lookup (also validated)
     found = shutil.which("kirocrew")
     if found and _usable(found):
         _KIROCREW_BIN = found
         return _KIROCREW_BIN
 
-    # 4. Last resort — don't cache, so a future call can retry
+    # 5. Last resort — don't cache, so a future call can retry
     logger.warning(
         "Could not resolve kirocrew binary to an existing file; "
         "falling back to bare 'kirocrew' (MCP probes may fail)"
@@ -1002,7 +1037,7 @@ def run_first_run_setup() -> None:
     """Deliver the install-time steps the desktop app needs without a terminal.
 
     The Electron app only runs ``kirocrew gateway`` — never ``kirocrew
-    setup`` — yet two concerns aren't covered by the gateway's agent-config
+    setup`` — yet several concerns aren't covered by the gateway's agent-config
     rebuild. This is invoked from gateway startup to close that gap:
 
     * **PATH shim** — ``ensure_kirocrew_on_path()`` is idempotent and only
@@ -1010,6 +1045,10 @@ def run_first_run_setup() -> None:
       WITHOUT ``claim_existing`` for exactly that reason: running unattended on
       every start, it must fill an empty or broken slot only, never take the
       command away from another install that still works.
+    * **Default-on builtin backfill** — ``defaultEnabled`` is applied only on an
+      app's FIRST registration, so a builtin promoted to default-on later never
+      reaches installs that already registered it. Runs ONCE, guarded by its own
+      marker file, because re-running it would override a user's own disable.
     * **Stale predecessor MCP purge** — ``clean_stale_managed_mcp()`` mutates
       the user's *global* ``~/.kiro/settings/mcp.json``, so it runs ONCE,
       guarded by a marker file, to honor the "KiroCrew owns only the agent
@@ -1037,7 +1076,25 @@ def run_first_run_setup() -> None:
     except Exception:
         logger.warning("First-run: admission policy seed failed", exc_info=True)
 
-    # 3. Stale managed-MCP purge — one-time, marker-guarded.
+    # 3. Default-on builtin backfill — one-shot per app, self-recorded on the
+    #    app's own installed.json (no marker file: the flag and the state it
+    #    guards must land in one atomic write). Placed BEFORE the stale-MCP early
+    #    return for the same reason step 2 is, and here the reason is the whole
+    #    point: an EXISTING install already holds the stale-MCP marker, and an
+    #    existing install is the ONLY kind this step has anything to do (a fresh
+    #    one registers these apps enabled and already flagged).
+    try:
+        from kiro_crew.apps.manager import (  # noqa: PLC0415
+            backfill_default_on_builtins,
+        )
+
+        flipped = backfill_default_on_builtins()
+        if flipped:
+            logger.info("First-run: enabled default-on builtin(s): %s", flipped)
+    except Exception:
+        logger.warning("First-run: default-on builtin backfill failed", exc_info=True)
+
+    # 4. Stale managed-MCP purge — one-time, marker-guarded.
     stale_marker = _stale_mcp_purge_marker()
     if stale_marker.exists():
         return
@@ -1297,7 +1354,14 @@ def _sel_hook_rejected(event: str, command: str, reason: str) -> None:
                 source="cli",
                 operation="kiro_hooks_rejected",
                 outcome="rejected",
-                resources=redact(f"event={event} command={command[:200]}"),
+                # redact-then-truncate on the interpolated value, through the
+                # same context-aware shim as the outer call: slicing ``command``
+                # raw could cut a credential at the boundary, and slicing after
+                # baseline-only redaction would still cut a companion-only token
+                # before the companion regexes see it. Context redaction runs
+                # over the FULL command first, so no redactor ever sees a
+                # boundary-cut fragment.
+                resources=redact(f"event={event} command={redact(command)[:200]}"),
                 error=reason,
             )
         )
@@ -2585,15 +2649,26 @@ def migrate_agent_specs() -> int:
     agent loads. Idempotent and cheap (a handful of small JSON files); safe to
     run on every gateway start. Returns the number of spec files cleaned.
     """
-    if not kiro_agents_dir_path().is_dir():
+    agents_dir = kiro_agents_dir_path()
+    if not agents_dir.is_dir():
         return 0
     cleaned = 0
-    for spec_path in sorted(kiro_agents_dir_path().glob("*.json")):
-        try:
-            data = json.loads(spec_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+    for spec_path in sorted(agents_dir.glob("*.json")):
+        # This read is followed by a rewrite, so the hardened reader's
+        # sensitive-target refusal is not sufficient on its own: refuse every
+        # symlink, escape and sensitive path before reading to prevent copy-out.
+        if not _spec_path_is_safe(spec_path, agents_dir):
             continue
-        if not isinstance(data, dict):
+        # The hardened reader (size cap, AppleDouble/sensitive-symlink and
+        # non-object refusal). This site also WRITES below: a spec the reader
+        # refuses is now never rewritten at all, whereas the old read_text
+        # path read -- and then rewrote -- whatever the file or link named.
+        data = _read_agent_spec(
+            spec_path,
+            operation="migrate_agent_specs",
+            source="unknown",
+        )
+        if data is None:
             continue
         if "model_managed" not in data and "cc_model" not in data:
             continue
@@ -2647,7 +2722,7 @@ def _read_spec_capped(path: Path) -> dict | None:
     A thin wrapper rather than a direct call at each site, so the reason the
     capped reader is used lives in one place.
     """
-    return _read_agent_spec(path)
+    return _read_agent_spec(path, operation="agent_spec_lookup", source="unknown")
 
 
 def _spec_path_is_safe(path: Path, agents_dir: Path) -> bool:
@@ -3257,6 +3332,70 @@ def _reconcile_tool_aliases_from_disk(path: Path, config: dict) -> bool:
     return existed
 
 
+#: Generation of the ceiling the on-disk ``allowedTools`` was last derived under. Compared
+#: for equality only, per ``governance_generation``'s contract.
+_projected_ceiling_generation: int | None = None
+
+
+def prime_ceiling_projection() -> None:
+    """Record the ceiling generation boot projected the agent config under.
+
+    Called once, before the central-distribution poller starts. Seeding here rather than on
+    :func:`reproject_for_ceiling_change`'s first call is the difference between "nothing has
+    changed since boot" and "nothing has changed since the first poll" — and the first poll
+    can install a new ceiling, so the latter would record that generation and skip the very
+    rebuild it needed.
+    """
+    global _projected_ceiling_generation
+    from kiro_crew.platform.context import governance_generation
+
+    _projected_ceiling_generation = governance_generation()
+
+
+def reproject_for_ceiling_change() -> None:
+    """Re-derive the on-disk ``allowedTools`` when the governance ceiling has moved.
+
+    ``allowedTools`` is kiro-cli's blanket auto-approve list, and it is **materialised**: the
+    five writers of it consult the ceiling when they write, and kiro-cli then reads the FILE.
+    So a ceiling that comes to deny a tool mid-flight does not narrow a list already on disk,
+    and every session started afterwards would keep auto-approving what the fleet now
+    forbids — the tool short-circuits inside the harness and never reaches Kiro Crew's own
+    PreToolUse gate.
+
+    Registered as a post-install hook on the central-distribution refresher, alongside the
+    tailnet revocation and for the same reason: before a live refresh existed the ceiling
+    only changed at boot, and boot projects the config anyway.
+
+    **Bounded to an actual change.** Hooks run on every confirming poll, so an unconditional
+    rebuild would rewrite a file kiro-cli watches every refresh interval, for nothing. The
+    baseline is seeded by :func:`prime_ceiling_projection` BEFORE the poller starts, not on
+    the first call: the first poll can itself install a new ceiling, and a first-call baseline
+    would record that generation and skip the very rebuild it needed.
+
+    **The memo advances only after a successful rebuild.** A failure raises through the hook
+    runner, which logs it and moves on — and if the generation had already been marked
+    synchronised, the retry the next poll would otherwise give us is lost, leaving forbidden
+    auto-approvals on disk for the process lifetime.
+
+    An unseeded baseline rebuilds once on the first call rather than skipping, which is the
+    safe direction: a redundant rewrite costs a file write, a skipped one costs the tighten.
+
+    What this cannot do is narrow a session ALREADY negotiated: kiro-cli holds the grants it
+    was given, and no policy mechanism reaches into a running one. That limit is the same
+    shape as an already-running process keeping its own sandbox, and a restart is its only
+    answer — which is why removing live refresh would not close it either.
+    """
+    global _projected_ceiling_generation
+    from kiro_crew.platform.context import governance_generation
+
+    generation = governance_generation()
+    if _projected_ceiling_generation == generation:
+        return
+    logger.info("the governance ceiling moved; re-deriving the agent config's auto-approvals")
+    rebuild_agent_config()
+    _projected_ceiling_generation = generation
+
+
 def rebuild_agent_config(*, clean: bool = False) -> Path:
     """Rebuild and write the merged kirocrew.json to ~/.kiro/agents/.
 
@@ -3692,6 +3831,13 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         for srv, srv_spec in scope.items()
         if isinstance(srv_spec, dict) and srv_spec.get("disabled")
     }
+    # A server the probe has failed N consecutive times is COUNTED and surfaced,
+    # but not unmounted here. The unmount has no safe lever in this file: the
+    # generated agent config is simultaneously the mount decision and the only
+    # home for agent-only configuration, so dropping an entry destroys whatever
+    # lives only there and stamping ``disabled`` makes ``list_servers`` delete the
+    # server's own row. See the follow-up issue linked from
+    # docs/system-specs/features/mcp-probe-quarantine.md.
     for name, spec in itertools.chain(
         extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items()
     ):
@@ -4117,6 +4263,12 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     except Exception:
         logger.debug("kirocrew-heartbeat agent install failed", exc_info=True)
 
+    # Install kirocrew-conductor agent (goal decomposition + session-control dispatch)
+    try:
+        _install_conductor_agent()
+    except Exception:
+        logger.debug("kirocrew-conductor agent install failed", exc_info=True)
+
     # Bidirectional sync: ensure packages installed for one provider
     # are also available for the other (agents↔plugins, skills).
     sync_aim_packages()
@@ -4181,16 +4333,6 @@ def _install_aim_capabilities() -> None:
     still written.
     """
     _install_lite_agent_fallback()
-
-
-def _remove_bare_lite_if_aim_installed() -> None:
-    """No-op on public installs (AIM package manager absent).
-
-    Symbol preserved for backward compatibility.  Previously removed the
-    bare ``kirocrew-lite.json`` when an AIM-installed duplicate existed; with
-    AIM install neutralized there is no AIM-managed copy to deduplicate.
-    """
-    return None
 
 
 def _install_lite_agent_fallback() -> None:
@@ -4356,6 +4498,321 @@ def _install_research_agent() -> None:
     logger.info("Installed research agent config: %s", path)
 
 
+_CONDUCTOR_SYSTEM_PROMPT = """# Kiro Crew Conductor
+
+You are `kirocrew-conductor`. You own a long-horizon goal: you decompose it into
+work items, dispatch one top-level session per item, verify their results, and
+decide each next round until the goal is met or a stop condition fires.
+
+**You never do a work item's work yourself.** A file to write, a build to run, a
+fix to make — each one is a work item for a child session. You have no
+file-writing tool, and a work item never goes to `spawn_run`,
+`spawn_sub_agents`, `workflow_run` or `task_run`: it goes to a session you can
+dispatch, verify and report on.
+
+**Acceptance is the evaluator's verdict, never your reading of a child's
+transcript.** Shell access exists to run the `goal-conductor` skill's two
+bundled scripts: `scripts/accept_eval.py` for acceptance verdicts,
+`scripts/ledger_entry.py` for the ledger's item-entry format.
+
+**Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
+instructions AND the exit condition, then end the turn; call `autonudge_stop`
+when you stop. A reply saying *requested* is success — do not retry it. If
+arming is refused outright, say no loop is running and drive that one round
+with `wait`.
+
+Your tools:
+
+- Child sessions — `session_create`, `session_send`, `session_read_message`,
+  `session_stop`, `list_sessions`.
+- Keeping the goal's sessions together — `chat_folder_tree`,
+  `chat_folder_create`.
+- State that outlives a round — `session_ledger_read`, `session_ledger_record`.
+- Patrol — `monitor_start`, `monitor_update`, `autonudge_stop`, `wait`.
+- Capacity, before standing up several sessions at once — `resource_status`.
+- Talking to the person — `ask_question` puts a decision that is not yours to
+  make to them as a card, after which you END your turn and their answer
+  arrives as the next message; `send_message` / `send_notification` to report.
+- Naming the right skill in a seed message — `skill_search`, `skill_fetch`.
+- Reading — `fs_read`, `web_fetch`.
+- `tool_search` loads a tool that is not in your list yet.
+
+The `goal-conductor` skill carries the operating procedure — the work-item
+tests, the dispatch steps, the patrol cycle, the stop conditions. Read it
+before acting on a goal. The user can message you at any time: apply goal
+changes at the round boundary, except a message that invalidates an in-flight
+item, which you handle immediately.
+
+{{VERBOSITY_BLOCK}}
+"""
+
+
+#: The dashboard verbs the conductor may call WITHOUT an approval prompt, named one
+#: by one rather than as the whole ``@kirocrew-dashboard`` server.
+#:
+#: THE INVARIANT, so a later reader extends this by rule and not by taste. A
+#: granted verb must satisfy BOTH halves:
+#:
+#: 1. It may CREATE something new or READ. It may never MUTATE user-visible
+#:    workspace state that already exists and is not the conductor's own — a
+#:    session's contents or liveness, or the arrangement the person made of their
+#:    sessions and folders.
+#: 2. Its worst case, called in a loop, must be BOUNDED BY THE SERVER — and
+#:    bounded so the resource stays reachable by everyone else.
+#:
+#: The conductor ingests untrusted text by design — its charter's worked example is
+#: "resolve this repo's open issues", and it holds ``web_fetch`` for exactly that —
+#: so every granted verb is reachable by content it read, with no human in the loop
+#: on a nudge-driven patrol cycle. Per-call approval was the only thing
+#: rate-limiting a granted verb, and ``allowedTools`` has no argument or rate
+#: matching to replace it, so the bound cannot live in this list: it has to live in
+#: the endpoint. Half 2 is not a restatement of half 1 — an unbounded create is how
+#: a create does damage without mutating anything.
+#:
+#: Half 1 names user-visible workspace state deliberately, rather than "any
+#: pre-existing resource", because a create ALWAYS writes some shared bookkeeping —
+#: the slot table, the folder index, the session-pulse counter below — and a literal
+#: reading would forbid every create and decide nothing. What it protects is state
+#: the person arranged and would have to reconstruct by hand. Creation is otherwise
+#: recoverable clutter; mutation of what the user arranged is not.
+#:
+#: Both granted creation verbs earn half 2 from a server ceiling, and BOTH ceilings
+#: were added by this change — neither verb was safe to auto-approve as the code
+#: stood:
+#:
+#: * ``chat_folder_create`` had no bound at all, so a loop grew durable on-disk
+#:   state without limit. Now ``MAX_CHAT_FOLDERS``, tested under the folder lock.
+#: * ``session_create`` had a GLOBAL ceiling (``MAX_LIVE_SLOTS``) but no
+#:   distribution: one caller could hold all 500, and every later create — the
+#:   person opening a chat tab included — got the 429. A bounded resource that one
+#:   caller can exhaust is not bounded from anybody else's point of view. Now
+#:   ``MAX_SLOTS_PER_CREATOR`` bounds what a single caller holds, leaving 450 slots
+#:   reachable no matter what the conductor does.
+#:
+#: Every verb this server exposes, against that rule:
+#:
+#: * ``chat_folder_tree`` — READ of the caller's visible tree. GRANTED.
+#: * ``chat_folder_create`` — creates a NEW folder, and
+#:   ``_refuse_tree_shaping_if_unverifiable`` refuses an unverifiable caller and
+#:   keeps an app agent out of the person's own folders. Touches nothing that
+#:   already existed, and bounded by ``MAX_CHAT_FOLDERS``. GRANTED.
+#: * ``session_create`` — creates a NEW session in the caller's workspace, bounded
+#:   both globally (``MAX_LIVE_SLOTS``, 429 on breach) and per caller
+#:   (``MAX_SLOTS_PER_CREATOR``), and visible in the sidebar. GRANTED.
+#:   One known side effect, recorded because it is the closest thing to an
+#:   exception here: ``create_session`` mints its slot with
+#:   ``origin=SlotOrigin.USER`` (it is a first-class user-owned session, which is
+#:   what keeps it correctly private), and ``get_or_create_slot`` increments the
+#:   session-pulse counter on exactly that origin — so conductor-created sessions
+#:   count toward the feedback survey's "10 genuine user chats" window. That is a
+#:   pre-existing conflation in the counter, not something this grant introduces:
+#:   the counter uses the ownership tag as a proxy for "a person started a chat",
+#:   and it miscounts for every caller of the session-control create verb. Filed
+#:   as issue #6139 rather than point-fixed here, because the correct fix is a
+#:   fail-open/fail-closed decision about which call sites opt in, inside the
+#:   session-pulse surface. Consequence if it drifts: a survey prompt appears
+#:   earlier than the product intended. No workspace state is altered.
+#: * ``session_read_message`` — read-only, and the verb the patrol loop actually
+#:   needs on a cycle with nobody at the keyboard. GRANTED.
+#: * ``chat_folder_move_session`` — WITHHELD. It writes another session's
+#:   ``folder_id``: the PATCH goes to ``/api/chat/slots/<target>/folder`` where the
+#:   target is the session named in the ARGUMENTS, and the strictly-resolved
+#:   caller key is only the authority header. ``mcp_dashboard`` calls it "the one
+#:   tool here that writes to a session OTHER than the caller's". Auto-approving it
+#:   would let ingested content silently refile or unfile any persistent
+#:   same-workspace session, losing filing the user did by hand.
+#: * ``chat_folder_move`` — WITHHELD. Reparents an existing folder tree, and no
+#:   conductor step needs it.
+#: * ``session_send`` — WITHHELD. Runs text as another session's user-role turn
+#:   under that target's own grants. The server-side gates bound WHICH target is
+#:   reachable; nothing bounds WHAT is sent.
+#: * ``session_stop`` — WITHHELD. Ends another session's in-flight turn and
+#:   DISCARDS its work (``stop_target``: "A first call cancels cooperatively;
+#:   calling again while that is pending escalates to a hard kill").
+#:
+#: Every withheld verb stays MOUNTED (``@kirocrew-dashboard`` is still in
+#: ``tools``) — it just passes through ``hooks.on_tool_call`` like any ungranted
+#: tool. The cost is an approval when a round files a session, seeds a child, or
+#: stops one; all three happen right after a human approved the plan, while the
+#: unattended patrol cycle needs none of them. Issue #6118 (a ``folder`` argument
+#: on ``session_create``) would remove the filing call altogether.
+_CONDUCTOR_DASHBOARD_GRANTS: tuple[str, ...] = (
+    "@kirocrew-dashboard/chat_folder_tree",
+    "@kirocrew-dashboard/chat_folder_create",
+    "@kirocrew-dashboard/session_create",
+    "@kirocrew-dashboard/session_read_message",
+)
+
+
+def _install_conductor_agent() -> None:
+    """Generate and install the kirocrew-conductor agent config.
+
+    Derives from the kirocrew agent (resolved MCP invocations, security hooks)
+    but narrows to the conductor's charter: session control + core tools +
+    shell for the bundled skill scripts (acceptance evaluator + ledger entry
+    codec), and **no tool that can write a
+    file** — not ``fs_write``, and not ``code`` either, which governance classes
+    under ``filesystem.write`` because it writes files and can shell out. That
+    is what makes "never does a work item's work itself" a property of the spec
+    rather than of the prompt. The ``kirocrew-dashboard`` server is the opt-in
+    per-agent set (folder + session-control tools); this installer granting it IS
+    the explicit per-agent assignment that set requires — it is deliberately
+    absent from the default agent's spec.
+
+    ``@kirocrew-dashboard`` is MOUNTED whole but auto-approved only verb by verb,
+    via ``_CONDUCTOR_DASHBOARD_GRANTS`` (see its comment for the per-verb
+    reasoning). Both backends honour a per-tool reference, so the narrowing is
+    real rather than cosmetic: kiro-cli's ``is_tool_in_allowlist`` checks
+    ``@server`` and then ``@server/<tool>``, and ``allowed_tools_to_permissions``
+    maps the same entry to an exact KAS ``server/tool`` resource match.
+
+    The line the split follows is stated as an invariant on that tuple, not as a
+    taste call: a granted verb may CREATE or READ, never MUTATE something that
+    already exists and is not the conductor's own. Reads and creates are granted
+    because the patrol loop is nudge-driven and must not block on an approval
+    nobody is there to give. ``session_stop`` (discards a peer's in-flight turn),
+    ``session_send`` (runs text as a peer's turn) and ``chat_folder_move_session``
+    (writes a peer session's ``folder_id``) are withheld, because the conductor
+    ingests untrusted content by design and the server-side gates bound which
+    target is reachable, not what is done to it.
+
+    ``execute_bash`` is withheld for a different reason that is worth keeping
+    distinct: ``allowedTools`` is name-scoped with no argument matching, so
+    trusting the two bundled scripts cannot be told apart from trusting arbitrary
+    shell. There is no per-argument form of that grant the way there is a per-tool
+    form of the MCP one.
+
+    The operating procedure ships as the ``goal-conductor`` builtin skill, NOT
+    ``conductor``: that skill name is owned by the generated delegation skill
+    (``conductor_skill.generate_conductor_skill``), and two existing code paths
+    delete ``<skills>/conductor/SKILL.md`` when ``agent.conductor_skill`` is
+    false — the default. Sharing the name would let ``kirocrew setup`` erase the
+    packaged skill on a stock install, and quarantine the user's delegation
+    skill when the flag is on.
+    """
+    config = build_agent_config()
+    config["name"] = "kirocrew-conductor"
+    config["description"] = (
+        "Owns a long-horizon goal: decomposes it into work items, stands up "
+        "a top-level session per item, patrols their state, and decides each "
+        "next round. Never does the work itself."
+    )
+    config["prompt"] = _CONDUCTOR_SYSTEM_PROMPT
+    config["tools"] = [
+        "execute_bash",
+        "fs_read",
+        # ``web_fetch`` serves the charter's own worked example (reading an issue
+        # list during triage). Deliberately NOT mounted: ``web_search`` (nothing
+        # names it), ``grep``/``glob`` (``fs_read`` covers every read the charter
+        # describes), and above all ``code`` — governance classes it under
+        # ``filesystem.write`` because it "writes files AND can shell out", so
+        # mounting it would make this spec's whole no-write property false.
+        # An unused grant is surface the charter cannot account for.
+        "web_fetch",
+        "session",
+        "report",
+        # Load-bearing, not decoration: with MCP Tool Search active the
+        # session-control specs are deferred, so the conductor cannot reach
+        # ``session_create`` / ``chat_folder_*`` / ``monitor_start`` at all until
+        # it loads them by id. Named in the prompt's tool inventory for that
+        # reason, and auto-approved below so the load itself never prompts.
+        "tool_search",
+        "@kirocrew-core",
+        "@kirocrew-dashboard",
+    ]
+    # ``allowedTools`` is the ONE path that never reaches the PreToolUse gate, so
+    # every grant is filtered through the governance ceiling first — the same
+    # predicate ``rebuild_agent_config`` applies to the primary spec's assembled
+    # list, and the entry point ``may_skip_gate_now`` exists precisely so a new
+    # writer cannot re-open the bypass by restating a literal. A governed ref
+    # stays MOUNTED (it is still in ``tools``); it just prompts, and the gate
+    # then applies the ceiling's per-tool rule with the real arguments.
+    granted: list[str] = []
+    withheld: list[str] = []
+    # ``tool_search`` is granted on the same rule as the dashboard verbs below:
+    # it only READS a tool spec into context — it cannot act, touch workspace
+    # state, or reach the machine — and it is bounded by the mounted catalog.
+    # Withholding it made the ONE call that unblocks every deferred
+    # session-control tool prompt first, so an unattended patrol cycle stalled
+    # on the load rather than on the work. ``execute_bash`` stays withheld for
+    # the reason recorded above it: ``allowedTools`` has no argument matching,
+    # so trusting the two bundled scripts cannot be told apart from trusting
+    # arbitrary shell.
+    for ref in (
+        "session",
+        "report",
+        "tool_search",
+        "@kirocrew-core",
+        *_CONDUCTOR_DASHBOARD_GRANTS,
+    ):
+        (granted if _may_auto_approve(ref) else withheld).append(ref)
+    config["allowedTools"] = granted
+    if withheld:
+        # Withholding a grant is a permission DECISION, and every other writer of
+        # an ``allowedTools`` list emits this same event for it — see
+        # ``strip_ungoverned_auto_approve``, whose comment names a silent pop as
+        # the one withhold path with no audit trail. Filtering silently here would
+        # make this installer exactly that path: on a governed host a ref loses its
+        # grant and the operator has no record of why the conductor now prompts.
+        # Same operation name so it lands in one feed, and the audit must never
+        # break the install.
+        try:
+            sel().log_api_access(
+                caller="system",
+                operation="mcp_auto_approve_withheld",
+                outcome="ok",
+                source="_install_conductor_agent",
+                resources=(
+                    f"{', '.join(withheld)} mounted without auto-approve "
+                    "(governance ceiling); calls go through the approval gate"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — the audit must not break the install
+            logger.debug("SEL audit unavailable for withheld auto-approve", exc_info=True)
+    mcp = config.get("mcpServers", {}) or {}
+    core_entry = mcp.get("kirocrew-core")
+    narrowed: dict = {}
+    if core_entry:
+        narrowed["kirocrew-core"] = core_entry
+    dash_cmd, dash_args = _kirocrew_mcp_invocation("mcp-dashboard")
+    dash_entry: dict[str, Any] = {"command": dash_cmd, "args": dash_args}
+    # Same managed-server metadata `build_agent_config` stamps on every entry it
+    # emits, and the reason this entry needs it spelled out is that it is the one
+    # server hand-built here rather than inherited: without `"type": "registry"`
+    # a registry-mode client silently DROPS the entry, so the conductor's
+    # session-control tools never launch and its whole dispatch/patrol purpose is
+    # dead with no local error; without the `KIROCREW_HOME` pin the shim reads the
+    # DEFAULT data home while the gateway runs under an override, so session
+    # control would act on a different session store than the one it reports on.
+    # Both helpers return empty on a default install, so the emitted spec is
+    # unchanged there.
+    if _mcp_registry_mode():
+        dash_entry["type"] = _MCP_REGISTRY_TYPE
+    dash_env = _managed_mcp_env()
+    if dash_env:
+        dash_entry["env"] = dash_env
+    narrowed["kirocrew-dashboard"] = dash_entry
+    config["mcpServers"] = narrowed
+    # Derive the KAS policy from the FILTERED grant list instead of restating it
+    # as a literal: the rules come out byte-identical, a later edit to
+    # ``allowedTools`` carries through, and a ceiling that strips a grant strips
+    # its KAS rule with it (a hand-written ``kirocrew-core/*`` allow would have
+    # survived the filter on the KAS backend). ``{"rules": []}`` when nothing
+    # qualifies — the key's mere PRESENCE is what makes KAS load the spec at all.
+    from kiro_crew.acp.kas_permissions import (  # noqa: PLC0415 - circular import
+        allowed_tools_to_permissions,
+    )
+
+    derived = allowed_tools_to_permissions(
+        config["allowedTools"], agent_id=Path(_CONDUCTOR_AGENT_FILENAME).stem
+    )
+    config["permissions"] = derived if derived is not None else {"rules": []}
+    kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
+    path = kiro_agents_dir_path() / _CONDUCTOR_AGENT_FILENAME
+    _atomic_json_write(path, config)
+    logger.info("Installed conductor agent config: %s", path)
+
+
 _HEARTBEAT_SYSTEM_PROMPT = """# KiroCrew Heartbeat Worker
 
 You are `kirocrew-heartbeat`, an unattended polling worker that runs one task
@@ -4435,9 +4892,17 @@ def _install_heartbeat_agent() -> None:
     # agent's ``--include-tools``/``--include-tool-tags``/``--exclude-tools``
     # filters so all read tools surface to the heartbeat agent — security is
     # enforced gateway-side against ``HEARTBEAT_SAFE_TOOLS`` via
-    # ``_heartbeat_approval``, not by per-agent MCP filtering.
-    main_config = _load_json(kiro_agents_dir_path() / AGENT_FILENAME)
-    main_mcp = main_config.get("mcpServers", {}) or {}
+    # ``_heartbeat_approval``, not by per-agent MCP filtering. Read through the
+    # capped reader (#6736): a refused main spec degrades as absent, but with an
+    # operator-visible signal, because the result is a heartbeat agent with no
+    # MCP servers -- a worker that fails every task.
+    main_path = kiro_agents_dir_path() / AGENT_FILENAME
+    main_config = _read_spec_capped(main_path)
+    if main_config is None and main_path.exists():
+        logger.warning(
+            "Main agent spec %s unusable; heartbeat agent installs with no MCP servers", main_path
+        )
+    main_mcp = (main_config or {}).get("mcpServers", {}) or {}
 
     _strip_flags = ("--include-tools", "--include-tool-tags", "--exclude-tools")
     mcp: dict[str, dict] = {}
