@@ -22,14 +22,24 @@
         "fallback_model": "auto",
         "reasoning_effort": "",
         "provider": "acp",
+        "mcp_registry_mode": false,
+        "mcp_quarantine_after_failures": 3,
         "safe_mode": false,
         "use_shim": false,
         "shim_openai_base_url": "http://127.0.0.1:11434/v1",
         "shim_openai_api_key": "",
         "provider_base_url": "",
         "provider_api_key": "",
-        "mcp_registry_mode": false,
-        "mcp_quarantine_after_failures": 3,
+        "provider_api_format": "",
+        "model_whitelist": [],
+        "image_redirect": "subagent",
+        "vision_fallback_model": "cmc/mimo-v2.5",
+        "vision_providers": [],
+        "text_only_models": [
+          "oc/deepseek-v4-flash",
+          "ol/deepseek-v4-flash:0731"
+        ],
+        "image_input_mode": "auto",
         "acp_backend": "",
         "member_acp_backend": "kas",
         "default_agent": "",
@@ -105,7 +115,7 @@
     {
       "path": "agent.streaming",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -133,58 +143,30 @@
     {
       "path": "agent.role_models",
       "kind": "core",
-      "type": "object",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
       "label": "Per-role models",
       "help": "Optional per-task-class model overrides. Keys: 'background' (lite / heartbeat background workers) and 'subagent' (spawned sub-agents). An empty value or 'auto' defers to the chat default (agent.model) and then to the provider default, so an unpinned role stays usable on every subscription tier. Pin a cheaper model here to run background / sub-agent work on it without changing the interactive chat default.",
-      "hasChildren": true,
+      "hasChildren": false,
       "enumValues": null,
       "defaultValue": {}
     },
     {
-      "path": "agent.role_models.*",
-      "kind": "core",
-      "type": "string",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "*",
-      "help": "",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": null
-    },
-    {
       "path": "agent.role_efforts",
       "kind": "core",
-      "type": "object",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
       "label": "Per-role reasoning effort",
       "help": "Optional per-task-class reasoning effort, paired with role_models (keys: 'background', 'subagent'). Empty for a role inherits the chat default (agent.reasoning_effort) and then the provider/model default. Only applies on reasoning-capable models.",
-      "hasChildren": true,
-      "enumValues": null,
-      "defaultValue": {}
-    },
-    {
-      "path": "agent.role_efforts.*",
-      "kind": "core",
-      "type": "string",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "*",
-      "help": "",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": null
+      "defaultValue": {}
     },
     {
       "path": "agent.fallback_model",
@@ -230,19 +212,45 @@
       "sensitive": false,
       "tags": [],
       "label": "Provider",
-      "help": "LLM provider backend. 'acp' drives kiro-cli; 'claude_code' drives claude-agent-acp (Claude Code over ACP, pointing at any ANTHROPIC_BASE_URL — e.g. a local router).",
+      "help": "LLM provider backend (KiroACP / kiro-cli).",
       "hasChildren": false,
       "enumValues": [
-        "acp",
-        "claude_code",
-        "opencode"
+        "acp"
       ],
       "defaultValue": "acp"
     },
     {
+      "path": "agent.mcp_registry_mode",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Enterprise MCP Registry Mode",
+      "help": "Set true when this Kiro account is governed by an enterprise MCP registry (Kiro console -> Shared settings -> MCP Registry URL, which applies to IAM Identity Center and API-key sign-ins). In registry mode the client connects ONLY to mcpServers entries carrying 'type': \"registry\" that resolve to a catalog entry of the same name, so Kiro Crew stamps that marker on the servers it manages. Leave false on a personal account: with no registry configured the filter inverts and registry-marked entries are the ones dropped. The administrator must also allow-list kirocrew-core, kirocrew-cron and kirocrew-computer in the registry by those exact names.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": false
+    },
+    {
+      "path": "agent.mcp_quarantine_after_failures",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Failing-Probe Threshold",
+      "help": "Consecutive failed probes before an MCP server is reported as persistently failing on its dashboard row. A probe verdict is otherwise forgotten between rounds, so a server that failed once on a cold cache looked identical to one that has failed forty times. Counts only 'error' and 'timeout': a server asking for OAuth sign-in is working correctly and is never counted, and one success clears the count. This is a health reading only -- the server stays mounted, and the dashboard offers a one-click count reset. 0 turns it off.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": 3
+    },
+    {
       "path": "agent.safe_mode",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -256,7 +264,7 @@
     {
       "path": "agent.use_shim",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -324,32 +332,116 @@
       "defaultValue": ""
     },
     {
-      "path": "agent.mcp_registry_mode",
+      "path": "agent.provider_api_format",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
-      "label": "Enterprise MCP Registry Mode",
-      "help": "Set true when this Kiro account is governed by an enterprise MCP registry (Kiro console -> Shared settings -> MCP Registry URL, which applies to IAM Identity Center and API-key sign-ins). In registry mode the client connects ONLY to mcpServers entries carrying 'type': \"registry\" that resolve to a catalog entry of the same name, so Kiro Crew stamps that marker on the servers it manages. Leave false on a personal account: with no registry configured the filter inverts and registry-marked entries are the ones dropped. The administrator must also allow-list kirocrew-core, kirocrew-cron and kirocrew-computer in the registry by those exact names.",
+      "label": "Provider API Format",
+      "help": "Wire format for the opencode backend ('anthropic' or 'openai'). Empty defaults to openai.",
       "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": false
+      "enumValues": [
+        "anthropic",
+        "openai"
+      ],
+      "defaultValue": ""
     },
     {
-      "path": "agent.mcp_quarantine_after_failures",
+      "path": "agent.model_whitelist",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
-      "label": "Failing-Probe Threshold",
-      "help": "Consecutive failed probes before an MCP server is reported as persistently failing on its dashboard row. A probe verdict is otherwise forgotten between rounds, so a server that failed once on a cold cache looked identical to one that has failed forty times. Counts only 'error' and 'timeout': a server asking for OAuth sign-in is working correctly and is never counted, and one success clears the count. This is a health reading only -- the server stays mounted, and the dashboard offers a one-click count reset. 0 turns it off.",
+      "label": "Model Whitelist",
+      "help": "Optional allowlist of model ids shown in the picker. Empty = all advertised/curated models.",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": 3
+      "defaultValue": []
+    },
+    {
+      "path": "agent.image_redirect",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Image Redirect",
+      "help": "How image prompts on text-only router models are handled. 'subagent' (default): dispatch the image to a one-shot vision subagent and inject its text description. 'switch': switch the session to the vision fallback model. 'off': pass the image through unchanged (upstream will reject it).",
+      "hasChildren": false,
+      "enumValues": [
+        "subagent",
+        "switch",
+        "off"
+      ],
+      "defaultValue": "subagent"
+    },
+    {
+      "path": "agent.vision_fallback_model",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Vision Fallback Model",
+      "help": "Picker-spelling model id used for image redirects (subagent or switch mode). Must be a vision-capable router model served by the local proxy.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": "cmc/mimo-v2.5"
+    },
+    {
+      "path": "agent.vision_providers",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Vision Providers",
+      "help": "Ordered fallback chain of vision-capable backends used to describe images on text-only models. Each entry is {provider, model, base_url?, api_key?}. 'router' reuses the main session's router endpoint and model must be a picker id; 'custom' (or any entry with a base_url) targets an Anthropic-compatible endpoint (e.g. a local Qwen-VL/LLaVA/Pixtral server). Entries are tried in order; the first successful description wins. Empty = fall back to agent.vision_fallback_model.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": []
+    },
+    {
+      "path": "agent.text_only_models",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Text-Only Models",
+      "help": "Router model ids whose upstream rejects image content; image prompts on these trigger the image_redirect behaviour. Empty list disables the redirect entirely.",
+      "hasChildren": false,
+      "enumValues": null,
+      "defaultValue": [
+        "oc/deepseek-v4-flash",
+        "ol/deepseek-v4-flash:0731"
+      ]
+    },
+    {
+      "path": "agent.image_input_mode",
+      "kind": "core",
+      "type": "string",
+      "required": false,
+      "deprecated": false,
+      "sensitive": false,
+      "tags": [],
+      "label": "Image Input Mode",
+      "help": "How user-attached images are presented to the model. 'auto' (default): attach natively when the active model is vision-capable (registry metadata or not in text_only_models), else run the vision-subagent describe pipeline. 'native': always attach the image as pixels (the model must accept image content). 'text': always describe via the vision subagent and inject the text.",
+      "hasChildren": false,
+      "enumValues": [
+        "auto",
+        "native",
+        "text"
+      ],
+      "defaultValue": "auto"
     },
     {
       "path": "agent.acp_backend",
@@ -360,7 +452,7 @@
       "sensitive": false,
       "tags": [],
       "label": "ACP Backend",
-      "help": "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, 'opencode' = OpenCode ACP (fork). KAS runs chat but has no native subagent progress reporting yet.",
+      "help": "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent. KAS runs chat but has no native subagent progress reporting yet.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""
@@ -396,7 +488,7 @@
     {
       "path": "agent.sweep_agents_backups",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -427,7 +519,7 @@
     {
       "path": "agent.sandbox_allow_no_isolation",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -441,7 +533,7 @@
     {
       "path": "agent.sandbox_allow_unsandboxed_exec",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -455,7 +547,7 @@
     {
       "path": "agent.apps_allow_third_party",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -469,86 +561,44 @@
     {
       "path": "agent.apps_trusted",
       "kind": "core",
-      "type": "array",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
       "label": "Trusted Apps",
       "help": "Per-app grants for third-party execution — the narrow form of apps_allow_third_party. An app whose manifest name appears here is admitted to run Python hooks, its backend, lifecycle scripts, and openCommand; every other third-party app stays blocked. Only a JSON array of app-name strings is honoured, and no wildcard entry is accepted (use apps_allow_third_party to trust all).",
-      "hasChildren": true,
+      "hasChildren": false,
       "enumValues": null,
       "defaultValue": []
     },
     {
-      "path": "agent.apps_trusted.*",
-      "kind": "core",
-      "type": "string",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "*",
-      "help": "",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": null
-    },
-    {
       "path": "agent.apps_trusted_local",
       "kind": "core",
-      "type": "array",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
       "label": "Trusted Local Apps",
       "help": "App names whose per-app execution grant was explicitly reviewed as local, repository-less code. This internal grant-kind marker distinguishes current local consent from legacy name-only grants; it is effective only with the matching apps_trusted entry.",
-      "hasChildren": true,
+      "hasChildren": false,
       "enumValues": null,
       "defaultValue": []
     },
     {
-      "path": "agent.apps_trusted_local.*",
-      "kind": "core",
-      "type": "string",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "*",
-      "help": "",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": null
-    },
-    {
       "path": "agent.apps_trusted_repositories",
       "kind": "core",
-      "type": "object",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
       "label": "Trusted App Repositories",
       "help": "Repository coordinates captured by the per-app trust endpoint. Each key is an app name from apps_trusted and each value is the normalized repository shown at consent. Registry installation refuses if that name later resolves to a different repository. Legacy repository-backed grants without an entry require one-time re-consent before code execution.",
-      "hasChildren": true,
-      "enumValues": null,
-      "defaultValue": {}
-    },
-    {
-      "path": "agent.apps_trusted_repositories.*",
-      "kind": "core",
-      "type": "string",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "*",
-      "help": "",
       "hasChildren": false,
       "enumValues": null,
-      "defaultValue": null
+      "defaultValue": {}
     },
     {
       "path": "agent.jail",
@@ -571,7 +621,7 @@
     {
       "path": "agent.dangerously_skip_permissions",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -606,7 +656,7 @@
     {
       "path": "agent.notify_override_expiry",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -634,7 +684,7 @@
     {
       "path": "agent.conductor_skill",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -648,7 +698,7 @@
     {
       "path": "agent.tool_search",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -662,7 +712,7 @@
     {
       "path": "agent.tool_search_min_pct",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -676,7 +726,7 @@
     {
       "path": "agent.tool_search_min_tokens",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -690,7 +740,7 @@
     {
       "path": "agent.session_sharing",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -704,7 +754,7 @@
     {
       "path": "agent.max_subagents",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -718,7 +768,7 @@
     {
       "path": "agent.max_stop_hook_nudges",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -732,7 +782,7 @@
     {
       "path": "agent.spawn_min_memory_gb",
       "kind": "core",
-      "type": "number",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -746,7 +796,7 @@
     {
       "path": "agent.resource_pressure_gb",
       "kind": "core",
-      "type": "number",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -760,7 +810,7 @@
     {
       "path": "agent.resource_critical_gb",
       "kind": "core",
-      "type": "number",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -774,7 +824,7 @@
     {
       "path": "agent.admission_gate",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -788,7 +838,7 @@
     {
       "path": "agent.workflow_run_timeout_secs",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -802,7 +852,7 @@
     {
       "path": "agent.subagent_mem_buffer_pct",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -816,7 +866,7 @@
     {
       "path": "agent.chat_turn_timeout_secs",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -830,7 +880,7 @@
     {
       "path": "agent.session_start_timeout_secs",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -844,7 +894,7 @@
     {
       "path": "agent.tool_approval_timeout_secs",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -858,7 +908,7 @@
     {
       "path": "agent.session_control",
       "kind": "core",
-      "type": "boolean",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -872,7 +922,7 @@
     {
       "path": "agent.subagent_cost_gb",
       "kind": "core",
-      "type": "number",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -886,7 +936,7 @@
     {
       "path": "agent.subagent_cpu_cost_cores",
       "kind": "core",
-      "type": "number",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -900,7 +950,7 @@
     {
       "path": "agent.subagent_auto_max",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -914,7 +964,7 @@
     {
       "path": "agent.subagent_spawn_stagger_secs",
       "kind": "core",
-      "type": "number",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -928,7 +978,7 @@
     {
       "path": "agent.subagent_max_turns",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -942,7 +992,7 @@
     {
       "path": "agent.subagent_timeout_secs",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -956,7 +1006,7 @@
     {
       "path": "agent.subagent_stall_idle_secs",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -988,7 +1038,7 @@
     {
       "path": "agent.completion_keep_chars",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -1002,7 +1052,7 @@
     {
       "path": "agent.subagent_result_ttl_secs",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -1016,14 +1066,14 @@
     {
       "path": "agent.subagent_cwd_allowed_roots",
       "kind": "core",
-      "type": "array",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
       "tags": [],
       "label": "SubAgent CWD Allowed Roots",
       "help": "Directory roots under which spawn_run's cwd parameter is permitted. Values support ~ expansion. Empty list disables cwd overrides.",
-      "hasChildren": true,
+      "hasChildren": false,
       "enumValues": null,
       "defaultValue": [
         "~/workspace",
@@ -1033,23 +1083,9 @@
       ]
     },
     {
-      "path": "agent.subagent_cwd_allowed_roots.*",
-      "kind": "core",
-      "type": "string",
-      "required": false,
-      "deprecated": false,
-      "sensitive": false,
-      "tags": [],
-      "label": "*",
-      "help": "",
-      "hasChildren": false,
-      "enumValues": null,
-      "defaultValue": null
-    },
-    {
       "path": "agent.max_channels",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -1063,7 +1099,7 @@
     {
       "path": "agent.max_channel_agents",
       "kind": "core",
-      "type": "integer",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,
@@ -1096,7 +1132,7 @@
     {
       "path": "agent.soft_stop_budget_secs",
       "kind": "core",
-      "type": "number",
+      "type": "string",
       "required": false,
       "deprecated": false,
       "sensitive": false,

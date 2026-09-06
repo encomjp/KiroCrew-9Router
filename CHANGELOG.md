@@ -1,3 +1,13 @@
+
+## [0.7.0-1.0] — 2026-09-06
+
+kirocrew-customapi release `v0.7.0-1.0` — kiro base `0.7.0` (upstream main) + fork version `1.0`.
+
+- **Base sync:** upstream `main` at `018c9ecf3` (1177 commits past `v0.5.0`) — config loader split into `config/sections.py`, `session.py` split into 6 service modules, providers gained the `mirrors/` contract, Codex ACP backend, MCP bounded-body reads, star/filter crews, session monitors, agent-backend governance (`apply_selectable_denials` + governance floor)
+- **Versions:** `src/kiro_crew/__init__.py` and Electron `package.json`/`package-lock.json` stamped `0.7.0-1.0` (`pyproject.toml` stays plain PEP440 `0.7.0`)
+- **Fork surface ported onto the new architecture:** provider/shim/vision config fields (`safe_mode`, `use_shim`, shim endpoints, `provider_base_url/api_key/api_format`, `model_whitelist`, `image_redirect`, `vision_*`, `text_only_models`, `image_input_mode`) into `config/sections.py` + loader plumbing; factory backend selection + ANTHROPIC env threading into the refactored `create_provider_factory`; opencode registered in `ACP_BACKENDS_KNOWN` + `BASELINE_SELECTABLE_BACKENDS`; claude_code task-session fallback in `session_allocation`; fork-bomb recursion guard in `subagent_manager/admission`; router doctor probe; Electron updater identity
+- i18n catalogs: upstream content with fork `kirocrew-customapi` renames re-applied (placeholders per contract)
+
 # Changelog
 
 All notable changes to KiroCrew are documented in this file.

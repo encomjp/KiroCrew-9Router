@@ -795,14 +795,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     }
   },
   {
-    "id": "chat.api-key",
-    "label": "API key",
-    "labelKey": "pages.settings.chatPanel.provider_api_key",
-    "tab": "chat",
-    "type": "input",
-    "occurrence": 1
-  },
-  {
     "id": "chat.auto-compact-threshold",
     "label": "Auto-Compact Threshold",
     "labelKey": "pages.settings.chatPanel.auto_compact_threshold",
@@ -835,14 +827,6 @@ export const SETTINGS_REGISTRY: SettingEntry[] =
     "labelKey": "pages.settings.chatPanel.background_model",
     "tab": "chat",
     "type": "select",
-    "occurrence": 1
-  },
-  {
-    "id": "chat.base-url",
-    "label": "Base URL",
-    "labelKey": "pages.settings.chatPanel.provider_url",
-    "tab": "chat",
-    "type": "input",
     "occurrence": 1
   },
   {
