@@ -23,9 +23,9 @@ const {
   MAX_CRASH_LOG_LINES,
 } = require("../crash-collector");
 
-const LOGS = "/logs";
-const DUMPS = "/dumps";
-const REPORTS = "/reports";
+const LOGS = path.join("logs") + path.sep;
+const DUMPS = path.join("dumps");
+const REPORTS = path.join("reports");
 // The name the packaged bundle, its executable, and therefore every crash
 // artifact on disk actually carry: electron-builder derives all three from
 // `build.productName`, which is the joined form. The collector is handed the

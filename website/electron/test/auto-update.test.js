@@ -4,11 +4,11 @@ const {
   initAutoUpdate,
   buildFeedBase,
   configureUpdater,
+  manualDownloadUrl,
   readExternallyManaged,
   canRewriteMarker,
-  DEFAULT_FEED_BASE,
+  DOWNLOAD_BASE,
   SUPPORTED_PLATFORMS,
-  readExternallyManaged,
 } = require("../auto-update");
 
 // ---------------------------------------------------------------------------

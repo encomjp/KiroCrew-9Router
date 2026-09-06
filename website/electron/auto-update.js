@@ -1882,8 +1882,8 @@ module.exports = {
   resolveLinuxInstall,
   readExternallyManaged,
   canRewriteMarker,
-  DEFAULT_FEED_BASE,
   DOWNLOAD_BASE,
+  GITHUB_OWNER,
+  GITHUB_REPO,
   SUPPORTED_PLATFORMS,
-  readExternallyManaged,
 };

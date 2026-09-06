@@ -1024,6 +1024,10 @@ export function AboutPanel() {
       setGwCommandCopied(false)
       setGwCommandCopyFailed(false)
       if (typeof d?.can_apply === 'boolean') setGwSelfUpdatable(d.can_apply)
+      // Fork: adopt divergence counts unconditionally (0 when absent) so one
+      // check's divergence can never survive into the next check's verdict.
+      setGwAhead(typeof d?.commits_ahead === 'number' ? d.commits_ahead : 0)
+      setGwBehind(typeof d?.commits_behind === 'number' ? d.commits_behind : 0)
       if (typeof d?.auto_update === 'boolean') setAutoUpdate(d.auto_update)
     },
   })

@@ -9,6 +9,7 @@ import { useAvailableModels } from '../../hooks/useAvailableModels'
 import { usePlainDiff } from '../../hooks/usePlainDiff'
 import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../../lib/effort'
 import { isMac } from '../../utils/platform'
+import { BACKEND_OPTIONS, PROVIDER_PRESETS, type AgentBackend } from './providerPresets'
 import { capRoleOther, clampRoleOther } from '../../lib/userProfile'
 import { ROLE_SLUGS, TECH_SLUGS } from '../../lib/profileOptions'
 
