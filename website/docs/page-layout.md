@@ -297,6 +297,133 @@ visible area (a chat container, a modal). Safe area is **padding, not size**:
 `padding-bottom: env(safe-area-inset-bottom)`, which resolves to 0 without
 `viewport-fit=cover`.
 
+**The shell is an application, not a zoomable document — page zoom is off on touch.**
+Pinching magnifies a `position: fixed` / `h-dvh` layout whose scrollers are all
+*inner*, so there is no axis left to reach what the magnification pushed outside the
+visual viewport: topbar, composer and drawer leave at once and only a second pinch
+brings them back. Three mechanisms enforce it because no single one covers every
+engine — `maximum-scale=1, user-scalable=no` in `index.html` (Blink, Gecko), a root
+`html { touch-action: pan-x pan-y }` under `@media (pointer: coarse)` in `index.css`
+(Blink's pinch and double-tap paths), and cancelling Safari's `gesturestart` in
+`utils/pageZoom.ts` (WebKit has ignored the viewport zoom keys for user gestures
+since iOS 10). Pointer-fine devices are untouched: ctrl+wheel and the trackpad pinch
+are a desktop convention this has no business changing.
+
+The corollary is the part to get right. **A surface that must magnify owns its own
+zoom — it does not ask for `pinch-zoom` back.** `touch-action` is intersected from
+the hit-test target up to the root, so a descendant cannot re-grant a behaviour the
+root withheld; declaring `touch-pinch-zoom` there buys a dead gesture, not a working
+one.
+
+**Count the surfaces this rule binds before believing it holds.** There are **three**
+full-viewport magnify overlays — the image viewer (`Lightbox` in
+`MarkdownRenderer.tsx`), the diagram viewer (`DiagramLightbox.tsx`), and the
+screenshot viewer in `pages/AppDetailPage.tsx` — and when page zoom was first
+switched off only the first owned a gesture. The second silently
+became unmagnifiable by any gesture, because its content is fit-scaled vector whose
+labels are smallest at exactly the state it opens in. The rule read as satisfied
+because the *documented example* obeyed it; nothing had counted the instances. The
+first two
+now share `hooks/usePinchZoom.ts` (contact tracking, focal anchoring, pan clamping),
+so a further such surface gets the gesture by using the hook rather than by
+re-deriving the math — and `touch-none` on the transform target is what opts it out
+of the root's `pan-x pan-y`.
+
+**A trackpad is a third input class, not a touchscreen.** A trackpad pinch emits no
+pointer events at all, so it reaches none of the contact-tracking code: Blink
+reports it as a `wheel` carrying `ctrlKey`, WebKit as
+`gesturestart`/`gesturechange` carrying a **cumulative** `scale`. The hook claims
+both, which is what gives a laptop — and `ctrl`+scroll on a mouse — the same
+magnification a touchscreen gets from two fingers. Four constraints are
+load-bearing and each is easy to get wrong:
+
+- **`gesture*` binds only under `(pointer: fine)`.** The converse of "a trackpad
+  pinch emits no pointer events" does not hold: a gesture event does not imply a
+  trackpad. **iOS Safari fires `gesturestart`/`gesturechange` for a two-finger
+  TOUCH pinch too**, and those fingers are already driving the contact-tracking
+  path — so binding both on a touch device puts two independent formulas on one
+  pinch and zooms twice. The media query keeps this an *additional* input path for
+  pointing devices rather than a second one for touch. `wheel` is deliberately
+  **not** gated: a coarse-pointer device can still carry a mouse. Absent
+  `matchMedia` counts as coarse, because failing closed costs only a trackpad path
+  on a platform that has none, while failing open restores the double zoom.
+
+- **The listeners cannot be React props.** React attaches `wheel` at the root
+  *passively*, so `preventDefault()` inside an `onWheel` prop is ignored and the
+  browser page-zooms anyway. They are manual `addEventListener` calls with
+  `{ passive: false }`.
+- **They sit on `window` and gate on containment**, not on the element. A viewer's
+  element ref is null until it opens, so an effect reading the element at mount
+  would bind nothing. Containment is the **overlay**, not the transform target: the
+  letterbox around a small image is visually the viewer, and letting a pinch there
+  fall through page-zooms the whole app behind a viewer that looks unchanged.
+- **Binding is gated on the consumer being in a zoomable state**, which carries two
+  distinct costs. A non-passive listener makes the compositor wait on main-thread
+  dispatch for *every* wheel event, so an always-mounted consumer would tax
+  scrolling app-wide while its viewer is shut. And claiming a gesture the consumer
+  ignores would suppress page zoom — which, on content that is **not** fit-scaled,
+  genuinely does magnify. So a no-viewBox diagram binds nothing and keeps that
+  fallback.
+- **Only `ctrl`+wheel is claimed.** A plain wheel belongs to whatever scroller owns
+  it, which is what a no-viewBox diagram depends on to reach its edges.
+
+And note why page zoom is not a substitute for any of this: a fit-to-viewport
+surface is *invariant* under page zoom. At 200% the viewport's CSS-pixel width
+halves, the `fixed inset-0` box halves with it, and the content re-fits to the
+smaller box while each CSS pixel covers two device pixels — the two cancel, and the
+labels come out the same apparent size.
+
+The guard that enforces this sweeps **both** `components/**` and `pages/**`, because
+a magnify overlay can live in either and a population scoped to one directory counts
+instances of a set it has itself narrowed. `AppDetailPage.tsx` is carried in that
+guard as a named, issue-linked exception rather than excluded by the glob: an
+exception a reader can see is a debt with an owner, a glob boundary is not. Giving it
+the gesture is tracked separately because its overlay also owns arrow-key navigation
+between screenshots and click-to-dismiss, so a pinch there has to be reconciled with
+a prev/next seam the other two do not have.
+
+Code blocks take the other legitimate route and scroll
+horizontally instead. And note what is *not* lost — the OS Display Zoom setting sits
+outside the viewport contract and still magnifies anything. A browser tab's own
+text-size control does too, but it is **not** a fallback in the installed app: a
+standalone PWA has no Safari toolbar to reach it from, so on a home-screen install
+Display Zoom is the only route. State it with that qualification everywhere the
+claim appears (`website/index.html`, `docs/guides/remote-and-mobile.md`) — an
+unqualified version points a low-vision user at a control that is not there.
+
+**Any touch input below 16px zooms the viewport on focus, and WebKit does not zoom
+back out.** The scale is `clampTo(16 / fontSize, minimumScale, maximumScale)` from the
+FIELD's computed size, so a `text-sm` field can leave the user zoomed in — and with
+page zoom off there is no pinch-out to undo it. **An app-wide floor for this was
+written and withdrawn, and it should stay withdrawn** unless someone brings evidence
+from a real device, because CSS cannot express a floor at all: it can only SET a
+size, so the two available shapes are wrong in opposite directions. A rule broad
+enough to reach every field SHRINKS the ones that are deliberately larger — measured,
+not hypothetical: `input:not([type=…]):not([type=…])` is (0,2,1) and beat the artifact
+rename field's `text-2xl`, snapping a 24px title to 16px on a phone. A narrower
+selector list misses fields instead, because a size can arrive as a named utility, an
+arbitrary value (`text-[13px]`), an `!important` modifier or an inline style, and no
+list contains the next one. A guard test rescues neither shape: ~120 of this app's
+fields are routed through `<Input>` / `<Textarea>` rather than a native tag, so a
+source sweep for `<input>` cannot see them and reports green.
+
+Two things make withholding the floor the safer side of that trade. The focus zoom is
+**pre-existing** — it is not introduced by suppressing pinch, which removes only the
+recovery gesture — and whether it can fire at all once `maximum-scale=1` is authored
+depends on the same engine path that decides whether WebKit honours the viewport keys,
+which is not answerable from source. Settle it on a device; if it does fire, the fix
+belongs in the field components, where a real `max(16px, authored)` is expressible.
+
+**The `meta-viewport` axe rule is left ENABLED, deliberately.** `@axe-core/react` scans
+every render, so `user-scalable=no` reports a critical WCAG 1.4.4 finding on every scan.
+A waiver for it was written and removed; do not re-add one. The argument for waiving was
+that a permanent finding nobody can action trains contributors to ignore the console —
+but the finding *is* actionable, because it is a decision, and a decision does not stop
+being owed because a scanner keeps asking for it. That recurring report is currently the
+only automated reminder that suppressing page zoom is an accessibility trade with no
+in-app text-size control substituting for it. Revisit the waiver only once that decision
+is recorded, and then record the decision rather than the silence.
+
 **Use the line-length cap in reverse to tell "ugly" from "broken".** WCAG 1.4.8 caps a
 reading measure at 80 characters, 40 for CJK. Run it backwards and a squeezed pane stops
 being a matter of taste: a 50px column at 13px holds three CJK glyphs, which is a defect

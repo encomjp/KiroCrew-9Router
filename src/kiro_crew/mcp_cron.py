@@ -30,6 +30,7 @@ from kiro_crew.cron import (
     CronJob,
     CronService,
     CronStoreBusy,
+    CronStoreUnreadable,
     compute_next_run_ts,
     format_schedule,
     get_local_tz,
@@ -964,7 +965,12 @@ def _list_tools() -> list[dict[str, Any]]:
                 'full last_error/last_result). Pass ids=["<job_id>", ...] '
                 "to fetch full bodies for only those jobs (drill-in "
                 "pattern after a compact list). ids takes precedence over "
-                "verbose."
+                "verbose. SCOPED TO THE CALLING SESSION: only jobs this "
+                "session owns are listed, so an empty result means none are "
+                "owned HERE, not that none are scheduled. Jobs owned by "
+                "another session, or created without one (the CLI, the "
+                "onboarding importer), are managed with `kirocrew cron list` "
+                "or on the dashboard Schedule page."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1677,6 +1683,34 @@ def _check_cron_job_ownership(svc: "CronService", job_id: str) -> str | None:
     return None
 
 
+#: The answer when rows exist but none are in the caller's scope, kept DISTINCT
+#: from the store-is-empty ``"No cron jobs."``.
+#:
+#: One string served both states until #6447, and a filtered result reading
+#: "nothing is scheduled" is actively misleading: an operator whose 15 jobs were
+#: all enabled and running on schedule read it and concluded this server was
+#: pointed at a different store. The scoping decision was legible only in the SEL
+#: row that records it (``kept=0 withheld=N``), and an audit log is the right
+#: place to keep that record, not the only place to explain it.
+#:
+#: ``dashboard/handlers/cron.py`` already documents the invariant this sentence
+#: states -- "cron_list only shows a session its own jobs, so a job whose key is
+#: empty ... [is] manageable only from this page or the CLI". The knowledge was
+#: written down; the message a caller actually sees just did not carry it.
+#:
+#: Deliberately WITHOUT a count of what was withheld. :data:`_UNOWNED` exists
+#: because an identified session is not necessarily the operator, and "N jobs
+#: exist that you may not see" discloses the admin surface's volume to exactly
+#: that principal. Naming the two surfaces that CAN reach those rows discloses
+#: nothing further: both already require the operator's own machine.
+_SCOPED_EMPTY = (
+    "No cron jobs owned by this session. Jobs owned by another session, or "
+    "created without one (the CLI and the onboarding importer), are outside "
+    "this session's scope and are not listed here. Manage those with "
+    "`kirocrew cron list` or on the dashboard Schedule page."
+)
+
+
 def _owned_by(jobs: list[CronJob], session_key: str) -> list[CronJob]:
     """The jobs *session_key* may reach -- for reading and for writing alike.
 
@@ -1715,7 +1749,9 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             session_key = _authz_session_key()
             jobs = _audit_list_scope(_owned_by(jobs, session_key), jobs, session_key)
             if not jobs:
-                return "No cron jobs."
+                # NOT the store-empty string above: rows exist, they are just out
+                # of scope. See _SCOPED_EMPTY for why the two must differ.
+                return _SCOPED_EMPTY
         # Drill-in: ids filter forces full bodies for matching jobs only.
         if ids_filter:
             id_set = set(ids_filter)
@@ -1862,6 +1898,8 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             )
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
+        except CronStoreUnreadable as exc:
+            return f"Error: {exc}"
         except ValueError as e:
             return f"Error: {e}"
         sched_str = format_schedule(job.schedule)
@@ -1948,6 +1986,8 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             updated = svc.update_job(jid, **kwargs)
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
+        except CronStoreUnreadable as exc:
+            return f"Error: {exc}"
         except ValueError as e:
             return f"Error: {e}"
         if not updated:
@@ -1969,24 +2009,11 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         if own_err:
             return own_err
         try:
-            removed = svc.remove_job(jid)
+            removed = svc.remove_job(jid, actor="mcp", source="mcp")
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
-        # SEL audit: single delete records the affected job and outcome, same
-        # shape as cron.create/cron.update above. Best-effort and exception-
-        # contained: the first sel() of a process CONSTRUCTS the log and can
-        # raise, and the job is already removed — a completed delete must not
-        # surface as a tool error because the audit trail is unavailable.
-        try:
-            sel().log_api_access(
-                caller="mcp",
-                operation="cron.remove",
-                outcome="allowed" if removed else "not_found",
-                source="mcp",
-                resources=f"job_id={jid}",
-            )
-        except Exception:
-            logger.warning("SEL audit for cron_remove failed (job %s)", jid, exc_info=True)
+        except CronStoreUnreadable as exc:
+            return f"Error: {exc}"
         if removed:
             return f"Removed job: {jid}"
         return f"Job not found: {jid}"
@@ -2021,11 +2048,19 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
                 resources=f"count={len(jobs)}",
             )
         try:
-            for j in jobs:
-                svc.remove_job(j.id)
+            # Distinct from the ``removed: bool`` that ``cron_remove``'s
+            # single-job path binds above: this is the batch's removed-id LIST,
+            # and reusing the name would rebind one variable to two types.
+            removed_ids, _missing = svc.remove_jobs_sync(
+                [j.id for j in jobs], actor=session_key or "mcp", source="mcp"
+            )
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
-        return f"Removed {len(jobs)} job(s)."
+        except CronStoreUnreadable as exc:
+            return f"Error: {exc}"
+        # main's count, not len(jobs): remove_jobs_sync reports what it actually
+        # removed, so a requested id that was already gone is not counted.
+        return f"Removed {len(removed_ids)} job(s)."
 
     if name == "cron_pause":
         jid = args["job_id"]
@@ -2037,6 +2072,8 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             paused = svc.enable_job(jid, enabled=False)
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
+        except CronStoreUnreadable as exc:
+            return f"Error: {exc}"
         if paused:
             return f"Paused job: {jid}"
         return f"Job not found: {jid}"
@@ -2051,6 +2088,8 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
             resumed = svc.enable_job(jid, enabled=True)
         except CronStoreBusy:
             return "Error: cron store busy, please retry"
+        except CronStoreUnreadable as exc:
+            return f"Error: {exc}"
         if resumed:
             return f"Resumed job: {jid}"
         return f"Job not found: {jid}"

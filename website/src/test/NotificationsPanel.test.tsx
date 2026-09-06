@@ -73,6 +73,20 @@ describe('NotificationsPanel', () => {
     expect(screen.getAllByText(/Ding/).length).toBeGreaterThan(0)
   })
 
+  it('renders the Agent messages row and loads its seeded override', () => {
+    // Seed the exact configuration the row exists for: silent default,
+    // audible agent messages.
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      enabled: true,
+      volume: 0.35,
+      perCategory: { all: 'none', agent: 'ding' },
+    }))
+    render(<NotificationsPanel />)
+    expect(screen.getAllByText('Proactive agent messages').length).toBeGreaterThan(0)
+    // The agent row shows "Ding" (the override), not "Use default"
+    expect(screen.getAllByText(/Ding/).length).toBeGreaterThan(0)
+  })
+
   it('persists volume=0 when slider is at 0 (enforces quiet mode)', () => {
     const { container } = render(<NotificationsPanel />)
     const slider = container.querySelector('input[type="range"]') as HTMLInputElement

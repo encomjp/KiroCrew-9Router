@@ -27,6 +27,8 @@ import SessionSummaryTab from './SessionSummaryTab'
 import { i18nT } from '../../i18n/t'
 import GitPanel from '../../components/GitPanel'
 import { fmtDateFields } from '../../i18n/format'
+import { isModelDowngrade } from './subagentCompletion'
+import { normalizeModelKey } from '../../lib/model'
 const STATUS = {
   pending: <Lock size={12} className="text-muted" />,
   running: <LoaderIcon size={12} className="text-accent animate-spin" />,
@@ -195,7 +197,32 @@ function SubagentPane({ a, slot, onClick, selected }: { a: SubagentActivity; slo
         <span className="shrink-0 flex items-center">{STATUS[a.status]}</span>
         <span className="text-[13px] font-semibold text-text truncate min-w-0" title={i18nT('pages.chat.activityViewer.subagent', { label: statusLabel })}>{statusLabel}</span>
         {a.agent && <code className="text-[11px] text-muted/50 bg-bg-hover px-1.5 py-0.5 rounded shrink-[3] min-w-0 max-w-[6.5rem] truncate inline-block align-middle" title={a.agent}>{a.agent}</code>}
-        {a.model && <code className="text-[11px] text-accent/70 bg-accent/10 px-1.5 py-0.5 rounded shrink-[4] min-w-0 max-w-[7rem] truncate inline-block align-middle [direction:rtl] [unicode-bidi:plaintext] text-left" data-testid="subagent-model" title={i18nT('pages.chat.activityViewer.model_label', { model: a.model })}>{a.model}</code>}
+        {(() => {
+          const resolvedKnown = !!a.model
+          const display = a.model || a.requestedModel || ''
+          if (!display) return null
+          const liveDowngrade = resolvedKnown && isModelDowngrade(a.requestedModel ?? '', a.model!)
+          // Requested-only (model not yet resolved): render a muted chip only
+          // for the 'auto' sentinel — the user asked "whatever the server picks"
+          // and that deserves a visible label. For a concrete pinned id, render
+          // nothing: showing an unconfirmed pin as fact is misleading; the chip
+          // appears once the model actually resolves.
+          if (!resolvedKnown && !liveDowngrade && normalizeModelKey(display) !== 'auto') return null
+          return (
+            <code
+              className={`text-[11px] px-1.5 py-0.5 rounded shrink-[4] min-w-0 max-w-[7rem] truncate inline-block align-middle [direction:rtl] [unicode-bidi:plaintext] text-left${liveDowngrade ? ' bg-warn-subtle border border-warn/20 text-warn' : resolvedKnown ? ' text-accent/70 bg-accent/10' : ' text-muted/60 bg-bg-hover'}`}
+              data-testid="subagent-model"
+              title={liveDowngrade
+                ? i18nT('pages.chat.activityViewer.model_downgraded', { requested: a.requestedModel, resolved: a.model })
+                : resolvedKnown
+                  ? i18nT('pages.chat.activityViewer.model_label', { model: a.model })
+                  : i18nT('pages.chat.activityViewer.model_effective', { model: display })}
+            >
+              {liveDowngrade && <AlertCircle size={10} aria-hidden className="inline-block mr-0.5 align-middle" />}
+              {display}
+            </code>
+          )
+        })()}
         {!isPending && <span className="text-[11px] text-muted/40 ml-auto font-mono shrink-0 whitespace-nowrap tabular-nums">{fmtElapsed}</span>}
         {isRunning && <button data-testid="subagent-cancel-btn" className="text-[11px] px-1.5 py-0.5 rounded border border-danger/40 text-danger/70 hover:bg-danger-subtle hover:text-danger cursor-pointer transition-all shrink-0 whitespace-nowrap inline-flex items-center" onClick={onCancel}><X className="lucide-inline" /> {i18nT('pages.chat.activityViewer.cancel')}</button>}
         {isDone && <span className="text-[14px] text-muted bg-bg-hover px-1.5 py-0.5 rounded shrink-0 ml-1">{collapsed ? '▸' : '▾'}</span>}
@@ -1052,7 +1079,7 @@ export default function ActivityViewer({ subagents, toolLog, open, onToggle, slo
       {/* Sits next to Logs on purpose: both answer "what actually happened
           in THIS session" — Logs for the tool calls, this for the context
           that was injected around them. */}
-      {effectiveTab === 'context' && <ContextBreakdownTab slot={slot} />}
+      {effectiveTab === 'context' && <ContextBreakdownTab slot={slot} subagents={subagents} />}
 
       {/* Session summary — the goal-level view of this session, so returning to
           it does not mean re-reading the transcript. */}

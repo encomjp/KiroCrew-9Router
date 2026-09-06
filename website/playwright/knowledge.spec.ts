@@ -46,10 +46,12 @@ test.describe('Knowledge Page E2E Tests', () => {
     // fresh fixture has 0 items and no filters applied, which is exactly the
     // state the onboarding copy exists for.
     await expect(page.getByTestId('knowledge-onboarding')).toBeVisible({ timeout: 10000 })
-    // exact: true — the onboarding heading also contains "Knowledge Library"
-    // ("Welcome to the Knowledge Library"), so a substring match resolves to two
-    // elements and trips strict mode.
-    await expect(page.getByText('Knowledge Library', { exact: true })).toBeVisible({ timeout: 10000 })
+    // /knowledge redirects to the Capabilities Knowledge tab, whose pane header
+    // shows the tab label + description. The description is the unique landing
+    // anchor: the bare label "Knowledge" also matches the rail's tab button, and
+    // the old standalone "Knowledge Library" title no longer renders (embedded
+    // mode yields it to the pane header).
+    await expect(page.getByText('Documents and sources your agent can search when answering')).toBeVisible({ timeout: 10000 })
     // The stats bar renders outside the empty-state branch, once /stats returns.
     // With the minimal fixture items and entities are 0, but sources may be >0
     // due to auto_ingest_artifacts.
@@ -116,10 +118,9 @@ test.describe('Knowledge Page E2E Tests', () => {
   })
 
   test('help dialog opens and closes', async ({ page }) => {
-    // exact: true — the onboarding heading also contains "Knowledge Library"
-    // ("Welcome to the Knowledge Library"), so a substring match resolves to two
-    // elements and trips strict mode (see the same guard above).
-    await expect(page.getByText('Knowledge Library', { exact: true })).toBeVisible({ timeout: 10000 })
+    // Landing anchor: the pane description (see the same guard above — the old
+    // standalone "Knowledge Library" title no longer renders in embedded mode).
+    await expect(page.getByText('Documents and sources your agent can search when answering')).toBeVisible({ timeout: 10000 })
 
     // Click the Help button
     await page.getByRole('button', { name: /Help/i }).click()

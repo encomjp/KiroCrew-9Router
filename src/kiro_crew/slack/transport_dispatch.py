@@ -134,6 +134,7 @@ async def handle_message_transport(
     consolidator: HistoryConsolidator | None = None,
     user_display_name: str | None = None,
     gateway: Any | None = None,
+    from_trusted_bot: bool = False,
 ) -> None:
     """Drive a Slack message through the new transport path end-to-end.
 
@@ -608,6 +609,8 @@ async def handle_message_transport(
             directive_consumer=build_directive_consumer(
                 session_key=session_key, sessions=sessions, dispatcher=gateway
             ),
+            audit_session_key=session_key,
+            audit_agent=_agent or "kirocrew",
         )
         # The thread's owner as of the moment the turn starts producing output.
         # A dashboard link landing during the run moves the conversation to a
@@ -849,11 +852,26 @@ async def handle_message_transport(
         Stats().inc_message_failed()
         if client and _acquired:
             await sessions.record_failure(session_key)
-        # Post error to Slack so user knows something went wrong
-        try:
-            await slack.post_message(
-                channel, "🔧 Something went wrong (transport path). Please try again.", reply_ts
+        # Post error to Slack so user knows something went wrong. The error
+        # MESSAGE is suppressed for trusted-bot messages: in a mutual-mesh
+        # setup (A trusts B, B trusts A) an error reply is itself a
+        # bot-authored event the peer admits, so replying would open an
+        # unbounded error-reply ping-pong. Mirrors the native path's guard in
+        # handler.py (from_trusted_bot and _had_error). The thread STATUS is
+        # cleared unconditionally — skipping it would leave a stale "working"
+        # status pinned to the thread forever.
+        if from_trusted_bot:
+            logger.info(
+                "Suppressing transport error reply to trusted bot message (echo-loop guard)"
             )
+        else:
+            try:
+                await slack.post_message(
+                    channel, "🔧 Something went wrong (transport path). Please try again.", reply_ts
+                )
+            except Exception:
+                pass
+        try:
             await slack.set_thread_status(channel, reply_ts, "")
         except Exception:
             pass

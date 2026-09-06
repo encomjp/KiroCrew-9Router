@@ -21,6 +21,8 @@ a future edit could quietly reintroduce a refusal (or lose the audit):
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -227,3 +229,62 @@ class TestTheOneRetainedRefusalIsNotHere:
 
         term = AppRef(name="Terminal", pid=1, bundle_id="com.apple.Terminal")
         assert policy.check_app(term, PolicyConfig()) is None
+
+
+class TestNothingInTreeStillCallsThisGateFailClosed:
+    """Ratchet: the tests above prove the gate PERMITS unconditionally, so prose
+    that calls it the fail-closed authorization point is not a stale phrasing --
+    it is a false statement about a security boundary, and it is the statement a
+    reader reasons from when wiring a new surface.
+
+    The fail-closed step is the keystone primary enable at the top of
+    ``tools._dispatch``; ``require_computer_use`` audits and returns no decision.
+    A source comment or spec paragraph that swaps those two sends the reader to
+    the wrong layer, and nothing else in the suite notices.
+
+    A mention is a violation when a fail-closed claim sits within
+    ``_WINDOW`` characters of it AND no audit-only correction sits in the same
+    window -- which is how a human reads the paragraph, and what keeps the
+    passages that name the enable's fail-closed posture *while* calling this gate
+    audit-only from being flagged.
+    """
+
+    _WINDOW = 200
+    _MENTION = re.compile(r"require_computer_use")
+    _CLAIMS_FAIL_CLOSED = re.compile(r"fail-?\s*clos|fails\s+CLOSED|authoritative gate", re.I)
+    _CORRECTS_IT = re.compile(r"audit-only|only audits|no decision|unconditionally permits", re.I)
+
+    @property
+    def _files(self):
+        root = Path(__file__).resolve().parents[1]
+        return [
+            p
+            for p in [*root.glob("src/kiro_crew/**/*.py"), *root.glob("docs/**/*.md")]
+            # gate.py is the definition; its own docstring states the contract.
+            if p.name != "gate.py"
+        ]
+
+    def _violations(self):
+        found = []
+        for path in self._files:
+            text = path.read_text(encoding="utf-8")
+            for match in self._MENTION.finditer(text):
+                window = text[max(0, match.start() - self._WINDOW) : match.end() + self._WINDOW]
+                window = " ".join(window.split())
+                if self._CLAIMS_FAIL_CLOSED.search(window) and not self._CORRECTS_IT.search(window):
+                    found.append(f"{path.name}:{text[: match.start()].count(chr(10)) + 1}")
+        return sorted(set(found))
+
+    def test_the_ratchet_actually_reads_the_mentions(self):
+        """A scan that matched nothing would pass vacuously."""
+        total = sum(len(self._MENTION.findall(p.read_text(encoding="utf-8"))) for p in self._files)
+        assert total >= 5, f"expected the known mentions of the gate, found {total}"
+
+    def test_no_source_or_spec_describes_this_gate_as_fail_closed(self):
+        violations = self._violations()
+        assert not violations, (
+            "require_computer_use permits unconditionally (see TestTheGatePermits); "
+            "the fail-closed step is the keystone primary enable at the top of "
+            "tools._dispatch. These describe it as the fail-closed authorization "
+            "point: " + ", ".join(violations)
+        )

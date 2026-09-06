@@ -27,6 +27,20 @@ MAX_TRANSCRIPT_CHARS = 4000  # per dispatched transcription line
 #: 413; accepted segments are never silently truncated.
 MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_BATCH_CHARS = 60_000  # per flushed agent batch
+#: Ceiling on transcript lines held while a starting meeting initializes its
+#: agents, counted in LINES rather than bytes: the producer is one finalized
+#: speech segment at a time, so lines are what the overflow rule has to reason
+#: about, and each is already capped at ``MAX_TRANSCRIPT_CHARS``.
+#:
+#: The window is the agent-initialization span, measured at ~46s on a real
+#: meeting (issue #4610). Speech finals arrive every few seconds, so a real
+#: opening lands 15-25 lines here; 200 leaves an order of magnitude of headroom
+#: while bounding the hold at ``200 * MAX_TRANSCRIPT_CHARS`` (~800 KB) for the
+#: one meeting ``MAX_CONCURRENT_MEETINGS`` permits.
+#:
+#: A bound is REQUIRED, not a nicety: ``POST .../dispatch`` accepts untrusted
+#: text, so an unbounded hold on that path is a memory-exhaustion lever.
+MAX_INIT_BUFFER_LINES = 200
 MAX_ATTACHMENTS = 25
 MAX_DICTIONARY_TERMS = 500
 MAX_CALENDAR_EVENTS = 500
@@ -93,12 +107,23 @@ CALENDAR_CACHE_FILE = "calendar-cache.json"
 SESSION_META_FILE = "session.json"
 TASKS_FILE = "tasks.json"
 TRANSCRIPT_FILE = "transcript.jsonl"
+TRANSLATIONS_FILE = "translations.json"
 
 # Durable transcript entry sources. Speech is a finalized STT segment; typed is
 # a line submitted through the broadcast bar.
 TRANSCRIPT_SOURCE_SPEECH = "speech"
 TRANSCRIPT_SOURCE_TYPED = "typed"
-VALID_TRANSCRIPT_SOURCES = (TRANSCRIPT_SOURCE_SPEECH, TRANSCRIPT_SOURCE_TYPED)
+#: An app-authored transcript record — currently only the init-buffer overflow
+#: marker. It MUST be in ``VALID_TRANSCRIPT_SOURCES``: ``read_transcript_page``
+#: drops every record whose source it does not recognize, so a marker written
+#: under an unlisted source would be filtered out on read and the gap it exists
+#: to announce would be silent again.
+TRANSCRIPT_SOURCE_SYSTEM = "system"
+VALID_TRANSCRIPT_SOURCES = (
+    TRANSCRIPT_SOURCE_SPEECH,
+    TRANSCRIPT_SOURCE_TYPED,
+    TRANSCRIPT_SOURCE_SYSTEM,
+)
 
 # The always-on system agent that maintains ``tasks.json``. Not a configurable
 # entry in ``meeting_agents`` — it is a core feature of the app.
@@ -132,6 +157,19 @@ SYSTEM_MEETING_RESTARTED = (
 )
 CHAT_PREFIX = "[chat]"
 
+#: Announces that the init-window hold overflowed and dropped its OLDEST lines.
+#:
+#: Written to the durable transcript AND enqueued to the agents, because a
+#: truncation only one of them can see is the failure this marker exists to
+#: prevent: the notes would simply begin mid-sentence with nothing to show a
+#: turn was lost.
+SYSTEM_INIT_BUFFER_OVERFLOW = (
+    "[system] {count} line(s) of speech from the start of this meeting were "
+    "dropped: they arrived faster than the agents could be initialized and "
+    "exceeded the hold of {limit} lines. The transcript above is complete; the "
+    "agents did not receive the dropped lines."
+)
+
 # Task provider ids (see backend/providers/tasks.py).
 TASK_PROVIDER_LOCAL = "local"
 DEFAULT_TASK_PROVIDER = TASK_PROVIDER_LOCAL
@@ -154,3 +192,50 @@ VALID_REVIEW_STATES = (REVIEW_PENDING, REVIEW_ARCHIVED, REVIEW_PUSHED)
 TASK_PRIORITIES = ("high", "medium", "low")
 DEFAULT_TASK_PRIORITY = "medium"
 TASK_STATES = ("open", "done")
+
+# ── live translation ────────────────────────────────────────────────────────
+
+# Target languages for live transcript translation, as ``(code, label)``.
+#
+# The label is the language's own endonym and is deliberately NOT translated:
+# a picker of target languages is the one place where every option should be
+# readable to whoever wants that option. Same rationale as the dashboard's own
+# UI-language picker.
+#
+# A curated list rather than every code a model might manage: each entry is a
+# promise that the translation is worth reading, and it is the set MeetNote
+# shipped. The empty string is not a member — see DEFAULT_TRANSLATION_LANG.
+TRANSLATION_LANGS: tuple[tuple[str, str], ...] = (
+    ("en", "English"),
+    ("ja", "日本語"),
+    ("ko", "한국어"),
+    ("zh", "中文 (简体)"),
+    ("zh-TW", "中文 (繁體)"),
+    ("fr", "Français"),
+    ("de", "Deutsch"),
+    ("es", "Español"),
+    ("pt", "Português"),
+    ("it", "Italiano"),
+    ("ru", "Русский"),
+)
+
+TRANSLATION_LANG_CODES: frozenset[str] = frozenset(code for code, _ in TRANSLATION_LANGS)
+
+#: Off. Live translation costs one model call per spoken line, so it is opt-in —
+#: a default-on feature would bill every meeting for something most do not need.
+DEFAULT_TRANSLATION_LANG = ""
+
+#: Lines waiting to be translated before the OLDEST are dropped.
+#:
+#: Translation runs one line at a time behind live speech, so a slow model builds
+#: a backlog. Dropping is the right failure: the panel is a live aid, and a
+#: translation that arrives ten minutes late is worth less than keeping up with
+#: what is being said now. Transcription and the agents are never affected —
+#: they do not wait on this queue.
+MAX_TRANSLATION_BACKLOG = 40
+
+#: Translated lines retained in ``translations.json``.
+#:
+#: Trimmed from the front when exceeded. Line numbers stay monotonic, so a client
+#: polling with ``since`` is unaffected by trimming — it only loses scroll-back.
+MAX_TRANSLATION_LINES = 2000

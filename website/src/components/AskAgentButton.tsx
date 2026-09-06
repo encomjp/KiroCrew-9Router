@@ -58,9 +58,14 @@ export default function AskAgentButton({
   /** Force a full page load (crash fallbacks, where the live tree is suspect). */
   hard?: boolean
   /**
-   * Called after the hand-off is staged. For callers that render inside a
-   * modal: the soft navigation does not unmount the modal's owner, so the
-   * modal would sit over the chat the hand-off lands on — close it here.
+   * Runs only once the hand-off has actually proceeded — for a caller that
+   * DISMISSES something (a modal that would otherwise sit over the chat, an error
+   * banner whose job is done).
+   *
+   * The guard matters: clearing a surface on a staging failure leaves neither a
+   * navigation nor a visible diagnostic, so the error is erased with nothing shown
+   * in its place. `sendErrorToChat` reports whether it staged, so one check covers
+   * every caller.
    */
   onHandoff?: () => void
   className?: string
@@ -78,8 +83,9 @@ export default function AskAgentButton({
     const resolved: ErrorReport | { message: string } | null =
       report ?? findReport(message) ?? (message ? { message } : null)
     if (!resolved) return
-    sendErrorToChat(askAgentPrompt(resolved), { hard })
-    onHandoff?.()
+    // Dismiss only once the hand-off actually proceeded.
+    if (!sendErrorToChat(askAgentPrompt(resolved), { hard })) return
+    try { onHandoff?.() } catch { /* dismissal is cosmetic; never throw here */ }
   }
 
   const base = 'inline-flex items-center gap-1 shrink-0 cursor-pointer transition-colors'

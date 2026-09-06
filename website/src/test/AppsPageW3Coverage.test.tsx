@@ -4,7 +4,8 @@
  * `AppsPageDiscover.test.tsx` covers the editorial/browse rendering surface.
  * This file covers what it does not touch: the navigation helpers (Cmd-click,
  * `autoAction` router state), the enable path including the trust-denied
- * consent hand-off, the Library disable toast, Update All's failure report,
+ * consent hand-off, the Library disable toast and updates hint row, Update
+ * All's failure report (on Discover's Updates sub-tab, its PR2 home),
  * the whole uninstall confirmation dialog (every provenance notice, the
  * dependency preview, keep-data / keep-dependency wiring), the query-error
  * card, the empty states, and `pickFeatured`'s trust filter.
@@ -99,7 +100,9 @@ vi.mock('../components/SimpleSelect', () => ({
   ),
 }))
 
-import AppsPage, { pickFeatured } from '../pages/AppsPage'
+import DiscoverPage from '../pages/apps/DiscoverPage'
+import LibraryPage from '../pages/apps/LibraryPage'
+import { pickFeatured } from '../pages/apps/useAppsData'
 import type { RegistryApp } from '../components/appstore/types'
 
 /** Detail-route probe: reports the app name and the `autoAction` router state. */
@@ -111,13 +114,20 @@ function DetailProbe() {
   )
 }
 
-function renderPage() {
+/** Mounts the split pages under their real routes. Library tests mount at
+ *  '/apps/library' directly — the in-page Library tab is gone (PR1 split). */
+function renderPage(initialRoute = '/apps') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
   return render(
     <QueryClientProvider client={qc}>
-      <MemoryRouter initialEntries={['/apps']}>
+      <MemoryRouter initialEntries={[initialRoute]}>
         <Routes>
-          <Route path="/apps" element={<AppsPage />} />
+          <Route path="/apps" element={<DiscoverPage />} />
+          {/* Static segments BEFORE the param routes, mirroring App.tsx's
+              route order. `/apps/-/updates` is Discover's Updates sub-tab
+              (PR2) — the pending-updates worklist and Update All live there. */}
+          <Route path="/apps/-/updates" element={<DiscoverPage />} />
+          <Route path="/apps/library" element={<LibraryPage />} />
           <Route path="/apps/detail/:name" element={<DetailProbe />} />
           <Route path="/apps/:name" element={<DetailProbe />} />
         </Routes>
@@ -210,7 +220,12 @@ async function browseRow(name: string) {
   return rows[rows.length - 1]
 }
 
-const goLibrary = () => fireEvent.click(screen.getByText('Library'))
+/** Mount the Library route directly — the split removed the in-page tab. */
+const renderLibrary = () => renderPage('/apps/library')
+
+/** Mount Discover's Updates sub-tab, where Update All lives since PR2 demoted
+ *  the Library banner to a hint row. */
+const renderUpdates = () => renderPage('/apps/-/updates')
 
 describe('AppsPage — Discover navigation', () => {
   it('Cmd-clicks a row into a new tab instead of routing in place', async () => {
@@ -283,7 +298,7 @@ describe('AppsPage — enable path', () => {
     await catalogReady()
     const row = await browseRow('Pets')
     fireEvent.click(within(row).getByRole('button', { name: /^Enable/ }))
-    expect(await screen.findByText('Trust Pets to run its own code?')).toBeInTheDocument()
+    expect(await screen.findByText('Trust “Pets” to run its own code?')).toBeInTheDocument()
     // A consent prompt is not an error — the error card must stay away.
     expect(screen.queryByText(/Failed to enable/)).toBeNull()
   })
@@ -295,7 +310,7 @@ describe('AppsPage — enable path', () => {
     const row = await browseRow('Pets')
     fireEvent.click(within(row).getByRole('button', { name: /^Enable/ }))
     expect(await screen.findByText('gateway is busy')).toBeInTheDocument()
-    expect(screen.queryByText('Trust Pets to run its own code?')).toBeNull()
+    expect(screen.queryByText('Trust “Pets” to run its own code?')).toBeNull()
   })
 
   it('falls back to the generic enable message when the failure carries no text', async () => {
@@ -328,7 +343,7 @@ describe('AppsPage — query failures and empty states', () => {
     listRegistry.mockResolvedValue({ apps: [] })
     renderPage()
     expect(await screen.findByText('No apps available')).toBeInTheDocument()
-    expect(screen.getByText('Add an app source (gear icon above) or install from a local path.')).toBeInTheDocument()
+    expect(screen.getByText('Add an app source (Sources, top right) or install from a local path.')).toBeInTheDocument()
   })
 
   it('shows the no-match state when the search excludes every row', async () => {
@@ -342,28 +357,22 @@ describe('AppsPage — query failures and empty states', () => {
   it('shows the empty Library state when no app is installed', async () => {
     listApps.mockResolvedValue([])
     listRegistry.mockResolvedValue({ apps: [] })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
+    renderLibrary()
     expect(await screen.findByText('No apps installed yet')).toBeInTheDocument()
   })
 
   it('shows the no-match Library state when the search excludes every installed app', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderLibrary()
     await screen.findByText('Slack inbox manager.')
-    fireEvent.change(screen.getByLabelText('Search apps'), { target: { value: 'nothing-matches-this' } })
+    fireEvent.change(screen.getByLabelText('Search library'), { target: { value: 'nothing-matches-this' } })
     expect(await screen.findByText('No matching apps')).toBeInTheDocument()
     expect(screen.getByText('Try a different search term')).toBeInTheDocument()
   })
 
   it('matches an installed app by its manifest tags', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderLibrary()
     await screen.findByText('Slack inbox manager.')
-    fireEvent.change(screen.getByLabelText('Search apps'), { target: { value: 'inbox' } })
+    fireEvent.change(screen.getByLabelText('Search library'), { target: { value: 'inbox' } })
     // The tag match keeps the row; nothing falls through to the empty state.
     await waitFor(() => expect(screen.queryByText('No matching apps')).toBeNull())
     expect(screen.getByText('Slack inbox manager.')).toBeInTheDocument()
@@ -372,9 +381,7 @@ describe('AppsPage — query failures and empty states', () => {
 
 describe('AppsPage — Library actions', () => {
   it('opens the app at its AppHost route from the card, and the detail page from its name', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderLibrary()
     // Open must resolve through the same appNavTarget derivation the sidebar and
     // command palette use: a third-party (non-builtin) app is AppHost-routed at
     // /apps/<name>, NOT its raw manifest page route (which only a native builtin
@@ -385,61 +392,85 @@ describe('AppsPage — Library actions', () => {
   })
 
   it('routes to the detail page when the card name is clicked', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Secretary' }))
     const probe = await screen.findByTestId('detail-route')
     expect(probe).toHaveAttribute('data-path', '/apps/detail/secretary')
     expect(probe).toHaveAttribute('data-auto', '')
   })
 
-  it('toasts after disabling a builtin and clears the toast on dismiss', async () => {
+  it('keeps the builtin row listed after disabling it, with no toast', async () => {
+    // The toast used to say "re-enable it from the Discover tab" because the row
+    // vanished on disable. It stays now, so the Enable button is the recovery
+    // path and nothing narrates a disappearance that no longer happens -- and the
+    // old copy pointed at a dead end for a builtin with no catalog row.
     listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: true }])
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Disable' }))
     await waitFor(() => expect(disableApp).toHaveBeenCalledWith('pets'))
-    expect(await screen.findByText('Disabled. You can re-enable it from the Discover tab.')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Dismiss message' }))
-    await waitFor(() =>
-      expect(screen.queryByText('Disabled. You can re-enable it from the Discover tab.')).toBeNull())
+    expect(screen.queryByText(/re-enable it from the Discover/)).toBeNull()
+  })
+
+  it('lists a builtin that is already disabled, with an Enable button', async () => {
+    // The reachability property itself: a disabled builtin is in Library at all.
+    listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: false }])
+    renderLibrary()
+    expect(await screen.findByRole('button', { name: 'Enable' })).toBeInTheDocument()
+  })
+
+  it('orders enabled rows above disabled ones', async () => {
+    // Listing disabled builtins adds ~20 rows on a fresh install and Library has
+    // only a search box, so ordering is what keeps the apps in use on top. The
+    // gateway returns them disabled-first here, so a pass-through would fail.
+    listApps.mockResolvedValue([
+      { ...BUILTIN_OFF, name: 'zeta-off', displayName: 'Zeta Off', enabled: false },
+      { ...BUILTIN_OFF, name: 'alpha-on', displayName: 'Alpha On', enabled: true },
+    ])
+    renderLibrary()
+    await screen.findByText('Alpha On')
+    const rendered = screen.getAllByText(/Alpha On|Zeta Off/).map(n => n.textContent)
+    expect(rendered.indexOf('Alpha On')).toBeLessThan(rendered.indexOf('Zeta Off'))
   })
 
   it('reports a failed disable with the action-failed message', async () => {
     disableApp.mockRejectedValue({})
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Disable' }))
     expect(await screen.findByText('Failed to disable secretary')).toBeInTheDocument()
   })
 
   it('names the apps that failed during Update All', async () => {
     updateApp.mockRejectedValue(new Error('clone failed'))
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    // Update All moved with the banner demotion (PR2): the batch runs from
+    // Discover's Updates sub-tab, whose page owns the error notice surface.
+    renderUpdates()
     fireEvent.click(await screen.findByRole('button', { name: 'Update All' }))
     expect(await screen.findByText('Failed to update: secretary')).toBeInTheDocument()
   })
 
   it('reports success after Update All and shows no error', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderUpdates()
     fireEvent.click(await screen.findByRole('button', { name: 'Update All' }))
     expect(await screen.findByText('Updated 1 app.')).toBeInTheDocument()
     expect(screen.queryByText(/Failed to update/)).toBeNull()
+  })
+
+  it('Library shows the muted updates hint row, not the old banner', async () => {
+    renderLibrary()
+    // PR2 demoted the banner: a one-line hint with the count and a hand-off
+    // link to the Updates sub-page — no Update All button on Library.
+    expect(await screen.findByText('1 update available')).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'View updates' }))
+      .toHaveAttribute('href', '/apps/-/updates')
+    expect(screen.queryByRole('button', { name: 'Update All' })).toBeNull()
+    // The affected card still wears its version chip (current → pending).
+    expect(screen.getByText('v1.0.0 (v1.1.0 available)')).toBeInTheDocument()
   })
 })
 
 describe('AppsPage — uninstall dialog', () => {
   const openDialog = async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Uninstall' }))
     return screen.findByRole('dialog', { name: 'Confirm uninstall' })
   }
@@ -619,9 +650,7 @@ describe('AppsPage — editorial layer wiring', () => {
 
 describe('AppsPage — Library enable and update', () => {
   it('Update on a Library card routes to the streaming detail page', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Update' }))
     const probe = await screen.findByTestId('detail-route')
     expect(probe).toHaveAttribute('data-path', '/apps/detail/secretary')
@@ -639,9 +668,7 @@ describe('AppsPage — Library enable and update', () => {
       source: '/home/u/apps/orchestrator-switch', origin: 'local',
     }])
     listRegistry.mockResolvedValue({ apps: [] })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
     await waitFor(() => expect(updateApp).toHaveBeenCalledWith('orchestrator-switch'))
     expect(screen.queryByTestId('detail-route')).toBeNull()
@@ -657,9 +684,7 @@ describe('AppsPage — Library enable and update', () => {
       source: '/home/u/apps/orchestrator-switch', origin: 'local',
     }])
     listRegistry.mockResolvedValue({ apps: [] })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
     expect(await screen.findByText(/Synced Orchestrator Switch from its source directory/)).toBeInTheDocument()
   })
@@ -671,9 +696,7 @@ describe('AppsPage — Library enable and update', () => {
     }])
     listRegistry.mockResolvedValue({ apps: [] })
     updateApp.mockRejectedValue(new Error('source path no longer exists'))
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
     expect(await screen.findByText('source path no longer exists')).toBeInTheDocument()
   })
@@ -681,9 +704,7 @@ describe('AppsPage — Library enable and update', () => {
   it('still routes a registry-sourced app at the registry when it has no update', async () => {
     listApps.mockResolvedValue([{ ...SECRETARY, source: 'registry:secretary' }])
     listRegistry.mockResolvedValue({ apps: [] })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
     const probe = await screen.findByTestId('detail-route')
     expect(probe).toHaveAttribute('data-auto', 'update')
@@ -692,9 +713,7 @@ describe('AppsPage — Library enable and update', () => {
 
   it('enables a switched-off installed app from the Library', async () => {
     listApps.mockResolvedValue([{ ...SECRETARY, enabled: false }])
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Enable' }))
     await waitFor(() => expect(enableApp).toHaveBeenCalledWith('secretary'))
   })
@@ -707,31 +726,22 @@ describe('AppsPage — Library enable and update', () => {
     }])
     listRegistry.mockResolvedValue({ apps: [] })
     enableApp.mockRejectedValue({ code: 'app_execution_denied' })
-    renderPage()
-    await screen.findByText('No apps available')
-    goLibrary()
+    renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Enable' }))
-    expect(await screen.findByText('Trust Local App to run its own code?')).toBeInTheDocument()
-    expect(screen.getByText('https://github.com/z/secretary')).toBeInTheDocument()
+    expect(await screen.findByText('Trust “Local App” to run its own code?')).toBeInTheDocument()
+    expect(screen.queryByText('https://github.com/z/secretary')).toBeNull()
   })
 })
 
 describe('AppsPage — toast expiry', () => {
-  it('the disable toast clears itself after four seconds', async () => {
-    listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: true }])
-    renderPage()
-    await catalogReady()
-    goLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Disable' }))
-    await screen.findByText('Disabled. You can re-enable it from the Discover tab.')
-    await act(async () => { vi.advanceTimersByTime(4000) })
-    expect(screen.queryByText('Disabled. You can re-enable it from the Discover tab.')).toBeNull()
-  })
+  // The disable-a-builtin toast is gone (the row stays listed, so nothing needs
+  // narrating), and with it the case that used to pin the four-second self-clear
+  // here. The Update All toast below pins the same timer on a toast that remains.
 
   it('the Update All toast clears itself after four seconds', async () => {
-    renderPage()
-    await catalogReady()
-    goLibrary()
+    // Update All lives on Discover's Updates sub-tab since PR2; its success
+    // toast is DiscoverPage's notice surface with the same 4s dismissal.
+    renderUpdates()
     fireEvent.click(await screen.findByRole('button', { name: 'Update All' }))
     await screen.findByText('Updated 1 app.')
     await act(async () => { vi.advanceTimersByTime(4000) })

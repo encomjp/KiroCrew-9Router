@@ -89,6 +89,20 @@ describe('createPagesProvider — registry + extras', () => {
     expect(spy).toHaveBeenCalledWith('/hooks')
   })
 
+  it('offers Knowledge and lands on the Capabilities knowledge tab', async () => {
+    // Knowledge has no rail surface, so ⌘K is the discoverability lifeline for
+    // anyone who used to click it in the sidebar — the entry must resolve and
+    // must target the tab, not the removed page.
+    const { nav, spy } = navigate()
+    const p = createPagesProvider(nav)
+
+    const arr = await run(p, 'knowledge')
+    const hit = arr.find((r) => r.subtitle === '/capabilities?tab=knowledge')
+    expect(hit).toBeDefined()
+    hit!.onActivate()
+    expect(spy).toHaveBeenCalledWith('/capabilities?tab=knowledge')
+  })
+
   it('hides the preview-gated Webhooks entry until the flag is on', async () => {
     // `hiddenFromNav` moved the surface out of `getAdvertisedSurfaces()`, which
     // is where the preview gate is normally applied — so the EXTRA_PAGES entry

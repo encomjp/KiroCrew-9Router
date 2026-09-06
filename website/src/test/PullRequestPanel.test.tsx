@@ -21,7 +21,6 @@ import PullRequestPanel, {
   CHECK_POLL_MAX_FAILURES,
   pullRequestCheckPollDelay,
   pullRequestCiSignal,
-  pullRequestErrorDetails,
   pullRequestIsLive,
   pullRequestLifecycleState,
   pullRequestMergeBlocker,
@@ -31,6 +30,7 @@ import PullRequestPanel, {
   stateLabel,
   statusPollDelay,
 } from '../components/PullRequestPanel'
+import { pullRequestErrorDetails } from '../utils/pullRequestErrors'
 
 /** An ApiError-shaped rejection: the human message plus the raw body the client
  *  preserves, which is where the machine-readable code lives. */
@@ -66,6 +66,28 @@ describe('source read retry policy', () => {
   it('backs off between attempts', () => {
     expect(sourceBusyRetryDelay(0)).toBe(2_000)
     expect(sourceBusyRetryDelay(1)).toBe(4_000)
+  })
+})
+
+describe('owner-not-configured mutation refusal', () => {
+  it('recognizes the code and swaps in the localized guidance', () => {
+    const denied = apiError({
+      error: 'this action needs a configured owner; set the Owner ID in Settings → Channels → Slack, then sign in again',
+      code: 'owner_not_configured',
+    })
+    const details = pullRequestErrorDetails(denied)
+    expect(details.ownerNotConfigured).toBe(true)
+    // The localized guidance replaces the server's English prose: the code,
+    // not the prose, is the contract.
+    expect(details.message).toContain('Owner Slack member ID')
+    expect(details.message).toContain('Slack')
+  })
+
+  it('leaves a generic forbidden untouched', () => {
+    const generic = apiError({ error: 'forbidden' })
+    const details = pullRequestErrorDetails(generic)
+    expect(details.ownerNotConfigured).toBe(false)
+    expect(details.message).toBe('forbidden')
   })
 })
 

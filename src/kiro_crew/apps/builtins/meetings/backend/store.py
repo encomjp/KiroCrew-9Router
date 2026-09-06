@@ -271,6 +271,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_preset": "",
     "poll_interval_active": 5000,
     "poll_interval_idle": 30000,
+    # "" = off. Live translation costs one model call per spoken line.
+    "translation_language": k.DEFAULT_TRANSLATION_LANG,
 }
 
 
@@ -615,6 +617,85 @@ def write_tasks(meeting_id: str, tasks: list[dict[str, Any]], root: Path | None 
     doc = {"meeting_id": meeting_id, "tasks": tasks, "updated_at": utc_now_iso()}
     _write_json(tasks_path(meeting_id, root), doc)
     return doc
+
+
+# ── live translation ────────────────────────────────────────────────────────
+
+
+def translations_path(meeting_id: str, root: Path | None = None) -> Path:
+    return contain(
+        meeting_dir(meeting_id, root) / k.TRANSLATIONS_FILE,
+        operation="meetings.translations",
+        root=root,
+    )
+
+
+def read_translations(meeting_id: str, root: Path | None = None) -> dict[str, Any]:
+    """The meeting's translated lines, or an empty document. BLOCKING.
+
+    Tolerates a missing or malformed file the same way :func:`read_tasks` does:
+    this feeds a live panel, and a half-written file must degrade to "nothing
+    translated yet" rather than break the meeting view.
+    """
+    doc = _read_json(translations_path(meeting_id, root), None)
+    if not isinstance(doc, dict):
+        return {"meeting_id": meeting_id, "language": "", "lines": [], "next_n": 0}
+    lines = doc.get("lines")
+    if not isinstance(lines, list):
+        doc["lines"] = []
+    if not isinstance(doc.get("next_n"), int):
+        doc["next_n"] = len(doc["lines"])
+    if not isinstance(doc.get("language"), str):
+        doc["language"] = ""
+    return doc
+
+
+def append_translation(
+    meeting_id: str,
+    *,
+    language: str,
+    source: str,
+    text: str,
+    root: Path | None = None,
+) -> dict[str, Any] | None:
+    """Append one translated line and return the stored entry. BLOCKING.
+
+    Takes :func:`meta_transaction` for the same reason every other
+    read-modify-write here does: the translation worker and a language change can
+    both be writing, and ``atomic_write`` makes the WRITE atomic, not the
+    read-modify-write around it.
+
+    Returns ``None`` without writing when the meeting no longer exists: the
+    worker's persistence runs on a thread and can lose a race with
+    ``delete_meeting`` — without this guard, ``_write_json``'s ``mkdir`` would
+    silently recreate the deleted meeting's directory. Both sides take
+    ``meta_transaction``, so the check cannot interleave with the ``rmtree``.
+
+    Switching target language RESETS the document. Interleaving two languages in
+    one list would leave the panel showing a mix with no way to tell which line is
+    in which, and the old lines are cheap to lose — they are a live aid, not a
+    record. (The transcript itself is kept by the agents, unaffected.)
+
+    ``n`` is monotonic and is NOT reindexed by trimming, so a client polling with
+    ``since`` never re-reads or skips a line.
+    """
+    with meta_transaction():
+        if not meeting_meta_path(meeting_id, root).is_file():
+            return None
+        doc = read_translations(meeting_id, root)
+        if doc.get("language") != language:
+            doc = {"meeting_id": meeting_id, "language": language, "lines": [], "next_n": 0}
+        n = int(doc["next_n"])
+        entry = {"n": n, "source": source, "text": text, "at": utc_now_iso()}
+        lines = list(doc["lines"])
+        lines.append(entry)
+        if len(lines) > k.MAX_TRANSLATION_LINES:
+            lines = lines[-k.MAX_TRANSLATION_LINES :]
+        doc["lines"] = lines
+        doc["next_n"] = n + 1
+        doc["updated_at"] = utc_now_iso()
+        _write_json(translations_path(meeting_id, root), doc)
+    return entry
 
 
 # ── agent output files ──────────────────────────────────────────────────────

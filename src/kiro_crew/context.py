@@ -1137,6 +1137,13 @@ _CRITICAL_RULES_TAIL = (
     '"Yes, delete it"). Never phrase a label in your own voice or as your own '
     'next action ("I\'ll merge it", "Let me show the diff", "I can rebase '
     'first"), and never phrase it as a question back to the user.\n'
+    "Every option must be SELF-CONTAINED: each rendered chip carries its own "
+    "send control, so the user can send any single option alone, and ONLY that "
+    "option's text is sent -- none of its siblings come with it. Never write "
+    'an option that only makes sense combined with another one ("Build the '
+    'widget" | "Include the stop button too" -- sent alone, the second names '
+    "no action). Fold the shared base action into each label instead "
+    '("Build the widget with the stop button included").\n'
     "[END CRITICAL RULES]\n\n"
 )
 # The dashboard variant is the module's canonical block: tests and the
@@ -1852,17 +1859,20 @@ class ContextBuilder:
                 'or any content that fails the test: "would the reader be '
                 'stuck without this line?"\n'
                 "- Code blocks and commands are the answer — never cut them.\n"
-                "- Never compress for brevity: security warnings, "
-                "irreversible-action confirmations, and ordered multi-step "
-                "instructions where a dropped step causes a mistake. Those "
-                "stay complete, and code, commands, paths, identifiers and "
-                "error strings stay verbatim.\n"
+                "- Stakes change what you must not omit, never the length: "
+                "security warnings and irreversible-action confirmations "
+                "always appear, each as one line naming the call, the risk, "
+                "and whether it can be undone; the mechanism and the failure "
+                "modes are not required. Ordered multi-step instructions "
+                "where a dropped step causes a mistake stay complete, and "
+                "code, commands, paths, identifiers and error strings stay "
+                "verbatim.\n"
                 "- When the user ASKS for something long (design doc, tutorial, "
                 "full implementation), ignore these constraints and deliver "
                 "what was asked.\n"
                 "- Required output formats are sacred and never cut: "
                 "[OPTIONS:] lines, diff blocks for file changes, full PR/MR "
-                "URLs, security warnings, and any format the rendering surface "
+                "URLs, and any format the rendering surface "
                 "needs. These go in their required position regardless of "
                 "brevity.\n"
                 "- Preserve the user's language."
@@ -1890,9 +1900,75 @@ class ContextBuilder:
                 "verbatim and complete. Brevity is for prose, never correctness.\n"
                 "- Preserve the user's language; compress the style, not the "
                 "content.\n\n"
-                "Ignore concise mode and keep full detail for: security warnings, "
-                "irreversible-action confirmations, and multi-step instructions "
-                "where order or omissions could cause a mistake."
+                "Stakes change what concise mode must not omit, never how "
+                "long it may run: security warnings and irreversible-action "
+                "confirmations always appear, each as one line naming the "
+                "call, the risk, and whether it can be undone; the mechanism "
+                "and the failure modes are not required. Likewise, multi-step "
+                "instructions where order or omissions could cause a mistake "
+                "stay complete."
+            )
+        elif verbosity == "answer_only":
+            verbosity_block = (
+                "## Response Verbosity: Answer Only\n\n"
+                "Answer-only mode is on. Deliver the answer, the artifact, or "
+                "the result — nothing else. Explanation is opt-in: either the "
+                "user asks for it, or it does not exist.\n\n"
+                "Rules:\n"
+                "- No explanation by default. When a reason earns its place at "
+                "all, it is ONE sentence — never a paragraph, and never a "
+                "re-derivation of a decision you have already made (e.g. once "
+                "you are confident in an action, show what it does and its "
+                "effect, not why you chose it).\n"
+                "- Cut entirely: preamble, restating the question, what you "
+                "are about to do, what you just did, rationale, alternatives "
+                "you rejected, caveats, trade-offs, unprompted next steps, and "
+                "closing offers to help.\n"
+                "- A change, a command, or a value IS the answer. Show it and "
+                "stop; do not narrate it.\n"
+                "- One exception to stopping: when that command or change "
+                "destroys, overwrites or rewrites something, the undo path "
+                "rides along with it in the same reply — how to get it back, "
+                "or plainly that you cannot. One clause is enough. A "
+                "destructive one-liner handed over with no undo path is not a "
+                "terse answer, it is a trap.\n"
+                "- Plain words, short sentences. Brevity is not enough — a "
+                "short reply can still be dense and unreadable. Drop jargon "
+                "that dresses up a simple point, hedges, and repetition; a "
+                "technical term stays only when it IS the fact, not when it is "
+                "decoration.\n"
+                "- Answer the question that was asked and nothing adjacent. "
+                "Take a position instead of listing options.\n"
+                "- Code, commands, paths, identifiers, error strings and file "
+                "contents stay verbatim and complete — this mode cuts prose, "
+                "never payload.\n"
+                "- The moment the user asks why, asks you to explain, or asks "
+                "for a doc, review, walkthrough or deep dive, this mode is off "
+                "for that reply: give the full detail they asked for.\n\n"
+                "Explaining in full, unasked, is the rare exception — not a "
+                "lane you look for. The default, even for judgement calls, is "
+                'the terse answer plus a one-line offer (e.g. "say why for '
+                'the reasoning"). Assume the user will NOT read an unrequested '
+                "explanation; when you are unsure whether one is worth it, that "
+                "uncertainty means leave it out and offer it in one line.\n\n"
+                "High stakes change what you must NOT omit, never the length. "
+                "When something is destructive, irreversible, or touches "
+                "security, credentials, data exposure, permissions or spend, "
+                "lead with the call — what to do, or that you are not doing it "
+                "— plus ONE line naming the risk and whether it can be undone. "
+                "That single line is the whole warning; the mechanism, the "
+                "failure modes and the reasoning are opt-in like everything "
+                "else, so offer them in a clause and stop. The defect here is "
+                "silence about a one-way door, not brevity about it.\n\n"
+                "Two things stay complete regardless: an ordered multi-step "
+                "procedure the user must follow (a dropped step causes the "
+                "mistake), and any output format the surface REQUIRES, in its "
+                "required position and full form — for example [OPTIONS:] "
+                "lines, diff blocks for file changes, or full PR/MR URLs. That "
+                "list is illustrative, not exhaustive: whenever a format is "
+                "mandated elsewhere in your instructions, brevity never "
+                "overrides it.\n\n"
+                "Preserve the user's language."
             )
         else:
             verbosity_block = ""
@@ -3064,7 +3140,9 @@ class ContextBuilder:
                 "as the very last line — exactly once, nothing after it. "
                 "Users can select multiple options before submitting. Label each choice "
                 'in the user\'s voice as an instruction to you — "Merge it now", not '
-                '"I\'ll merge it".)'
+                '"I\'ll merge it". Make each choice self-contained — any single one can '
+                "be sent alone, so never write a choice that merely modifies a sibling "
+                '("Include the stop button too"); fold the base action into it.)'
             )
             # Situational nudges for tools that may otherwise never surface with
             # MCP Tool Search. Gated on having a dashboard tab open, because
@@ -3074,17 +3152,19 @@ class ContextBuilder:
             # wants none of the Crew's dashboard-tool nudges (it drives its own
             # UI through its MCP tools), so honor that here too, not just for
             # _CRITICAL_RULES.
-            # ask_question is a MID-turn blocking decision; [OPTIONS:] remains
-            # the cheaper END-turn choice mechanism on every interactive surface.
+            # ask_question posts a NON-BLOCKING card and the agent ends its turn:
+            # what blocks is the DECISION, not the tool call. [OPTIONS:] remains
+            # the cheaper choice mechanism on every interactive surface.
             if has_dashboard_surface(session_key or "") and _agent_includes_crew_context(agent):
                 parts.append(
-                    "\n\n(If you need the user's answer to a blocking question BEFORE "
-                    "you can continue the current turn, use the ask_question tool — it "
-                    "pauses and returns the answer as the tool result. Use it SPARINGLY: "
-                    "only when you genuinely cannot proceed without the answer. When you "
-                    "are ENDING your turn, use the final [OPTIONS:] line instead. Never "
-                    "interrupt the user for a non-blocking choice, and never ask what you "
-                    "can reasonably decide or discover yourself.)"
+                    "\n\n(If a decision is genuinely needed before the work can "
+                    "continue, use the ask_question tool to put it to the user as a card, "
+                    "then END YOUR TURN: the tool does not block, and the answer arrives "
+                    "as the user's next message rather than as the tool's result. Use it "
+                    "SPARINGLY: only when you cannot proceed without the answer. When you "
+                    "are ending your turn anyway, use the final [OPTIONS:] line instead. "
+                    "Never interrupt the user for a non-blocking choice, and never ask "
+                    "what you can reasonably decide or discover yourself.)"
                 )
                 # A follow-up card is distinct from both: it offers concrete NEXT
                 # tasks after work is done, optionally handing one to a worktree.

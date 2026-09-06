@@ -48,7 +48,14 @@ async def test_bridge_terminates_when_writer_thread_dies(monkeypatch) -> None:
 
     # Falls back to the real writer-thread path (stdout_writer=None).
     await asyncio.wait_for(
-        stub.run_bridge(reader, writer, stop_event, stdin=stdin, stdout_writer=None),
+        stub.run_bridge(
+            reader,
+            writer,
+            stop_event,
+            stdin=stdin,
+            stdout_writer=None,
+            session=stub.StubSession(),
+        ),
         timeout=10,
     )
 
@@ -78,6 +85,13 @@ async def test_bridge_terminates_when_writer_dies_and_upstream_silent(
     writer = MagicMock()
 
     await asyncio.wait_for(
-        stub.run_bridge(reader, writer, stop_event, stdin=stdin, stdout_writer=None),
+        stub.run_bridge(
+            reader,
+            writer,
+            stop_event,
+            stdin=stdin,
+            stdout_writer=None,
+            session=stub.StubSession(),
+        ),
         timeout=10,
     )

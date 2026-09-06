@@ -66,7 +66,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getAppMenuItems: (id) => ipcRenderer.invoke("app-menu:items", id),
   executeAppMenuItem: (id, index) => ipcRenderer.send("app-menu:execute", id, index),
   // App-menu navigation: main.js sends an in-app path ("/settings",
-  // "/settings?tab=about") when the user picks Settings…/About from the
+  // "/settings/about") when the user picks Settings…/About from the
   // native application menu; the SPA routes to it (see App.tsx).
   onNavigate: (cb) => {
     const handler = (_e, path) => cb(path);
@@ -103,6 +103,20 @@ contextBridge.exposeInMainWorld("electronAPI", {
       repeatKeyCalls: Number(w && w.repeatKeyCalls) || 0,
       maxLen: Number(w && w.maxLen) || 0,
       heapMB: Number(w && w.heapMB) || -1,
+    }),
+  // Large binary-allocation reports (see src/lib/allocWatch.ts). Coerced here
+  // because preload is the trust boundary: the main process writes these into a
+  // log line, so a renderer bug must not be able to put an object or an
+  // unbounded string there. The stack is capped hard — the main-side buffer caps
+  // again, but the cheapest place to bound it is before it crosses the wire.
+  // Fire-and-forget; the renderer never waits on a diagnostic.
+  reportBigAlloc: (e) =>
+    ipcRenderer.send("big-alloc", {
+      kind: String((e && e.kind) || "?").slice(0, 40),
+      bytes: Number(e && e.bytes) || 0,
+      outcome: e && e.outcome === "failed" ? "failed" : "requested",
+      stack: String((e && e.stack) || "").slice(0, 4000),
+      error: String((e && e.error) || "").slice(0, 200),
     }),
   // The system-wide summon hotkey as ACTUALLY bound by main.js (registration
   // can degrade to the default or to nothing when a key is taken), so the

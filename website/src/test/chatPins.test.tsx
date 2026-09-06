@@ -626,6 +626,119 @@ describe('useChatPins', () => {
     })
   })
 
+  // === Coordination survives remount / second consumer (issue #5168) ===
+
+  it('a create started by one hook instance is awaited by a DIFFERENT instance on the same QueryClient', async () => {
+    // The unpin-race coordination lives on the QueryClient, not in per-instance
+    // refs. Instance A starts a create and then unmounts (a remount, or a
+    // second consumer of the same slot); instance B, sharing the QueryClient,
+    // issues the unpin. B must still find A's in-flight promise, await it, and
+    // DELETE the real server id — not fall into the "no tracked promise" branch
+    // that silently drops the unpin (the pin would resurface on refetch).
+    // With per-instance ref maps this test fails: B's map is empty.
+    let resolveCreate!: (pin: ChatPin) => void
+    ;(pinsApi.create as ReturnType<typeof vi.fn>).mockReturnValue(
+      new Promise<ChatPin>(resolve => { resolveCreate = resolve }),
+    )
+    ;(pinsApi.list as ReturnType<typeof vi.fn>).mockResolvedValue({ pins: [] })
+    ;(pinsApi.remove as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const wrapper = createWrapper(qc)
+
+    // Instance A starts the create, then unmounts.
+    const hookA = renderHook(() => useChatPins('slot-remount'), { wrapper })
+    await waitFor(() => expect(hookA.result.current.loading).toBe(false))
+    let pinPromise!: Promise<void>
+    act(() => {
+      pinPromise = hookA.result.current.pinMessage({
+        mid: 'm-remount',
+        message_ts: 'ts-remount',
+        role: 'user',
+        preview: 'pin before remount',
+      })
+    })
+    let tempPin!: ChatPin
+    await waitFor(() => {
+      const found = hookA.result.current.pins.find(p => p.id.startsWith('temp-'))
+      expect(found).toBeDefined()
+      tempPin = found!
+    })
+    hookA.unmount()
+
+    // Instance B (fresh mount, same QueryClient, same slot) issues the unpin
+    // while A's create is still in flight.
+    const hookB = renderHook(() => useChatPins('slot-remount'), { wrapper })
+    await waitFor(() => expect(hookB.result.current.loading).toBe(false))
+    let unpinPromise!: Promise<void>
+    act(() => {
+      unpinPromise = hookB.result.current.unpinById(tempPin.id)
+    })
+
+    // Resolve A's create with a real server id and let both settle.
+    const serverPin: ChatPin = { ...mockPin, id: 'pin-remount-real', slot_key: 'slot-remount', mid: 'm-remount' }
+    await act(async () => {
+      resolveCreate(serverPin)
+      await Promise.allSettled([pinPromise, unpinPromise])
+    })
+
+    // B awaited A's create and deleted the REAL server id (never a temp id).
+    await waitFor(() => {
+      expect(pinsApi.remove).toHaveBeenCalledWith('pin-remount-real')
+    })
+    const tempDeletes = (pinsApi.remove as ReturnType<typeof vi.fn>)
+      .mock.calls.filter(([id]: [string]) => id.startsWith('temp-'))
+    expect(tempDeletes).toHaveLength(0)
+  })
+
+  it('pin intent and its deferred unpin coordinate across separate hook instances (generation survives)', async () => {
+    // Pin -> pending unpin -> pin-again, but the SECOND pin comes from a
+    // different hook instance on the same QueryClient (e.g. after a remount).
+    // The generation bump must be visible to the deferred unpin so the newer
+    // intent wins and the re-created pin is NOT deleted. With per-instance
+    // generation maps the second instance's bump is invisible and the pin is
+    // wrongly removed.
+    let resolveCreate1!: (pin: ChatPin) => void
+    const serverPin: ChatPin = { ...mockPin, id: 'pin-cross-idem', slot_key: 'slot-cross', mid: 'm-cross' }
+    ;(pinsApi.create as ReturnType<typeof vi.fn>)
+      .mockReturnValueOnce(new Promise<ChatPin>(r => { resolveCreate1 = r }))
+      .mockResolvedValueOnce(serverPin) // idempotent second create: same record
+    ;(pinsApi.list as ReturnType<typeof vi.fn>).mockResolvedValue({ pins: [] })
+    ;(pinsApi.remove as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true })
+
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const wrapper = createWrapper(qc)
+    const body = { mid: 'm-cross', message_ts: 'ts-c', role: 'user' as const, preview: 'p' }
+
+    // Instance A: pin (create 1 pending), then unpin awaiting create 1.
+    const hookA = renderHook(() => useChatPins('slot-cross'), { wrapper })
+    await waitFor(() => expect(hookA.result.current.loading).toBe(false))
+    let pin1!: Promise<void>
+    act(() => { pin1 = hookA.result.current.pinMessage(body) })
+    let tempPin!: ChatPin
+    await waitFor(() => {
+      const found = hookA.result.current.pins.find(p => p.id.startsWith('temp-'))
+      expect(found).toBeDefined()
+      tempPin = found!
+    })
+    let unpin1!: Promise<void>
+    act(() => { unpin1 = hookA.result.current.unpinById(tempPin.id) })
+
+    // Instance B (same QueryClient) pins the SAME message again — a newer
+    // intent that must supersede the deferred unpin.
+    const hookB = renderHook(() => useChatPins('slot-cross'), { wrapper })
+    await waitFor(() => expect(hookB.result.current.loading).toBe(false))
+    let pin2!: Promise<void>
+    act(() => { pin2 = hookB.result.current.pinMessage(body) })
+
+    // Resolve create 1 and let everything settle.
+    act(() => { resolveCreate1(serverPin) })
+    await act(async () => { await Promise.allSettled([pin1, pin2, unpin1]) })
+
+    // The newer pin intent won across instances: no DELETE was issued.
+    expect(pinsApi.remove as ReturnType<typeof vi.fn>).not.toHaveBeenCalled()
+  })
+
   it('removes ghost optimistic pin on error when ctx.prev is undefined', async () => {
     // Create a fresh QueryClient with NO pre-seeded data for the slot,
     // so when the mutation's onMutate runs cancelQueries + getQueryData,

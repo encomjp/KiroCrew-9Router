@@ -6,6 +6,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import CommentThreads, {
@@ -49,8 +50,12 @@ function source(comments: PullRequestComment[], over: Partial<PullRequestSource>
 
 function mount(src: PullRequestSource) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  // MemoryRouter because the owner-not-configured refusal renders a settings
+  // <Link>, which needs a Router ancestor even in tests that never hit it.
   return render(
-    <QueryClientProvider client={qc}><CommentThreads src={src} /></QueryClientProvider>,
+    <MemoryRouter>
+      <QueryClientProvider client={qc}><CommentThreads src={src} /></QueryClientProvider>
+    </MemoryRouter>,
   )
 }
 
@@ -233,6 +238,21 @@ describe('writing', () => {
     await userEvent.type(screen.getByRole('textbox', { name: /Reply/ }), 'Agreed')
     await userEvent.click(screen.getByRole('button', { name: /^Reply$/ }))
     expect(await screen.findByText(/gh api said no/)).toBeTruthy()
+  })
+
+  it('explains what to configure when resolve is refused for a missing owner', async () => {
+    // A standalone local install: reads pass, so the Resolve button renders live,
+    // and the backend refuses the mutation with the coded 403. The refusal must
+    // name the remedy and link the settings pane, not dead-end on "forbidden".
+    mockApi.resolvePullRequestThread.mockRejectedValue(Object.assign(
+      new Error('forbidden'),
+      { body: JSON.stringify({ error: 'forbidden', code: 'owner_not_configured' }) },
+    ))
+    mount(source([comment({ threadId: 'T1' })]))
+    await userEvent.click(screen.getByRole('button', { name: /Resolve/ }))
+    expect(await screen.findByText(/Set .Owner Slack member ID. in Settings/)).toBeTruthy()
+    const link = screen.getByRole('link', { name: /Slack settings/i })
+    expect(link.getAttribute('href')).toBe('/settings/channels/slack')
   })
 
   it('keeps the draft when the post fails, so nothing typed is lost', async () => {

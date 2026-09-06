@@ -806,6 +806,8 @@ class TelegramDispatcher:
                 directive_consumer=build_directive_consumer(
                     session_key=session_key, sessions=self.sessions, dispatcher=self
                 ),
+                audit_session_key=session_key,
+                audit_agent=agent or "kirocrew",
             )
             accumulated = await driver.run(full_message)
 

@@ -183,6 +183,77 @@ class TestSlotsBroadcastCarriesFolders:
         frame = json.loads(ws.send_str.call_args[0][0])
         assert frame["folders"] == []
 
+    def test_frame_carries_the_folder_generation(self, state: DashboardState) -> None:
+        # The tree alone is not a change signal — this frame fires on routine
+        # session activity — so the client needs the generation to tell "the
+        # store changed" from "a session blinked".
+        state.serialize_slots = MagicMock(return_value=[])  # type: ignore[method-assign]
+        state._folders_generation = 3
+        ws = self._DashboardWS()
+        state.register_ws(ws)  # type: ignore[arg-type]
+
+        state._do_slots_broadcast()
+
+        frame = json.loads(ws.send_str.call_args[0][0])
+        assert frame["foldersGeneration"] == 3
+
+    def test_slot_activity_alone_does_not_advance_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        # THE guardrail. The client refetches whenever this number moves, so a
+        # generation that crept up on ordinary slot churn would refetch the
+        # session-scanning GET /api/chat/folders on every session event and land
+        # that refetch over any in-flight optimistic folder edit.
+        state.serialize_slots = MagicMock(return_value=[{"key": "chat-1"}])  # type: ignore[method-assign]
+        state._folders = [{"id": "f1", "name": "Work", "order": 0}]
+        ws = self._DashboardWS()
+        state.register_ws(ws)  # type: ignore[arg-type]
+
+        state._do_slots_broadcast()
+        state.serialize_slots = MagicMock(  # type: ignore[method-assign]
+            return_value=[{"key": "chat-1", "title": "renamed"}, {"key": "chat-2"}]
+        )
+        state._do_slots_broadcast()
+
+        generations = [
+            json.loads(call[0][0])["foldersGeneration"] for call in ws.send_str.call_args_list
+        ]
+        assert len(generations) == 2
+        assert generations[0] == generations[1]
+
+    @pytest.mark.asyncio
+    async def test_folder_mutation_advances_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        # Bumped in the mutate_folders funnel rather than at each call site, so a
+        # new folder-writing endpoint cannot forget to do it.
+        before = state.folders_generation()
+
+        await state.mutate_folders(
+            lambda folders: (True, folders.append({"id": "f9", "name": "New", "order": 0}))
+        )
+
+        state.serialize_slots = MagicMock(return_value=[])  # type: ignore[method-assign]
+        ws = self._DashboardWS()
+        state.register_ws(ws)  # type: ignore[arg-type]
+        state._do_slots_broadcast()
+
+        frame = json.loads(ws.send_str.call_args[0][0])
+        assert frame["foldersGeneration"] == before + 1
+        assert frame["folders"] == [{"id": "f9", "name": "New", "order": 0}]
+
+    @pytest.mark.asyncio
+    async def test_a_no_op_folder_transaction_does_not_advance_the_generation(
+        self, state: DashboardState
+    ) -> None:
+        # `changed=False` returns before the write; nothing changed, so no client
+        # should be told to refetch.
+        before = state.folders_generation()
+
+        await state.mutate_folders(lambda folders: (False, None))
+
+        assert state.folders_generation() == before
+
 
 class TestOwnerScopedBroadcast:
     """Owner-only typed broadcast + its delivery count (PR #461)."""
@@ -260,6 +331,293 @@ class TestSlotModel:
     def test_model_defaults_empty(self, state: DashboardState) -> None:
         slot = state.get_or_create_slot("test-2")
         assert slot.model == ""
+
+
+class TestSlotEffectiveAgent:
+    """`to_dict()["effective_agent"]` — the non-destructive divergence report.
+
+    The contract is asymmetric on purpose. ``agent`` is the user's INTENT and is
+    stored verbatim; ``effective_agent`` is a claim that something else answers,
+    and is emitted ONLY when that is known to be true. Every "we cannot tell yet"
+    case therefore has to come back empty: a false "your agent was substituted"
+    marker sends the user chasing a substitution that never happened, which is
+    strictly worse than a boot window with no marker at all.
+
+    The other pinned property is that resolution touches NO filesystem. It runs
+    inside every slots frame on the event loop, so a scan here would be a
+    recurring gateway stall — the tests below make the scanning entry points
+    explode and still expect an answer.
+    """
+
+    @staticmethod
+    def _pin(monkeypatch, *, aliases, default_alias, materialized, ready=True):
+        """Pin both in-memory snapshots, isolating from the host's real config.
+
+        Without this the resolver reads whatever ``~/.kiro/agents`` and the last
+        ``load()`` left behind, so a developer host with a real agent called
+        "researcher" would answer differently from CI.
+        """
+        import kiro_crew.config.loader as loader
+
+        monkeypatch.setattr(
+            loader,
+            "_CONFIG_AGENT_ALIAS_SNAPSHOT",
+            (frozenset(aliases), default_alias, ready),
+        )
+        monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS", frozenset(materialized))
+        monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS_READY", ready)
+
+    def test_honored_alias_reports_nothing(self, monkeypatch) -> None:
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew", "researcher"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        slot = _ChatSlot("s1", agent="researcher")
+        d = slot.to_dict()
+        assert d["effective_agent"] == ""
+        # The request is never rewritten by the report.
+        assert d["agent"] == "researcher"
+
+    def test_materialized_kiro_agent_reports_nothing(self, monkeypatch) -> None:
+        """An app agent lives in ~/.kiro/agents, never in config.agents."""
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized={"mochi"},
+        )
+        slot = _ChatSlot("s1", agent="mochi")
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_unresolvable_agent_names_the_fallback(self, monkeypatch) -> None:
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized={"mochi"},
+        )
+        slot = _ChatSlot("s1", agent="deleted-app")
+        d = slot.to_dict()
+        assert d["effective_agent"] == "kirocrew"
+        # Still verbatim: the marker describes, it does not normalize.
+        assert d["agent"] == "deleted-app"
+
+    def test_blank_agent_reports_nothing(self, monkeypatch) -> None:
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        assert _ChatSlot("s1").to_dict()["effective_agent"] == ""
+
+    def test_cold_materialized_snapshot_reports_nothing(self, monkeypatch) -> None:
+        """The boot window. A cold snapshot cannot see app agents that DO exist."""
+        import kiro_crew.config.loader as loader
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        monkeypatch.setattr(loader, "_MATERIALIZED_AGENTS_READY", False)
+        slot = _ChatSlot("s1", agent="mochi")
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_cold_alias_snapshot_reports_nothing(self, monkeypatch) -> None:
+        """No load() has published yet, so there is no fallback name to name."""
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases=set(),
+            default_alias="",
+            materialized=set(),
+            ready=False,
+        )
+        slot = _ChatSlot("s1", agent="mochi")
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_agent_equal_to_the_fallback_reports_nothing(self, monkeypatch) -> None:
+        """Nothing diverged: the name requested IS the one answering."""
+        import kiro_crew.config.loader as loader
+
+        self._pin(
+            monkeypatch,
+            aliases=set(),
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        assert loader.resolve_effective_agent("kirocrew") == ""
+
+    def test_project_declared_agent_reports_nothing(self, monkeypatch) -> None:
+        """A project's own .kiro scope resolves the name; that is not divergence."""
+        import kiro_crew.agent_discovery as discovery
+        import kiro_crew.config.loader as loader
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        monkeypatch.setattr(
+            discovery,
+            "cached_project_agent_names",
+            lambda _d: frozenset({"repo-agent"}),
+        )
+        slot = _ChatSlot("s1", agent="repo-agent")
+        slot.project = "/some/checkout"
+        assert slot.to_dict()["effective_agent"] == ""
+        # Same pinning, a name the warm cache does NOT declare: now it diverges.
+        other = _ChatSlot("s2", agent="gone")
+        other.project = "/some/checkout"
+        assert other.to_dict()["effective_agent"] == "kirocrew"
+        assert loader is not None
+
+    def test_cold_project_cache_reports_nothing(self, monkeypatch) -> None:
+        """An uncached project is not evidence of absence."""
+        import kiro_crew.agent_discovery as discovery
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        monkeypatch.setattr(discovery, "cached_project_agent_names", lambda _d: None)
+        slot = _ChatSlot("s1", agent="repo-agent")
+        slot.project = "/some/checkout"
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_resolution_never_touches_the_filesystem(self, monkeypatch) -> None:
+        """The loop-safety property, as a gate rather than a comment.
+
+        Both scanning entry points are made to explode. `to_dict` runs on the
+        event loop for every slots frame, so reaching either one would be a
+        per-frame stall — the kind the loop-stall watchdog blames on chat.
+        """
+        import kiro_crew.agent_discovery as discovery
+        import kiro_crew.config.loader as loader
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+
+        def _boom(*_a, **_k):  # pragma: no cover - must never run
+            raise AssertionError("effective-agent resolution scanned the filesystem")
+
+        monkeypatch.setattr(loader, "refresh_materialized_agents", _boom)
+        monkeypatch.setattr(loader, "_scan_materialized_agents", _boom)
+        monkeypatch.setattr(discovery, "project_agent_names", _boom)
+        monkeypatch.setattr(discovery, "cached_project_agent_names", lambda _d: frozenset())
+
+        slot = _ChatSlot("s1", agent="deleted-app")
+        slot.project = "/some/checkout"
+        assert slot.to_dict()["effective_agent"] == "kirocrew"
+
+    def test_project_lookup_failure_reports_nothing(self, monkeypatch) -> None:
+        """A broken cache read is "no evidence", never an exception into a frame."""
+        import kiro_crew.agent_discovery as discovery
+        from kiro_crew.dashboard.state import _ChatSlot
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+
+        def _raise(_d):
+            raise RuntimeError("cache exploded")
+
+        monkeypatch.setattr(discovery, "cached_project_agent_names", _raise)
+        slot = _ChatSlot("s1", agent="deleted-app")
+        slot.project = "/some/checkout"
+        assert slot.to_dict()["effective_agent"] == ""
+
+    def test_load_publishes_the_alias_snapshot(self, monkeypatch) -> None:
+        """`load()` is the publisher, so the resolver never reads config.json."""
+        import kiro_crew.config.loader as loader
+
+        monkeypatch.setattr(
+            loader, "_CONFIG_AGENT_ALIAS_SNAPSHOT", (frozenset(), "", False)
+        )
+
+        cfg = loader.KiroCrewConfig.load()
+        aliases, default_alias, ready = loader.agent_alias_snapshot()
+        assert ready is True
+        assert aliases == frozenset(cfg.agents)
+        assert default_alias in cfg.agents
+
+    def test_publish_overwrites_a_richer_previous_snapshot(self, monkeypatch) -> None:
+        """The degraded-defaults path must SHRINK the snapshot, not union into it.
+
+        Leaving a stale alias published would have the resolver honor a name that
+        no longer loads, which is the false-negative twin of a false marker.
+        """
+        import dataclasses
+
+        import kiro_crew.config.loader as loader
+
+        self._pin(
+            monkeypatch,
+            aliases={"kirocrew", "researcher"},
+            default_alias="kirocrew",
+            materialized=set(),
+        )
+        cfg = loader.KiroCrewConfig()
+        cfg = dataclasses.replace(
+            cfg,
+            agents={"default": loader.KiroCrewAgentConfig(kiro_agent="kirocrew")},
+            default_agent="default",
+        )
+        loader.publish_agent_alias_snapshot(cfg)
+        aliases, default_alias, _ = loader.agent_alias_snapshot()
+        assert aliases == frozenset({"default"})
+        assert default_alias == "default"
+        assert loader.resolve_effective_agent("researcher") == "default"
+
+    def test_snapshot_is_published_as_one_immutable_triple(self, monkeypatch) -> None:
+        """Why the read path needs no lock, as a gate rather than a comment.
+
+        A reader loads ONE name, so it sees either the whole old triple or the
+        whole new one. Split across three globals it could pair a fresh alias set
+        with a stale fallback name, and the fix for that would be a mutex acquired
+        once per slot per frame on the event loop.
+        """
+        import kiro_crew.config.loader as loader
+
+        monkeypatch.setattr(
+            loader, "_CONFIG_AGENT_ALIAS_SNAPSHOT", (frozenset(), "", False)
+        )
+        before = loader.agent_alias_snapshot()
+        loader.publish_agent_alias_snapshot(loader.KiroCrewConfig.load())
+        after = loader.agent_alias_snapshot()
+
+        assert isinstance(after, tuple) and len(after) == 3
+        assert isinstance(after[0], frozenset)
+        # Swapped wholesale, so the value a reader already holds is unchanged.
+        assert before == (frozenset(), "", False)
+        assert after is not before
 
 
 class TestChatSlotStopState:
@@ -539,10 +897,56 @@ class TestOwnerSourceStatusTransport:
         assert len(generic_messages) == 1
         assert "ci" not in str(generic_messages[0]["data"])
         assert "state" not in generic_messages[0]["data"][0]["source_links"][0]
-        assert len(owner_messages) == 2
-        assert "ci" not in str(owner_messages[0]["data"])
-        assert owner_messages[1]["data"][0]["source_links"][0]["ci"] == "passed"
-        assert owner_messages[1]["data"][0]["source_links"][0]["state"] == "OPEN"
+        # EXACTLY ONE frame for the owner, and it is the enriched one. Two frames
+        # delivered the same list twice, the first without `ci`/`state`, and the
+        # client replaces its slot list per frame — so every decorated PR chip lost
+        # its status glyph on frame one and regained it on frame two, re-wrapping
+        # the sidebar chip strip on every push.
+        assert len(owner_messages) == 1
+        assert owner_messages[0]["data"][0]["source_links"][0]["ci"] == "passed"
+        assert owner_messages[0]["data"][0]["source_links"][0]["state"] == "OPEN"
+        # The owner frame is now the owner's only one, so it must carry every key
+        # the generic frame does. Asserted as SET EQUALITY over the whole envelope,
+        # not as a list of the keys known today: `_send_ws_all` skips owner sockets
+        # for `slots`, so the generic frame no longer backstops an owner, and a key
+        # added to one site and not the other would silently deprive every owner
+        # window. Both frames come from `_slots_ws_frame`, which makes that
+        # impossible by construction; this pins the property so a future site that
+        # hand-builds the envelope again fails here instead of in production.
+        assert set(owner_messages[0]) == set(generic_messages[0])
+        assert owner_messages[0]["folders"] == generic_messages[0]["folders"]
+        assert (
+            owner_messages[0]["gitlabHostsGeneration"]
+            == generic_messages[0]["gitlabHostsGeneration"]
+        )
+
+    def test_owner_sockets_still_receive_non_slot_broadcasts(
+        self, state: DashboardState, monkeypatch
+    ) -> None:
+        """The `slots` exclusion must not silence an owner socket generally.
+
+        The generic fan-out skips owner sockets for `slots` alone, because that is
+        the one message type they receive twice. Every other type has no
+        owner-specific frame to fall back on, so a skip that keyed on the socket
+        rather than on the message type would drop it entirely — an owner window
+        that stops seeing refreshes, with nothing raised anywhere. This is the
+        control for that: it fails if the exclusion is ever widened.
+        """
+        sent: list[tuple[object, dict]] = []
+        monkeypatch.setattr(
+            state,
+            "_spawn_ws_send",
+            lambda client, message: sent.append((client, json.loads(message))),
+        )
+        owner_ws = MagicMock(closed=False)
+        state.register_ws(owner_ws, owner=True)
+
+        state._broadcast({"_type": "refresh", "kinds": "crons,agents"})
+
+        owner_messages = [message for client, message in sent if client is owner_ws]
+        assert len(owner_messages) == 1
+        assert owner_messages[0]["type"] == "refresh"
+        assert owner_messages[0]["data"]["kinds"] == ["crons", "agents"]
 
     @pytest.mark.parametrize(
         ("claims", "owner_request"),

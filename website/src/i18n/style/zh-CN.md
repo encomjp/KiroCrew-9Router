@@ -74,7 +74,7 @@ a reviewer should check consistency but context may require variation.
 |---|---|---|
 | session | 会话 | 进程, 对话 |
 | workspace | 工作区 | 工作空间, 工作台 |
-| artifact | 工件 | 制品, 产物 |
+| artifact | 产物 | 工件, 制品 |
 | agent / subagent | 代理 / 子代理 | 智能体, 子智能体 |
 | skill | 技能 | 技巧 |
 | cron job / scheduled job | 定时任务 | 计划任务 |

@@ -24,6 +24,7 @@ import {
   parseBrandingConfig,
   applyBrandingToHtml,
   SHELL_OVERLAY_ALLOWLIST,
+  verifyOverlayBytes,
 } from './scripts/lib/editionShell.mjs'
 
 /** Shape produced by parseBrandingConfig (editionShell.mjs is untyped .mjs). */
@@ -133,6 +134,15 @@ function vendorRuntimePlugin(): Plugin {
         const hit = RUNTIMES.find((r) => r.servePath === url)
         if (!hit) return next()
         res.setHeader('Content-Type', 'text/javascript; charset=utf-8')
+        // The consumers of these two files are sandboxed srcdoc iframes — null
+        // origin — whose <script> tags load with crossorigin="anonymous", which
+        // makes this header MANDATORY (without it the load hard-fails at the
+        // CORS layer and dev-mode widgets/sketches render unstyled). Vite's own
+        // cors default cannot supply it: since Vite 6.2 the default is a
+        // localhost-origin allowlist that `Origin: null` does not match. Scoped
+        // to exactly these two public runtime files, mirroring the gateway's
+        // /vendor/-only grant in production.
+        res.setHeader('Access-Control-Allow-Origin', '*')
         res.end(readFileSync(hit.src))
       })
     },
@@ -337,6 +347,26 @@ function editionExtensionPlugin(): Plugin {
           source: readFileSync(path.join(path.dirname(editionEntry as string), 'public', file)),
         })
       }
+    },
+    // Enforce the emitFile-over-publicDir precedence generateBundle relies on.
+    // The overlay above assumes an emitted asset with a pinned fileName wins
+    // over the same-named publicDir copy; that is empirical (Vite 8 / Rolldown),
+    // not a documented bundler contract. writeBundle runs AFTER the bundle is
+    // written to disk, so it sees what actually landed: byte-compare each
+    // overlaid dist file against its edition source and fail loud on a mismatch
+    // or a missing file. A future bundler upgrade that flips the precedence
+    // would silently ship stock icons/manifest on a green build — and edition
+    // builds run downstream, outside this repo's CI, so this check is the only
+    // thing that would catch it. No-op for stock builds (overlayFiles is empty).
+    writeBundle(options) {
+      if (overlayFiles.length === 0) return
+      verifyOverlayBytes({
+        distDir: options.dir ?? path.resolve('dist'),
+        editionPublicDir: path.join(path.dirname(editionEntry as string), 'public'),
+        overlayFiles,
+        readFile: readFileSync,
+        join: path.join,
+      })
     },
     config() {
       if (editionDir) {
@@ -587,7 +617,14 @@ export default defineConfig({
     // 3 is both the fastest and cheaper in memory than 4; peak single-fork RSS
     // was ~1.0-1.4 GB against the 3072 MB per-fork heap ceiling below.
     maxWorkers: 3,
-    execArgv: ['--max-old-space-size=3072'],
+    // Node 25 enables its process-global experimental Web Storage in forks but
+    // gives those workers no persistence path, emitting one
+    // "--localstorage-file ... without a valid path" warning per test file.
+    // happy-dom supplies the window-scoped Storage this suite actually tests,
+    // and setup.ts replaces it with a deterministic in-memory implementation,
+    // so disable the unrelated Node global instead of sharing a disk file
+    // across concurrent workers.
+    execArgv: ['--max-old-space-size=3072', '--no-experimental-webstorage'],
     // Default 5s is too tight for tests that ``await import(...)`` inside the
     // body: under a full concurrent forks run the collect phase can starve the
     // dynamic import past 5s and it times out. 15s gives headroom for

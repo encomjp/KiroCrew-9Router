@@ -8,13 +8,16 @@ Tests the api_slack_upload_file handler's channel routing:
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from kiro_crew.dashboard.handlers.files import api_slack_upload_file
+from kiro_crew.dashboard.handlers.files import api_channel_upload_file, api_slack_upload_file
 from kiro_crew.dashboard.state import DashboardState
 
 
@@ -35,6 +38,20 @@ def outbox_file(tmp_path):
     outbox = tmp_path / "outbox"
     outbox.mkdir()
     f = outbox / "report.txt"
+    f.write_text("hello world", encoding="utf-8")
+    return f
+
+
+@pytest.fixture
+def outbox_pdf(tmp_path):
+    """A non-raster document in the outbox — the extension the extraction
+    sanitizer would rewrite to `.bin`, which is what the document verb exists
+    to preserve. The delivered name comes from ``OutboundFile.path`` (the
+    resolved file on disk), not from the request's ``filename`` field.
+    """
+    outbox = tmp_path / "outbox"
+    outbox.mkdir(exist_ok=True)
+    f = outbox / "report.pdf"
     f.write_text("hello world", encoding="utf-8")
     return f
 
@@ -551,3 +568,438 @@ class TestFileUploadSlotThreading:
                 body = await resp.json()
                 assert "not authorized" in body.get("error", "")
                 slack.upload_file.assert_not_called()
+
+
+class TestChannelUploadEndpoint:
+    """POST /api/channel/upload-file — the non-Slack parity leg of file_send.
+
+    Destination comes exclusively from the caller's session map entry via the
+    shared send ladder; these tests fake the ladder's answer and verify the
+    handler's own obligations: skip-vs-error semantics, the shared admission
+    gate, and the per-channel delivery calls.
+    """
+
+    def _app(self, state=None):
+        if state is None:
+            state = MagicMock(spec=DashboardState)
+            state.sessions = MagicMock()
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post("/api/channel/upload-file", api_channel_upload_file)
+        return app
+
+    @staticmethod
+    def _link(channel_type, channel_id="42", thread_id=None):
+        from kiro_crew.messaging.link import ChannelLink
+
+        return ChannelLink(channel_type=channel_type, channel_id=channel_id, thread_id=thread_id)
+
+    @pytest.mark.asyncio
+    async def test_a_restricted_session_gets_no_native_delivery(self, tmp_path, outbox_file):
+        # The renderers' extraction path enforces the restricted ceiling
+        # (incognito/temporary sessions ship no local file bytes); an explicit
+        # file_send must not be the bypass. Same shared predicate, same skip
+        # shape as every other "cannot deliver here" answer.
+        from unittest.mock import AsyncMock
+
+        transport = MagicMock(spec_set=["send_document"])
+        transport.send_document = AsyncMock(return_value="123")
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("telegram", "42"), transport),
+        ), patch(
+            "kiro_crew.messaging.upload_gate.uploads_restricted",
+            new=AsyncMock(return_value=True),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={"file_path": str(outbox_file), "filename": "report.txt"},
+                    headers={"X-Session-Key": "telegram:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 200
+        assert body["delivered"] is False
+        assert body["skipped"] == "restricted_session"
+        transport.send_document.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_credential_bearing_filename_is_rejected_for_both_legs(self, tmp_path):
+        # The Slack leg rejects a sensitive filename at its send site; the
+        # channel leg must not be the bypass. Enforced in the SHARED gate so
+        # neither leg can drift: checked before path resolution, so the name
+        # never even selects a file.
+        from unittest.mock import AsyncMock
+
+        transport = MagicMock(spec_set=["send_document"])
+        transport.send_document = AsyncMock(return_value="123")
+        app = self._app()
+        leaky_name = "AKIA" + "IOSFODNN7EXAMPLE" + ".txt"
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("telegram", "42"), transport),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={"file_path": str(tmp_path / leaky_name), "filename": leaky_name},
+                    headers={"X-Session-Key": "telegram:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 400
+        assert "filename contains sensitive content" in body.get("error", "")
+        transport.send_document.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_outbound_text_is_redacted_in_display_form(self, tmp_path, outbox_file):
+        # redact() scans literal bytes; a channel renderer strips markdown
+        # delimiters at display, so AKIA**…** passes a literal scan and
+        # displays as an intact key. The caption must go through
+        # redact_for_display before delivery — same boundary rule as every
+        # renderer sink.
+        from unittest.mock import AsyncMock
+
+        key = "AKIA" + "IOSFODNN7EXAMPLE"
+        transport = MagicMock(spec_set=["send_document"])
+        transport.send_document = AsyncMock(return_value="900")
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("telegram", "42"), transport),
+        ), patch(
+            "kiro_crew.config.loader.outbox_dir", return_value=outbox_file.parent
+        ), patch(
+            "kiro_crew.config.loader.workspace_root", return_value=tmp_path
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={
+                        "file_path": str(outbox_file),
+                        "filename": "report.txt",
+                        "description": f"{key[:4]}**{key[4:]}**",
+                    },
+                    headers={"X-Session-Key": "telegram:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 200 and body["delivered"] is True
+        _, kwargs = transport.send_document.call_args
+        caption = kwargs["caption"]
+        # What the channel DISPLAYS (delimiters stripped) must not reassemble
+        # the key.
+        assert key not in caption.replace("*", "").replace("`", "").replace("_", "")
+
+    @pytest.mark.asyncio
+    async def test_destination_resolution_runs_off_the_event_loop(self, tmp_path, outbox_file):
+        # The ladder reloads governance profiles and reads the persisted
+        # session map — synchronous filesystem work. Like the admission gate,
+        # it must not run inline in the async handler
+        # (no-blocking-call-on-event-loop).
+        from unittest.mock import AsyncMock
+
+        loop_thread = threading.get_ident()
+        seen: dict = {}
+        transport = MagicMock(spec_set=["send_document"])
+        transport.send_document = AsyncMock(return_value="123")
+
+        def _fake_resolver(state, session_key):
+            seen["thread"] = threading.get_ident()
+            return None  # skip path; the thread identity is the assertion
+
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            side_effect=_fake_resolver,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={"file_path": str(outbox_file), "filename": "report.txt"},
+                    headers={"X-Session-Key": "telegram:1"},
+                )
+                assert (await resp.json())["skipped"] == "no_channel_destination"
+        assert seen.get("thread") is not None, "resolver must have run"
+        assert seen["thread"] != loop_thread, "resolver ran ON the event loop thread"
+        assert asyncio.get_event_loop() is not None  # loop alive throughout
+
+    @pytest.mark.asyncio
+    async def test_no_session_key_is_a_skip_not_an_error(self, tmp_path):
+        """Destination is resolved before the file is even read."""
+        app = self._app()
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/channel/upload-file",
+                json={"file_path": str(tmp_path / "missing.txt"), "filename": "missing.txt"},
+            )
+            body = await resp.json()
+        assert resp.status == 200
+        assert body == {"ok": True, "delivered": False, "skipped": "no_session"}
+
+    @pytest.mark.asyncio
+    async def test_no_destination_is_a_skip(self, tmp_path, outbox_file):
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=None,
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={"file_path": str(outbox_file), "filename": "report.txt"},
+                    headers={"X-Session-Key": "dashboard:chat-1"},
+                )
+                body = await resp.json()
+        assert resp.status == 200
+        assert body["delivered"] is False
+        assert body["skipped"] == "no_channel_destination"
+
+    @pytest.mark.asyncio
+    async def test_telegram_destination_gets_send_document(self, tmp_path, outbox_file):
+        from unittest.mock import AsyncMock
+
+        transport = MagicMock(spec_set=["send_document"])
+        transport.send_document = AsyncMock(return_value="123")
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("telegram", "42", thread_id="7"), transport),
+        ), patch(
+            "kiro_crew.config.loader.outbox_dir", return_value=outbox_file.parent
+        ), patch(
+            "kiro_crew.config.loader.workspace_root", return_value=tmp_path
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={
+                        "file_path": str(outbox_file),
+                        "filename": "report.txt",
+                        "description": "weekly numbers",
+                    },
+                    headers={"X-Session-Key": "telegram:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 200
+        assert body == {"ok": True, "delivered": True, "channel_type": "telegram"}
+        transport.send_document.assert_awaited_once()
+        args, kwargs = transport.send_document.call_args
+        assert args[0] == "42"
+        outbound = args[1]
+        # The OutboundFile contract: the gated bytes ARE the payload.
+        assert outbound.data == b"hello world"
+        assert outbound.path == str(outbox_file)
+        assert kwargs["caption"] == "weekly numbers"
+        assert kwargs["thread_id"] == "7"
+
+    @pytest.mark.asyncio
+    async def test_discord_destination_gets_send_document(self, tmp_path, outbox_pdf):
+        # Issue #6058: Discord was an explicit skip while its only upload verb
+        # was the extraction one, whose sanitizer maps any non-raster mime to
+        # `.bin` (report.pdf would arrive as report.bin). It now has the same
+        # purpose-built name-preserving verb Telegram uses, so it delivers.
+        from unittest.mock import AsyncMock
+
+        transport = MagicMock(spec_set=["send_document", "send_message_with_files"])
+        transport.send_document = AsyncMock(return_value="900")
+        transport.send_message_with_files = AsyncMock(return_value="901")
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("discord", "555"), transport),
+        ), patch(
+            "kiro_crew.config.loader.outbox_dir", return_value=outbox_pdf.parent
+        ), patch(
+            "kiro_crew.config.loader.workspace_root", return_value=tmp_path
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={
+                        "file_path": str(outbox_pdf),
+                        "filename": "report.pdf",
+                        "description": "weekly numbers",
+                    },
+                    headers={"X-Session-Key": "discord:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 200
+        assert body == {"ok": True, "delivered": True, "channel_type": "discord"}
+        transport.send_document.assert_awaited_once()
+        # The extraction verb stays out of this path: it is the one whose
+        # sanitizer would rename the attachment.
+        transport.send_message_with_files.assert_not_called()
+        args, kwargs = transport.send_document.call_args
+        assert args[0] == "555"
+        outbound = args[1]
+        # The OutboundFile contract: the gated bytes ARE the payload.
+        assert outbound.data == b"hello world"
+        assert outbound.path == str(outbox_pdf)
+        # `.pdf` survives end-to-end — the whole point of the separate verb.
+        # `upload_filename` would have made this `report.bin`.
+        from kiro_crew.messaging.outbound_files import upload_filename
+
+        assert Path(outbound.path).name == "report.pdf"
+        assert upload_filename(outbound, 0) == "report.bin"
+        assert outbound.mime == "application/pdf"
+        assert kwargs["caption"] == "weekly numbers"
+
+    @pytest.mark.asyncio
+    async def test_discord_outbound_text_is_redacted_in_display_form(self, tmp_path, outbox_file):
+        # Same boundary rule as the Telegram leg: redact() scans literal bytes,
+        # and Discord renders markdown, so AKIA**…** displays as an intact key.
+        from unittest.mock import AsyncMock
+
+        key = "AKIA" + "IOSFODNN7EXAMPLE"
+        transport = MagicMock(spec_set=["send_document"])
+        transport.send_document = AsyncMock(return_value="900")
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("discord", "555"), transport),
+        ), patch(
+            "kiro_crew.config.loader.outbox_dir", return_value=outbox_file.parent
+        ), patch(
+            "kiro_crew.config.loader.workspace_root", return_value=tmp_path
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={
+                        "file_path": str(outbox_file),
+                        "filename": "report.pdf",
+                        "description": f"{key[:4]}**{key[4:]}**",
+                    },
+                    headers={"X-Session-Key": "discord:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 200 and body["delivered"] is True
+        caption = transport.send_document.call_args[1]["caption"]
+        assert key not in caption.replace("*", "").replace("`", "").replace("_", "")
+
+    @pytest.mark.asyncio
+    async def test_a_discord_transport_without_the_verb_is_still_a_skip(self, tmp_path, outbox_file):
+        # The channel list is not the authority — the verb is. A transport that
+        # predates it keeps the dashboard-link fallback rather than being routed
+        # into the extraction upload whose sanitizer renames the attachment.
+        from unittest.mock import AsyncMock
+
+        transport = MagicMock(spec_set=["send_message_with_files"])
+        transport.send_message_with_files = AsyncMock(return_value="900")
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("discord", "555"), transport),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={"file_path": str(outbox_file), "filename": "report.txt"},
+                    headers={"X-Session-Key": "discord:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 200
+        assert body["delivered"] is False
+        assert body["skipped"] == "channel_upload_unsupported:discord"
+        transport.send_message_with_files.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_channel_without_an_upload_verb_is_a_skip(self, tmp_path, outbox_file):
+        transport = MagicMock(spec_set=["send_message"])  # no upload verb
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("teams", "t1"), transport),
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={"file_path": str(outbox_file), "filename": "report.txt"},
+                    headers={"X-Session-Key": "teams:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 200
+        assert body["delivered"] is False
+        assert body["skipped"] == "channel_upload_unsupported:teams"
+
+    @pytest.mark.asyncio
+    async def test_path_outside_allowed_roots_is_denied(self, tmp_path):
+        from unittest.mock import AsyncMock
+
+        stray = tmp_path / "stray.txt"
+        stray.write_text("x", encoding="utf-8")
+        outbox = tmp_path / "outbox"
+        outbox.mkdir()
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        transport = MagicMock(spec_set=["send_document"])
+        transport.send_document = AsyncMock()
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("telegram"), transport),
+        ), patch(
+            "kiro_crew.config.loader.outbox_dir", return_value=outbox
+        ), patch(
+            "kiro_crew.config.loader.workspace_root", return_value=workspace
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={"file_path": str(stray), "filename": "stray.txt"},
+                    headers={"X-Session-Key": "telegram:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 403
+        assert body.get("code") == "path_not_allowed"
+        transport.send_document.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_transport_failure_is_a_502_with_a_sanitized_error(self, tmp_path, outbox_file):
+        from unittest.mock import AsyncMock
+
+        transport = MagicMock(spec_set=["send_document"])
+        transport.send_document = AsyncMock(side_effect=RuntimeError("boom"))
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("telegram"), transport),
+        ), patch(
+            "kiro_crew.config.loader.outbox_dir", return_value=outbox_file.parent
+        ), patch(
+            "kiro_crew.config.loader.workspace_root", return_value=tmp_path
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={"file_path": str(outbox_file), "filename": "report.txt"},
+                    headers={"X-Session-Key": "telegram:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 502
+        assert "boom" in body["error"]
+
+    @pytest.mark.asyncio
+    async def test_an_empty_message_id_is_a_502(self, tmp_path, outbox_file):
+        from unittest.mock import AsyncMock
+
+        transport = MagicMock(spec_set=["send_document"])
+        transport.send_document = AsyncMock(return_value="")
+        app = self._app()
+        with patch(
+            "kiro_crew.dashboard.chat_runner._resolve_mirror_target",
+            return_value=(self._link("telegram"), transport),
+        ), patch(
+            "kiro_crew.config.loader.outbox_dir", return_value=outbox_file.parent
+        ), patch(
+            "kiro_crew.config.loader.workspace_root", return_value=tmp_path
+        ):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/channel/upload-file",
+                    json={"file_path": str(outbox_file), "filename": "report.txt"},
+                    headers={"X-Session-Key": "telegram:1"},
+                )
+                body = await resp.json()
+        assert resp.status == 502
+        assert body["error"] == "channel delivery failed"

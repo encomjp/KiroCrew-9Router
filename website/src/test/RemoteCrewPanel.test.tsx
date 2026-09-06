@@ -3,6 +3,8 @@ import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from './helpers'
 import { RemoteCrewPanel } from '../pages/settings/RemoteCrewPanel'
+import { consumeChatHandoff, __resetErrorJournalForTests } from '../utils/errorReport'
+import { __resetInstanceFailuresForTests } from '../utils/instanceFailureReport'
 
 vi.mock('../api/client', () => {
   class ApiError extends Error {
@@ -25,6 +27,7 @@ vi.mock('../api/client', () => {
       disconnectInstance: vi.fn(),
       removeInstance: vi.fn(),
       instanceStatus: vi.fn(),
+      updateInstance: vi.fn(),
       patchConfig: vi.fn(),
       cloudLaunches: vi.fn(),
       cloudPreflight: vi.fn(),
@@ -104,6 +107,9 @@ const PREFLIGHT_OK = {
 beforeEach(() => {
   vi.clearAllMocks()
   localStorage.clear()
+  sessionStorage.clear()
+  __resetErrorJournalForTests()
+  __resetInstanceFailuresForTests()
 })
 
 describe('RemoteCrewPanel', () => {
@@ -550,5 +556,196 @@ describe('RemoteCrewPanel', () => {
     await waitFor(() => expect(api.cloudLaunch).toHaveBeenCalledWith({ profile: '', region: 'us-east-1', size_key: 'balanced' }))
     // Progress card polls the job and renders its steps.
     expect(await screen.findByText('Installing Kiro Crew')).toBeInTheDocument()
+  })
+
+  describe('agent hand-off from the diagnosis note', () => {
+    // These live HERE, on the panel SettingsPage actually renders. The same
+    // surfaces exist on the unreachable `InstancesPanel`, whose only importers are
+    // test files — a hand-off wired there would pass its tests and reach nobody.
+    const BROKEN = {
+      id: 'c1', name: 'Nimbus', connection_method: 'ssh', ssh_host: 'nimbus-alias',
+      remote_port: 5476,
+      status: { instance_id: 'c1', state: 'error', error: 'Remote dashboard did not answer' },
+    }
+    const DIAGNOSED = {
+      instance_id: 'c1',
+      state: 'error',
+      error: 'Remote dashboard did not answer',
+      diagnosis: {
+        code: 'remote_down', ok: false, reason: 'Remote dashboard down',
+        probes: [{ name: 'ssh', ok: true }, { name: 'remote_dashboard', ok: false }],
+      },
+    }
+
+    it('hands the diagnosis to the agent with the ladder code and probe chain', async () => {
+      // A diagnosis that names the broken link and then leaves the user with
+      // nothing to do about it is the dead end this change exists to remove. The
+      // prompt must carry the verdict CODE and the probes, not the `id: reason`
+      // string rendered on screen.
+      sessionStorage.clear()
+      ;vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [BROKEN] } as never)
+      ;vi.mocked(api.instanceStatus).mockResolvedValue(DIAGNOSED as never)
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      await screen.findByText('Nimbus')
+      await openRowMenu(u)
+      await u.click(await screen.findByRole('menuitem', { name: /Diagnose Nimbus/i }))
+      await screen.findByText(/c1: Remote dashboard down/i)
+      await u.click(screen.getByRole('button', { name: /agent/i }))
+
+      const prompt = consumeChatHandoff() || ''
+      expect(prompt).toContain('remote_down')
+      expect(prompt).toContain('ssh=ok -> remote_dashboard=FAILED')
+      expect(prompt).toContain('Nimbus')
+    })
+
+    it('keeps the typed add-form values across that hand-off', async () => {
+      // The navigation unmounts this whole panel, the add form included, and a
+      // first-time user has just typed the crew by hand. The values are held in the
+      // store on every form change rather than by the button, so an exit the button
+      // knows nothing about still costs nothing.
+      //
+      // The SAME store is passed to the remount: that is what an in-app navigation
+      // is. A fresh store would model a full page reload, which this deliberately
+      // does not cover.
+      sessionStorage.clear()
+      ;vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [BROKEN] } as never)
+      ;vi.mocked(api.instanceStatus).mockResolvedValue(DIAGNOSED as never)
+      const u = userEvent.setup()
+      const first = renderWithProviders(<RemoteCrewPanel />)
+
+      await screen.findByText('Nimbus')
+      await u.type(screen.getByPlaceholderText('Remote Host 1'), 'Cirrus')
+      await openRowMenu(u)
+      await u.click(await screen.findByRole('menuitem', { name: /Diagnose Nimbus/i }))
+      await screen.findByText(/c1: Remote dashboard down/i)
+      await u.click(screen.getByRole('button', { name: /agent/i }))
+      first.unmount()
+
+      renderWithProviders(<RemoteCrewPanel />, { store: first.store })
+      await waitFor(() =>
+        expect(screen.getByPlaceholderText('Remote Host 1')).toHaveValue('Cirrus'),
+      )
+    })
+
+    it('keeps an unsaved crew EDIT across that hand-off, and re-opens its form', async () => {
+      // Held values nobody re-mounts are the same loss with an extra step, so the
+      // row has to re-open on the way back — not merely retain the text somewhere.
+      sessionStorage.clear()
+      ;vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [BROKEN] } as never)
+      ;vi.mocked(api.instanceStatus).mockResolvedValue(DIAGNOSED as never)
+      const u = userEvent.setup()
+      const first = renderWithProviders(<RemoteCrewPanel />)
+
+      await screen.findByText('Nimbus')
+      await openRowMenu(u)
+      await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+      const host = (await screen.findByLabelText(/SSH host/i, { selector: '#edit-instance-c1-ssh-host' })) as HTMLInputElement
+      await u.clear(host)
+      await u.type(host, 'nimbus-fixed')
+      await openRowMenu(u)
+      await u.click(await screen.findByRole('menuitem', { name: /Diagnose Nimbus/i }))
+      await screen.findByText(/c1: Remote dashboard down/i)
+      await u.click(screen.getByRole('button', { name: /agent/i }))
+      first.unmount()
+
+      renderWithProviders(<RemoteCrewPanel />, { store: first.store })
+      await waitFor(() =>
+        expect(screen.getByLabelText(/SSH host/i, { selector: '#edit-instance-c1-ssh-host' }))
+          .toHaveValue('nimbus-fixed'),
+      )
+    })
+
+    it('measures a restored edit against the record it was OPENED on, not the live one', async () => {
+      // The baseline travels with the values as the same object it was captured
+      // from. Re-reading the live record on the way back would read a change
+      // someone else made during the hand-off as the user's own edit, and write
+      // back a field the user never touched.
+      // The record must CARRY a ttl for this to discriminate: against a record with
+      // no `ttl` key at all, the form's empty string differs from `undefined` and
+      // would be sent whatever baseline is used — the test would pass for the wrong
+      // reason and then fail for it too.
+      const WITH_TTL = { ...BROKEN, ttl: '4h' }
+      sessionStorage.clear()
+      ;vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [WITH_TTL] } as never)
+      ;vi.mocked(api.instanceStatus).mockResolvedValue(DIAGNOSED as never)
+      const u = userEvent.setup()
+      const first = renderWithProviders(<RemoteCrewPanel />)
+
+      await screen.findByText('Nimbus')
+      await openRowMenu(u)
+      await u.click(await screen.findByRole('menuitem', { name: /Edit settings/i }))
+      const host = (await screen.findByLabelText(/SSH host/i, { selector: '#edit-instance-c1-ssh-host' })) as HTMLInputElement
+      await u.clear(host)
+      await u.type(host, 'nimbus-fixed')
+      await openRowMenu(u)
+      await u.click(await screen.findByRole('menuitem', { name: /Diagnose Nimbus/i }))
+      await screen.findByText(/c1: Remote dashboard down/i)
+      await u.click(screen.getByRole('button', { name: /agent/i }))
+      first.unmount()
+
+      // Someone else moved the TTL while the user was in the chat.
+      ;vi.mocked(api.listInstances).mockResolvedValue(
+        { active: true, warm_set_cap: 5, instances: [{ ...WITH_TTL, ttl: '9h' }] } as never,
+      )
+      renderWithProviders(<RemoteCrewPanel />, { store: first.store })
+      const back = (await screen.findByLabelText(/SSH host/i, { selector: '#edit-instance-c1-ssh-host' })) as HTMLInputElement
+      await waitFor(() => expect(back).toHaveValue('nimbus-fixed'))
+      await u.click(screen.getByRole('button', { name: /Save changes/i }))
+
+      // Only the field the user actually typed is written. `ttl` is absent, so the
+      // concurrent change stands.
+      await waitFor(() => expect(api.updateInstance).toHaveBeenCalled())
+      const body = vi.mocked(api.updateInstance).mock.calls[0]?.[1] as Record<string, unknown>
+      expect(body).toMatchObject({ ssh_host: 'nimbus-fixed' })
+      expect(body).not.toHaveProperty('ttl')
+    })
+  })
+
+  describe('the launch form survives the hand-off', () => {
+    // Every exit from this panel unmounts it, the agent hand-off's navigation
+    // included, so a picked size held only in the component silently reverts to the
+    // recommended default — a launch the user did not ask for. Persisted like the
+    // sibling profile/region fields, which already work this way.
+    it('remembers a picked x86 size and re-opens the section that holds it', async () => {
+      localStorage.clear()
+      ;vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] } as never)
+      const u = userEvent.setup()
+      const first = renderWithProviders(<RemoteCrewPanel />)
+
+      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      // The x86 tiers live behind a disclosure; open it and pick one. Several cards
+      // match, so address the list rather than expecting a unique name.
+      await u.click(await screen.findByRole('button', { name: /Smaller and x86_64 sizes/i }))
+      const choices = await screen.findAllByRole('button', { name: /· x86_64/i })
+      const picked = choices[choices.length - 1]
+      const pickedName = picked.getAttribute('aria-label') || ''
+      await u.click(picked)
+      first.unmount()
+
+      renderWithProviders(<RemoteCrewPanel />)
+      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      // Visible WITHOUT touching the disclosure: a remembered size whose card is
+      // hidden would drive the launch with nothing on screen saying so.
+      const back = await screen.findAllByRole('button', { name: /· x86_64/i })
+      const same = back.find(c => c.getAttribute('aria-label') === pickedName)
+      expect(same).toBeTruthy()
+      expect(same).toHaveAttribute('aria-pressed', 'true')
+    })
+
+    it('falls back to the default when the remembered size names no tier', async () => {
+      // A value written by an older build must not leave every card unselected while
+      // the launch still carries the stale id.
+      localStorage.clear()
+      localStorage.setItem('mc-cloud-size', 'tier-that-no-longer-exists')
+      ;vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] } as never)
+      const u = userEvent.setup()
+      renderWithProviders(<RemoteCrewPanel />)
+
+      await u.click(await screen.findByRole('button', { name: /Set up a new one/i }))
+      const arm = await screen.findAllByRole('button', { name: /· arm64/i })
+      expect(arm.some(c => c.getAttribute('aria-pressed') === 'true')).toBe(true)
+    })
   })
 })

@@ -1217,6 +1217,62 @@ class TestRespawnBackendForStub:
         await _drain_task(got_task)
 
     @pytest.mark.asyncio
+    async def test_a_recorded_hazard_makes_the_respawn_come_back_private(
+        self, monkeypatch, tmp_path
+    ):
+        """The retreat's hole if the respawn inherited the shared binding blindly.
+
+        The recycle that follows an unroutable server request comes straight back
+        here, so re-pooling would hand the SAME stubs a shared backend for the
+        server just observed misbehaving, and no new register happens to
+        re-decide it. Also pins that a now-private respawn releases NO
+        reservation: only ``pool.get_or_create`` reserves, so releasing on the
+        old backend's binding instead would decrement a digest this respawn never
+        reserved and drop a concurrent pooled connection's eviction protection.
+        """
+        from kiro_crew.mcp_gateway import hazards
+
+        key = _pool_key(server="respawn-hazard-mcp")
+        ledger = hazards.HazardLedger(tmp_path / hazards.HAZARDS_FILENAME)
+        ledger.record(
+            "respawn-hazard-mcp",
+            hazards.HAZARD_UNROUTABLE_SERVER_REQUEST,
+            hazards.launch_identity(
+                key.command_args_hash, key.effective_env_hash, key.binary_version
+            ),
+        )
+        monkeypatch.setattr(hazards, "_sink", ledger)
+
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        old = _fake_backend()
+        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
+        assert not old.exclusive_token, "old backend must be POOLED for this case"
+        fresh = _fake_backend(key, pid=6262)
+        fresh.prime_initialize = AsyncMock()  # type: ignore[method-assign]
+        new_inbox: asyncio.Queue[bytes] = asyncio.Queue()
+        fresh.attach_stub = AsyncMock(return_value=new_inbox)  # type: ignore[method-assign]
+        acquire = AsyncMock(return_value=(fresh, True))
+        monkeypatch.setattr(gw, "_acquire_backend", acquire)
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            key,
+            lambda k: None,
+            "stub-hz1",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+        )
+
+        assert out is not None
+        assert acquire.await_args.kwargs["exclusive_stub_uuid"] == "stub-hz1"
+        pool.unreserve.assert_not_called()
+        await _drain_task(out[2])
+
+    @pytest.mark.asyncio
     async def test_replay_skipped_when_owner_rekeyed_mid_respawn(self, monkeypatch):
         """A ``claim`` frame can retarget this connection's identity during
         the respawn's acquire/prime awaits. The captured URIs belong to the

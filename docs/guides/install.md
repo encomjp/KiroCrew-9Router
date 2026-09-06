@@ -483,13 +483,12 @@ which shows the live session and lets you take over with real mouse and keyboard
 That is how you complete a CAPTCHA or a 2FA prompt, and how you log in once so a
 session can be captured with `playwright-cli state-save`.
 
-**Installing the CLI is what grants browsing.** There is no separate toggle,
-because the CLI has no capability gating and a binary on `PATH` is reachable from
-any shell command the agent runs, so no subset of browsing could be granted or
-withheld. Read that in both directions: uninstalling `playwright-cli` (or never
-installing it) is the way to withhold the capability, and if you installed it for
-your own unrelated work then the capability is armed on this host without a
-separate opt-in. It matters most for `playwright-cli attach --extension`, which
+**Installing the CLI makes browsing available; it does not auto-approve it.**
+There is no separate capability toggle because the CLI has no way to expose only
+a subset of its verbs. Every `playwright-cli` shell command still follows the
+ordinary approval flow. Under normal mode the first command prompts; you can
+approve once, trust its command pattern for the session, or deliberately enable a
+wider trust mode. This matters most for `playwright-cli attach --extension`, which
 drives your own running Chrome with the sessions you are already logged into.
 
 ## Configuration
@@ -677,11 +676,15 @@ kirocrew service install
 
 Where, and only where, this mechanism is the one in play, the installer also
 writes `/etc/apparmor.d/kirocrew-userns` and loads it. The profile grants
-exactly one permission (`userns`) and is applied by systemd to the kirocrew
-service only, via `AppArmorProfile=-kirocrew-userns` in the unit. It is a
-**named** profile with no attachment path, so it cannot apply to any other
-process, and it is the same approach stock Ubuntu already uses for `chrome` and
-`brave`.
+exactly one permission (`userns`) and is **attached** to the resolved kirocrew
+launcher script (the same absolute path `service install` uses as `ExecStart`,
+typically something like `~/.kiro/crew-venv/bin/kirocrew`) — the same approach
+stock Ubuntu already uses for `chrome` and `brave`. An earlier version of this
+profile was named-but-unattached and applied purely via `AppArmorProfile=` in
+the unit; that shipped first (#1210) but was found not to actually confine the
+gateway's sandbox probe (#3463) — the directive labels only the unit's own
+top-level process, and the probe runs in a child reached through a fork the
+directive's labelling never reaches. The directive is no longer used.
 
 This uses the sudo prompt `service install` already needs for the unit file, so
 it costs no additional privilege, and it **cannot fail your install**: if the
@@ -696,12 +699,16 @@ rule needs 4.x or newer). So on Debian, Arch, RHEL and Amazon Linux nothing
 changes.
 
 **Running the gateway outside systemd** (for example `kirocrew gateway` in a
-terminal) does not pick up the profile, because systemd is what applies it —
-and there is no unprivileged way to enter it yourself. `aa_change_onexec()` into
-a named profile is not permitted for an ordinary unconfined user, and `aa-exec`
-does **not** fail when it cannot transition: it execs the command unconfined, so
-`aa-exec -p kirocrew-userns -- kirocrew gateway` appears to work and changes
-nothing. Run the gateway as the service instead.
+terminal) is covered *only when the launch goes through the attached launcher
+path*: the kernel applies a path-attached profile at every `execve()` of that
+exact file, unit or no unit, so once `service install` has attached the profile,
+a foreground `kirocrew gateway` typed at a shell that resolves to the same
+launcher script runs confined too. A launch that does **not** go through that
+path — `python -m kiro_crew`, a different venv's entry point, a re-created venv
+the profile has not been re-pointed at — stays unconfined, and `kirocrew doctor`
+reports the attachment as stale in the re-created-venv case. Prefer running the
+gateway as the service: it pins `ExecStart` to the attached path and restarts on
+boot.
 
 ### The AppImage (desktop app) needs its own profile
 

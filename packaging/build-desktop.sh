@@ -122,6 +122,59 @@ esac
 
 log() { printf '\n\033[1;36m▶ %s\033[0m\n' "$*"; }
 
+is_macos_intel_backend() {
+  local want_arch="$1"
+  [ "$OS" = "darwin" ] && {
+    [ "$want_arch" = "x86_64" ] ||
+      { [ -z "$want_arch" ] && [ "$HOST_ARCH" = "x86_64" ]; }
+  }
+}
+
+# NOTE ON THE APPLE-SILICON DECODER -- do NOT re-introduce a compressed payload.
+#
+# The arm64 imageio-ffmpeg executable ships as a PLAIN Mach-O under
+# Contents/Resources, exactly like its x86_64 sibling, so the app signer signs it
+# with Developer ID + hardened runtime + secure timestamp along with every other
+# nested binary (packaging/signing/generate-manifest.py enumerates it).
+#
+# #6746 instead stored it as inert gzip data, to keep the bytes byte-identical to
+# the pinned upstream wheel across signing. The Apple notary service DECOMPRESSES
+# archive members and scans what is inside them, so that made notarization fail
+# closed on the whole release (submission 3dbd3c7d, three `error` issues on
+# .../binaries/ffmpeg-macos-aarch64-v7.1.gz/ffmpeg-macos-aarch64-v7.1: not signed
+# with a valid Developer ID certificate / no secure timestamp / hardened runtime
+# not enabled). The x86_64 copy of the same wheel, shipped raw in the same
+# submission, drew no issue at all -- that is the working shape.
+#
+# The runtime consequence is handled in kiro_crew.transcribe: the packaged decoder
+# is accepted either at the pinned upstream digest (local builds and the build gate
+# below, which run BEFORE signing) or on a valid Developer ID signature from our
+# team (the released app, whose bytes signing necessarily rewrote).
+
+# Prove that the installed native wheel, audio decoder, and their transitive
+# libraries can actually run from the pruned bundle. A successful pip resolution
+# is not enough: an ABI mismatch or missing executable otherwise reaches every
+# user as an unusable Download button. Model weights are deliberately not involved
+# in this gate.
+#   $1 = bundled interpreter
+local_voice_runtime_gate() {
+  local python="$1"
+  log "Verifying bundled local voice runtime…"
+  env PYTHONNOUSERSITE=1 PYTHONPATH= "$python" -s -c '
+from kiro_crew.stt.engine import probe
+from kiro_crew.transcribe import _packaged_ffmpeg_version_probe
+
+state = probe()
+if not state.ok:
+    raise SystemExit(f"{state.code}: {state.detail}")
+if not _packaged_ffmpeg_version_probe():
+    raise SystemExit("bundled ffmpeg executable is missing, modified, or cannot run")
+' || {
+    echo "ERROR: bundled local voice runtime cannot load" >&2
+    exit 1
+  }
+}
+
 # Re-stamp every staged backend tree with <dist>, for the Linux multi-format
 # path (see LINUX_TARGET_DISTS). Rewrites one generated module per tree, so it
 # is cheap enough to run between electron-builder invocations. Finding the trees
@@ -171,6 +224,80 @@ rm_rf_resilient() {
     fi
     attempt=$((attempt + 1))
     sleep 1
+  done
+}
+
+# Invoke electron-builder. Split into its own function purely so a test can
+# shadow it with a stub -- CSC_IDENTITY_AUTO_DISCOVERY=false disables macOS
+# codesign identity auto-discovery for local/CI builds.
+_eb_invoke() {
+  CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder "$@"
+}
+
+# Run electron-builder (EB_ARGS as "$@"), retrying a bounded number of times
+# on two transient failure classes -- and still failing the build on anything
+# else, or once the retry budget is exhausted:
+#
+#   - macOS .DS_Store/ENOTEMPTY temp-dir race (electron-userland/electron-builder#6890):
+#     the universal build's lipo-merge stage removes dist/mac-universal-<arch>-temp
+#     dirs with a recursive fs.rm that has no retries of its own, and Desktop
+#     Services (Finder/Spotlight) can drop a fresh .DS_Store into one mid-removal.
+#   - transient network/TLS failures in electron-builder's OWN mid-build
+#     fetches: the AppImage and NSIS/Squirrel targets pull their own tooling
+#     through `got` AFTER the electron zip has already reported
+#     progress=100%. A dropped connection ("socket hang up"), a
+#     TLS-intercepted response ("self-signed certificate"), or an HTTP-level
+#     answer from the artifact CDN that is retryable rather than final
+#     ("Response code 504") aborts the whole build there. These are
+#     per-execution network events, not build errors -- the same commit
+#     passes on a plain re-run, and one matrix leg can fail while its
+#     siblings go green in the same attempt (#3088, #6795).
+#
+# Split out of the packaging step (rather than left inline) so the
+# retry/classification logic is testable in isolation, mirroring
+# rm_rf_resilient above: a test extracts this function's body, shadows
+# _eb_invoke with a stub that fails N times, and asserts the real retry/
+# classification logic here recovers (or correctly gives up).
+run_electron_builder_with_retry() {
+  local attempt=1 max_attempts=3 eb_log eb_transient eb_backoff
+  while : ; do
+    eb_log="$(mktemp "${TMPDIR:-/tmp}/kc-eb.XXXXXX")"
+    if _eb_invoke "$@" 2>&1 | tee "$eb_log"; then
+      rm -f "$eb_log"; return 0
+    fi
+    # Classify the failure before deciding: each transient class needs its
+    # own cleanup, and anything unrecognised must still abort on the first
+    # failure.
+    eb_transient=""
+    if grep -q "ENOTEMPTY" "$eb_log"; then
+      eb_transient="ds_store"
+    # Socket-level errno strings and HTTP-level statuses share ONE class
+    # because the class boundary here is cleanup, not protocol layer (see the
+    # header comment): both arise in the same `got` fetches, and both recover
+    # by simply re-fetching on the next attempt with nothing to sweep first.
+    # A 5xx is transient by definition and a 429 is a rate limit that clears;
+    # every OTHER 4xx (401/403/404/400) is a configuration or authorisation
+    # fault that would fail identically on all three attempts, so it stays
+    # unrecognised and still aborts on the first one.
+    elif grep -qE "socket hang up|self[- ]signed certificate|ECONNRESET|ETIMEDOUT|EAI_AGAIN|ENOTFOUND" "$eb_log" \
+      || grep -qE "Response code (429|5[0-9][0-9])" "$eb_log"; then
+      eb_transient="network"
+    fi
+    if [ -n "$eb_transient" ] && [ "$attempt" -lt "$max_attempts" ]; then
+      if [ "$eb_transient" = "ds_store" ]; then
+        echo "  ⚠ macOS .DS_Store/ENOTEMPTY temp-dir race (attempt $attempt/$max_attempts); sweeping .DS_Store and retrying…" >&2
+        find dist -name .DS_Store -delete 2>/dev/null || true
+        rm -rf dist/*-temp 2>/dev/null || true
+        eb_backoff=2
+      else
+        echo "  ⚠ transient network/TLS/HTTP failure in an electron-builder fetch (attempt $attempt/$max_attempts); retrying…" >&2
+        eb_backoff=$((attempt * 10))
+      fi
+      rm -f "$eb_log"; attempt=$((attempt + 1)); sleep "$eb_backoff"; continue
+    fi
+    rm -f "$eb_log"
+    echo "❌ electron-builder failed (not a known transient class, or retries exhausted)." >&2
+    return 1
   done
 }
 
@@ -253,6 +380,41 @@ build_backend() {
     "$out/bin/python3.12" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check "$ROOT"
 
+  # The voice extras, in TWO steps.
+  #
+  # They have to be in the bundle at all because `local` is the default
+  # speech-to-text provider and nothing in the app can install it later: the
+  # pip-invoking endpoint was deliberately removed, so a bundle without them
+  # reports the default provider as unavailable with no in-app way to fix it.
+  #
+  # Two steps because pip resolves an extra ATOMICALLY, and this bundle is
+  # UNIVERSAL on macOS where Intel has no published pywhispercpp wheel. A single
+  # `[voice]` install there fails as a whole and omits boto3 and amazon-transcribe
+  # with it, taking the `transcribe` provider down alongside the `local` one it has
+  # nothing to do with. So the cloud half goes in first and unconditionally, then
+  # the recogniser is attempted on its own.
+  #
+  # `--only-binary pywhispercpp` (scoped to that one name, so kirocrew itself still
+  # installs from this checkout) prevents a surprise CMake/C++ source build. Missing
+  # recogniser wheels fail every supported desktop build: local dictation is the
+  # default and must be usable immediately. macOS Intel is the sole legacy exception.
+  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+    "$out/bin/python3.12" -m pip install --prefer-binary \
+    --no-warn-script-location --disable-pip-version-check \
+    "$ROOT[voice-aws]" "imageio-ffmpeg==0.6.0"
+  if ! env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+      "$out/bin/python3.12" -m pip install --prefer-binary \
+      --only-binary pywhispercpp \
+      --no-warn-script-location --disable-pip-version-check "$ROOT[voice]"; then
+    if is_macos_intel_backend "$want_arch"; then
+      log "No prebuilt speech recogniser for macOS Intel — leaving that legacy backend unsupported."
+    else
+      echo "ERROR: no prebuilt speech recogniser for supported target ${OS}/${want_arch:-$HOST_ARCH}" >&2
+      echo "       Refusing to ship a desktop app whose default local voice provider is unusable." >&2
+      exit 1
+    fi
+  fi
+
   # Stage the dashboard dist into the package's static dir.
   sp="$out/lib/python3.12/site-packages"
   log "Staging dashboard dist into kiro_crew/static/dist…"
@@ -314,6 +476,10 @@ LAUNCH
     rm -rf lib/python3.12/test lib/python3.12/idlelib lib/python3.12/tkinter \
            lib/python3.12/turtledemo lib/python3.12/ensurepip lib/python3.12/lib2to3 2>/dev/null || true )
 
+  if ! is_macos_intel_backend "$want_arch"; then
+    local_voice_runtime_gate "$out/bin/python3.12"
+  fi
+
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
 
@@ -328,7 +494,7 @@ LAUNCH
 # python.exe directly -- see main.js).
 #   $1 = PBS interpreter dir   $2 = output dir
 build_backend_windows() {
-  local pbs_dir="$1" out="$2" sp
+  local pbs_dir="$1" out="$2" sp root_uri
 
   log "Installing kiro_crew into the bundled interpreter ($(basename "$out"))…"
   mkdir -p "$(dirname "$out")"
@@ -338,6 +504,35 @@ build_backend_windows() {
   env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
     "$out/python.exe" -m pip install --prefer-binary \
     --no-warn-script-location --disable-pip-version-check "$ROOT"
+
+  # Git Bash normally rewrites a plain /d/a/... argument for a native Windows
+  # process, which is why the core install above works. Appending `[voice]`
+  # defeats that MSYS path conversion and pip receives the literal POSIX path,
+  # then rejects it as an invalid requirement. Derive a real file URI from the
+  # native interpreter's cwd and use explicit PEP 508 direct references for both
+  # extras, so spaces and the drive-letter boundary are unambiguous too.
+  root_uri="$(cd "$ROOT" && "$out/python.exe" -c \
+    'import sys; from pathlib import Path; sys.stdout.write(Path.cwd().as_uri())')"
+
+  # The voice extras, in two steps so an independent AWS-provider dependency
+  # cannot be omitted by recogniser resolution. Windows is a supported local-
+  # dictation target, so the recogniser is a hard gate. Model weights remain an
+  # explicit one-click download after installation.
+  #
+  # They have to be in the bundle at all because `local` is the default
+  # speech-to-text provider and nothing in the app can install it later: the
+  # pip-invoking endpoint was deliberately removed, so a bundle without them
+  # reports the default provider as unavailable with no in-app way to fix it.
+  #
+  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+    "$out/python.exe" -m pip install --prefer-binary \
+    --no-warn-script-location --disable-pip-version-check \
+    "kirocrew[voice-aws] @ $root_uri" "imageio-ffmpeg==0.6.0"
+  env PYTHONNOUSERSITE=1 PYTHONPATH= KIROCREW_SKIP_FRONTEND=1 \
+    "$out/python.exe" -m pip install --prefer-binary \
+    --only-binary pywhispercpp \
+    --no-warn-script-location --disable-pip-version-check \
+    "kirocrew[voice] @ $root_uri"
 
   sp="$out/Lib/site-packages"
   log "Staging dashboard dist into kiro_crew/static/dist…"
@@ -374,6 +569,8 @@ build_backend_windows() {
            Lib/site-packages/kiro_crew/_vendor/llama_cpp_libs/macos_x86_64 \
            2>/dev/null || true
     rm -f DLLs/_tkinter.pyd DLLs/tcl*.dll DLLs/tk*.dll 2>/dev/null || true )
+
+  local_voice_runtime_gate "$out/python.exe"
 
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
@@ -615,40 +812,18 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
   # per target, and clearing between them would delete the previous artifact.
   rm_rf_resilient dist
 
-  # One electron-builder invocation, with the macOS .DS_Store/ENOTEMPTY retry:
-  # electron-builder's universal step stages each arch into
-  # dist/mac-universal-<arch>-temp, lipo-merges them, then removes the temp
-  # dirs with a recursive fs.rm. If macOS Desktop Services (Finder/Spotlight)
-  # drops a .DS_Store into a temp dir *during* that removal, Node's fs.rm --
-  # which performs no retries -- fails the final rmdir with ENOTEMPTY and the
-  # whole build aborts (electron-userland/electron-builder#6890). It is a
-  # transient race, so retry from a swept, clean dir a bounded number of times.
-  eb_run() {
-    local attempt=1 max_attempts=3 eb_log
-    while : ; do
-      eb_log="$(mktemp "${TMPDIR:-/tmp}/kc-eb.XXXXXX")"
-      if CSC_IDENTITY_AUTO_DISCOVERY=false ./node_modules/.bin/electron-builder "$@" 2>&1 | tee "$eb_log"; then
-        rm -f "$eb_log"; return 0
-      fi
-      if grep -q "ENOTEMPTY" "$eb_log" && [ "$attempt" -lt "$max_attempts" ]; then
-        echo "  ⚠ macOS .DS_Store/ENOTEMPTY temp-dir race (attempt $attempt/$max_attempts); sweeping .DS_Store and retrying…" >&2
-        find dist -name .DS_Store -delete 2>/dev/null || true
-        rm -rf dist/*-temp 2>/dev/null || true
-        rm -f "$eb_log"; attempt=$((attempt + 1)); sleep 2; continue
-      fi
-      rm -f "$eb_log"
-      echo "❌ electron-builder failed (not the .DS_Store race, or retries exhausted)." >&2
-      exit 1
-    done
-  }
-
+  # Each electron-builder invocation below goes through
+  # run_electron_builder_with_retry (defined above, alongside rm_rf_resilient)
+  # so the macOS .DS_Store/ENOTEMPTY race AND transient network/TLS failures
+  # in electron-builder's own mid-build fetches are both retried, not just
+  # the former.
   if [ "$OS" = "darwin" ]; then
     EB_ARGS+=( --mac )
     [ "$UNIVERSAL" = "1" ] && EB_ARGS+=( --universal )
-    eb_run "${EB_ARGS[@]}" --publish never
+    run_electron_builder_with_retry "${EB_ARGS[@]}" --publish never
   elif [ "$OS" = "windows" ]; then
     EB_ARGS+=( --win )
-    eb_run "${EB_ARGS[@]}" --publish never
+    run_electron_builder_with_retry "${EB_ARGS[@]}" --publish never
   else
     # One invocation PER FORMAT, each preceded by its own beacon stamp, so the
     # AppImage and the deb do not both claim the label of whichever was built
@@ -659,7 +834,7 @@ log "Packaging desktop app (electron-builder, version: $KC_VERSION)…"
       target="${pair%%:*}"; dist="${pair##*:}"
       log "Packaging Linux ${target} (dist=${dist})…"
       restamp_backends "$dist"
-      eb_run "${EB_ARGS[@]}" --linux "$target" --publish never
+      run_electron_builder_with_retry "${EB_ARGS[@]}" --linux "$target" --publish never
     done
   fi
 )

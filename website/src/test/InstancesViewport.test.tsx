@@ -4,6 +4,13 @@ import userEvent from '@testing-library/user-event'
 import { renderWithProviders, createTestStore } from './helpers'
 import InstancesViewport from '../components/InstancesViewport'
 import { setActiveId } from '../store/instancesSlice'
+import {
+  consumeChatHandoff,
+  installSoftNavigate,
+  __resetErrorJournalForTests,
+  __resetNavSeamForTests,
+} from '../utils/errorReport'
+import { __resetInstanceFailuresForTests } from '../utils/instanceFailureReport'
 
 // The postinstall patch (scripts/patch-happy-dom-iframe.mjs) makes happy-dom's
 // disabled-iframe path dispatch 'load' instead of throwing DOMException when
@@ -54,6 +61,12 @@ import { api } from '../api/client'
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(isEmbeddedPane).mockReturnValue(false)
+  // Module-level state in the failure recorder: without this the de-dup from an
+  // earlier test would suppress the report a later one asserts on.
+  __resetInstanceFailuresForTests()
+  __resetErrorJournalForTests()
+  __resetNavSeamForTests()
+  sessionStorage.clear()
 })
 
 describe('InstancesViewport', () => {
@@ -181,6 +194,69 @@ describe('InstancesViewport', () => {
     expect(screen.getByRole('button', { name: /Retry/i })).toBeInTheDocument()
     // No iframe is mounted for a non-warm instance.
     expect(document.querySelector('iframe')).toBeNull()
+  })
+
+  it('offers an agent hand-off carrying the diagnosis ladder, not just Retry', async () => {
+    // Retry is right for a momentary drop, and useless for the failures a first
+    // connect actually hits — SSH config, a remote gateway that is not running, a
+    // wrong port. The panel's evidence arrives on a SUCCESSFUL poll, so this panel
+    // has to journal it itself, and the report has to carry `probes`: ssh ok +
+    // remote dashboard failed names a different repair than ssh failed does.
+    __resetErrorJournalForTests()
+    vi.mocked(api.listInstances).mockResolvedValue({
+      instances: [
+        {
+          id: 'cd-1',
+          name: 'Cloud One',
+          ssh_host: 'cd-1-alias',
+          remote_port: 7777,
+          local_port: 0,
+          ttl: '20h',
+          remote_bin: '',
+          was_connected: true,
+          status: {
+            instance_id: 'cd-1',
+            state: 'error',
+            error: 'ssh unreachable',
+            remote_port: 7777,
+            diagnosis: {
+              code: 'remote_down',
+              ok: false,
+              reason: 'SSH works but the remote dashboard is not responding',
+              probes: [
+                { name: 'ssh', ok: true },
+                { name: 'remote_dashboard', ok: false },
+              ],
+            },
+          },
+        },
+      ],
+      warm_set_cap: 5,
+    })
+    const store = createTestStore({
+      instances: { warm: {}, activeId: 'cd-1', mru: ['cd-1'], unread: {} },
+    })
+    renderWithProviders(<InstancesViewport />, { store })
+
+    expect(await screen.findByText(/Connection error/i)).toBeInTheDocument()
+    // Present alongside Retry, not instead of it.
+    expect(screen.getByRole('button', { name: /Retry/i })).toBeInTheDocument()
+
+    // Click it: the button resolves its own report by EXACT message match, so this
+    // is the only assertion that catches a label re-derived locally from the
+    // status — the journal would still be correct while the prompt lost the ladder.
+    installSoftNavigate(() => {})
+    await userEvent.click(await screen.findByRole('button', { name: /agent/i }))
+    const prompt = consumeChatHandoff() ?? ''
+    expect(prompt).toContain('Code: remote_down')
+    expect(prompt).toContain('probes: ssh=ok -> remote_dashboard=FAILED')
+    // And the hand-off must be VISIBLE. This panel lives inside the viewport's
+    // opaque root overlay, which covers the local pane while a remote tab is
+    // active, and the hand-off only soft-navigates the local SPA to /chat —
+    // underneath it. Without returning to Local the user keeps staring at this same
+    // error panel and reads the button as dead, while every further click stacks
+    // another copy of the prompt onto the hand-off queue.
+    expect(store.getState().instances.activeId).toBeNull()
   })
 
   it('surfaces the error panel for an active warm-but-disconnected tab (stale warm)', async () => {

@@ -367,7 +367,7 @@ def ensure_shots_dir() -> str:
     every other owner-only directory in the tree uses.
 
     Tightening runs at most once per process (guarded by ``_dir_ready``) because
-    ``restrict_to_owner`` shells out to ``icacls`` on Windows, and a subprocess per
+    ``restrict_to_owner`` rewrites a DACL on Windows, and doing that per
     screenshot would block the pooled worker that also serves chat. A failure is
     logged and tolerated, the posture ``capture_macos`` takes: the files still land
     under a per-user ``%TEMP%``.

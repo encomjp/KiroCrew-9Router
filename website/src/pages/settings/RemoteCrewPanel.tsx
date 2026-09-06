@@ -57,13 +57,20 @@ import {
   DropdownMenuSeparator,
 } from '../../components/ui/dropdown-menu'
 import ErrorNotice from '../../components/ErrorNotice'
+import AskAgentButton from '../../components/AskAgentButton'
+import type { ErrorReport } from '../../utils/errorReport'
+import { reportInstanceFailure } from '../../utils/instanceFailureReport'
 import { readPersistedString, usePersistedString } from '../../hooks/usePersistedString'
 import { copyToClipboard } from '../../utils/clipboard'
-import { useAppDispatch } from '../../store'
-import { removeWarm } from '../../store/instancesSlice'
+import { useAppDispatch, useAppSelector } from '../../store'
+import { removeWarm, setCrewEditForm } from '../../store/instancesSlice'
 import { i18nT } from '../../i18n/t'
 import { AddInstanceForm, StatusBadge } from './InstancesPanel'
-import { EditInstanceForm, instanceFormFromView, type InstanceDraft } from './InstanceFormFields'
+import {
+  EditInstanceForm,
+  instanceFormFromView,
+  type InstanceDraft,
+} from './InstanceFormFields'
 
 
 /** A launch job the user is still waiting on (not yet a switchable crew). */
@@ -73,6 +80,12 @@ const isInProgress = (j: LaunchJob) => IN_PROGRESS.includes(j.status)
 /** Remembered across navigation — see the state declarations for why. */
 const CLOUD_PROFILE_KEY = 'mc-cloud-profile'
 const CLOUD_REGION_KEY = 'mc-cloud-region'
+// The launch form's third input. Persisted like the two above rather than held in
+// the component, because every way out of this panel unmounts it — the agent
+// hand-off's navigation, a sidebar click, the back button — and a size picked and
+// then silently reset to the recommended default is a launch the user did not ask
+// for.
+const CLOUD_SIZE_KEY = 'mc-cloud-size'
 const DEFAULT_REGION = 'us-east-1'
 
 /** A launch that has reached a final state — nothing more will happen to it. */
@@ -651,8 +664,22 @@ export function RemoteCrewPanel() {
   const [region, setRegion] = usePersistedString(CLOUD_REGION_KEY, DEFAULT_REGION)
   const [checkedProfile, setCheckedProfile] = useState(() => readPersistedString(CLOUD_PROFILE_KEY, ''))
   const [checkedRegion, setCheckedRegion] = useState(() => readPersistedString(CLOUD_REGION_KEY, DEFAULT_REGION))
-  const [showMoreSizes, setShowMoreSizes] = useState(false)
-  const [sizeKey, setSizeKey] = useState<SizeTier['key']>('balanced')
+  // Opened when the REMEMBERED size lives inside it. Derived rather than persisted
+  // on its own: the extra tiers are behind this disclosure, so a remembered x86
+  // size with the section closed would drive the launch while its card was not on
+  // screen — a worse failure than the reset, because nothing shows what is selected.
+  const [showMoreSizes, setShowMoreSizes] = useState(
+    () => X86_TIERS.some(t => t.key === readPersistedString(CLOUD_SIZE_KEY, 'balanced')),
+  )
+  const [persistedSize, setSizeKey] = usePersistedString(CLOUD_SIZE_KEY, 'balanced')
+  // A value written by an older build — or naming a tier since removed — must not
+  // select a tier that no longer exists: every card would render unselected while
+  // the launch still carried the stale id.
+  const sizeKey = (
+    SIZE_TIERS.some(t => t.key === persistedSize) || X86_TIERS.some(t => t.key === persistedSize)
+      ? persistedSize
+      : 'balanced'
+  ) as SizeTier['key']
   const [copied, setCopied] = useState<'command' | 'policy' | null>(null)
   const [activeLaunchId, setActiveLaunchId] = useState<string | null>(null)
   const [confirmDeleteTag, setConfirmDeleteTag] = useState<string | null>(null)
@@ -663,14 +690,15 @@ export function RemoteCrewPanel() {
   // Unsaved work in the open form. Swapping rows would unmount it and lose typed
   // host/port corrections silently, so the swap is refused instead.
   // The unsaved edit itself, keyed by crew — NOT a boolean. The form unmounts
-  // whenever the crew list does (switching to the setup tab is enough), and a
-  // guard can only refuse the exits it knows about; holding the values here means
-  // the work survives the unmount instead of needing a new guard per exit.
+  // whenever the crew list does (switching to the setup tab is enough) AND when
+  // the error → agent hand-off navigates out of Settings entirely, and a guard can
+  // only refuse the exits it knows about. Holding it in the store rather than in
+  // this component means the work outlives every one of those exits without a
+  // guard per exit, and without a serialised copy that would have to be
+  // re-measured against a server record on the way back.
   // `seq` counts REBASES, and is used as the form's React key: adopting the current
   // record rewrites the draft's values, and a mounted form cannot re-seed itself.
-  const [editDraft, setEditDraft] = useState<
-    { id: string; draft: InstanceDraft; seq: number } | null
-  >(null)
+  const editDraft = useAppSelector(s => s.instances.crewForms?.edit ?? null)
   const editDirty = editDraft !== null
   // Which row's Edit was refused, not a bare flag: the refusal has to render at
   // the row the user actually clicked. Shown once at the bottom of the Card it
@@ -687,6 +715,11 @@ export function RemoteCrewPanel() {
   const [deletingTags, setDeletingTags] = useState<Set<string>>(new Set())
   const [actionErr, setActionErr] = useState<string | null>(null)
   const [diagNote, setDiagNote] = useState<string | null>(null)
+  // The diagnosis note's own report, so the hand-off carries the ladder's verdict
+  // code and probe chain rather than the `id: reason` string on screen. Held as an
+  // object because message text is not an identity: two crews unreachable the same
+  // way produce byte-identical prose.
+  const [diagReport, setDiagReport] = useState<ErrorReport | null>(null)
   const [restartPending, setRestartPending] = useState(false)
 
   const errMsg = useCallback(
@@ -810,9 +843,21 @@ export function RemoteCrewPanel() {
     if (!instancesQuery.isSuccess) return
     const live = new Set(instances.map(i => i.id))
     if (editingId !== null && !live.has(editingId)) setEditingId(null)
-    setEditDraft(prev => (prev !== null && !live.has(prev.id) ? null : prev))
+    if (editDraft !== null && !live.has(editDraft.id)) dispatch(setCrewEditForm(null))
     setEditBlockedId(prev => (prev !== null && !live.has(prev) ? null : prev))
-  }, [instances, instancesQuery.isSuccess, editingId])
+  }, [instances, instancesQuery.isSuccess, editingId, editDraft, dispatch])
+
+  // Re-open the row whose edit is still held: a draft nobody re-mounts is the same
+  // loss with an extra step. Runs whenever an unsaved edit exists with no form open
+  // — arriving back from the hand-off, and equally after the setup tab unmounted the
+  // list. No race with the user's own Cancel, and no guard for one: Cancel drops the
+  // held values, so there is nothing left for this to re-open. That is the whole
+  // benefit of one source of truth over a stored copy plus component state.
+  useEffect(() => {
+    if (!instancesQuery.isSuccess || editingId !== null || editDraft === null) return
+    if (!instances.some(i => i.id === editDraft.id)) return
+    setEditingId(editDraft.id)
+  }, [instances, instancesQuery.isSuccess, editingId, editDraft])
 
   // instance_id → cloud tag, from every launch job that produced an instance.
   // An SSM instance whose target matches is a cloud crew, and this is its tag.
@@ -852,10 +897,23 @@ export function RemoteCrewPanel() {
   })
   const diagnoseMutation = useMutation({
     mutationFn: (id: string) => api.instanceStatus(id, true),
-    onMutate: () => { setActionErr(null); setDiagNote(null) },
+    onMutate: () => { setActionErr(null); setDiagNote(null); setDiagReport(null) },
     onSuccess: (st, id) => {
       const reason = st.diagnosis?.reason || st.error
       if (reason) setDiagNote(`${id}: ${reason}`)
+      // Journal unconditionally, healthy verdict included: the recorder's
+      // no-failure path is what clears its de-dup signature, so skipping the call
+      // on a healthy diagnose would leave the signature standing and suppress the
+      // next identical failure. It returns null when there is nothing to describe.
+      const inst = instances.find(i => i.id === id)
+      setDiagReport(reportInstanceFailure({
+        id,
+        name: inst?.name || id,
+        transport: inst?.connection_method === 'ssm' ? 'ssm' : 'ssh',
+        status: st,
+        stage: 'connect',
+        fallbackMessage: reason || '',
+      }))
     },
     onError: (e, id) => setActionErr(i18nT('pages.settings.instancesPanel.diagnose_failed', { id, error: errMsg(e, i18nT('pages.settings.instancesPanel.unknown_error')) })),
     onSettled: reloadInstances,
@@ -1001,7 +1059,7 @@ export function RemoteCrewPanel() {
   if (disabled) {
     return (
       <Card>
-        <div className="flex items-center gap-2 text-text font-medium mb-1">
+        <div className="flex items-center gap-2 text-text font-medium mb-1" data-setting-label={i18nT('pages.settings.instancesPanel.enable_remote_crew_management')}>
           <Server className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.multi_instance_management_is_off')}
         </div>
         <p className="text-[13px] text-muted mb-3">{i18nT('pages.settings.instancesPanel.enable_it_to_let_this_gateway_open_ssh_tunnels_t')}</p>
@@ -1049,7 +1107,13 @@ export function RemoteCrewPanel() {
         <div role="status" className="flex items-start gap-2 px-3 py-2 mb-3 text-[13px] rounded-md bg-accent/10 text-accent border border-accent/30">
           <Stethoscope size={14} className="lucide-inline mt-0.5 shrink-0" />
           <span className="flex-1 break-words">{diagNote}</span>
-          <button type="button" aria-label={i18nT('pages.settings.instancesPanel.dismiss_diagnosis')} className="shrink-0 opacity-70 hover:opacity-100" onClick={() => setDiagNote(null)}><X size={12} /></button>
+          {/* The dead end this PR exists to remove: a diagnosis names the broken
+              link and then leaves the user with nothing to do about it. Safe on both
+              tabs because every unsaved input this panel holds outlives the
+              navigation — the two forms in the store, the launch form's size and
+              account in localStorage. */}
+          {diagReport && <AskAgentButton report={diagReport} />}
+          <button type="button" aria-label={i18nT('pages.settings.instancesPanel.dismiss_diagnosis')} className="shrink-0 opacity-70 hover:opacity-100" onClick={() => { setDiagNote(null); setDiagReport(null) }}><X size={12} /></button>
         </div>
       )}
     </>
@@ -1131,7 +1195,7 @@ export function RemoteCrewPanel() {
                       setEditBlockedId(null)
                       // Cancel (id === null) is the user CHOOSING to discard; the draft
                       // goes with it. Every other way the form disappears keeps it.
-                      if (id === null) setEditDraft(null)
+                      if (id === null) dispatch(setCrewEditForm(null))
                       setEditingId(id)
                     }}
                     editDraft={editDraft?.id === inst.id ? editDraft.draft : null}
@@ -1142,41 +1206,38 @@ export function RemoteCrewPanel() {
                     // values instead would turn untouched-but-stale fields into
                     // deliberate writes — the exact clobber the baseline exists to stop.
                     editDraftSeq={editDraft?.id === inst.id ? editDraft.seq : 0}
-                    onEditRebase={() =>
-                      setEditDraft(prev => {
-                        if (prev === null || prev.id !== inst.id) return prev
-                        const base = instanceFormFromView(prev.draft.baseline)
-                        const live = instanceFormFromView(inst)
-                        const merged = { ...live }
-                        for (const k of Object.keys(base) as (keyof typeof base)[]) {
-                          if (prev.draft.values[k] === base[k]) continue
-                          // Field-wise assign: the value's type is the field's own, and
-                          // a generic index write cannot see that.
-                          Object.assign(merged, { [k]: prev.draft.values[k] })
-                        }
-                        return {
-                          id: inst.id,
-                          draft: { values: merged, baseline: inst },
-                          seq: prev.seq + 1,
-                        }
-                      })
-                    }
-                    onEditDraftChange={draft =>
-                      setEditDraft(prev => {
-                        const next =
-                          draft === null
-                            ? null
-                            : { id: inst.id, draft, seq: prev?.id === inst.id ? prev.seq : 0 }
-                        // Same values, same object: the report fires on every keystroke,
-                        // and a fresh object each time would re-render for nothing.
-                        return JSON.stringify(prev) === JSON.stringify(next) ? prev : next
-                      })
-                    }
+                    onEditRebase={() => {
+                      if (editDraft === null || editDraft.id !== inst.id) return
+                      const base = instanceFormFromView(editDraft.draft.baseline)
+                      const live = instanceFormFromView(inst)
+                      const merged = { ...live }
+                      for (const k of Object.keys(base) as (keyof typeof base)[]) {
+                        if (editDraft.draft.values[k] === base[k]) continue
+                        // Field-wise assign: the value's type is the field's own, and
+                        // a generic index write cannot see that.
+                        Object.assign(merged, { [k]: editDraft.draft.values[k] })
+                      }
+                      dispatch(setCrewEditForm({
+                        id: inst.id,
+                        draft: { values: merged, baseline: inst },
+                        seq: editDraft.seq + 1,
+                      }))
+                    }}
+                    onEditDraftChange={draft => {
+                      const next =
+                        draft === null
+                          ? null
+                          : { id: inst.id, draft, seq: editDraft?.id === inst.id ? editDraft.seq : 0 }
+                      // Same values, same action: the report fires on every keystroke,
+                      // and dispatching an equal-but-new object re-renders for nothing.
+                      if (JSON.stringify(editDraft) === JSON.stringify(next)) return
+                      dispatch(setCrewEditForm(next))
+                    }}
                     // Clearing editingId without clearing the refusal left the UI
                     // instructing the user about a form that no longer exists.
                     onEditSaved={updated => {
                       setEditingId(null)
-                      setEditDraft(null)
+                      dispatch(setCrewEditForm(null))
                       setEditBlockedId(null)
                       // A warm pane is an iframe pointed at the OLD local port with the
                       // OLD token. If the save tore the tunnel down (any transport

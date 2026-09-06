@@ -10,7 +10,7 @@
 // - user-facing copy comes from the failure `code`, not from the raw library
 //   `message`
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, act, fireEvent } from '@testing-library/react'
+import { render, screen, cleanup, act, fireEvent, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 
@@ -75,6 +75,30 @@ describe('AboutPanel download states', () => {
     cleanup()
     vi.unstubAllGlobals()
     delete (window as unknown as { updateAPI?: unknown }).updateAPI
+  })
+
+  it('takes the lane pair from the live push over the mount-time getInfo answer', async () => {
+    // `info` is a one-shot getInfo() read from mount; every later check pushes its
+    // own answer on the lifecycle payload. A check that runs while this panel is
+    // open therefore has to win, or the chip keeps folding on a stale not-ahead
+    // and renames insider bytes to a stable release that does not exist.
+    const { setState } = mountWithStates({
+      version: '0.5.0-insider.2',
+      channel: 'stable',
+      stampedChannel: 'insider',
+      channelSwitchable: true,
+      // The mount-time answer: stable publishes exactly these bytes.
+      laneVersion: '0.5.0-insider.2',
+      runningAheadOfLane: false,
+    })
+    // With only that, the chip folds -- the promoted-stable case.
+    const chip = await screen.findByTestId('about-version')
+    await waitFor(() => expect(chip.textContent).toContain('0.5.0'))
+    expect(chip.textContent).not.toContain('insider')
+
+    // A later check finds stable at an OLDER release: these bytes are ahead of it.
+    setState({ state: 'not-available', laneVersion: '0.4.1-insider.1', runningAheadOfLane: true })
+    await waitFor(() => expect(chip.textContent).toContain('0.5.0-insider.2'))
   })
 
   it('renders a determinate progress bar when percent is present', async () => {

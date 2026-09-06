@@ -14,7 +14,12 @@ import userEvent from '@testing-library/user-event'
 
 import FeedbackPill from '../components/FeedbackPill'
 
-const status: { release_channel?: string } = {}
+const status: {
+  release_channel?: string
+  update_channel?: string
+  update_check_status?: string
+  update_channel_move_pending?: boolean
+} = {}
 
 vi.mock('../store', () => ({
   useAppSelector: (sel: (s: unknown) => unknown) =>
@@ -32,6 +37,9 @@ function mount() {
 
 beforeEach(() => {
   delete status.release_channel
+  delete status.update_channel
+  delete status.update_check_status
+  delete status.update_channel_move_pending
 })
 
 describe('FeedbackPill', () => {
@@ -43,6 +51,43 @@ describe('FeedbackPill', () => {
 
   it.each(['nightly', 'insider'])('shows the report chip on a %s build', ch => {
     status.release_channel = ch
+    mount()
+    expect(screen.getByTestId('prerelease-report-chip')).toBeInTheDocument()
+  })
+
+  it('shows NO chip on a PROMOTED stable release, whose version reads as insider', () => {
+    // `release_channel` is derived from the version STRING, and promotion
+    // re-points the soaked candidate's bytes at stable without re-stamping them:
+    // a promoted stable release is literally `0.4.1rc1`, which classifies as
+    // `insider`. Keyed on that alone, this chip was a permanent header bug
+    // affordance for the ENTIRE stable population — the thing the component's
+    // own docstring says stable must not have.
+    status.release_channel = 'insider'
+    status.update_channel = 'stable'
+    status.update_check_status = 'succeeded'
+    status.update_channel_move_pending = false
+    mount()
+    expect(screen.queryByTestId('prerelease-report-chip')).toBeNull()
+  })
+
+  it('KEEPS the chip for insider bytes the stable lane never shipped', () => {
+    // The exemption is "the lane you follow publishes these bytes", not "you
+    // follow stable": an insider build whose switcher was flipped to stable is
+    // still running prerelease bytes, and it is still the population whose
+    // reports matter.
+    status.release_channel = 'insider'
+    status.update_channel = 'stable'
+    status.update_check_status = 'succeeded'
+    status.update_channel_move_pending = true
+    mount()
+    expect(screen.getByTestId('prerelease-report-chip')).toBeInTheDocument()
+  })
+
+  it('does not exempt on an unproven check', () => {
+    // No completed comparison means UNKNOWN. Exempting there would hide the chip
+    // from a genuine prerelease user on the strength of a check that never ran.
+    status.release_channel = 'insider'
+    status.update_channel = 'stable'
     mount()
     expect(screen.getByTestId('prerelease-report-chip')).toBeInTheDocument()
   })

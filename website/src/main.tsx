@@ -2,6 +2,7 @@
 // FIRST (before store/providers/App) so seam registrations run before render.
 // Empty in the stock build. See website/src/extensions.ts.
 import './extensions'
+import { installAllocWatch } from './lib/allocWatch'
 import React, { StrictMode, Suspense, lazy } from 'react'
 import { createRoot } from 'react-dom/client'
 import { withCommitProfiler, installCommitProfilerConsoleApi } from './lib/commitProfiler'
@@ -26,6 +27,7 @@ import App from './App'
 import { queryClient } from './api/queryClient'
 import ErrorBoundary from './components/ErrorBoundary'
 import DashboardBootstrap from './components/DashboardBootstrap'
+import { installPageZoomSuppression } from './utils/pageZoom'
 import 'katex/dist/katex.min.css'
 import './index.css'
 import './styles/cli-mode.css'
@@ -40,6 +42,12 @@ initRum(__APP_VERSION__)
 // reconciles against the server-authoritative config value.
 setProductName('kirocrew-customapi')
 initI18n()
+
+// Page zoom is off on touch: the shell is an application, not a document. The
+// viewport meta and the root `touch-action` cover Blink/Gecko; this covers
+// WebKit, which ignores both for user gestures. Installed before render so the
+// very first pinch is already suppressed. See utils/pageZoom.ts.
+installPageZoomSuppression()
 
 // Auto-recover from stale lazy-chunk errors after a frontend rebuild.
 // Vite fires `vite:preloadError` on window when a dynamic import() of a
@@ -82,6 +90,13 @@ window.addEventListener('vite:preloadError', (event) => {
 
 // Accessibility: runtime DOM scanning in dev mode (logs violations to console)
 if (import.meta.env.DEV) {
+  // The `meta-viewport` rule is deliberately NOT waived, even though this shell ships
+  // `maximum-scale=1, user-scalable=no` and axe therefore reports a critical WCAG 1.4.4
+  // finding on every dev render. A waiver was written and removed; do not re-add one.
+  // The finding is not noise — it is the only recurring reminder that suppressing page
+  // zoom is an accessibility trade nobody has yet accepted in writing, and "nobody can
+  // action it" was wrong: it is a decision, and a decision stays owed.
+  // See the page-zoom section of website/docs/page-layout.md for the policy.
   import('react-dom').then(ReactDOM => import('@axe-core/react').then(axe => axe.default(React, ReactDOM, 1000)))
 }
 
@@ -110,6 +125,13 @@ if (!isEmbeddedPane()) {
 }
 
 const WorldsPopout = lazy(() => import('./pages/WorldsPopout'))
+
+// Patch the buffer-allocating constructors before app code allocates, so a large
+// ArrayBuffer/TypedArray that precedes a V8 cage OOM is reported to the main
+// process (and flushed next to the crash line) instead of dying unnamed with the
+// renderer. Cheap, idempotent, and no-ops when there is no main process to
+// report to (a plain-browser dashboard).
+installAllocWatch()
 
 // Debug-only, and inert unless explicitly armed with ?profile=commits. When
 // disarmed withCommitProfiler returns the children untouched, so no Profiler

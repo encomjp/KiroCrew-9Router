@@ -48,6 +48,19 @@ FTS5 search via `~/.kiro/crew/memory_index.db` (SQLite via `pysqlite3-binary` on
 
 Context injection includes source citations per section. Agent can update memory files via kiro-cli's file tools.
 
+### Knowledge library duplicate ownership
+
+Folder ingestion tracks two identities for each file: `content_hash` is the hash
+of the file's raw bytes, while `text_hash` is the hash of the text extracted by
+the reader and stored on knowledge items. They are equal for plain text but not
+for transformed formats such as PDF, DOCX, and HTML. The pre-ingest duplicate
+gate passes its exact extracted-text hash to the caller's in-transaction
+`on_duplicate` finalizer. `FolderWatcher` stores that value on the deduped state
+row before the gate commits, so a later source deletion can reassign and adopt
+the surviving item into the correct file row. Deriving the value only from a
+byte-identical sibling is a fallback for older direct state writes, not the
+ingestion contract.
+
 ### Decaying Memory (`read_recent_history`)
 
 History context uses natural decay: recent days in full detail, older days
@@ -260,6 +273,7 @@ Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kir
 - **Non-blocking model load**: the GGUF load runs on a background daemon thread (`_kick_background_load()`, thread name `kc-embed-load`) — `embed()`/`embed_batch()` NEVER block on the load. When the model isn't in memory yet, the call kicks the background load and returns `None` immediately; memory degrades to keyword search until the load lands. The gateway/dashboard event loop is never stalled by embedding work. `wait_ready(timeout)` exists for sync contexts (tests, one-shot CLI flows) that legitimately want to block — never call it from an event-loop thread
 - The underlying `Llama` object is NOT thread-safe — inference on a loaded model is serialized behind a lock (tens of ms per short text)
 - `get_shared_embedder()` — process-wide singleton (~700MB RSS when loaded), shared by vector memory AND the knowledge library; `close()` unloads the model to free RSS
+- **Bounded llama.cpp scratch memory**: the accepted context and logical batch remain 2,048 tokens, while the physical decode micro-batch (`n_ubatch`) is 512. llama.cpp splits a long input across those physical batches before applying last-token pooling, so the complete context still contributes to one vector. Against the shipped Qwen model, a maximum 6,000-character input produced byte-identical 1,024-dimensional vectors at 512 and 2,048 (`cosine=1.0`, max absolute difference `0.0`); 512 reduced Linux peak/resident RSS by approximately 419 MiB for that pass. Do not lower `n_ctx` or `n_batch` as a memory shortcut: either would reduce the semantic input the model can accept.
 - Per-platform native libs live in `_vendor/llama_cpp_libs/{linux_x86_64,linux_aarch64,macos_arm64,macos_x86_64,win_amd64}`, selected at import time via `LLAMA_CPP_LIB_PATH` (upstream-supported override; an operator-set value wins, enabling e.g. a GPU build). Before loading the bundled Linux x86_64 runtime, `_load_llama_class()` intersects the `flags` reported for every visible processor in `/proc/cpuinfo` and requires the baseline compiled into the shipped upstream wheel (AVX, AVX2, BMI2, F16C, FMA, SSE3, SSSE3). A missing or unreadable feature list refuses the native runtime before it can raise an uncatchable SIGILL; memory stays available through keyword search. The gate does not apply to an operator-set `LLAMA_CPP_LIB_PATH`, because that directory may contain a lower-baseline build. Unsupported platforms, incompatible bundled CPUs, and import failures all degrade to keyword-only memory search. See `_vendor/README.md`
 - **The shipped closure is declared, not inferred.** `_REQUIRED_VENDORED_LIBS` names the exact files each platform must carry, and `verify_vendored_libs(root=None)` returns `{platform: [missing…]}` (empty when complete) against a source tree, an unpacked sdist, or an installed wheel. `_load_llama_class()` consults it before importing, so an incomplete install is reported as a **packaging defect naming the absent files** rather than surfacing as ctypes' `Shared library with base name 'llama' not found` — which reads as an unsupported architecture and misdirected the real-world diagnosis of this bug. `kirocrew doctor` prints the same detail. The check is **skipped when `LLAMA_CPP_LIB_PATH` is set**: the libs then load from the operator's directory, so the bundled tree's contents no longer determine whether the runtime works, and refusing on them would disable the documented override for exactly the users an incomplete wheel stranded (the warning names the env var as a remedy for that reason). Each packaging lane selects these files by a different mechanism (MANIFEST.in for the sdist, `package_data` for the wheel — which the desktop bundle inherits, since it pip-installs the project into its bundled interpreter), so each is guarded independently in `test/test_vendored_llama_payload.py`, and both `build.yml` (every PR) and `build-wheel.yml` (release/nightly) re-check the built wheel **and** sdist against the same declaration via the shared `scripts/verify_vendored_payload.py` (one script for both lanes, so they cannot drift into a gate that stops guarding without failing) — the sdist explicitly, because `python -m build --wheel` never evaluates `MANIFEST.in` and so cannot see an sdist regression at all. Linux ships no BLAS backend by design: upstream publishes none in its Linux CPU wheels (macOS gets `libggml-blas` only via the system Accelerate framework), and the Linux `libggml-cpu` carries the optimized GEMM kernels instead
 - Failed model loads (corrupt file, bad native libs) are retried only after a 300s cooldown so a broken state can't spawn a loader thread per embed call
@@ -370,10 +384,19 @@ Model: `Qwen/Qwen3-Embedding-0.6B` Q8_0 GGUF (610MB). Apache-2.0 licensed. Serve
 
 `kirocrew memory {list,search,show,stats,audit,export,migrate,import}` — manage memory from the command line:
 - `show [preferences|projects|history]` — read the markdown layer through `MemoryStore` (all three targets when none given); `--format md|json` (json entries carry `path`, `updated_at` mtime in UTC ISO-8601, `content`), `--since YYYY-MM-DD` filters history days. Missing/empty files print as empty rather than erroring
+- `search <query>` — searches BOTH memories and labels each section: the vector store's episodic recall, then keyword hits from the markdown layer's FTS5 index (`MemoryStore.search`, over `preferences.md` / `projects.md` / every `history/*.md`). `--layer vector|history|all` (default `all`); `--layer vector` reproduces the previous vector-only output exactly, and `--layer history` skips constructing the vector store entirely, the same way `show` does. The two indexes answer different questions — "where did I write this word" versus "what does this mean like" — so they are reported separately rather than merged into one ranking
 - `export` — vector-store collections; `--include-markdown` opts in a `markdown` collection (`preferences`/`projects` entries + per-day `history` list from `MemoryStore.markdown_snapshot()`) without changing the default payload shape
 - `migrate` — one-time markdown → structured migration (preferences.md → semantic, history/*.md → episodic)
 - `import <file>` — restore from JSON export with full validation
 - `kirocrew security audit` also scans vector memory for injection patterns
+
+### Keyword search over the markdown layer
+
+**Query escaping.** The query is treated as literal words, not FTS5 expression syntax. Tokens are quoted by `fts5_quote_tokens` in `_sqlite_compat.py`, the single escaping dialect shared with knowledge retrieval. Unquoted, `-` and `.` and a bare `AND` are FTS5 operators, so `PROJ-123` or `hooks.py` raises inside the driver and `MemoryStore.search`'s `except` turns it into `[]`, a silent "never written" for the likeliest queries. The join differs by surface on purpose: memory ANDs every token (a hand-typed query is deliberate), knowledge drops stopwords and ORs (natural-language recall).
+
+**Empty index is not absence.** `MemoryStore.index_row_count()` returns the FTS row count, or `None` when the index cannot be read, so a caller can separate three states that `search` collapses into one empty list: unreadable, empty, genuinely no match. An unbuilt or unreadable index is reported as such rather than as "no match".
+
+**No agent-facing tool.** The index is reachable from the CLI only. An MCP tool that reads memory on demand would have to enforce the temporary-session read boundary itself, and that boundary is not readable from an out-of-process stdio server: `memory_mode` lives on the dashboard's `SessionSlot`, while Slack and Telegram carry it in `privacy_mode.is_temporary`, and a temporary Slack thread writes no transcript metadata at all. Exposing the index to agents needs a governance capability scope, the way `learn_add` gates durable writes through `capabilities.memory_writes`, and that is left to separate work.
 
 ### Migration (`migrate_from_markdown`)
 
@@ -397,6 +420,13 @@ The backend `POST /api/memory/migrate` endpoint and the `kirocrew memory migrate
 ### Cross-Platform
 
 macOS (Apple Silicon and Intel), Linux (x86_64, arm64/Graviton), and Windows supported. All paths use `pathlib.Path`. GGUF model downloaded over sha256-pinned HTTPS from the Kiro Crew CDN. No runtime install step — native llama.cpp libraries are vendored per platform in `_vendor/llama_cpp_libs/` and selected via `LLAMA_CPP_LIB_PATH` (the old Docker fallback is gone).
+
+Before the vendored runtime becomes usable, `embeddings._load_llama_class()`
+reconfigures llama-cpp-python's import-time stdout/stderr null streams to UTF-8
+with backslash replacement. The upstream suppressor temporarily installs those
+streams process-wide while the GGUF loads on `kc-embed-load`; keeping the same
+handles preserves its native fd suppression while preventing unrelated Unicode
+gateway output from failing under a locale encoding such as Windows cp1252.
 
 | Platform | Vendored libs | GPU | Notes |
 |----------|--------------|-----|-------|
@@ -1052,6 +1082,16 @@ The `false` value carries no new privilege surface: it can only reduce what a
 skill delivers, and foreign-imported skills are refused for declaring `triggers`
 at all (`onboarding_import.py`), so an import cannot reach either path.
 
+**Disabled-app skill gating.** When an app is disabled (`_disabled_app_names()`),
+its bundled skills are withheld across all user-facing surfaces: trigger matching
+(`get_triggered_skills`), per-turn index listing and search (`list_skills`,
+`get_context`, `search_skills`), always-injected bodies (`get_always_skills`),
+and explicit `$skill` token resolution (`resolve_dollar_skills`). An unreadable
+app registry fails open so a transient read error never hides enabled skills.
+Internal plumbing helpers (`load_skill`, `_served_key_by_realpath`,
+`resolve_ledger_aliases`, `_resolve_path_and_root`) remain ungated so
+reconciliation and pinned paths function without modification.
+
 **Setting it from the dashboard.** `POST /api/skills/-/inject-on-trigger` (body
 `{name, inject}`) edits that one frontmatter line server-side via
 `SkillsLoader.set_inject_on_trigger()`, mirroring `set_pinned()` — atomic write,
@@ -1212,7 +1252,7 @@ and exfiltration URLs; clean assets are copied byte-for-byte, including leading
 and trailing whitespace. No per-asset preview truncation is used for either the
 security decision or the copied content.
 
-**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep.
+**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
 
 **LLM tool mechanisms:**
 - MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**
@@ -1421,6 +1461,20 @@ a hook is therefore **not portable across platforms**:
 
 Both platforms receive the same `KIROCREW_HOOK_EVENT` / `KIROCREW_HOOK_CONTEXT`
 env vars and the same hook-event JSON on stdin.
+
+**A hook subprocess inherits only an allowlisted slice of the gateway
+environment, not the whole of `os.environ`.** The gateway process holds
+credentials (provider API keys, tokens) in its environment; copying that wholesale
+into every hook command would hand an untrusted shell line those secrets. The
+allowlist (`_HOOK_BASE_ENV_KEYS` in `hooks.py`) preserves only what a hook
+legitimately needs — `PATH`/`PATHEXT`/`COMSPEC`/`SYSTEMROOT`, the home/profile and
+`KIROCREW_HOME` data-home vars, temp-dir and locale vars, and TLS-trust
+(`SSL_CERT_*`, `NO_PROXY`) — plus the two `KIROCREW_HOOK_*` metadata vars set last.
+`HTTP(S)_PROXY` is deliberately dropped (it commonly embeds userinfo credentials).
+The consequence for operators: a hook that relied on an ambient var outside that
+set (e.g. `VIRTUAL_ENV`, `PYTHONPATH`, `JAVA_HOME`, `AWS_PROFILE`, nvm/pyenv vars)
+runs fine in a terminal but fails once fired as a hook; the fix is to add that key
+to `_HOOK_BASE_ENV_KEYS` by name — the allowlist is fail-closed by design.
 
 **Windows spawns through `asyncio.create_subprocess_shell`, not an argv.** cmd.exe
 must receive the operator's command line verbatim: an argv spawn of

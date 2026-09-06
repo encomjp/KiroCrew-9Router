@@ -27,6 +27,13 @@ installed by the caller should just forward into ``stop_event.set()``.
 
 from __future__ import annotations
 
+# System-trust injection is process-local and must run before imports below can
+# create or cache an SSLContext. Environment-only CA settings are inherited
+# from GatewayManager, but Security.framework-backed contexts are not.
+from kiro_crew._ssl_compat import _ensure_ssl_certs
+
+_ensure_ssl_certs()
+
 import argparse
 import asyncio
 import contextlib
@@ -43,7 +50,11 @@ from typing import Any, Callable, Collection, Iterator, Optional
 
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.loader import config_dir as _config_dir
-from kiro_crew.executors import maintenance_executor, subprocess_executor
+from kiro_crew.executors import (
+    configure_default_executor,
+    maintenance_executor,
+    subprocess_executor,
+)
 from kiro_crew.mcp_caller import CallerContext
 from kiro_crew.mcp_caller import _parent_pid as _ppid_fn
 from kiro_crew.mcp_gateway import credwatch, hazards, socketsec, transport
@@ -82,6 +93,7 @@ from kiro_crew.mcp_gateway.stub import fallback_counts as stub_fallback_counts
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.peer_resolve import resolve_peer_identity
 from kiro_crew.platform_compat import IS_WINDOWS
+from kiro_crew.platform_compat import count_open_fds as _shared_count_open_fds
 from kiro_crew.platform_compat import get_process_start_id as _get_process_start_id
 from kiro_crew.platform_compat import proc_rss_bytes as _proc_rss_bytes
 from kiro_crew.sandbox import _PYTHON_ENV_PREFIXES, warm_backend
@@ -311,9 +323,10 @@ async def run_gatewayd(
     """
     socket_path = Path(socket_path)
     # Off the event loop for the same reason as the manager's call: the
-    # owner-only step shells out to icacls on Windows. Startup is the least
-    # contended moment in this process, but the daemon's signal handlers and
-    # supervising ping are already live, so it is offloaded here too.
+    # owner-only step is blocking filesystem work (the Windows DACL is applied
+    # in-process). Startup is the least contended moment in this process, but
+    # the daemon's signal handlers and supervising ping are already live, so it
+    # is offloaded here too.
     await asyncio.to_thread(transport.prepare_dir, socket_path)
     # Singleton guard (race-free): acquire an exclusive advisory lock on a
     # lockfile beside the endpoint BEFORE probing/unlinking/binding. Without it,
@@ -393,10 +406,17 @@ async def run_gatewayd(
     async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
         try:
-            await _handle_connection(reader, writer, pool, resolver, socket_path, hot_keys)
+            await _handle_connection(
+                reader, writer, pool, resolver, socket_path, hot_keys, stop_event=stop_event
+            )
         except asyncio.CancelledError:
             # Normal on shutdown — propagate for the gather() below.
             raise
+        except ConnectionError:
+            # Abrupt peer disconnect (ECONNRESET / EPIPE from a hard-killed
+            # client) is routine — the clean-EOF sibling is already handled
+            # inside _handle_connection — so don't log it as a crash.
+            logger.debug("client disconnected abruptly", exc_info=True)
         except Exception:
             logger.exception("connection handler crashed")
         finally:
@@ -1286,6 +1306,46 @@ def _declared_env_to_forward(pool_key: PoolKey) -> dict[str, str]:
     return _declared_non_secret_env(pool_key)
 
 
+#: The canonical target-env prefix. ``MC_MCP_TARGET_`` is the legacy spelling
+#: :func:`env_target_resolver` still accepts, so both normalize to this stem set.
+_TARGET_ENV_PREFIXES = ("KIROCREW_MCP_TARGET_", "MC_MCP_TARGET_")
+
+
+def resolvable_target_stems(env: Optional[dict[str, str]] = None) -> list[str]:
+    """The set of target-env STEMS this daemon can resolve, sorted.
+
+    A stem is the env key with its prefix and any ``__<command_args_hash>``
+    suffix removed -- e.g. both ``KIROCREW_MCP_TARGET_KIROCREW_CORE`` and
+    ``KIROCREW_MCP_TARGET_KIROCREW_CORE__61774e20...`` yield ``KIROCREW_CORE``.
+
+    Reported on the ``pong`` reply so an adopting :class:`GatewayManager` can
+    tell whether an incumbent daemon's env still covers the servers the current
+    config wants stubbed. This is the ONLY way to see that: the daemon's target
+    map is baked into its process env at spawn (``manager._spawn_once``) and a
+    frozen :class:`GatewaySpec` is never re-applied to an adopted survivor, so a
+    daemon that predates a ``stub_servers`` change serves a stale map forever.
+
+    Deliberately reports STEMS rather than server names. Recovering a name would
+    mean undoing ``upper().replace("-", "_")``, which is lossy -- ``my-server``
+    and ``my_server`` normalize identically (the rewriter warns about exactly
+    that collision). Both sides comparing stems needs no such guess.
+    """
+    source = os.environ if env is None else env
+    stems: set[str] = set()
+    for key in source:
+        for prefix in _TARGET_ENV_PREFIXES:
+            if not key.startswith(prefix):
+                continue
+            stem = key[len(prefix) :]
+            # Strip the args-disambiguated suffix so a hashed-only entry still
+            # reports the server it serves.
+            stem = stem.split("__", 1)[0]
+            if stem:
+                stems.add(stem)
+            break
+    return sorted(stems)
+
+
 def env_target_resolver(pool_key: PoolKey) -> Optional[tuple[str, list[str], dict[str, str], str]]:
     """Look up ``KIROCREW_MCP_TARGET_<SERVER>`` in the process env and return the
     spawn tuple, or ``None`` if no mapping is set.
@@ -2024,6 +2084,88 @@ def _audit_prewarm_spawn(pool_label: str) -> None:
         logger.debug("SEL audit emit for prewarm spawn failed", exc_info=True)
 
 
+def _audit_stand_down(reason: str, outcome: str) -> None:
+    """Emit a SEL audit event for a stand-down request.
+
+    A stand-down ends the daemon, so it is the most consequential frame the
+    control surface accepts and belongs in the HMAC-chained SEL alongside the
+    claim/abort/peer decisions. Wrapped defensively -- an audit-log failure must
+    never break connection handling.
+    """
+    try:
+        SecurityEventLog().log_api_access(
+            caller="gateway-manager",
+            operation="mcp-gateway.stand_down",
+            outcome=outcome,
+            source="gateway",
+            resources=",".join(resolvable_target_stems()) or "(none)",
+            error=reason,
+        )
+    except Exception:  # pragma: no cover — audit must never break the handler
+        logger.debug("SEL audit emit for stand-down failed", exc_info=True)
+
+
+def _apply_stand_down(frame: dict[str, Any], stop_event: Optional[asyncio.Event]) -> dict[str, Any]:
+    """Yield the socket voluntarily so a daemon with a current target map can bind.
+
+    ``manager._report_adoption_drift`` can already SEE that an adopted survivor's
+    baked target map no longer covers the configured stub set; its own warning
+    ends "Replace the daemon to restore them", and this frame is how that
+    replacement happens without anyone unlinking a live socket.
+
+    Setting ``stop_event`` takes exactly the graceful path SIGTERM takes (the
+    signal handlers installed by ``_amain`` do only ``stop_event.set()``):
+    accepts stop, attached stubs drain, ``pool.shutdown_all()`` runs, the
+    endpoint is removed, the lock is released, the process exits. Doing it this
+    way round is the whole point. The alternative -- the starting gateway
+    unlinking the socket to take it -- is a connect-probe-then-unlink, which in
+    its documented false-stale window steals a LIVE incumbent's endpoint and
+    re-introduces the socket-theft class the flock guard exists to prevent. Here
+    the incumbent decides, and the request only ever arrives over a connection
+    that proves the incumbent is alive, so there is no stale-vs-live judgement to
+    get wrong.
+
+    ``need`` is the list of target stems the caller requires. A daemon that
+    already resolves ALL of them is REFUSED: there is nothing to gain by cycling
+    it, and honouring the request would turn this into a bare kill switch a
+    confused caller could aim at a daemon serving it correctly. A SUPERSET is
+    therefore fit -- extra stems a newer config no longer asks for are harmless,
+    and refusing on inequality would cycle a perfectly good daemon.
+
+    Trust basis for the rest is the same uid-gated owner-only socket that
+    authenticates Register/Claim/Abort.
+    """
+    need = frame.get("need")
+    if not isinstance(need, list) or not need or not all(isinstance(s, str) and s for s in need):
+        _audit_stand_down("missing or invalid need list", "denied")
+        return {"type": "stand-down-rejected", "reason": "missing or invalid 'need' stem list"}
+    served = set(resolvable_target_stems())
+    missing = sorted(set(need) - served)
+    if not missing:
+        _audit_stand_down("already covers every needed stem", "denied")
+        return {
+            "type": "stand-down-rejected",
+            "reason": "this daemon already resolves every requested target stem",
+        }
+    if stop_event is None:
+        # Reached only by a handler wired without a stop event (unit tests
+        # constructing _handle_connection directly). Refuse rather than claim a
+        # shutdown that cannot happen -- an accepted-but-inert control frame is
+        # worse than a rejected one, because the caller then waits for a lock
+        # that is never released.
+        _audit_stand_down("handler has no stop event", "denied")
+        return {"type": "stand-down-rejected", "reason": "shutdown not wired on this handler"}
+    logger.warning(
+        "gatewayd: standing down on request — this daemon cannot resolve %s, "
+        "which the caller's current config requires; draining so a daemon with "
+        "the current target map can bind",
+        ", ".join(missing),
+    )
+    _audit_stand_down(f"missing {','.join(missing)}", "allowed")
+    stop_event.set()
+    return {"type": "standing-down", "missing": missing}
+
+
 async def _handle_connection(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -2031,6 +2173,8 @@ async def _handle_connection(
     resolver: TargetResolver,
     socket_path: Path,
     hot_keys: Optional[HotKeyStore] = None,
+    *,
+    stop_event: Optional[asyncio.Event] = None,
 ) -> None:
     """Process one stub connection end-to-end.
 
@@ -2116,7 +2260,10 @@ async def _handle_connection(
     # uses this to confirm the daemon is serving before returning from
     # ``start()``.
     if register.get("type") == "ping":
-        await _write_json_line(writer, {"type": "pong"})
+        # ``targets`` lets the pinger detect a STALE incumbent before adopting
+        # it. Absent on a pre-#6xxx daemon, which the adoption gate treats as
+        # unverifiable rather than assuming coverage.
+        await _write_json_line(writer, {"type": "pong", "targets": resolvable_target_stems()})
         return
 
     # Metrics short-circuit: return a point-in-time pool snapshot (backends,
@@ -2155,6 +2302,17 @@ async def _handle_connection(
     # same uid-gated 0700 socket as Register/Claim.
     if register.get("type") == "abort":
         await _write_json_line(writer, await _apply_abort(register, pool))
+        return
+
+    # Stand-down short-circuit (one-shot control connection from a STARTING
+    # gateway): "your baked target map cannot resolve what my config needs --
+    # yield the socket". The only frame that ends the daemon, and the mechanism
+    # that turns _report_adoption_drift's warning into an actual repair. Trust
+    # basis: same uid-gated owner-only socket as Register/Claim/Abort.
+    # Validation, the already-covers refusal and auditing live in
+    # ``_apply_stand_down``.
+    if register.get("type") == "stand-down":
+        await _write_json_line(writer, _apply_stand_down(register, stop_event))
         return
 
     # App-call short-circuit (one-shot control connection from the dashboard):
@@ -2211,10 +2369,50 @@ async def _handle_connection(
     # the safe default in both directions: an overlay written before the flag
     # existed never silently starts sharing, and a malformed frame cannot widen
     # a connection's blast radius beyond itself.
-    exclusive_stub_uuid = "" if register.get("poolable") is True else stub_uuid
+    poolable_requested = register.get("poolable") is True
+    exclusive_stub_uuid = "" if poolable_requested else stub_uuid
+
+    # Retreat: a server OBSERVED behaving per-client while shared is not pooled
+    # again, whatever the overlay still says. This is the consuming half of the
+    # hazard ledger. Without it, recording a hazard changed a label on the MCP
+    # page and nothing else, so "share by default, retreat when observed" had no
+    # retreat -- the ledger's own evidence never reached a routing decision.
+    #
+    # The identity-checked read is the right one precisely BECAUSE this acts on
+    # the verdict: it answers for the program this launch actually runs, so an
+    # upgrade or a config edit re-earns pooling instead of leaving the server
+    # stranded on evidence about the build it replaced.
+    #
+    # Per-connection and per-key, so nothing global is switched off: every other
+    # server keeps pooling, and this one still gets a working PRIVATE backend --
+    # the same topology it would have with no gateway at all. The cost of a
+    # wrong retreat is therefore lost process reuse, never a broken server.
+    if poolable_requested:
+        observed = hazards.observed_codes(
+            pool_key.server_name,
+            hazards.launch_identity(
+                pool_key.command_args_hash,
+                pool_key.effective_env_hash,
+                pool_key.binary_version,
+            ),
+        )
+        if observed:
+            exclusive_stub_uuid = stub_uuid
+            logger.warning(
+                "hazard retreat: serving %r a private backend because %s was "
+                "observed while it was shared",
+                pool_key.server_name,
+                ", ".join(observed),
+            )
 
     def _release_reservation() -> None:
         """Release the hand-out reservation this connection actually took.
+
+        Keyed on the OUTCOME, because that is what decides which acquire path
+        ran: ``pool.get_or_create`` reserves, ``pool.acquire_exclusive`` does
+        not. A hazard-retreated connection therefore reserved nothing even
+        though it asked to pool, so releasing on the REQUEST would decrement a
+        digest this connection never reserved.
 
         A private backend takes none: it never enters the shared index, so no
         sweeper can reclaim it between hand-out and attach. Releasing one anyway
@@ -2222,9 +2420,10 @@ async def _handle_connection(
         ``poolable`` is not a PoolKey dimension, so a pooled connection with an
         identical PoolKey shares the digest. That pairing is reachable whenever
         the allowlist changes under a daemon that outlives the gateway: the old
-        overlay's stub still registers poolable while the new one does not. The
-        stray decrement would drop the pooled connection's eviction protection
-        before its stub attaches.
+        overlay's stub still registers poolable while the new one does not, and
+        now also whenever a retreat lands beside a concurrent pooled connection
+        on the same key. The stray decrement would drop the pooled connection's
+        eviction protection before its stub attaches.
         """
         if not exclusive_stub_uuid:
             pool.unreserve(pool_key)
@@ -2525,12 +2724,43 @@ async def _handle_connection(
                         # + create_task overhead so the metric stays true to name.
                         _acquire_ms = (time.monotonic() - _acquire_t0) * 1000.0
                     except _TargetUnknown as exc:
-                        _audit_pool_rejected(
+                        # An unknown target here means THIS DAEMON'S env has no
+                        # mapping -- which, at the pre-flight, can only be map
+                        # drift: a stub exists at all only because the rewriter
+                        # wrapped that server, and the stub is holding the real
+                        # ``--target-command`` on its own argv. A genuinely
+                        # unrunnable target fails later, as BackendUnavailable.
+                        # So this is fallback-ELIGIBLE: no real MCP frame has
+                        # been forwarded yet, so the stub can exec the target
+                        # directly and lose nothing but pooling.
+                        #
+                        # Loud, and named: the pre-fix behaviour was a bare
+                        # ``rejected`` with no ``fallback`` key, which the stub
+                        # reads as terminal (stub.py) -- it died in 0.2s having
+                        # logged only to a stderr nobody captures, so a whole
+                        # server's tools vanished from the session with no
+                        # attributable record anywhere. See
+                        # docs/architecture/design-notes/mcp-stub-decoupling.md.
+                        logger.warning(
+                            "ensure_backend: no target mapping for %s -- this "
+                            "daemon's target env predates the current "
+                            "stub_servers set (target map is baked at spawn and "
+                            "an adopted daemon never re-applies it). Replying "
+                            "fallback-eligible so the stub degrades to a "
+                            "per-session exec; pooling and the strict session "
+                            "key are LOST for this connection. Daemon stems: %s",
+                            pool_key.human_readable(),
+                            ",".join(resolvable_target_stems()) or "(none)",
+                        )
+                        _audit_pool_fallback(
                             caller.session_key if caller else "",
                             pool_key.human_readable(),
                             str(exc),
                         )
-                        await _write_json_line(writer, {"type": "rejected", "reason": str(exc)})
+                        await _write_json_line(
+                            writer,
+                            {"type": "rejected", "reason": str(exc), "fallback": True},
+                        )
                         return
                     except (BackendUnavailable, PoolAtCapacity) as exc:
                         logger.info(
@@ -2627,6 +2857,20 @@ async def _handle_connection(
                     # create_task overhead.
                     _lazy_elapsed_ms = (time.monotonic() - _lazy_t0) * 1000.0
                 except _TargetUnknown as exc:
+                    # Same drift as the pre-flight site, but NOT fallback-tagged:
+                    # only a pre-ensure_backend stub reaches this path and it has
+                    # already forwarded a real MCP frame, so an exec fallback
+                    # would lose that frame. Terminal is correct here -- what was
+                    # missing is saying so anywhere durable.
+                    logger.warning(
+                        "lazy-spawn: no target mapping for %s -- this daemon's "
+                        "target env predates the current stub_servers set. "
+                        "Terminal (a real frame was already forwarded, so an "
+                        "exec fallback would drop it): this server's tools will "
+                        "be ABSENT for the session. Daemon stems: %s",
+                        pool_key.human_readable(),
+                        ",".join(resolvable_target_stems()) or "(none)",
+                    )
                     _audit_pool_rejected(
                         caller.session_key if caller else "",
                         pool_key.human_readable(),
@@ -2999,14 +3243,43 @@ async def _respawn_backend_for_stub(
         )
         return None
 
+    # A respawn must honour the ledger too, or the retreat has a hole exactly
+    # where it matters most. The recycle that follows an unroutable server
+    # request comes straight back here, so re-pooling would hand the SAME stubs
+    # a shared backend for the server just observed misbehaving -- and no new
+    # register happens to re-decide it, so the retreat would not take effect
+    # until those sessions reconnected.
+    #
+    # ONE local drives both the acquire below and the release in the ``finally``,
+    # because those two must agree: only ``pool.get_or_create`` reserves, so a
+    # release keyed on a different predicate than the acquire would decrement a
+    # digest this respawn never reserved and drop a concurrent pooled
+    # connection's eviction protection.
+    respawn_exclusive_uuid = stub_uuid if old_backend.exclusive_token else ""
+    if not respawn_exclusive_uuid and hazards.observed_codes(
+        pool_key.server_name,
+        hazards.launch_identity(
+            pool_key.command_args_hash,
+            pool_key.effective_env_hash,
+            pool_key.binary_version,
+        ),
+    ):
+        respawn_exclusive_uuid = stub_uuid
+        logger.warning(
+            "hazard retreat on respawn: %r comes back private because a "
+            "hazard is on record for this launch",
+            pool_key.server_name,
+        )
+
     try:
         new_backend, _ = await _acquire_backend(
             pool,
             pool_key,
             resolver,
             # A respawn must not silently promote a private backend into the
-            # shared bucket: the replacement inherits the original binding.
-            exclusive_stub_uuid=stub_uuid if old_backend.exclusive_token else "",
+            # shared bucket: the replacement inherits the original binding,
+            # unless the ledger has since argued against sharing it at all.
+            exclusive_stub_uuid=respawn_exclusive_uuid,
         )
     except (_TargetUnknown, BackendUnavailable, PoolAtCapacity, OSError) as exc:
         logger.info(
@@ -3084,8 +3357,11 @@ async def _respawn_backend_for_stub(
     finally:
         # A private backend never took a reservation, and releasing one would
         # decrement a POOLED connection sharing this digest (see
-        # ``_release_reservation`` in the connection handler).
-        if not old_backend.exclusive_token:
+        # ``_release_reservation`` in the connection handler). Read the SAME
+        # local the acquire used, not ``old_backend.exclusive_token``: a hazard
+        # retreat above can make this respawn private while the old backend was
+        # pooled, and the two must not disagree.
+        if not respawn_exclusive_uuid:
             pool.unreserve(pool_key)
     new_writer_task = asyncio.create_task(
         _drain_inbox_to_stub(new_inbox, writer, stub_uuid),
@@ -3290,41 +3566,19 @@ def _count_open_fds() -> int:
     the count per snapshot lets us confirm or eliminate that path without
     deploying a separate tracer.
 
-    Platform implementations:
-    - Linux: ``/proc/self/fd``
-    - macOS/BSD: ``/dev/fd``
-    - Windows: ``GetProcessHandleCount`` via ctypes (handle count, not
-      fd count — the field documents this as platform-dependent)
+    Delegates to :func:`platform_compat.count_open_fds` — the one shared
+    per-platform probe (Linux ``/proc/self/fd``, macOS/BSD ``/dev/fd``,
+    Windows ``GetProcessHandleCount``), also behind the
+    ``kirocrew.process.open_fds`` gauge — so this diagnostic cannot drift
+    from the figure the metrics report. The shared probe subtracts the
+    enumeration fd on POSIX, so the value here is exactly one lower than the
+    raw count the pre-consolidation duplicate reported; immaterial for a
+    zombie-diagnostic snapshot field.
 
     Returns ``-1`` when the platform cannot provide the value.
     """
-    # Linux — preferred, most precise.
-    try:
-        return len(os.listdir("/proc/self/fd"))
-    except OSError:
-        pass
-
-    # macOS / BSD — /dev/fd is a per-process virtual directory.
-    try:
-        return len(os.listdir("/dev/fd"))
-    except OSError:
-        pass
-
-    # Windows — count kernel handles for the current process.
-    if sys.platform == "win32":
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-            handle_count = wintypes.DWORD()
-            current_process = kernel32.GetCurrentProcess()
-            if kernel32.GetProcessHandleCount(current_process, ctypes.byref(handle_count)):
-                return handle_count.value
-        except (OSError, AttributeError, ValueError):
-            pass
-
-    return -1
+    count = _shared_count_open_fds()
+    return -1 if count is None else count
 
 
 def _read_rss_kb() -> int:
@@ -3561,6 +3815,13 @@ async def _amain(argv: Optional[list[str]] = None) -> int:
     stop_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()
+
+    # ── Name the default executor ──
+    # asyncio.to_thread and run_in_executor(None, ...) route onto the loop's
+    # default executor, which Python names threads anonymously.  This names
+    # them ``mc-default`` so profilers like py-spy can attribute blocking work
+    # to this gateway.  Must run BEFORE any to_thread offload.
+    configure_default_executor()
 
     # Catch exceptions that slip past per-task handlers — e.g. a
     # fire-and-forget coroutine that blows up without ``await``. Without

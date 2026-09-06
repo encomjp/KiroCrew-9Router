@@ -316,8 +316,6 @@ def test_structured_context_window_seeds_central_authority(tmp_path):
         "kiro_crew.sandbox.resource_limit_preexec", lambda: None
     ), patch.object(
         agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)
-    ), patch.object(
-        agents.asyncio, "wait_for", return_value=(payload, b"")
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
     assert resp.status == 200
@@ -361,8 +359,6 @@ def test_list_models_spawns_at_the_configured_sandbox_tier(tmp_path):
         "kiro_crew.sandbox.resource_limit_preexec", lambda: None
     ), patch.object(
         agents.asyncio, "create_subprocess_exec", return_value=_FakeProc(payload)
-    ), patch.object(
-        agents.asyncio, "wait_for", return_value=(payload, b"")
     ):
         resp = _run(agents.api_models(_kiro_request(tmp_path)))
 

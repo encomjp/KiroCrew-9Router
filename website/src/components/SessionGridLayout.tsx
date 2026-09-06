@@ -101,8 +101,13 @@ function SplitContainer({
               role="separator"
               aria-orientation={horizontal ? 'vertical' : 'horizontal'}
             >
+              {/* Visual bar only — the 6px parent is the hit area and stays
+                  full-length. The bar's ends are inset by the panes' border
+                  radius (rounded-lg = 8px, so 16px total) so it spans exactly
+                  the straight segment of the adjacent pane borders instead of
+                  overshooting past where they curve away at the corners. */}
               <div
-                className={`bg-border group-hover/div:bg-accent transition-colors rounded-full ${horizontal ? 'w-[2px] h-full' : 'h-[2px] w-full'}`}
+                className={`bg-border group-hover/div:bg-accent transition-colors rounded-full ${horizontal ? 'w-[2px] h-[calc(100%-16px)]' : 'h-[2px] w-[calc(100%-16px)]'}`}
               />
             </div>
           )}

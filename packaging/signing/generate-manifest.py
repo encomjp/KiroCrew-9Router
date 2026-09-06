@@ -32,13 +32,18 @@ INPUT_KEY, OUTPUT_KEY) and prints the final manifest JSON to stdout. A summary
 line is printed to stderr for build logs.
 """
 
+import bz2
 import glob
+import gzip
 import json
+import lzma
 import os
 import plistlib
 import re
 import struct
 import sys
+import tarfile
+import zipfile
 
 # Fallback identifier prefix when the app bundle's own CFBundleIdentifier
 # cannot be read (never expected for a real electron-builder output).
@@ -70,12 +75,8 @@ _THIN_MAGICS = {0xFEEDFACE, 0xFEEDFACF, 0xCEFAEDFE, 0xCFFAEDFE}
 _FAT_MAGIC, _FAT_CIGAM = 0xCAFEBABE, 0xBEBAFECA
 
 
-def is_macho(path: str) -> bool:
-    try:
-        with open(path, "rb") as fh:
-            head = fh.read(8)
-    except OSError:
-        return False
+def is_macho_head(head: bytes) -> bool:
+    """Mach-O detection from the first 8 bytes of a stream."""
     if len(head) < 8:
         return False
     (magic,) = struct.unpack(">I", head[:4])
@@ -88,6 +89,15 @@ def is_macho(path: str) -> bool:
         (nfat,) = struct.unpack("<I", head[4:8])
         return 0 < nfat < 30
     return False
+
+
+def is_macho(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        return False
+    return is_macho_head(head)
 
 
 def read_bundle_identifier(bundle_path: str) -> "str | None":
@@ -205,6 +215,79 @@ def validate_layout(machos: "list[str]") -> "list[str]":
                         "Contents/Frameworks or add explicit bundle handling."
                     )
                     break
+    return errors
+
+
+def find_archived_machos(app_path: str) -> "list[str]":
+    """Fail-closed tripwire for a Mach-O hidden inside a compressed member.
+
+    collect_all_machos() reads magic bytes, so a Mach-O stored compressed is
+    invisible to it and to the pre-sign strip -- nothing signs it. The Apple
+    notary service, however, DECOMPRESSES archive members and scans what is
+    inside them, so such a payload fails the whole notarization with
+    "The binary is not signed with a valid Developer ID certificate",
+    "The signature does not include a secure timestamp" and "The executable does
+    not have the hardened runtime enabled" against a path of the form
+    `<archive>/<member>`. That is exactly how #6746 broke the release lane
+    (submission 3dbd3c7d): the Apple-Silicon imageio-ffmpeg executable was
+    gzip-sealed to survive signing byte-for-byte, and Apple looked inside.
+
+    Catch it HERE -- at sign time, with a bisectable trail -- instead of ~30
+    minutes later as an opaque notarization Invalid. Only stdlib-openable
+    containers are inspected, and only their first 8 bytes are read.
+    """
+    errors: "list[str]" = []
+
+    def report(archive_rel: str, member: str) -> None:
+        errors.append(
+            f"Mach-O inside a compressed member: {archive_rel} -> {member}\n"
+            "    Nothing signs a binary stored compressed, and the Apple notary "
+            "service decompresses archive members and rejects the submission "
+            "over it. Ship the executable UNCOMPRESSED so it is signed with the "
+            "other nested binaries (see kiro_crew.transcribe for how the runtime "
+            "authenticates a payload whose bytes signing rewrote)."
+        )
+
+    for root, _dirs, files in os.walk(app_path):
+        for name in files:
+            full = os.path.join(root, name)
+            if os.path.islink(full):
+                continue
+            rel = os.path.relpath(full, app_path)
+            lower = name.lower()
+            try:
+                if tarfile.is_tarfile(full):
+                    with tarfile.open(full) as archive:
+                        for member in archive:
+                            if not member.isfile():
+                                continue
+                            stream = archive.extractfile(member)
+                            if stream is not None and is_macho_head(stream.read(8)):
+                                report(rel, member.name)
+                elif zipfile.is_zipfile(full):
+                    with zipfile.ZipFile(full) as archive:
+                        for info in archive.infolist():
+                            if info.is_dir():
+                                continue
+                            with archive.open(info) as stream:
+                                if is_macho_head(stream.read(8)):
+                                    report(rel, info.filename)
+                elif lower.endswith(".gz"):
+                    with gzip.open(full, "rb") as stream:
+                        if is_macho_head(stream.read(8)):
+                            report(rel, name[: -len(".gz")])
+                elif lower.endswith(".bz2"):
+                    with bz2.open(full, "rb") as stream:
+                        if is_macho_head(stream.read(8)):
+                            report(rel, name[: -len(".bz2")])
+                elif lower.endswith((".xz", ".lzma")):
+                    with lzma.open(full, "rb") as stream:
+                        if is_macho_head(stream.read(8)):
+                            report(rel, name.rsplit(".", 1)[0])
+            except Exception:
+                # An unreadable or malformed container is not evidence of a
+                # hidden Mach-O; the notary reads what it can and so do we.
+                continue
     return errors
 
 
@@ -357,6 +440,7 @@ def main() -> int:
 
     machos = collect_all_machos(app_path)
     layout_errors = validate_layout(machos)
+    layout_errors.extend(find_archived_machos(app_path))
     if layout_errors:
         print("ERROR: bundle layout not understood by this generator:", file=sys.stderr)
         for err in layout_errors:

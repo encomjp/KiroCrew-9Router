@@ -553,6 +553,15 @@ export default [
               // a closed DOM set cannot match prose — no English phrase is
               // `AltRight` — and a new key code has to be added here on purpose.
               '^(?:Alt|Control|Meta|Shift)(?:Left|Right)$',
+              // The TWO provider-CLI LOGIN COMMANDS the pull-request panel offers
+              // as copyable recovery text (`pullRequestErrorDetails` returns one
+              // verbatim and the panel renders it in a <code> block). A command
+              // typed into a terminal is a wire string: translating it breaks
+              // it. Enumerated rather than shaped, like the key codes above — a
+              // "lowercase words" shape would exempt exactly the prose this
+              // config fights hardest, and this is a closed two-member set that
+              // grows only when a new provider CLI is wired in on purpose.
+              '^(?:gh|glab) auth login$',
               // A `mc:`-NAMESPACED BROWSER-STORAGE KEY, e.g.
               // `mc:notif:activeKinds:v2`, `mc:notif:seenChannels`. The dashboard
               // namespaces every localStorage key it owns under `mc:`, and such
@@ -853,7 +862,10 @@ export default [
               // fixed vocabulary (`message_sent`, `tool_call`, `approval_required`), read
               // by the behaviour state machine, never rendered.
               '^report[A-Z]\\w*$', '^pickFile$',
-              'querySelector(All)?', 'getElementById', 'createElement',
+              // `closest` takes the same CSS-selector contract as querySelector:
+              // its argument is an attribute/type selector walked up the tree,
+              // never rendered copy.
+              'querySelector(All)?', 'closest', 'getElementById', 'createElement',
               'addEventListener', 'removeEventListener', 'matchMedia',
               // WebGL/DOM capability lookups take registry identifiers
               // (`WEBGL_lose_context`), which are mixed-case and so escape the

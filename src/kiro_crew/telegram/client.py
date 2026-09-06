@@ -722,17 +722,22 @@ class TelegramClient:
         # handler it spawns races SessionManager._closing and may be refused,
         # exactly as a plain message arriving at shutdown already is today. It
         # costs nothing, sometimes wins, and drains the buffer either way.
-        self._flush_all_albums()
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        # Session close in a `finally` -- see DiscordClient.close() for why the
+        # steps above it can raise and what leaking the session costs.
+        try:
+            self._flush_all_albums()
+            if self._task:
+                self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    self._task = None
+        finally:
+            if self._session and not self._session.closed:
+                await self._session.close()
+                self._session = None
 
     def set_message_handler(self, on_message: Callable[[TelegramInbound], Awaitable[None]]) -> None:
         """Set/replace the inbound-message handler after construction.
@@ -1026,6 +1031,44 @@ class TelegramClient:
         if disable_notification:
             params["disable_notification"] = True
         result = await self._api_multipart("sendPhoto", params, [photo], field_names=["photo"])
+        return result.get("message_id") if isinstance(result, dict) else None
+
+    async def send_document(
+        self,
+        chat_id: int,
+        document: "OutboundFile",
+        *,
+        caption: str | None = None,
+        message_thread_id: int | None = None,
+        disable_notification: bool = True,
+    ) -> int | None:
+        """Upload ONE file via ``sendDocument``. Returns the message_id or None.
+
+        The generic-file counterpart of :meth:`send_photo`, for attachments that
+        are not raster images (PDF, CSV, archives — whatever the caller's own
+        gates admitted). Sent silently by default: every current caller has
+        already landed a text bubble for the same turn, and a second ping for
+        the same action is the pattern the other media sends avoid.
+
+        ``filenames`` pins the document's real name: the multipart sanitizer is
+        aimed at LLM-authored reference paths, and this caller's name has
+        already passed the file_send gates — letting the sanitizer rewrite the
+        extension would break the receiver's file-type association.
+        """
+        params: dict[str, Any] = {"chat_id": chat_id}
+        if message_thread_id is not None:
+            params["message_thread_id"] = message_thread_id
+        if caption:
+            params["caption"] = caption[:TELEGRAM_MAX_CAPTION]
+        if disable_notification:
+            params["disable_notification"] = True
+        result = await self._api_multipart(
+            "sendDocument",
+            params,
+            [document],
+            field_names=["document"],
+            filenames=[Path(document.path).name],
+        )
         return result.get("message_id") if isinstance(result, dict) else None
 
     async def send_voice(

@@ -54,12 +54,12 @@
  * Usage: node scripts/capture-pierre-files-tab.mjs [outDir]
  */
 import { chromium } from 'playwright'
-import { mkdirSync, readFileSync, existsSync, readdirSync } from 'node:fs'
-import { join, dirname, resolve } from 'node:path'
+import { mkdirSync, readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { homedir } from 'node:os'
 import { serveDist } from './lib/serve-dist.mjs'
 import { logPageProblems, stubDashboardApi, json } from './lib/stub-dashboard-api.mjs'
+import { chromiumExecutable } from './lib/chromium-executable.mjs'
 
 const OUT = process.argv[2] || '../temp-screenshots/pierre-diffs'
 /** Repo root, derived from this script's own location: the fixtures show a real
@@ -245,27 +245,7 @@ function pngSize(path) {
   return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) }
 }
 
-/**
- * Chromium to drive. `website/node_modules/playwright` pins one browser
- * revision, but this machine's `~/.cache/ms-playwright` may only hold builds
- * fetched by a DIFFERENT playwright — so honour `PLAYWRIGHT_CHROMIUM`, else the
- * newest cached shell, else let playwright resolve (and report) its own pin.
- */
-function chromiumExecutable() {
-  if (process.env.PLAYWRIGHT_CHROMIUM) return process.env.PLAYWRIGHT_CHROMIUM
-  const cache = join(homedir(), '.cache', 'ms-playwright')
-  if (!existsSync(cache)) return undefined
-  const rev = d => parseInt((/-(\d+)$/.exec(d) || [])[1] || '0', 10)
-  return readdirSync(cache)
-    .filter(d => d.startsWith('chromium_headless_shell-') || d.startsWith('chromium-'))
-    .sort((a, b) => rev(b) - rev(a))
-    .flatMap(d => [
-      join(cache, d, 'chrome-headless-shell-linux64', 'chrome-headless-shell'),
-      join(cache, d, 'chrome-linux64', 'chrome'),
-      join(cache, d, 'chrome-linux', 'chrome'),
-    ])
-    .find(existsSync)
-}
+/** Chromium resolution lives in ./lib/chromium-executable.mjs (shared across the capture harnesses). */
 
 async function main() {
   const { srv, base } = await serveDist()
@@ -644,10 +624,10 @@ async function main() {
     probe('rendered markdown h1', p12.locator('h1')),
     probe('rendered table cell text=PierrePatch', p12.getByText('PierrePatch', { exact: false })),
     probe('prose heading text=The file-tab layout', p12.getByText('The file-tab layout')),
-    probe('View Source toggle (so we are in PREVIEW)', p12.getByRole('button', { name: 'View Source' })),
+    probe('Edit toggle (so we are in PREVIEW)', p12.getByRole('button', { name: 'Edit' })),
   ], [await assertTreeRows('12-file-preview-aligned', ['AGENTS.md', 'website'])])
 
-  await page.locator('button:has-text("View Source")').first().click()
+  await page.locator('button:has-text("Edit")').first().click()
   await page.waitForTimeout(1800)
   const gSource = { ...await geometry(), firstLineTop: await firstLineTop(page.getByText('# Pierre migration', { exact: false })) }
   console.log('DIAG geometry-source', JSON.stringify(gSource))
@@ -656,7 +636,7 @@ async function main() {
     // SOURCE mode; preview renders it as an <h1> with the marker consumed.
     probe('literal source line text="# Pierre migration"', page.getByText('# Pierre migration', { exact: false })),
     probe('literal source text="## Surfaces"', page.getByText('## Surfaces', { exact: false })),
-    probe('View Preview toggle (so we are in SOURCE)', panel().getByRole('button', { name: 'View Preview' })),
+    probe('Preview toggle (so we are in SOURCE)', panel().getByRole('button', { name: 'Preview' })),
   ], [await assertTreeRows('13-file-source-aligned', ['AGENTS.md', 'website'])])
   const delta = k => (gPreview[k] == null || gSource[k] == null ? null : gPreview[k] - gSource[k])
   console.log('DIAG alignment-delta preview-minus-source', JSON.stringify({
@@ -700,7 +680,7 @@ async function main() {
   await page.getByText('The file-tab layout').first().waitFor({ state: 'visible', timeout: 20000 })
   await waitTreeText(ALL_ONLY_ROW)
   await page.waitForTimeout(1500)
-  await page.locator('button:has-text("View Source")').first().click()
+  await page.locator('button:has-text("Edit")').first().click()
   await page.getByText('# Pierre migration', { exact: false }).first().waitFor({ state: 'visible', timeout: 20000 })
   await page.waitForTimeout(1200)
   // Put the caret at the end of the file's first line and type.

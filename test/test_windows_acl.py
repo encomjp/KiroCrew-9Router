@@ -956,3 +956,145 @@ class TestLoadRefusesOffWindows:
     def test_describe_refuses_rather_than_returning_a_permissive_answer(self) -> None:
         with pytest.raises(windows_acl.AclUnavailable):
             windows_acl.describe(Path("/etc/hosts"))
+
+
+class TestApplyOwnerOnlyOffWindows:
+    """The WRITE side, driven off Windows through the same injected-handle seam.
+
+    `_load()` is the module's only platform gate, so substituting plain Python
+    objects for the two DLL handles runs the real ACL construction anywhere.
+
+    The volume gate is injected rather than derived, mirroring the split the
+    reader already uses: `TestVolumeClassification` owns `_volume_is_local`'s
+    platform-bound parsing (Windows-only, because `posixpath.splitdrive` never
+    returns a drive so it short-circuits to False off Windows), and the POLICY
+    consequence is asserted platform-independently by feeding the decision in.
+    Deriving it here instead is what made the first version of this class pass on
+    Windows and fail on every POSIX shard: `"C:\\\\x"` has no drive component off
+    Windows, so the local-volume cases refused before constructing anything.
+
+    Note this mechanism applies the DACL on ANY volume. The event-loop caller's
+    volume gate is NOT here -- it is :func:`windows_acl.volume_is_local`, asked at
+    the call site before the write begins, because a refusal raised from inside
+    this function would arrive after the caller had already paid the filesystem
+    cost the gate exists to avoid.
+    """
+
+    @staticmethod
+    def _writer():
+        """A fake exposing just the write-side surface, plus a call recorder."""
+
+        class _FakeWriter:
+            def __init__(self) -> None:
+                self.set_calls: list[dict] = []
+                self.freed: list[object] = []
+                self._next = 0x1000
+
+            # -- kernel32 --
+            def LocalFree(self, handle):
+                self.freed.append(handle)
+                return None
+
+            # -- advapi32 --
+            def ConvertStringSidToSidW(self, sid, out_ref):
+                self._next += 0x10
+                out_ref._obj.value = self._next
+                return 1
+
+            def GetLengthSid(self, _psid):
+                return 12
+
+            def InitializeAcl(self, _pacl, _size, _rev):
+                return 1
+
+            def AddAccessAllowedAceEx(self, _pacl, _rev, flags, mask, psid):
+                self.set_calls.append({"kind": "ace", "flags": flags, "mask": mask})
+                return 1
+
+            def SetNamedSecurityInfoW(self, path, obj, info, _o, _g, _dacl, _s):
+                self.set_calls.append({"kind": "set", "path": path, "info": info})
+                return 0
+
+        return _FakeWriter()
+
+    def _install(self, monkeypatch, *, local: bool):
+        """Install the fake handles and an injected volume verdict; record calls."""
+        fake = self._writer()
+        seen: list[str] = []
+        monkeypatch.setattr(windows_acl, "_load", lambda: (fake, fake))
+        monkeypatch.setattr(
+            windows_acl,
+            "_volume_is_local",
+            lambda _k32, path: (seen.append(str(path)), local)[1],
+        )
+        return fake, seen
+
+    def test_the_volume_is_never_consulted_by_this_mechanism(self, monkeypatch) -> None:
+        """The writer applies the DACL on ANY volume; the gate is not its job.
+
+        local=False would have refused while the gate lived here. It no longer
+        does: an on-loop caller has to ask before it starts (see
+        :func:`windows_acl.volume_is_local`), because a refusal at this depth
+        arrives after the caller already paid the cost it was avoiding.
+        """
+        fake, seen = self._install(monkeypatch, local=False)
+        windows_acl.apply_owner_only("Z:\\home\\config.json", inherit=False, sids=("S-1-3-4",))
+        assert seen == [], "the writer must not classify the volume itself"
+        assert any(c["kind"] == "set" for c in fake.set_calls), fake.set_calls
+
+    def test_the_public_predicate_reports_a_network_volume(self, monkeypatch) -> None:
+        # The seam an on-loop caller uses BEFORE it writes anything. It must
+        # classify without touching the platform write surface at all.
+        fake, seen = self._install(monkeypatch, local=False)
+        assert windows_acl.volume_is_local("Z:\\home\\config.json") is False
+        assert seen == ["Z:\\home\\config.json"], seen
+        assert fake.set_calls == [], f"classifying must write nothing: {fake.set_calls}"
+
+    def test_the_public_predicate_reports_a_local_volume(self, monkeypatch) -> None:
+        fake, seen = self._install(monkeypatch, local=True)
+        assert windows_acl.volume_is_local("C:\\config.json") is True
+        assert seen == ["C:\\config.json"], seen
+        assert fake.set_calls == [], f"classifying must write nothing: {fake.set_calls}"
+
+    def test_a_local_volume_writes_both_grants_and_frees_every_sid(self, monkeypatch) -> None:
+        fake, _ = self._install(monkeypatch, local=True)
+        windows_acl.apply_owner_only(
+            "C:\\config.json", inherit=False, sids=("S-1-3-4", "S-1-5-21-1")
+        )
+        aces = [c for c in fake.set_calls if c["kind"] == "ace"]
+        sets = [c for c in fake.set_calls if c["kind"] == "set"]
+        assert len(aces) == 2, aces
+        assert len(sets) == 1, sets
+        # File shape: no inheritance flags.
+        assert all(c["flags"] == 0 for c in aces), aces
+        # PROTECTED_DACL is what replaces icacls' /inheritance:r -- without it the
+        # new DACL would merge with the parent's instead of replacing it.
+        assert sets[0]["info"] & 0x80000000, hex(sets[0]["info"])
+        # Every parsed SID is LocalAlloc'd and must be freed.
+        assert len(fake.freed) == 2, fake.freed
+
+    def test_a_directory_grant_carries_both_inheritance_flags(self, monkeypatch) -> None:
+        fake, _ = self._install(monkeypatch, local=True)
+        windows_acl.apply_owner_only("C:\\vault", inherit=True, sids=("S-1-3-4",))
+        aces = [c for c in fake.set_calls if c["kind"] == "ace"]
+        # OBJECT_INHERIT (0x1) propagates to files, CONTAINER_INHERIT (0x2) to
+        # subdirectories; neither sets INHERIT_ONLY, so the directory itself keeps
+        # the grant and stays traversable.
+        assert all(c["flags"] == 0x03 for c in aces), aces
+
+    def test_a_failed_descriptor_write_still_frees_the_sids(self, monkeypatch) -> None:
+        fake, _ = self._install(monkeypatch, local=True)
+        monkeypatch.setattr(fake, "SetNamedSecurityInfoW", lambda *a: 5)  # ACCESS_DENIED
+        with pytest.raises(windows_acl.AclWriteFailed):
+            windows_acl.apply_owner_only("C:\\config.json", inherit=False, sids=("S-1-3-4",))
+        assert len(fake.freed) == 1, fake.freed
+
+    def test_empty_sids_is_refused_before_the_platform_is_touched(self, monkeypatch) -> None:
+        """An ACL with no ACEs denies everyone, the owner included."""
+
+        def _boom():
+            pytest.fail("_load() must not be reached for an empty grant list")
+
+        monkeypatch.setattr(windows_acl, "_load", _boom)
+        with pytest.raises(windows_acl.AclWriteFailed, match="no grants"):
+            windows_acl.apply_owner_only("C:\\config.json", inherit=False, sids=())

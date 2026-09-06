@@ -169,20 +169,28 @@ class TestLivenessDrainLoop:
         assert pooled is healthy
 
     @pytest.mark.asyncio
-    async def test_provider_without_is_alive_discarded(self):
-        """Provider missing is_alive attribute is treated as dead."""
-        mgr, _ = _make_manager(pool_agent="kirocrew")
+    async def test_unanswerable_liveness_probe_is_discarded_fail_closed(self):
+        """A provider whose liveness probe fails is discarded, not recycled.
 
-        no_alive = _make_provider()
-        del no_alive.is_process_alive
+        The TTL recycle reads the same process check, and an unusable answer
+        is treated as dead (WARNING, discard) so a broken provider never
+        reaches a session. Under the declared-ABC liveness contract a real
+        provider always answers ``is_process_alive`` (the ABC defaults it to
+        ``is_alive``), so the only remaining unanswerable case is a probe
+        that raises — which this models.
+        """
+        mgr, _ = _make_manager(pool_agent="kirocrew", pool_ttl_secs=1)
+
+        broken = _make_provider()
+        broken.is_process_alive = MagicMock(side_effect=RuntimeError("probe failed"))
         healthy = _make_provider()
 
-        mgr._warm_pool.put_nowait((no_alive, time.monotonic()))
+        mgr._warm_pool.put_nowait((broken, time.monotonic() - 10))
         mgr._warm_pool.put_nowait((healthy, time.monotonic()))
 
         pooled = await mgr._drain_and_claim("kirocrew")
 
-        no_alive.shutdown.assert_awaited_once()
+        broken.shutdown.assert_awaited_once()
         assert pooled is healthy
 
 

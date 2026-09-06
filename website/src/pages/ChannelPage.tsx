@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, type ReactNode } from 'react'
-import Clickable from '../components/Clickable'
+import Modal from '../components/Modal'
 import { Hourglass, Ear, Check, X, Wrench, Radio, VolumeX, User, MessageSquare, Users, Zap, AlertTriangle, RotateCcw } from 'lucide-react'
 import { useAppSelector } from '../store'
 import type { RootState } from '../store'
@@ -10,6 +10,7 @@ import MarkdownRenderer from '../components/MarkdownRenderer'
 import AgentSelector from '../components/AgentSelector'
 import { useAgents } from '../hooks/useAgents'
 import { useImeGuard } from '../hooks/useImeGuard'
+import { useMenuKeyboard, menuItemsOf } from '../hooks/useMenuKeyboard'
 import { AnimatePresence } from 'framer-motion'
 import DetailPanel from '../components/DetailPanel'
 
@@ -47,6 +48,11 @@ interface Channel {
   topic: string
   agents: ChannelAgent[]
   messages: ChannelMessage[]
+}
+
+interface ChannelPageError {
+  title: string
+  message: string
 }
 
 /* Map snake_case backend → camelCase frontend */
@@ -192,12 +198,46 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
 }) {
   const [menu, setMenu] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
+  // The trigger, so an explicit dismissal can hand focus back to it: the menu
+  // keyboard contract moves focus INTO the menu on open, and the row holding
+  // it is unmounted by the close — without a restore, focus would be orphaned
+  // on <body>. Outside-click dismissal is left alone (the browser routes focus
+  // per the click target), matching the MicSourceMenu posture (#6267).
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  // The role="menu" element itself — narrower than `menuRef` (which wraps the
+  // trigger too) so item discovery never picks up the trigger button.
+  const menuListRef = useRef<HTMLDivElement>(null)
   const alive = agent.state !== 'done' && agent.state !== 'failed'
+
+  // role="menu" promises the WAI-ARIA menu keyboard contract (arrow-key row
+  // navigation with wrap, Home/End, Tab containment). The shared hook owns it
+  // for all role="menu" surfaces rather than re-spelled here (#6231, #6269).
+  // The rows are native <button>s (`Btn`), so the hook's item discovery finds
+  // them with no extra markup. Escape stays owned by the dismiss effect below:
+  // what "close" means here — menu state, focus restore — is this host's
+  // business. Focus ENTRY is host-owned too (`focusFirstOnOpen: false`): this
+  // menu is not portalled and sits inside the agents rail's scroll container,
+  // so the hook's plain `.focus()` entry would scroll the rail on every open,
+  // shifting the row the user just clicked out from under the pointer —
+  // `preventScroll` keeps the rail still (arrow navigation still scrolls a
+  // focused row into view, which is wanted).
+  useMenuKeyboard({ enabled: menu, containerRef: menuListRef, focusFirstOnOpen: false })
+  useEffect(() => {
+    if (menu) menuItemsOf(menuListRef.current)[0]?.focus({ preventScroll: true })
+  }, [menu])
 
   useEffect(() => {
     if (!menu) return
     const close = (e: MouseEvent) => { if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenu(false) }
-    const esc = (e: KeyboardEvent) => { if (e.key === 'Escape') setMenu(false) }
+    const esc = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMenu(false)
+        // Focus lives inside the menu at this point (focus entry on open, Tab
+        // containment while open, and any outside mousedown already closed the
+        // menu) — hand it back to the trigger before its row unmounts.
+        triggerRef.current?.focus()
+      }
+    }
     document.addEventListener('mousedown', close)
     document.addEventListener('keydown', esc)
     return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', esc) }
@@ -210,12 +250,19 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
         <div className="text-sm font-medium text-text truncate">{agent.role}</div>
         {agent.agentName && <div className="text-[11px] text-muted font-mono truncate">{agent.agentName}</div>}
         <div className="relative inline-block" ref={menuRef}>
-          <Btn onClick={() => setMenu(!menu)} className="!p-0 !border-none !rounded-none text-[13px] text-muted hover:text-text">
+          <Btn ref={triggerRef} onClick={() => setMenu(!menu)} aria-haspopup="menu" aria-expanded={menu} className="!p-0 !border-none !rounded-none text-[13px] text-muted hover:text-text">
             <Badge variant={LISTEN_BADGE[agent.listenMode]?.variant || 'warn'}>{LISTEN_BADGE[agent.listenMode]?.label || agent.listenMode}</Badge>
           </Btn>
-          {menu && <div role="menu" className="absolute top-full left-0 mt-1 bg-bg-elevated border border-border rounded-md shadow-lg z-10">
+          {menu && <div role="menu" ref={menuListRef} aria-label={i18nT('pages.channelPage.listen_mode')} className="absolute top-full left-0 mt-1 bg-bg-elevated border border-border rounded-md shadow-lg z-10">
             {LISTEN_MODES.map(m => (
-              <Btn key={m} onClick={() => { onListenChange(m); setMenu(false) }}
+              <Btn key={m} role="menuitemradio" aria-checked={m === agent.listenMode}
+                onClick={() => {
+                  onListenChange(m); setMenu(false)
+                  // Activation is an explicit dismissal too: the row that has
+                  // focus is being unmounted, so restore to the trigger rather
+                  // than dropping focus on <body>.
+                  triggerRef.current?.focus()
+                }}
                 className={`!rounded-none block w-full text-left px-3 py-1.5 text-[13px] !border-none ${m === agent.listenMode ? 'text-accent bg-accent/10' : 'text-text hover:bg-bg-hover'}`}>
                 <Badge variant={LISTEN_BADGE[m]?.variant || 'warn'}>{LISTEN_BADGE[m]?.label || m}</Badge>
               </Btn>
@@ -287,6 +334,15 @@ function presetLabel(p: Preset): string {
 function NewChannelDialog({ onClose, onCreate, presets }: { onClose: () => void; onCreate: (topic: string, presetId: string) => void; presets: Preset[] }) {
   const [topic, setTopic] = useState('')
   const [preset, setPreset] = useState(presets[0]?.id || 'custom')
+  const topicRef = useRef<HTMLInputElement>(null)
+
+  // Initial focus belongs on the Topic field — the one input this dialog
+  // exists to collect. Modal's shared focus trap focuses the dialog's FIRST
+  // focusable on mount, which is the header's X button; this effect flushes
+  // after the child Modal's (child effects run before the parent's), so it
+  // wins. A plain `autoFocus` attribute cannot: React applies it during
+  // commit, before the trap's mount effect runs.
+  useEffect(() => { topicRef.current?.focus({ preventScroll: true }) }, [])
 
   const handleCreate = () => {
     if (!topic.trim()) return
@@ -294,36 +350,51 @@ function NewChannelDialog({ onClose, onCreate, presets }: { onClose: () => void;
   }
 
   return (
-    <Clickable className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100]" onClick={onClose}>
-      {/* Handlers only stop propagation so clicks/keys inside the dialog don't
-          bubble to the backdrop's close handler — the dialog itself is not an
-          interactive control. label-has-for is deprecated and can't detect the
-          custom <Input> as a nested control; htmlFor+id (and aria-label) already
-          give a real programmatic association. */}
-      {/* eslint-disable jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/label-has-for */}
-      <div role="dialog" aria-modal="true" aria-label={i18nT('pages.channelPage.new_channel')} className="bg-bg-elevated border border-border rounded-xl p-5 w-96 shadow-xl" onClick={e => e.stopPropagation()} onKeyDown={e => e.stopPropagation()}>
-        <h3 className="text-base font-semibold text-text-strong mb-4">{i18nT('pages.channelPage.new_channel_2')}</h3>
-        <label htmlFor="new-channel-topic" className="block text-[13px] font-medium text-muted mb-1">{i18nT('pages.channelPage.topic')}</label>
-        <Input id="new-channel-topic" aria-label={i18nT('pages.channelPage.topic')} value={topic} onChange={e => setTopic(e.target.value)} autoFocus
-          className="w-full mb-4"
-          placeholder={i18nT('pages.channelPage.e_g_investigate_gamma_deployment_failure')} />
-        <span id="new-channel-preset-label" className="block text-[13px] font-medium text-muted mb-1">{i18nT('pages.channelPage.team_preset')}</span>
-        <div role="radiogroup" aria-labelledby="new-channel-preset-label" className="space-y-1.5 mb-4">
-          {presets.map(p => (
-            <Btn key={p.id} onClick={() => setPreset(p.id)}
-              className={`w-full text-left px-3 py-2 !rounded-lg text-sm ${preset === p.id ? '!border-accent bg-accent/10 text-text-strong' : '!border-border text-muted hover:bg-bg-hover'}`}>
-              <span className="font-medium">{presetLabel(p)}</span>
-              {p.agents.length > 0 && <span className="text-[13px] text-muted ml-2">({p.agents.map(a => a.role).join(', ')})</span>}
-            </Btn>
-          ))}
-        </div>
-        <div className="flex justify-end gap-2">
+    // The shared Modal owns the backdrop, Escape dismissal, keyboard isolation
+    // (global chords stopped at the dialog panel, header X included; Escape
+    // excepted; an IME-owned Escape claimed — see Modal.tsx), scroll lock, and
+    // the focus trap/restore the hand-rolled overlay lacked. `open` is constant
+    // because the call site conditionally mounts this component — that is what
+    // resets topic/preset on every open (an always-mounted dialog would compute
+    // the default preset once, before the presets fetch resolves).
+    // `ariaLabel` keeps the dialog's established accessible name ("New channel"),
+    // which predates this conversion and differs from the rendered title only in
+    // case. The eslint disable below covers the label/Input association
+    // (label-has-for cannot see through the custom <Input>).
+    /* eslint-disable jsx-a11y/label-has-for */
+    <Modal
+      open
+      onClose={onClose}
+      title={i18nT('pages.channelPage.new_channel_2')}
+      ariaLabel={i18nT('pages.channelPage.new_channel')}
+      maxWidth={384}
+      footer={
+        <>
           <Btn onClick={onClose}>{i18nT('pages.channelPage.cancel')}</Btn>
           <Btn onClick={handleCreate} disabled={!topic.trim()} primary>{i18nT('pages.channelPage.create')}</Btn>
-        </div>
+        </>
+      }
+    >
+      <label htmlFor="new-channel-topic" className="block text-[13px] font-medium text-muted mb-1">{i18nT('pages.channelPage.topic')}</label>
+      {/* No composition tracking here: the IME-owned-Escape claim moved into
+        * Modal with the keyboard boundary, and Modal's document-tracked latch
+        * hears this input's composition events natively — a local latch would
+        * have no reader. */}
+      <Input ref={topicRef} id="new-channel-topic" aria-label={i18nT('pages.channelPage.topic')} value={topic} onChange={e => setTopic(e.target.value)}
+        className="w-full mb-4"
+        placeholder={i18nT('pages.channelPage.e_g_investigate_gamma_deployment_failure')} />
+      <span id="new-channel-preset-label" className="block text-[13px] font-medium text-muted mb-1">{i18nT('pages.channelPage.team_preset')}</span>
+      <div role="radiogroup" aria-labelledby="new-channel-preset-label" className="space-y-1.5">
+        {presets.map(p => (
+          <Btn key={p.id} onClick={() => setPreset(p.id)}
+            className={`w-full text-left px-3 py-2 !rounded-lg text-sm ${preset === p.id ? '!border-accent bg-accent/10 text-text-strong' : '!border-border text-muted hover:bg-bg-hover'}`}>
+            <span className="font-medium">{presetLabel(p)}</span>
+            {p.agents.length > 0 && <span className="text-[13px] text-muted ml-2">({p.agents.map(a => a.role).join(', ')})</span>}
+          </Btn>
+        ))}
       </div>
-      {/* eslint-enable jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/label-has-for */}
-    </Clickable>
+    </Modal>
+    /* eslint-enable jsx-a11y/label-has-for */
   )
 }
 
@@ -456,7 +527,7 @@ export default function ChannelPage() {
   const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
   const [showAddAgent, setShowAddAgent] = useState(false)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<ChannelPageError | null>(null)
   const [threadId, setThreadId] = useState<string | null>(null)
   // Which thread the unsent reply belongs to, so it is neither discarded on
   // navigation nor inherited by a different thread.
@@ -593,7 +664,8 @@ export default function ChannelPage() {
         openDetail()
       }
     } catch (err) {
-      setError(apiError(err, i18nT('pages.channelPage.failed_to_create_channel')))
+      const title = i18nT('pages.channelPage.failed_to_create_channel')
+      setError({ title, message: apiError(err, title) })
     }
   }
 
@@ -604,17 +676,20 @@ export default function ChannelPage() {
     <div className={`flex h-full relative ${isMobile ? '-mx-4 -mb-8' : ''}`}>
       {showNew && <NewChannelDialog onClose={() => setShowNew(false)} presets={presets} onCreate={handleCreateChannel} />}
 
-      {/* Error modal */}
-      {error && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[100]">
-          <div className="bg-[var(--bg-elevated)] border border-[var(--border)] rounded-xl p-5 w-80 shadow-xl text-center">
-            <div className="text-3xl mb-2"><AlertTriangle className="lucide-inline" /></div>
-            <div className="text-sm font-semibold text-[var(--text-strong)] mb-2">{i18nT('pages.channelPage.limit_reached')}</div>
-            <div className="text-sm text-[var(--text)] mb-4">{error}</div>
-            <Btn onClick={() => setError(null)} primary>{i18nT('pages.channelPage.ok')}</Btn>
+      <Modal
+        open={!!error}
+        onClose={() => setError(null)}
+        title={error?.title ?? ''}
+        maxWidth={360}
+        footer={<Btn onClick={() => setError(null)} primary>{i18nT('pages.channelPage.ok')}</Btn>}
+      >
+        {error && error.message !== error.title ? (
+          <div className="flex items-start gap-3 text-sm text-text">
+            <AlertTriangle className="shrink-0 text-warn" />
+            <span>{error.message}</span>
           </div>
-        </div>
-      )}
+        ) : null}
+      </Modal>
 
       {/* Channel list sidebar */}
       <div className={`flex flex-col ${showList ? '' : 'hidden'} ${isMobile ? 'w-full' : 'w-64 shrink-0 border-r border-border'}`}>
@@ -673,7 +748,7 @@ export default function ChannelPage() {
           <div className="flex flex-1 min-h-0">
             <div className={`flex-1 overflow-y-auto py-3 space-y-1 ${isMobile ? 'px-0' : 'px-2'} ${isMobile && (showAgents || threadId) ? 'hidden' : ''}`}>
               {topLevelMessages.length === 0 && (
-                <EmptyState icon={<Zap className="lucide-inline" />} title={i18nT('pages.channelPage.setting_up_channel')} subtitle={`${channel.agents.length} agent${channel.agents.length !== 1 ? 's' : ''} joining`} />
+                <EmptyState icon={<Zap className="lucide-inline" />} title={i18nT('pages.channelPage.setting_up_channel')} subtitle={i18nT('pages.channelPage.agent_joining', { count: channel.agents.length })} />
               )}
               {topLevelMessages.map(msg => (
                 <MessageBubble key={msg.id} msg={msg} agents={channel.agents}
@@ -747,7 +822,10 @@ export default function ChannelPage() {
                     <AddAgentForm onCancel={() => setShowAddAgent(false)} onAdd={async (role, task, agent) => {
                       if (!channel) return
                       setShowAddAgent(false)
-                      try { await api.channelAddAgent(channel.id, { role, task: task || channel.topic, agent }) } catch (err) { setError(apiError(err, i18nT('pages.channelPage.failed_to_add_agent'))) }
+                      try { await api.channelAddAgent(channel.id, { role, task: task || channel.topic, agent }) } catch (err) {
+                        const title = i18nT('pages.channelPage.failed_to_add_agent')
+                        setError({ title, message: apiError(err, title) })
+                      }
                     }} />
                   ) : (
                     <Btn onClick={() => setShowAddAgent(true)} primary className="w-full">{i18nT('pages.channelPage.add_agent')}</Btn>

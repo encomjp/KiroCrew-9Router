@@ -29,6 +29,15 @@ export type UpdateState = {
   /** Platform handoff the ready/installing UI should explain. */
   installHandoff?: 'windows-installer' | 'automatic-relaunch'
   /**
+   * What the FOLLOWED channel's feed reported and whether these bytes are ahead
+   * of it, carried on every lifecycle payload so a renderer that mounted before
+   * the latest check does not keep rendering `getInfo()`'s older answer. `''` /
+   * `null` means no usable answer — never "ahead". See auto-update.js
+   * `laneSnapshot`.
+   */
+  laneVersion?: string
+  runningAheadOfLane?: boolean | null
+  /**
    * True when this payload was replayed from getInfo() on a fresh mount rather
    * than pushed live. Restoration surfaces (the About card) render it like any
    * other state; interruption surfaces (the UpdateModal) ignore it, so a

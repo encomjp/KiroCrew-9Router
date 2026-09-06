@@ -452,7 +452,7 @@ describe('ChannelPage — Add Agent form', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: '+ Add Agent' })).toBeInTheDocument())
   })
 
-  it('surfaces a structured api error in the limit modal', async () => {
+  it('labels a structured api error with the failed add-agent action', async () => {
     vi.mocked(api).channelAddAgent = vi.fn()
       .mockRejectedValue(new Error(JSON.stringify({ error: 'agent cap reached' })))
     await renderPage()
@@ -460,8 +460,10 @@ describe('ChannelPage — Add Agent form', () => {
     await userEvent.click(screen.getByRole('button', { name: '+ Add Agent' }))
     fireEvent.change(await screen.findByLabelText('Role'), { target: { value: 'Extra' } })
     await userEvent.click(screen.getByRole('button', { name: 'Add' }))
-    expect(await screen.findByText('Limit Reached')).toBeInTheDocument()
-    expect(screen.getByText('agent cap reached')).toBeInTheDocument()
+    const dialog = await screen.findByRole('dialog', { name: 'Failed to add agent' })
+    expect(within(dialog).getByText('agent cap reached')).toBeInTheDocument()
+    expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument()
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Close' })).toHaveFocus())
   })
 
   it('falls back to the raw message when the api error is not JSON', async () => {
@@ -471,7 +473,9 @@ describe('ChannelPage — Add Agent form', () => {
     await userEvent.click(screen.getByRole('button', { name: '+ Add Agent' }))
     fireEvent.change(await screen.findByLabelText('Role'), { target: { value: 'Extra' } })
     await userEvent.click(screen.getByRole('button', { name: 'Add' }))
-    expect(await screen.findByText('gateway timeout')).toBeInTheDocument()
+    const dialog = await screen.findByRole('dialog', { name: 'Failed to add agent' })
+    expect(within(dialog).getByText('gateway timeout')).toBeInTheDocument()
+    expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument()
   })
 
   it('falls back to the generic copy when the rejection is not an Error', async () => {
@@ -536,7 +540,75 @@ describe('ChannelPage — New Channel dialog', () => {
     expect(screen.getByRole('dialog', { name: 'New channel' })).toBeInTheDocument()
   })
 
-  it('reports a create failure in the limit modal and dismisses it with OK', async () => {
+  it('renders through the shared Modal: Escape dismisses, no hand-rolled backdrop', async () => {
+    await renderPage()
+    await userEvent.click(screen.getByRole('button', { name: '+ New' }))
+    await screen.findByRole('dialog', { name: 'New channel' })
+    // The old overlay was a raw `fixed inset-0 bg-black/50` div; the shared
+    // Modal renders its own backdrop instead. (The error modal still carries
+    // the raw class until #5570 lands, but it is not mounted here.)
+    expect(document.querySelector('.bg-black\\/50')).toBeNull()
+    // Escape dismissal is what the hand-rolled overlay lacked — Modal owns it.
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'New channel' })).not.toBeInTheDocument())
+  })
+
+  it('puts initial focus on the Topic field, not the header close button', async () => {
+    // Modal's shared focus trap focuses the dialog's first focusable (the X
+    // button); the dialog's own effect must win and land on the one input the
+    // dialog exists to collect.
+    await renderPage()
+    await userEvent.click(screen.getByRole('button', { name: '+ New' }))
+    const dialog = await screen.findByRole('dialog', { name: 'New channel' })
+    await waitFor(() => expect(within(dialog).getByLabelText('Topic')).toHaveFocus())
+  })
+
+  it('keeps global shortcuts out of the form, while Escape still bubbles to dismiss', async () => {
+    // useKeyboardShortcuts binds bubble-phase document keydown, and some chords
+    // deliberately fire from inside inputs — unguarded, one typed into a
+    // part-filled topic would navigate away and destroy the draft.
+    const globalShortcut = vi.fn()
+    document.addEventListener('keydown', globalShortcut)
+    try {
+      await renderPage()
+      await userEvent.click(screen.getByRole('button', { name: '+ New' }))
+      const dialog = await screen.findByRole('dialog', { name: 'New channel' })
+      fireEvent.keyDown(within(dialog).getByLabelText('Topic'), { key: ',', code: 'Comma', metaKey: true })
+      expect(globalShortcut).not.toHaveBeenCalled()
+      // The header X button is part of the same boundary: a chord fired while
+      // it holds focus (one Shift+Tab away from the form) must not leak either.
+      fireEvent.keyDown(within(dialog).getByRole('button', { name: 'Close' }), { key: '3', code: 'Digit3', ctrlKey: true })
+      expect(globalShortcut).not.toHaveBeenCalled()
+      // The exception that keeps dismissal alive: Modal listens for Escape on
+      // window BUBBLE phase, so Escape must not be swallowed by the guard.
+      fireEvent.keyDown(within(dialog).getByLabelText('Topic'), { key: 'Escape' })
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'New channel' })).not.toBeInTheDocument())
+    } finally {
+      document.removeEventListener('keydown', globalShortcut)
+    }
+  })
+
+  it('does not dismiss on an Escape the IME owns (candidate-list cancel)', async () => {
+    // A CJK user cancelling the IME candidate list mid-composition is not
+    // cancelling the dialog: that Escape must never reach Modal's window
+    // listener, or the part-composed topic is destroyed with the dialog.
+    await renderPage()
+    await userEvent.click(screen.getByRole('button', { name: '+ New' }))
+    const dialog = await screen.findByRole('dialog', { name: 'New channel' })
+    const topic = within(dialog).getByLabelText('Topic')
+    fireEvent.change(topic, { target: { value: '频道' } })
+    fireEvent.compositionStart(topic)
+    fireEvent.keyDown(topic, { key: 'Escape' })
+    expect(screen.getByRole('dialog', { name: 'New channel' })).toBeInTheDocument()
+    // After the composition ends (and its post-composition window passes), a
+    // real Escape dismisses again.
+    fireEvent.compositionEnd(topic)
+    await new Promise(r => setTimeout(r, 60))
+    fireEvent.keyDown(topic, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'New channel' })).not.toBeInTheDocument())
+  })
+
+  it('labels a create failure with its action and dismisses the shared modal with OK', async () => {
     vi.mocked(api).channelCreate = vi.fn()
       .mockRejectedValue(new Error(JSON.stringify({ error: 'channel cap reached' })))
     await renderPage()
@@ -544,9 +616,11 @@ describe('ChannelPage — New Channel dialog', () => {
     const dialog = await screen.findByRole('dialog', { name: 'New channel' })
     fireEvent.change(within(dialog).getByLabelText('Topic'), { target: { value: 'One too many' } })
     await userEvent.click(within(dialog).getByRole('button', { name: 'Create' }))
-    expect(await screen.findByText('channel cap reached')).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'OK' }))
-    await waitFor(() => expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument())
+    const errorDialog = await screen.findByRole('dialog', { name: 'Failed to create channel' })
+    expect(within(errorDialog).getByText('channel cap reached')).toBeInTheDocument()
+    expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument()
+    await userEvent.click(within(errorDialog).getByRole('button', { name: 'OK' }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Failed to create channel' })).not.toBeInTheDocument())
   })
 
   it('ignores a create response that carries no channel', async () => {

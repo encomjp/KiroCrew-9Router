@@ -21,7 +21,7 @@ import reducer, {
   warmSlotCache,
   sseSubagentPending,
   sseSubagentSpawn,
-  sseSubagentChunk,
+  sseSubagentBatchChunks,
   sseSubagentTool,
   sseSubagentDone,
   sseSubagentSnapshot,
@@ -669,6 +669,80 @@ describe('appendSlotMessage steer reconcile', () => {
     expect(state.messages.filter(m => m.role === 'user')[1].meta?.optimistic).toBeUndefined()
   })
 
+  it('reconciles by sendId when both echo and bubble carry one, over any content drift (#6075)', () => {
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
+    state = reducer(state, appendMessage({ role: 'user', content: 'raw with secret AKIA123', cls: 'msg msg-u', ts: 't1', meta: { steer: true, optimistic: true, sendId: 'sid-1' } }))
+    state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'raw with secret [REDACTED]', cls: 'msg msg-u', ts: 't2', meta: { steer: true, sendId: 'sid-1' } } }))
+    const users = state.messages.filter(m => m.role === 'user')
+    expect(users).toHaveLength(1)
+    expect(users[0].meta?.optimistic).toBeUndefined()
+    expect(users[0].content).toBe('raw with secret [REDACTED]')
+  })
+
+  it('an id-carrying echo never consumes a bubble with a DIFFERENT sendId (#6075)', () => {
+    // Another tab steered too: its echo must not eat this tab's pending
+    // bubble, even when the texts coincide. The foreign echo inserts its own
+    // row; this tab's bubble stays optimistic until ITS echo arrives.
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
+    state = reducer(state, appendMessage({ role: 'user', content: 'same text', cls: 'msg msg-u', ts: 't1', meta: { steer: true, optimistic: true, sendId: 'sid-mine' } }))
+    state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'same text', cls: 'msg msg-u', ts: 't2', meta: { steer: true, sendId: 'sid-theirs' } } }))
+    const users = state.messages.filter(m => m.role === 'user')
+    expect(users).toHaveLength(2)
+    expect(users[0].meta?.optimistic).toBe(true)
+    expect(users[0].meta?.sendId).toBe('sid-mine')
+  })
+
+  it('an id-carrying echo never content-consumes an ID-LESS bubble (#6075)', () => {
+    // A pre-upgrade tab left an id-less optimistic steer bubble; a NEW tab
+    // then steers byte-identical text with a sendId. The id-bearing echo
+    // belongs to the new send: consuming the old bubble on the text
+    // coincidence would overwrite it AND omit the new steer's card. Id-bearing
+    // echoes match by id only — no match means insert (over-insert is the
+    // recoverable direction; the old bubble keeps waiting for its own echo).
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
+    state = reducer(state, appendMessage({ role: 'user', content: 'same text', cls: 'msg msg-u', ts: 't1', meta: { steer: true, optimistic: true } }))
+    state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'same text', cls: 'msg msg-u', ts: 't2', meta: { steer: true, sendId: 'sid-new-tab' } } }))
+    const users = state.messages.filter(m => m.role === 'user')
+    expect(users).toHaveLength(2)
+    expect(users[0].meta?.optimistic).toBe(true)
+    expect(users[0].meta?.sendId).toBeUndefined()
+    expect(users[1].meta?.sendId).toBe('sid-new-tab')
+  })
+
+  it('a delayed echo after the refresh already installed the persisted row inserts nothing (#6075)', () => {
+    // chat_done fires a transcript refresh that can replace the optimistic
+    // bubble with the persisted steer row BEFORE the steer_push echo is
+    // processed. The id-matched non-optimistic row proves the echo is a
+    // redelivery: inserting would render a duplicate steer card (and
+    // finalize-on-steer could freeze an unrelated live stream below it).
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
+    state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'check X', cls: 'msg msg-u', ts: 't3', meta: { steer: true, sendId: 'sid-dup', mid: 'm-1' } } }))
+    state = reducer(state, updateStreamingMessage('post-steer stream'))
+    const before = state.messages.length
+    state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'check X', cls: 'msg msg-u', ts: 't3', meta: { steer: true, sendId: 'sid-dup' } } }))
+    expect(state.messages).toHaveLength(before)
+    expect(state.messages.filter(m => m.role === 'user')).toHaveLength(1)
+    // The live post-steer stream was not frozen by the redelivered echo.
+    expect(state.messages.some(m => m.role === 'streaming')).toBe(true)
+  })
+
+  it('an ID-LESS echo never consumes an id-bearing bubble (#6075)', () => {
+    // The gateway serves this SPA bundle, so an id-less echo is not version
+    // skew — it is a DIFFERENT send that carried no id (a scene-interaction
+    // steer). Consuming this tab's id-bearing bubble on the text coincidence
+    // would adopt the foreign echo's identity AND suppress the bubble's own
+    // later exact-id echo via the redelivery guard. The id-less echo inserts
+    // its own row; the id-bearing bubble keeps waiting for its echo.
+    let state = { ...initial, activeSlot: 'A', messages: [] as ChatMessage[] }
+    state = reducer(state, appendMessage({ role: 'user', content: 'steered text', cls: 'msg msg-u', ts: 't1', meta: { steer: true, optimistic: true, sendId: 'sid-this-tab' } }))
+    state = reducer(state, appendSlotMessage({ slot: 'A', message: { role: 'user', content: 'steered text', cls: 'msg msg-u', ts: 't2', meta: { steer: true } } }))
+    const users = state.messages.filter(m => m.role === 'user')
+    expect(users).toHaveLength(2)
+    expect(users[0].meta?.optimistic).toBe(true)
+    expect(users[0].meta?.sendId).toBe('sid-this-tab')
+    expect(users[1].meta?.sendId).toBeUndefined()
+  })
+
   it('does not reconcile into an unrelated non-steer optimistic user message', () => {
     // A plain queued/optimistic user message (no meta.steer) with different
     // content must NOT swallow a steer echo — the echo appends instead.
@@ -1104,6 +1178,44 @@ describe('confirmOptimisticSend — the send response retires the pending state'
     expect(state.messages[0].meta?.sendId).toBe('s-confirm-1')
   })
 
+  it('stamps the receipt mid on the confirmed bubble so it becomes pinnable this turn', () => {
+    let state = reducer(withSlot, appendMessage({
+      role: 'user', content: 'ship it', cls: '', ts: '2026-08-16T10:00:00.000Z',
+      meta: { sendId: 's-mid-1' },
+    }))
+    // The optimistic bubble is born with NO mid (the pin control is gated on it).
+    expect(state.messages[0].meta?.mid).toBeUndefined()
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-mid-1', mid: 'm-server-42' }))
+
+    expect(state.messages[0].meta?.mid).toBe('m-server-42')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('leaves the bubble without a mid when the receipt carried none (queued/steer send)', () => {
+    let state = reducer(withSlot, appendMessage({
+      role: 'user', content: 'ship it', cls: '', ts: '2026-08-16T10:00:00.000Z',
+      meta: { sendId: 's-nomid' },
+    }))
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-nomid' }))
+
+    expect(state.messages[0].meta?.mid).toBeUndefined()
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+  })
+
+  it('never overwrites a mid a refresh already reconciled (identity is stable once assigned)', () => {
+    let state = reducer(withSlot, appendMessage({
+      role: 'user', content: 'ship it', cls: '', ts: '2026-08-16T10:00:00.000Z',
+      meta: { sendId: 's-existing', mid: 'm-already-here' },
+    }))
+
+    state = reducer(state, confirmOptimisticSend({ slot: 'slot-1', sendId: 's-existing', mid: 'm-late-different' }))
+
+    expect(state.messages[0].meta?.mid).toBe('m-already-here')
+    expect(state.messages[0].meta?.optimistic).toBeUndefined()
+  })
+
   it('confirms only the matching send, leaving a sibling in-flight bubble pending', () => {
     let state = reducer(withSlot, appendMessage({ role: 'user', content: 'first', cls: '', ts: '2026-08-16T10:00:00.000Z', meta: { sendId: 's-a' } }))
     state = reducer(state, appendMessage({ role: 'user', content: 'second', cls: '', ts: '2026-08-16T10:00:01.000Z', meta: { sendId: 's-b' } }))
@@ -1293,15 +1405,15 @@ describe('subagent reducers', () => {
     expect(state.subagents['a1']).toBeUndefined()
   })
 
-  it('sseSubagentChunk appends streaming text', () => {
+  it('sseSubagentBatchChunks appends streaming text', () => {
     let state = reducer(withSlot, sseSubagentSpawn({ slot: 'slot-1', id: 'a1', task: 'task', agent: '' }))
-    state = reducer(state, sseSubagentChunk({ slot: 'slot-1', id: 'a1', text: 'hello ' }))
-    state = reducer(state, sseSubagentChunk({ slot: 'slot-1', id: 'a1', text: 'world' }))
+    state = reducer(state, sseSubagentBatchChunks({ chunks: [{ slot: 'slot-1', id: 'a1', text: 'hello ' }] }))
+    state = reducer(state, sseSubagentBatchChunks({ chunks: [{ slot: 'slot-1', id: 'a1', text: 'world' }] }))
     expect(state.subagents['a1'].streaming).toBe('hello world')
   })
 
-  it('sseSubagentChunk ignores unknown agent', () => {
-    const state = reducer(withSlot, sseSubagentChunk({ slot: 'slot-1', id: 'unknown', text: 'data' }))
+  it('sseSubagentBatchChunks ignores unknown agent', () => {
+    const state = reducer(withSlot, sseSubagentBatchChunks({ chunks: [{ slot: 'slot-1', id: 'unknown', text: 'data' }] }))
     expect(state.subagents['unknown']).toBeUndefined()
   })
 
@@ -1737,6 +1849,34 @@ describe('slotHistory — session navigation stack', () => {
       payload: 'B',
     })
     expect(state.slotHistory).toEqual(['A'])
+  })
+
+  it('resumeFromHistory.fulfilled with a non-chat surface keeps the history row and the active slot (#3624)', () => {
+    // The wire resume succeeded, but ChatPage cannot display the surface.
+    // Consuming the row while the sidebar's notice says "can't be opened"
+    // reads as data loss, and switching activeSlot to an undisplayable slot
+    // is the silent bounce itself -- the reducer must not mutate at all.
+    const before = { ...initial, activeSlot: 'A', history: [{ key: 'dash-1', title: 'Ops', messages: 3 }], historyOffset: 1, slotHistory: ['Z'] }
+    const after = reducer(before, {
+      type: 'chat/resumeFromHistory/fulfilled',
+      meta: { arg: { key: 'dash-1', title: 'Ops' }, requestId: 'r1', requestStatus: 'fulfilled' as const },
+      payload: { ok: true, key: 'dash-1', surface: 'dashboard', messages: [], hasMore: false, total: 0 },
+    })
+    expect(after.history).toEqual(before.history)
+    expect(after.activeSlot).toBe('A')
+    expect(after.historyOffset).toBe(1)
+    expect(after.slotHistory).toEqual(['Z'])
+  })
+
+  it('resumeFromHistory.fulfilled with a chat-page surface still consumes the row and switches', () => {
+    let state = { ...initial, activeSlot: 'A', history: [{ key: 'H', title: 'old', messages: 1 }] }
+    state = reducer(state, {
+      type: 'chat/resumeFromHistory/fulfilled',
+      meta: { arg: { key: 'H', title: 'old' }, requestId: 'r1', requestStatus: 'fulfilled' as const },
+      payload: { ok: true, key: 'H', surface: 'orchestrator', messages: [], hasMore: false, total: 0 },
+    })
+    expect(state.history).toEqual([])
+    expect(state.activeSlot).toBe('H')
   })
 
   it('resumeFromHistory.fulfilled pushes activeSlot onto history', () => {

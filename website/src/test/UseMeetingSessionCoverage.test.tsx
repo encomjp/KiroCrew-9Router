@@ -330,6 +330,35 @@ describe('useMeetingSession transcription binding', () => {
     expect(stt.start).not.toHaveBeenCalled()
   })
 
+  it('starts the microphone while the server is HOLDING speech through agent init', async () => {
+    // The server buffers speech for the initializing agents instead of refusing
+    // it (issue #4610), so a line sent now lands — it is just replayed in order
+    // once they are ready. Keeping the mic shut here is what cost every meeting
+    // its opening ~46s, so capture must follow the hold as well as the direct
+    // fan-out.
+    apiMocks.meeting.mockResolvedValue({
+      meta: meta({ status: 'active' }),
+      live: { accepting_dispatches: false, buffering_dispatches: true },
+    })
+    await mountLoaded()
+
+    await waitFor(() => expect(stt.start).toHaveBeenCalled())
+    expect(stt.stop).not.toHaveBeenCalled()
+  })
+
+  it('keeps the microphone closed when the server neither admits nor holds', async () => {
+    // Both flags false is the genuinely closed case — stopping, reviewing, or an
+    // expired session. The hold must not widen this into "always open".
+    apiMocks.meeting.mockResolvedValue({
+      meta: meta({ status: 'active' }),
+      live: { accepting_dispatches: false, buffering_dispatches: false },
+    })
+    const view = await mountLoaded()
+    await waitFor(() => expect(view.result.current.status).toBe('active'))
+
+    expect(stt.start).not.toHaveBeenCalled()
+  })
+
   it('keeps the microphone closed when the meeting is active with no live session', async () => {
     // `active` on disk with `live: null` (a gateway restart dropped the
     // session) means a dispatch CANNOT land; unknown must read as not-ready.

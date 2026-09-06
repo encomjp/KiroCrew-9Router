@@ -80,6 +80,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       # Non-blocking size signal: raise a concern when the REVIEWABLE diff is
       # large enough that a single review pass may not cover it reliably. Only
@@ -206,7 +207,7 @@ jobs:
       - name: Opus 4.8 discovery
         id: discover
         if: github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}
@@ -286,7 +287,7 @@ jobs:
       - name: Opus 4.8 validation
         id: review
         if: github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
         with:
           use_bedrock: "true"
           github_token: ${{ secrets.GITHUB_TOKEN }}

@@ -80,8 +80,21 @@ When a subagent's tool call triggers `EVENT_PERMISSION_REQUEST`, approval
 is decided in strict priority order:
 
 1. **Hook deny** — `hooks.on_tool_call()` returns `TOOL_DENY` → reject
-2. **YOLO mode** — `is_yolo()` (live check) → auto-approve
-3. **Parent policy** — `parent_policy == "auto"` (snapshot at spawn) → auto-approve
+2. **Hook auto-approve** — `hooks.on_tool_call()` returns `TOOL_AUTO_APPROVE`
+   (the `auto_approve_tools` globs / read-only allowlist — a grant made by
+   program NAME), honoured only after `name_grant.refusal_for_event(event)`
+   confirms each program name in the shell command still resolves to the
+   program it appears to name. A refusal DOWNGRADES to rungs 3–5 (never a hard
+   block) and is audited as `outcome=auto_approve_declined` with
+   `reason=name_grant`, the refusal code, and `tier=hook_auto_approve`. This
+   matters most here: the subagent surface runs unattended, so an unverified
+   shadowed name would be honoured with nobody watching. On Windows the check
+   cannot model the shell's lookup at all, so it declines every name-based
+   shell grant there — a headless subagent (no parent `auto` policy, no
+   interactive approver) then rejects shell tools its allowlist used to grant.
+3. **Parent policy** — `parent_policy == "auto"` → auto-approve. Resolved once
+   at `_run_inner` start (see the chain below); an active global YOLO folds
+   into this snapshot rather than being re-read per event.
 4. **Interactive callback** — `on_tool_approval` (races dashboard + Slack, 2h timeout)
 5. **Deny by default** — none of the above matched → reject
 
@@ -93,8 +106,26 @@ is decided in strict priority order:
 Step 3 ensures parentless subagents (e.g. cron jobs) respect the user's
 global approval mode instead of falling through to interactive approval.
 
-The `is_yolo()` check in the cascade is live (reads current gateway state),
-providing coverage if YOLO is toggled mid-execution.
+**Child-fidelity gate.** A child-origin permission event whose SECURITY context
+is absent (`AcpEvent.child_low_fidelity`: structured params never reached the
+tool_call cache, unresolved shell classification, or a shell without a
+recoverable command) skips steps 2–3 and is handed to the interactive callback
+with an "UNVERIFIED child request" annotation (headless: rejected), because
+every field a shortcut would judge is agent-authored. One carve-out: when the
+event's canonical MCP identity IS verified (`child_mcp_identity_trusted` — the
+`_meta.kiro` server/tool pair resolved from the tool_call cache, carrying the
+explicit `mcp_identity_trusted` provenance flag those cache hits set, resolved
+non-shell; the shape a remote MCP server produces by streaming empty
+`rawInput`), the **unconditional** `parent_policy == "auto"` grant still
+auto-approves — the call site reads the hoisted
+`AcpEvent.child_unconditional_grant_eligible` property: its decision consumes
+no agent-authored event data, only the
+arguments remain unverified. The hook auto-approve (title-pattern-matched) and
+every content-matching path stay fail-closed on the composite fidelity.
+
+The `is_yolo()` read happens once, when `parent_policy` is resolved at
+`_run_inner` start — a YOLO toggle mid-execution takes effect on the next
+subagent run, not on the current run's remaining tools.
 
 ### `cancel_all() -> None`
 Cancels all running subagents, stops the reaper loop, and awaits their cleanup. Handles `CancelledError` gracefully — sessions released, count decremented.
@@ -187,7 +218,7 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 - **An undelivered report abandoned at shutdown is made RECOVERABLE, not silently dropped.** The terminal record — including the tombstone — is written before delivery is attempted, and a tombstone is exactly what `list_orphans()` uses to EXCLUDE a folder from the next start's reconciliation. So cancelling a still-pending report at the drain deadline would leave an outcome that was never injected *and* invisible to the only path that could still inject it. `cancel_all()` therefore calls `clear_tombstone(id)` for each report it cancels, re-admitting that agent to the next start's orphan reconciliation (which finds `result.txt` and re-delivers). Extending the drain to `_ON_DONE_TIMEOUT` instead was rejected: it would hold gateway shutdown for up to 20 minutes on one wedged injection, which is the exact failure the bounded drain exists to prevent. Only reports cancelled **before** `_on_done` returned are re-admitted — `info._reported_to_parent` is set the moment the injection returns, so a cancellation in the later teardown/tombstone waits cannot cause a duplicate delivery on restart.
 - **Every reporter goes through the claim — including cancel-recovery failure.** There are more terminal paths than the two obvious ones: when a cancel-recovery respawn cannot happen, its `except` arm also finalizes the agent. That site previously fired `subagent_done` and `_on_done` directly, gated only on `done`/`reaped`, so a reaper racing a failed respawn delivered the outcome twice. It now takes `_claim_finalize` like every other reporter and reports through the shielded helper (which matters because `_force_reap` cancels that very task). `_resume_guarded`'s CancelledError arm writes only the RECORD and deliberately never reports — during shutdown the drain owns delivery.
 - **The reaped marker and the recovery cancel precede every `await` in `_force_reap`.** Both used to sit after the session teardown, which yields for up to `_RESET_TIMEOUT` (longer on the SIGKILL path). A recovery task whose bounded handshake expired inside that window observed `reaped == False` and respawned the run being killed — tools executing after a user Stop, strictly worse than a duplicate report.
-- **Delivery bookkeeping trails teardown.** Spawning the report ahead of teardown opens a window the older ordering did not have: writing the "delivered" tombstone before the session is torn down would hide a surviving child from orphan reconciliation if the process died in between. The report therefore waits on a `teardown_done` event (set in `_run`'s `finally`, so it fires even under cancellation, and bounded so the report can never wedge) before marking delivery. A reaped or recovery-failed member still settles its **siblings'** digest holds, since those siblings' results did reach the parent even though this member's did not.
+- **Delivery bookkeeping trails teardown.** Spawning the report ahead of teardown opens a window the older ordering did not have: writing the "delivered" tombstone before the session is torn down would hide a surviving child from orphan reconciliation if the process died in between. The report therefore waits on a `teardown_done` event (set in `_run`'s `finally`, so it fires even under cancellation, and bounded so the report can never wedge) before marking delivery. A reaped or recovery-failed member still settles its **siblings'** digest holds, since those siblings' results did reach the parent even though this member's did not. On the dashboard routes the report's own settle and `mark_delivered` are no-ops by design: `_subagent_done` defers the delivery bookkeeping — the completed member's own tombstone AND any held wave siblings — to the parent's CONSUMPTION of the announce via `_defer_queued_delivery` (the #4839 content-keyed slot ledger + `_delivery_queued`), on the queue branch settled by the drain and on the direct-injection branch by `_arm_queued_delivery_settlement` armed on the injection task (#2233). A bare `_on_done` return is a local routing success, not evidence the parent received anything; an unconfirmed hand-off leaves the debt parked and orphan-recoverable rather than tombstoned.
 - `_sigkill_session`: best-effort SIGKILL when graceful reset hangs
 - After decrementing `_running_count`, `_force_reap` calls `_drain_queue()` so the freed slot immediately starts a queued spawn. Normal completion pumps the queue via its `finally` block, but that block is gated on `not info.reaped`; a reap sets `reaped=True` and decrements the count itself, so without this explicit drain a queued spawn would sit stranded until an unrelated agent finished or a new spawn arrived.
 - Wired up in `gateway.py` after `SubagentManager` init
@@ -201,7 +232,7 @@ Event kinds are NOT the discriminator: the same `EVENT_SUBAGENT_LIST` also reach
 Why the exclusion exists: `_kiro.dev/subagent/list_update` carries no `sessionId`, so the runtime broadcasts it to *every* session queue, and under `agent.session_sharing` one roster notification lands on every co-tenant subagent's stream. Counting it as activity refreshed `last_activity` for a whole batch of wedged subagents at the same instant and cleared their badge, so the badge flapped and the reported `idle_secs` measured time since an unrelated agent's roster churn (`#4841`; the plateau measured in `#2854`).
 
 Per sweep, for an agent that has actually started (`turns > 0` or a live `_pid`) and is **not** blocked on a human approval prompt (`_awaiting_approval`):
-- `idle > _stall_idle_secs` and not already flagged → consult liveness (below), and unless the verdict clears it, set `info.stalled = True`, emit `subagent_stalled {stalled: true, idle_secs}` (surface-only; the card shows a "no activity" warning), and append a record of the slow command to `~/.kiro/crew/subagents/slow_commands.jsonl` for later analysis.
+- `idle > _stall_idle_secs` and not already flagged → consult liveness (below), and unless the verdict clears it, set `info.stalled = True`, emit `subagent_stalled {stalled: true, idle_secs}` (surface-only; the card shows a "no activity" warning), and append a record of the slow command to `~/.kiro/crew/subagents/slow_commands.jsonl` for later analysis (rotated at 1 MiB keeping one previous generation, `.jsonl.1`, so total disk stays bounded at ~2 MiB; a reader wanting full available history must consume both generations).
 - Detection is **surface-only**: `_maybe_flag_stall` never terminates the agent. A genuinely-hung subagent is closed by the user from the UX (per-row stop → `spawnDelete` → `SubagentManager.cancel(agent_id)`, or header Stop-all). The wall-clock reaper at `_TIMEOUT_SECS` remains the only automatic terminator; a `DEAD` liveness verdict deliberately does **not** escalate to a kill, because that would be a change to reap semantics rather than to the signal.
 
 #### Liveness attribution (why idle time alone is not the detector)
@@ -233,7 +264,7 @@ The slow-command record (`record_slow_command`, `subagent_persistence.py`) is ap
 
 ### Running-card progress events
 
-`subagent_tool` is fired on **`EVENT_TOOL_CALL`** (not only `EVENT_PERMISSION_REQUEST`) — kiro-auto-allowed tools surface only as informational `tool_call` updates, so this is the sole progress signal a simple/read-only task emits. Payload carries `{tool, tool_kind, turns, tool_count}`; `info.tool_count` increments per observed tool call. The `subagent_snapshot` reconnect payload (`dashboard/ws.py`) also carries `tool_count` and `stalled` so a reloading client recovers progress/stall state (a transition-only WS signal always needs a matching snapshot field).
+`subagent_tool` is fired on **`EVENT_TOOL_CALL`** (not only `EVENT_PERMISSION_REQUEST`) — kiro-auto-allowed tools surface only as informational `tool_call` updates, so this is the sole progress signal a simple/read-only task emits. Payload carries `{tool, tool_kind, turns, tool_count}`; `info.tool_count` increments per observed tool call. The `subagent_snapshot` reconnect payload (`dashboard/ws.py`, built by `build_subagent_snapshot()`) also carries `tool_count`, `stalled`, and — only while stalled — `idle_secs`, recomputed at replay time from `last_activity` (clamped at 0, omitted entirely for a healthy agent) so a reloading client recovers progress/stall state including the span that justifies the stall badge (a transition-only WS signal always needs a matching snapshot field).
 
 
 ### Model Provenance (#3582)
@@ -242,7 +273,8 @@ Every subagent card names the model the run actually ran on, so a model-pinned
 review's real model is auditable. `SubagentInfo` carries two fields: `requested_model`
 — the EFFECTIVE pin, i.e. the per-spawn `model` OR, when empty, the
 `agent.role_models['subagent']` config pin (AGENTS.md's documented way to pin a
-subagent model), resolved once at spawn — and `resolved_model`, the id the live
+subagent model), resolved once at spawn; `"auto"` when completely unpinned (no
+per-spawn model, no role pin) — and `resolved_model`, the id the live
 session actually served, read via the provider's public `served_model` accessor
 (`_resolved_model_of`, which normalizes the `DEFAULT_MODEL` "auto" sentinel to `""`
 = unknown). `resolved_model` is captured at spawn (ACP reports it immediately) and
@@ -250,18 +282,34 @@ refreshed on the first text chunk (covers the CC path); a known value is never
 clobbered back to `""`.
 
 The resolved id rides the wire as a `model` field on the `subagent_spawn`,
-`subagent_done`, and reconnect `subagent_snapshot` payloads. The single-completion
+`subagent_done`, and reconnect `subagent_snapshot` payloads, and the requested pin
+rides alongside it as a `requested_model` field on those same payloads (both are
+`_redact()`-ed, since the pin is caller-supplied). The single-completion
 meta (`subagent_completion_meta.single_completion_meta`, mirrored by
 `website/src/pages/chat/subagentCompletion.ts`) additionally carries `requestedModel`
 and `resolvedModel`. The frontend renders the resolved model as a chip beside the
-agent pill (Subagents panel + completion card) and flags a **downgrade** — an amber
-chip plus a persistent `role="status"` "Requested X, served Y" banner — when the two
-name different models. "Same model" is decided by the shared `normalizeModelKey`
+agent pill and flags a **downgrade** — an amber chip plus a persistent
+`role="status"` "Requested X, served Y" banner — when the two name different models,
+on BOTH the completion card AND the **live** Subagents-panel row (`ActivityViewer`),
+so a mis-pinned run is visible mid-flight, not only at completion. Because the pin
+rides `subagent_done` (and its reconnect replay), a downgraded run that completes
+before a reconnect rehydrates its card with the amber flag intact. For unpinned
+spawns `requested_model="auto"` records the sentinel so the frontend shows a neutral
+chip rather than hiding the column. "Same model" is decided by the shared
+`normalizeModelKey`
 (`website/src/lib/model.ts`, mirroring the backend `_normalize_model_key`): dotted vs
 dashed spellings and case fold, and `auto`/`default` fold to "no pin", so an honored
 pin whose wire spelling differs does not false-flag. Wave-digest completions
-(`wave_chunk_meta`/`wave_final_meta`) do NOT yet carry model fields — batch members
-are unauditable for now (scoped increment; tracked as follow-up).
+(`wave_chunk_meta`/`wave_final_meta`) carry no structured model field, but each
+member's **served** model is surfaced inline in the digest body
+(`ok_lines`/`fail_lines`) that both the parent LLM and the card already read —
+`— \`id\` ✅ task · model <served>` — so batch members are auditable for which
+model actually ran. Only the served id is shown (no requested/downgrade
+qualifier): a raw requested-vs-resolved inequality is not the card's downgrade
+fold and would false-amber every member of a normal `auto`-pinned wave, so the
+amber-downgrade signal stays a single-completion concern until this shares the
+card's fold (or #5339's registry fold). The value is redacted through the
+display context before it enters the broadcast digest text.
 ## Completion Injection
 
 Subagent results are routed back to the **originating session** via
@@ -420,7 +468,7 @@ Parameters:
 - `cwd` (str, optional): absolute path to launch subagent in. Must be under a configured `subagent_cwd_allowed_roots` entry (default: `~/workspace`, `~/workspaces`, `~/workplace`, `~/workplaces`). Validated via realpath + prefix match. Pool skipped when cwd is set. These roots are a least-privilege allowlist and are never widened automatically: a persisted list whose roots all fail to exist on the host rejects every cwd, and the operator must edit `agent.subagent_cwd_allowed_roots` (or delete the key to take the shipped default). Neither the loader nor the guard stats the configured roots.
 - `max_turns` (int, optional): override tool-call budget for this spawn (default: config or 100)
 - `agent` (str, optional): agent name for the subagent
-- `reasoning_effort` (str, optional): per-call reasoning-effort override (`low`/`medium`/`high`/`xhigh`/`max`), batch-wide like `model`. Precedence: per-call value → `agent.role_efforts['subagent']` pin → provider default; `""`/absent changes nothing. Like a model/effort role pin, a non-empty value forces the dedicated-process path (the parent's shared runtime cannot switch effort per session), so a wide fan-out pays a full process per subagent — and that cost is paid even when the resolved model turns out not to support effort (the level is then dropped at the provider factory). Carried through the stagger queue and the retry endpoint like the context-group flags. NOT inherited by `spawn_continue` — a continuation resolves effort fresh (role pin, else default), the same parity as `model`. When the caller also pins a per-call `model` that does not support effort, the tool reports it informationally and still spawns; with no per-call model the check is best-effort only, since the effective model resolves server-side after the tool returns. Per-TASK variation inside one call is deliberately not supported (see issue #2140).
+- `reasoning_effort` (str, optional): per-call reasoning-effort override (`low`/`medium`/`high`/`xhigh`/`max`), batch-wide like `model`. Precedence: per-call value → `agent.role_efforts['subagent']` pin → provider default; `""`/absent changes nothing. Like a model/effort role pin, a non-empty value forces the dedicated-process path (the parent's shared runtime cannot switch effort per session), so a wide fan-out pays a full process per subagent — and that cost is paid even when the resolved model turns out not to support effort (the level is then dropped at the provider factory). Carried through the stagger queue and the retry endpoint like the context-group flags. NOT inherited by `spawn_continue` — a continuation resolves effort fresh (role pin, else default), the same parity as `model`. When the requested effort cannot take effect, the gateway says so: `/api/spawn` resolves the model the factory's effort gate will see (per-call value, else the subagent role pin, else the session chain for the effective agent — a crew's own model pin, else a non-sentinel global `agent.model`; a named kiro agent's own pin resolves downstream and cannot carry the overlay) and returns an `effort_dropped` reason on the success response, which the tool renders as one attributed line per distinct verdict — subagents sharing an identical verdict (the usual case, since the value is batch-wide) are collapsed into a single line naming all of them, while differing verdicts keep their own attributed lines — including the default case where nothing is pinned and the model resolves to "auto". When the effort WILL apply, the response instead carries an `effort_applied` note naming the resolved model and the family-specific settings key (`reasoning` for GPT, `output_config` for Claude) it is delivered under, rendered the same way — so both outcomes of a requested effort are visible in the tool result. A role-pinned effort that will be dropped (no per-call effort involved) still surfaces in the gateway log at warning level, since the tool caller never asked for it — that warning is emitted by the provider factory's effort gate itself (`config/loader.py`), the single authority that drops the level, so one log line covers every surface that funnels through it (spawn, dashboard slot, cron) and cannot drift from the decision it reports on. The provider factory remains the single dropping authority; the report never rejects or alters a spawn. Per-TASK variation inside one call is deliberately not supported (see issue #2140).
 - `include_memory` / `include_lessons` / `include_project` (bool, optional, default `true`): which switchable context groups the subagent inherits, applied to every task in a batch spawn. All-on is byte-identical to the injection a normal session gets, so a caller that omits them changes nothing. `include_memory=false` drops preferences, projects, daily history, semantic and episodic memory, and prior-session provenance — the normal choice for fan-out whose task text is self-contained. `include_lessons=false` additionally drops the user's learned corrections and profile, so keep it on for any subagent that writes code, edits files, or runs git. `include_project=false` drops the docs pointer and the project-directory line. It also drops the injected steering block, but ONLY on the Claude Code backend: on the ACP/kiro backend `kiro-cli --agent` loads the agent's `resources` (including steering globs) itself, which Kiro Crew cannot suppress from here, so steering still reaches an ACP sub-agent regardless of this flag. The conduct group — critical output-format rules, date, agent identity, runtime, workspace identity, and the skills index — is never switchable, because a subagent without it cannot discover its own capabilities or format what it reports back. A subagent is told by name which groups were withheld (`[CONTEXT SCOPE]`) so it reports the gap rather than guessing. Resolved once at spawn, carried through the capacity-queue round-trip and `POST /api/spawn/{id}/retry` like `approval_mode`/`silent`/`keep`. `spawn_continue` does not take the flags but does **inherit** them from the run it continues: a continuation rebuilds session context (`get_or_create` reports `is_new=True` even when it restores the session via `session/load`), so without inheritance a scoped-down run would regain a group on its follow-up turn. See `memory-skills-hooks.md` § Switchable context groups for the section-by-section mapping.
 
 Response semantics:

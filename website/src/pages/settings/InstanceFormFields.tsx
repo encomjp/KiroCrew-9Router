@@ -16,30 +16,12 @@ import { Btn } from '../../components/ui'
 import ErrorNotice from '../../components/ErrorNotice'
 import { i18nT } from '../../i18n/t'
 
-/** Form-shaped mirror of an instance record: every field is a string the user typed. */
-/**
- * Unsaved edit state that outlives the form component: the typed values plus the
- * record they were typed against. The two travel together because a draft is only
- * meaningful relative to its baseline — rebasing it onto a newer poll is how an
- * untouched field becomes an unintended write.
- */
-export interface InstanceDraft {
-  values: InstanceFormValues
-  baseline: InstanceView
-}
-
-export interface InstanceFormValues {
-  name: string
-  method: 'ssh' | 'ssm'
-  sshHost: string
-  ssmTarget: string
-  awsProfile: string
-  awsRegion: string
-  ssmRunAs: string
-  remotePort: string
-  ttl: string
-  remoteBin: string
-}
+// Re-exported so the form's existing consumers keep one import site, while the
+// shapes themselves live in a neutral module the store can read without
+// depending on a page — `instancesSlice` holds an unsaved form while the route
+// that renders it is unmounted.
+export type { InstanceFormValues, InstanceDraft } from '../../types/instanceForm'
+import type { InstanceFormValues, InstanceDraft } from '../../types/instanceForm'
 
 // Defaults for a brand-new crew. The port and TTL mirror the backend's own
 // defaults so an untouched form round-trips to the same record the API would
@@ -76,6 +58,15 @@ export const EMPTY_INSTANCE_FORM: InstanceFormValues = {
   remotePort: DEFAULT_REMOTE_PORT,
   ttl: DEFAULT_TTL,
   remoteBin: '',
+}
+
+/** Whether the form holds nothing worth keeping. Compared against the defaults,
+ *  not against emptiness: `method` and `remotePort` ship with values, so a
+ *  never-touched form is not all-blank. */
+export function isBlankInstanceForm(values: InstanceFormValues): boolean {
+  return (Object.keys(EMPTY_INSTANCE_FORM) as (keyof InstanceFormValues)[]).every(
+    key => values[key] === EMPTY_INSTANCE_FORM[key],
+  )
 }
 
 /** Seed the form from an existing crew, so editing starts from what is stored. */
@@ -315,7 +306,11 @@ export function EditInstanceForm({
   // record it was opened on, restored with the draft when it remounts. Seeding
   // `initial` from the live `inst` instead would make `dirty` and the request body
   // disagree about what "unchanged" means.
-  const baselineRef = useRef(draft?.baseline ?? inst)
+  // Initialised from the live record because that IS the baseline when no draft
+  // was restored. A restored draft carries its own, and the rebase below is the ONE
+  // place that applies it — deliberately not a second `draft?.baseline ??` here,
+  // which would leave each spelling masking a defect in the other.
+  const baselineRef = useRef(inst)
   // The baseline is normally fixed for the form's lifetime, but a REBASE replaces it
   // deliberately: the user has been shown that the record moved and chose to apply
   // their edits to the record as it now is. Following it here is what makes both

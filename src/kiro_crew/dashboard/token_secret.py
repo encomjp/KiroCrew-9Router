@@ -54,8 +54,7 @@ def _enforce_owner_only(key_path: Path) -> None:
     try:
         # restrict_to_owner (fail-loud), NOT chmod_safe: chmod_safe swallows
         # OSError, which would make this security-warning handler dead code.
-        # POSIX applies ``chmod 0o600``; Windows applies an owner-only DACL via
-        # icacls.
+        # POSIX applies ``chmod 0o600``; Windows applies an owner-only DACL.
         platform_compat.restrict_to_owner(key_path)
     except OSError:
         # Logs the key file PATH (key_path), never the key bytes.
@@ -221,10 +220,11 @@ def _load_or_create_secret() -> bytes:
             # have substituted at the same path in the meantime.
             created_stat = os.fstat(fd)
             wrote_durable_key = False
-            # Lock the DACL down BEFORE writing the secret bytes: on Windows
-            # restrict_to_owner shells out to icacls (a measurable subprocess
-            # window during which another local principal could slurp the
-            # bytes); on POSIX it collapses to an in-process chmod. Create empty
+            # Lock the DACL down BEFORE writing the secret bytes: on Windows the
+            # lockdown replaces an existing DACL rather than being applied at
+            # create time, so writing first would leave a window during which
+            # another local principal could slurp the bytes; on POSIX it
+            # collapses to an in-process chmod. Create empty
             # → tighten → write → fsync.
             try:
                 _enforce_owner_only(key_path)

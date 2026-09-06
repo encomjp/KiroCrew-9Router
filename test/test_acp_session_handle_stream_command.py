@@ -20,11 +20,14 @@ import pytest
 from kiro_crew.acp.session_handle import AcpRuntimeError, AcpSessionHandle
 from kiro_crew.acp.types import (
     EVENT_AGENT_SWITCHED,
+    EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
     EVENT_TEXT_CHUNK,
     METHOD_AGENT_SWITCHED,
     METHOD_COMMANDS_EXECUTE,
+    METHOD_COMPACTION_STATUS,
     METHOD_SESSION_UPDATE,
+    STOP_REASON_COMPACTION_FAILED,
     JsonRpcMessage,
 )
 
@@ -320,3 +323,203 @@ async def test_no_response_terminates_at_timeout():
 
 async def _collect_with_timeout(handle: AcpSessionHandle, command: str, timeout: float) -> list:
     return [ev async for ev in handle.stream_command(command, timeout=timeout)]
+
+
+# ── Post-compaction-failure budget (issue #3583) ─────────────────────────────
+
+
+def _failed_compaction(params: dict | None = None) -> JsonRpcMessage:
+    return JsonRpcMessage(
+        method=METHOD_COMPACTION_STATUS,
+        params=params if params is not None else {"status": {"type": "failed"}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_compaction_then_no_response_ends_the_turn(monkeypatch):
+    """kiro-cli reports compaction `failed` and then abandons the prompt: no
+    response, no end_turn. The turn must end at the post-failure budget with
+    STOP_REASON_COMPACTION_FAILED instead of draining to the turn ceiling and
+    holding the slot (issue #3583)."""
+    from kiro_crew.acp import session_handle as sh
+
+    monkeypatch.setattr(sh, "_COMPACTION_FAILED_TURN_BUDGET", 0.2)
+
+    handle, _rt = _make(respond=False, updates=[_failed_compaction()])
+    start = time.monotonic()
+    events = [ev async for ev in handle.prompt("hello", timeout=30.0)]
+    elapsed = time.monotonic() - start
+
+    assert events[0].kind == EVENT_COMPACTION_STATUS
+    assert events[0].text == "failed"
+    assert events[-1].kind == EVENT_COMPLETE
+    assert events[-1].stop_reason == STOP_REASON_COMPACTION_FAILED
+    # Proves the budget ended it, not the 30s turn deadline. The bound is loose
+    # because the check runs on the loop's own tick: the dispatch loop parks on
+    # the session queue for up to 5s, so a fired budget is acted on at the next
+    # wake, not the instant it expires.
+    assert elapsed < 10.0, f"turn ran too long ({elapsed:.2f}s) — the hang is back"
+    assert handle._turn_done.is_set()
+    assert handle.is_turn_active is False
+
+
+@pytest.mark.asyncio
+async def test_a_tool_in_flight_suspends_the_post_failure_budget(monkeypatch):
+    """Shared-runtime twin of the client rule: a tool dispatched after the failed
+    compaction is live work, so the budget must not cancel the session under it.
+    The tool-stall watchdog owns that case on its own longer, liveness-gated
+    budget."""
+    from kiro_crew.acp import session_handle as sh
+
+    monkeypatch.setattr(sh, "_COMPACTION_FAILED_TURN_BUDGET", 0.05)
+
+    handle, _rt = _make(respond=False, updates=[_failed_compaction()])
+
+    # The turn ceiling must outlast one queue tick (the loop parks on the
+    # session queue for up to 5s, and the budget is checked at the loop top), or
+    # the unsuspended budget could not fire either and the test would be vacuous.
+    start = time.monotonic()
+    events = []
+    async for ev in handle.prompt("hello", timeout=8.0):
+        events.append(ev)
+        if ev.kind == EVENT_COMPACTION_STATUS and ev.text == "failed":
+            # The turn recovers and dispatches a tool. Set from the consumer
+            # side because prompt()'s prologue clears the flag at turn start.
+            handle._tool_dispatched = True
+    elapsed = time.monotonic() - start
+
+    # The turn ran to its own deadline instead of being reaped at the budget,
+    # so the terminal event is the ordinary timeout, not the compaction reason.
+    assert events[-1].stop_reason != STOP_REASON_COMPACTION_FAILED
+    assert elapsed >= 7.0, f"turn ended at {elapsed:.2f}s — the budget reaped a live tool"
+    # Still armed: the budget re-fires once the tool resolves.
+    assert handle._compaction_failed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_failed_compaction_notice_carries_the_reason(monkeypatch):
+    """The dashboard notice reads AcpEvent.title, and kiro-cli leaves `summary`
+    empty on failure — the notification's own reason rides the title so the row
+    stops collapsing to "unknown error"."""
+    from kiro_crew.acp import session_handle as sh
+
+    monkeypatch.setattr(sh, "_COMPACTION_FAILED_TURN_BUDGET", 0.2)
+
+    handle, _rt = _make(
+        respond=False,
+        updates=[_failed_compaction({"status": {"type": "failed", "reason": "history too long"}})],
+    )
+    events = [ev async for ev in handle.prompt("hello", timeout=30.0)]
+
+    assert events[0].title == "history too long"
+
+
+@pytest.mark.asyncio
+async def test_co_tenant_fanout_frames_do_not_defer_the_budget(monkeypatch):
+    """On a shared runtime, ownerless global notifications are fanned out to
+    every co-tenant queue (msg.fanout_no_owner). They are ANOTHER session's
+    traffic: if they reset this session's post-failure silence clock, a busy
+    co-tenant defers the budget to the multi-hour outer deadline and the
+    original #3583 hang survives on shared runtimes."""
+    from kiro_crew.acp import session_handle as sh
+
+    monkeypatch.setattr(sh, "_COMPACTION_FAILED_TURN_BUDGET", 0.2)
+
+    handle, _rt = _make(respond=False, updates=[_failed_compaction()])
+
+    stop_feeding = asyncio.Event()
+
+    async def _co_tenant_chatter():
+        # Recurring ownerless roster updates, well inside the budget interval.
+        while not stop_feeding.is_set():
+            frame = JsonRpcMessage(method="kiro/subagents/update", params={"subagents": []})
+            frame.fanout_no_owner = True
+            handle._queue.put_nowait(frame)
+            await asyncio.sleep(0.05)
+
+    feeder = asyncio.create_task(_co_tenant_chatter())
+    try:
+        start = time.monotonic()
+        events = [ev async for ev in handle.prompt("hello", timeout=30.0)]
+        elapsed = time.monotonic() - start
+    finally:
+        stop_feeding.set()
+        await feeder
+
+    assert events[-1].kind == EVENT_COMPLETE
+    assert events[-1].stop_reason == STOP_REASON_COMPACTION_FAILED
+    assert elapsed < 10.0, f"turn ran {elapsed:.2f}s — co-tenant fanout frames deferred the budget"
+
+
+@pytest.mark.asyncio
+async def test_ownerless_failure_does_not_arm_a_co_tenant_budget(monkeypatch):
+    """A compaction notification with no sessionId is fanned out to every
+    co-tenant, so at most one recipient actually compacted. Arming this
+    session's budget from a peer's failure would reap this session's live turn
+    at the budget — and every consumer resets the session on that terminal, so
+    the peer's failure destroys unrelated work."""
+    from kiro_crew.acp import session_handle as sh
+
+    monkeypatch.setattr(sh, "_COMPACTION_FAILED_TURN_BUDGET", 0.2)
+
+    frame = _failed_compaction()
+    frame.fanout_no_owner = True
+    handle, _rt = _make(respond=False, updates=[frame])
+
+    # The deadline must sit past the dispatch loop's queue park (up to 5s) or
+    # the budget never gets a tick to fire on and the test cannot fail.
+    start = time.monotonic()
+    events = [ev async for ev in handle.prompt("hello", timeout=7.0)]
+    elapsed = time.monotonic() - start
+
+    assert handle._compaction_failed_at is None, "a peer's failure armed this session"
+    assert events[-1].kind == EVENT_COMPLETE
+    assert events[-1].stop_reason != STOP_REASON_COMPACTION_FAILED
+    assert (
+        elapsed >= 5.5
+    ), f"turn ended after {elapsed:.2f}s — a co-tenant's failure reaped this turn"
+
+
+@pytest.mark.asyncio
+async def test_ownerless_completion_does_not_disarm_the_budget(monkeypatch):
+    """The mirror direction, and the one that silently restores the #3583 hang:
+    a peer's SUCCESSFUL compaction is fanned out too, and clearing this
+    session's armed budget from it would leave a genuinely abandoned turn
+    draining to the multi-hour turn ceiling again."""
+    from kiro_crew.acp import session_handle as sh
+
+    monkeypatch.setattr(sh, "_COMPACTION_FAILED_TURN_BUDGET", 0.2)
+
+    peer_ok = _failed_compaction({"status": {"type": "completed"}, "summary": "peer"})
+    peer_ok.fanout_no_owner = True
+    # This session's own failure arms the budget; the peer's completion must not
+    # clear it.
+    handle, _rt = _make(respond=False, updates=[_failed_compaction(), peer_ok])
+
+    events = [ev async for ev in handle.prompt("hello", timeout=30.0)]
+
+    assert events[-1].kind == EVENT_COMPLETE
+    assert (
+        events[-1].stop_reason == STOP_REASON_COMPACTION_FAILED
+    ), "a co-tenant's successful compaction disarmed this session's budget"
+
+
+@pytest.mark.asyncio
+async def test_completed_compaction_does_not_arm_the_budget(monkeypatch):
+    """A successful compaction must not arm the budget: the turn keeps running
+    and completes on the backend's own response."""
+    from kiro_crew.acp import session_handle as sh
+
+    monkeypatch.setattr(sh, "_COMPACTION_FAILED_TURN_BUDGET", 0.2)
+
+    handle, _rt = _make(
+        response_result={"stopReason": "end_turn"},
+        updates=[_failed_compaction({"status": {"type": "completed"}, "summary": "3k saved"})],
+    )
+    events = [ev async for ev in handle.prompt("hello", timeout=5.0)]
+
+    assert events[0].kind == EVENT_COMPACTION_STATUS
+    assert events[0].text == "completed"
+    assert events[-1].kind == EVENT_COMPLETE
+    assert events[-1].stop_reason == "end_turn"
+    assert handle._compaction_failed_at is None

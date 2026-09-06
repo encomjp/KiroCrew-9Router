@@ -65,7 +65,7 @@ def test_auto_approve_action_targets_the_approval_setting():
     # The URL uses the same highlight=key:<configKey> format <SettingRef> builds,
     # so useSettingHighlight can scroll to the toggle.
     assert _SKILL_APPROVAL_SETTING_URL == (
-        "/settings?tab=skills&highlight=key:skills.approval_required"
+        "/settings/skills?highlight=key:skills.approval_required"
     )
 
 

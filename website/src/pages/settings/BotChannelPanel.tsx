@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, Check, AlertTriangle, Lock } from 'lucide-react'
 import { SettingsSection, SettingsCard, SettingsInput, SettingsSelect, SettingsToggle } from '../../components/settings'
 import { SecretField } from '../../components/SecretField'
+import { CopyCommandButton } from '../../components/settingRef/CopyCommandButton'
 import { Btn } from '../../components/ui'
 import { TagListEditor } from './SlackPanel'
 
@@ -35,10 +36,30 @@ export interface BotChannelConfigData {
   /** Telegram forum per-topic config (optional; only Telegram sends these). */
   allow_forum?: boolean
   allowed_forum_chat_ids?: string[]
+  /**
+   * Group-chat scope (optional; only Feishu sends these). Distinct from
+   * ``allow_forum``: that gates per-TOPIC routing inside one Telegram
+   * supergroup, whereas this gates whole group conversations. Sharing one field
+   * would make the panel's copy lie for whichever channel borrowed the other's.
+   */
+  allow_group?: boolean
+  allowed_group_ids?: string[]
   /** When to answer inside an allow-listed forum topic (optional; Telegram). */
   forum_activation?: string
   /** Sidebar folder this channel's sessions are filed into ("" = off). */
   session_folder?: string
+  /**
+   * Optional-SDK state (only a channel declaring ``sdkExtra`` sends these).
+   * ``sdk_installed`` false means the client library is not importable by the
+   * gateway process, so the channel is skipped at boot however complete the rest
+   * of the config is; ``sdk_install_supported`` false marks the environments
+   * where a pip install cannot work at all (bundled desktop interpreter, no pip
+   * module, PEP 668 externally-managed); ``sdk_install_command`` names the
+   * gateway's OWN interpreter and is empty whenever it would not help.
+   */
+  sdk_installed?: boolean
+  sdk_install_supported?: boolean
+  sdk_install_command?: string
 }
 
 /** Writable fields shared by every bot-token channel save endpoint. */
@@ -64,6 +85,8 @@ export interface BotChannelConfigSave {
   allow_forum?: boolean
   allowed_forum_chat_ids?: string[]
   forum_activation?: string
+  allow_group?: boolean
+  allowed_group_ids?: string[]
   session_folder?: string
 }
 
@@ -194,6 +217,29 @@ export interface BotChannelSpec {
     }
   }
   /**
+   * Optional group-chat scope (Feishu group conversations). When present, the
+   * panel renders an allow_group toggle plus a chat-id tag editor. Separate from
+   * ``forum`` on purpose: a Telegram forum topic lives INSIDE one supergroup and
+   * carries its own activation mode, while this is "may this channel serve group
+   * conversations at all, and which ones". Channels that omit it never send
+   * ``allow_group`` or ``allowed_group_ids``.
+   */
+  groupChats?: {
+    toggleLabel: string
+    toggleDescription: ReactNode
+    allowlistLabel: string
+    allowlistDescription: string
+    allowlistPlaceholder: string
+    /** Entry validator; ids are opaque so each channel supplies its own shape. */
+    allowlistValidate?: (v: string) => boolean
+    /**
+     * Hint shown while the toggle is ON and the list is empty. Both fail closed,
+     * so that combination serves no group at all — without the hint the panel
+     * would look configured while doing nothing.
+     */
+    emptyHint: string
+  }
+  /**
    * Optional progress-display toggles rendered in the Behavior card: how much of
    * a running turn the channel shows (the phase-reaction ladder, and whether the
    * model's reasoning is surfaced). Channels that omit it are unaffected and
@@ -208,6 +254,18 @@ export interface BotChannelSpec {
     thinkingDescription: string
     /** Config path the thinking toggle writes, for `<SettingRef>` deep-links. */
     thinkingConfigKey: string
+  }
+  /**
+   * Optional SDK extra. Present only for a channel whose client library ships
+   * outside core (Feishu: lark-oapi), which is the one case where a fully
+   * configured channel still cannot start. All the COPY lives in this shared
+   * namespace parameterised on the channel and package names, so a channel
+   * adopting the card adds no translation keys of its own — an object rather
+   * than a bare string so a later field is not a breaking change.
+   */
+  sdkExtra?: {
+    /** Distribution name as the user would type it, e.g. "lark-oapi". */
+    packageLabel: string
   }
   /** API calls. */
   getConfig: () => Promise<BotChannelConfigData>
@@ -230,6 +288,8 @@ type Draft = {
   allow_forum: boolean
   allowed_forum_chat_ids: string[]
   forum_activation: string
+  allow_group: boolean
+  allowed_group_ids: string[]
   /** Whether this channel files its sessions in a folder at all (off = unfiled). */
   session_folder_on: boolean
   /** Folder name, kept while the toggle is off so turning it back on restores it. */
@@ -257,6 +317,11 @@ function draftFrom(c: BotChannelConfigData): Draft {
     voice_replies: !!c.voice_replies,
     allow_forum: !!c.allow_forum,
     allowed_forum_chat_ids: [...(c.allowed_forum_chat_ids ?? [])],
+    // Default OFF like the backend: an absent field means "this channel does
+    // not send it", and defaulting a GROUP-access switch on would widen reach
+    // for a channel that never asked for it.
+    allow_group: !!c.allow_group,
+    allowed_group_ids: [...(c.allowed_group_ids ?? [])],
     // Falls back to the backend's own default rather than to "", which is not a
     // valid mode and would post a value the loader then has to reject.
     forum_activation: c.forum_activation || 'always',
@@ -396,6 +461,10 @@ export function BotChannelPanel({ spec }: { spec: BotChannelSpec }) {
       payload.allowed_forum_chat_ids = draft.allowed_forum_chat_ids
       if (spec.forum.activation) payload.forum_activation = draft.forum_activation
     }
+    if (spec.groupChats) {
+      payload.allow_group = draft.allow_group
+      payload.allowed_group_ids = draft.allowed_group_ids
+    }
     if (spec.progressDisplay) {
       payload.reactions_enabled = draft.reactions_enabled
       payload.show_thinking = draft.show_thinking
@@ -472,6 +541,44 @@ export function BotChannelPanel({ spec }: { spec: BotChannelSpec }) {
           </div>
         </SettingsCard>
       </SettingsSection>
+
+      {/* ── Missing optional SDK ── */}
+      {/*
+        Strictly `=== false`: an older gateway omits the field entirely, and
+        treating undefined as "missing" would tell every user of one to install a
+        package they may already have.
+      */}
+      {spec.sdkExtra && data.sdk_installed === false && (
+        <SettingsSection title={i18nT('pages.settings.botChannelPanel.sdk_missing', { channel: spec.name })}>
+          <SettingsCard>
+            {data.sdk_install_supported && data.sdk_install_command ? (
+              <>
+                <p className="text-[13px] text-text m-0">
+                  {i18nT('pages.settings.botChannelPanel.sdk_missing_body', { channel: spec.name, package: spec.sdkExtra.packageLabel })}
+                </p>
+                {/*
+                  The command names the gateway's own interpreter rather than a
+                  bare `pip`, because installing into a different environment is
+                  the failure this card exists to prevent — so it must stay
+                  copyable verbatim: break-all, never truncated.
+                */}
+                <div className="flex items-start gap-2 mt-2 rounded-md border border-border bg-bg-elevated px-3 py-2">
+                  <code className="flex-1 text-[12px] font-mono text-text break-all">{data.sdk_install_command}</code>
+                  <CopyCommandButton text={data.sdk_install_command} />
+                </div>
+                <p className="text-[12px] text-muted mt-2 mb-0">
+                  {i18nT('pages.settings.botChannelPanel.sdk_restart_after_install', { channel: spec.name })}
+                </p>
+              </>
+            ) : (
+              <p className="text-[13px] text-warn m-0 flex items-start gap-1.5">
+                <AlertTriangle size={13} className="flex-none mt-0.5" />
+                {i18nT('pages.settings.botChannelPanel.sdk_install_unsupported', { package: spec.sdkExtra.packageLabel })}
+              </p>
+            )}
+          </SettingsCard>
+        </SettingsSection>
+      )}
 
       {/* ── Required ── */}
       <SettingsSection title={i18nT('pages.settings.botChannelPanel.required')}>
@@ -650,6 +757,38 @@ export function BotChannelPanel({ spec }: { spec: BotChannelSpec }) {
                 />
               </div>
             )}
+          </SettingsCard>
+        </SettingsSection>
+      )}
+
+      {/* ── Group chats (optional; Feishu group conversations) ── */}
+      {spec.groupChats && (
+        <SettingsSection title={i18nT('pages.settings.botChannelPanel.group_chats')}>
+          <SettingsCard index={3}>
+            <SettingsToggle
+              label={spec.groupChats.toggleLabel}
+              description={spec.groupChats.toggleDescription}
+              checked={draft.allow_group}
+              onChange={v => upd({ allow_group: v })}
+              disabled={ro}
+            />
+            <div className="border-t border-border mt-4 pt-4">
+              <TagListEditor
+                label={spec.groupChats.allowlistLabel}
+                description={spec.groupChats.allowlistDescription}
+                values={draft.allowed_group_ids}
+                placeholder={spec.groupChats.allowlistPlaceholder}
+                onChange={v => upd({ allowed_group_ids: v })}
+                validate={spec.groupChats.allowlistValidate}
+                readOnly={ro}
+              />
+              {draft.allow_group && draft.allowed_group_ids.length === 0 && (
+                <p className="text-[12px] text-warn mt-2 mb-0 flex items-start gap-1.5">
+                  <AlertTriangle size={13} className="flex-none mt-0.5" />
+                  <span>{spec.groupChats.emptyHint}</span>
+                </p>
+              )}
+            </div>
           </SettingsCard>
         </SettingsSection>
       )}

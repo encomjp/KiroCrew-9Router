@@ -21,12 +21,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from kiro_crew import platform_compat
 from kiro_crew.artifacts import slugify
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import data_home
+from kiro_crew.jsonl_util import rotate_jsonl_at
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +39,41 @@ MEMBERS_DIR_NAME = "members"
 
 #: Append-only pointer log inside a member's directory.
 ACTIVITY_FILE_NAME = "activity.jsonl"
+
+# Rotate a member's activity log once it exceeds this size, keeping ONE
+# previous generation (``.jsonl.1``) — the same 1 MiB cap / ~2 MiB total
+# shape as ``mcp_gateway.stub._FALLBACK_LOG_MAX_BYTES``. Entries are ~150
+# bytes, so the two generations together hold thousands of the most recent
+# pointers for :func:`read_activity`'s consumers (today the
+# ``dedupe_session`` probe inside :func:`record_activity`) — while an
+# unbounded log would grow forever (one append per participation event,
+# from multiple processes, and nothing ever pruned it). The dedupe probe
+# also reads this whole file synchronously on every deduped call, so the
+# cap bounds that read as well as the disk.
+_ACTIVITY_LOG_MAX_BYTES = 1024 * 1024
+
+#: Crew-slug -> DM-thread binding inside a member's directory.
+DM_FILE_NAME = "dm.json"
+# Bindings live under the keystone-gated ``trust/`` subtree, NOT inside the
+# member's own directory. The binding IS the thread's identity authority (the
+# resume/send/thread-open guards all defer to it precisely because transcript
+# metadata is operator-editable), so it must not sit on a path the agent's
+# file tools can write: a prompt-injected write that re-points ``member`` at a
+# colliding crew would hand that crew the thread's entire transcript at the
+# next restore. ``trust/`` is already in the sensitive-path floor as a whole
+# directory (like the SEL HMAC key and Spec Builder's decision record), and
+# keystone writers open paths there directly, so the gateway keeps working.
+DM_BINDINGS_DIR_NAME = "member-bindings"
+
+#: Slot ``mode`` tag for member DM threads. The frontend's single
+#: chat-ownership predicate (``isChatPageSurface``) does not admit it, so a
+#: slot born with this mode is excluded from the ordinary Sessions list on
+#: every consumer with no filtering code of its own.
+DM_SLOT_MODE = "member"
+
+#: Slot-key prefix for member DM threads (``member-<slug>``), following the
+#: existing ``<kind>-<id>`` key convention (``chat-<N>-<ts>``, ``cron-<id>``).
+DM_SLOT_KEY_PREFIX = "member-"
 
 # Same shape the artifact store enforces for its slugs: lowercase letters,
 # digits and hyphens, 1-80 chars, no leading or trailing hyphen. Kept here as a
@@ -62,6 +101,25 @@ def members_root() -> Path:
     maintenance (including a destructive leftover sweep) on every call.
     """
     return data_home() / MEMBERS_DIR_NAME
+
+
+def dm_binding_path(slug: str) -> Path:
+    """Absolute path to one member's DM-thread binding, containment-checked.
+
+    Lives under the keystone-gated ``trust/`` subtree (see the note on
+    ``DM_BINDINGS_DIR_NAME``): agent file tools cannot reach it, the gateway
+    opens it directly. One flat ``<slug>.json`` per member — the slug is
+    already validated to a safe charset, so the filename cannot traverse.
+    Does NOT create the directory; :func:`write_dm_binding` does on demand.
+    """
+    validate_slug(slug)
+    root = (data_home() / "trust" / DM_BINDINGS_DIR_NAME).resolve()
+    target = (root / f"{slug}.json").resolve()
+    # Defence in depth behind validate_slug, mirroring member_dir: a symlinked
+    # component must not land the binding outside its trust-rooted directory.
+    if target.parent != root and root not in target.parents:
+        raise MemberSlugError(f"member slug {slug!r} escapes {root}")
+    return target
 
 
 def validate_slug(slug: str) -> str:
@@ -106,6 +164,128 @@ def member_dir(slug: str) -> Path:
     if target != root and root not in target.parents:
         raise MemberSlugError(f"member slug {slug!r} escapes {root}")
     return target
+
+
+def member_slot_key(slug: str) -> str:
+    """Derived, stable chat-slot key for a member's pinned DM thread.
+
+    One slot per member, reused forever. Purely a derivation — nothing is read
+    or written. The dashboard's slot layer normalizes keys to a filename-safe
+    charset, but a validated slug is already inside that charset, so the
+    derived key survives ``_normalize_slot_key`` unchanged; callers must still
+    use the slot layer's RETURNED key as the source of truth.
+    """
+    return DM_SLOT_KEY_PREFIX + validate_slug(slug)
+
+
+def read_dm_binding(slug: str) -> dict | None:
+    """Return a member's DM-thread binding, or ``None`` when absent/unusable.
+
+    Total by contract, like :func:`read_activity`: a bad slug, a missing file,
+    an unreadable file, or a malformed payload all read as "not bound" — the
+    binding is idempotently re-creatable, so degrading to re-creation is
+    always safe and the caller needs no try/except.
+
+    Blocking file IO: call via ``asyncio.to_thread`` from async code.
+    """
+    try:
+        path = dm_binding_path(slug)
+    except (MemberSlugError, OSError, RuntimeError):
+        # member_dir resolves (and may mkdir) real filesystem paths, so an
+        # unreadable directory or a symlink loop surfaces here — the totality
+        # contract above says every such state reads as "not bound", and the
+        # restore paths rely on that to survive any on-disk state at boot.
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        # Invalid UTF-8 is the same totality case as an unreadable file: the
+        # binding reads as absent, never as a 500 out of every member API.
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    # A binding is only usable if it names the thread's slot and the exact
+    # member it belongs to. Slugification is lossy (two crew names can share
+    # one slug and therefore one dm.json), so the member name inside the
+    # payload — not the directory — is what attributes the thread.
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("slot_key"), str)
+        or not data["slot_key"]
+        or not isinstance(data.get("member"), str)
+        or not data["member"]
+    ):
+        return None
+    # The slot key is a pure derivation of the slug; any other value is a
+    # malformed or tampered binding. Accepting it would let dm.json point the
+    # roster (and the page, which trusts `bound` rows enough to skip the
+    # create POST) at an arbitrary unrelated session. Treat non-canonical as
+    # absent — the thread endpoint then repairs it to the derived key.
+    if data["slot_key"] != member_slot_key(slug):
+        return None
+    # And the member must actually BELONG to this slug: a tampered dm.json in
+    # slug A's directory naming crew B (a real, registered crew whose slug
+    # differs) would otherwise pin A's thread — and A's restored transcript —
+    # to B's identity. Colliding names are fine: every name that slugifies to
+    # this slug passes; anything else reads as absent.
+    if slug_for_name(data["member"]) != slug:
+        return None
+    return data
+
+
+def write_dm_binding(slug: str, *, member: str, slot_key: str) -> dict:
+    """Persist a member's DM-thread binding atomically; return the record.
+
+    ``slot_key`` must be the slug's own derivation — the same canonicality
+    invariant :func:`read_dm_binding` enforces on the way back. Writing any
+    other value would produce a binding that always reads as absent, so the
+    mismatch is a caller bug worth failing loudly on.
+
+    Raises :class:`MemberSlugError` on a bad slug and lets ``OSError``
+    propagate: unlike the advisory activity log, the caller (the thread
+    get-or-create endpoint) must know the binding did not land so it can
+    report failure instead of advertising a thread that will not be found
+    again.
+
+    No fsync, deliberately: the binding is re-derivable — the slot key is a
+    pure function of the slug and the endpoint that writes it is idempotent —
+    so losing it to a crash costs one re-create, while a durability barrier
+    would stall the event-loop thread pool for every thread open. The write
+    itself is atomic (unique temp file + rename), so a torn file is never
+    observable. Not a secret (a slot key and a crew name), so no owner-only
+    permission tightening.
+    """
+    path = dm_binding_path(slug)
+    if slot_key != member_slot_key(slug):
+        raise ValueError(
+            f"non-canonical dm binding slot_key {slot_key!r} for slug {slug!r} "
+            f"(expected {member_slot_key(slug)!r}); such a binding always reads back as absent"
+        )
+    binding = {
+        "member": member,
+        "slug": slug,
+        "slot_key": slot_key,
+        "created_ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The trust subtree is owner-only everywhere else (sel.py creates it 0o700);
+    # a parents=True mkdir would otherwise leave a default-mode directory chain.
+    # Best-effort: the sensitive-path floor is the real fence, the mode is
+    # defence in depth, and a chmod failure must not cost the thread its binding.
+    for _dir in (path.parent, path.parent.parent):
+        try:
+            platform_compat.restrict_dir_to_owner(_dir)
+        except OSError:
+            logger.debug("could not tighten mode on %s", _dir, exc_info=True)
+    # fsync: the binding is the thread's durability anchor — the orphan-history
+    # guard REFUSES to rebind a slug whose binding is gone while its transcript
+    # survives, so a binding lost to power failure after a transcript flush
+    # would strand that transcript behind member_binding_missing. The binding
+    # must be at least as durable as the transcript it attributes.
+    atomic_write(path, json.dumps(binding, ensure_ascii=False), fsync=True)
+    return binding
 
 
 def record_activity(
@@ -201,6 +381,15 @@ def record_activity(
         # terminator and be absorbed by whatever came next. read_activity skips
         # the blank lines this produces.
         line = "\n" + json.dumps(entry, ensure_ascii=False) + "\n"
+        # Bound the log before appending. The helper's rotation is
+        # try-lock-guarded (the log is append-only from multiple processes, so
+        # unserialized rotation would let two writers hitting the cap together
+        # discard a generation), best-effort, and never raises; a lost
+        # try-lock skips rotating rather than waiting, so this call cannot
+        # stall the shared event loop any more than the append itself.
+        # History survives rotation: read_activity spans both generations, so
+        # the `dedupe_session` probe keeps seeing rotated-aside entries.
+        rotate_jsonl_at(path / ACTIVITY_FILE_NAME, _ACTIVITY_LOG_MAX_BYTES)
         # No fsync: this is an advisory pointer log, and a durability barrier is
         # a blocking kernel syscall that would stall the shared event loop for
         # every concurrent session. Losing the final entry to a crash is
@@ -216,30 +405,61 @@ def record_activity(
 def read_activity(slug: str, limit: int = 0) -> list[dict]:
     """Return a member's activity entries, oldest first.
 
-    Malformed lines are skipped rather than raising: the log is append-only from
-    multiple processes, and one torn line must not make the whole history
-    unreadable. ``limit`` > 0 returns only the most recent N.
+    Reads the one rotated generation (``.jsonl.1``, see
+    :data:`_ACTIVITY_LOG_MAX_BYTES`) before the live file — the same
+    two-generation read as the stub fallback log's aggregator — so a
+    rotation does not hide history from consumers: in particular the
+    ``dedupe_session`` probe keeps suppressing a session pair whose entry
+    was rotated aside. Malformed lines are skipped rather than raising: the
+    log is append-only from multiple processes, and one torn line must not
+    make the whole history unreadable. A generation that cannot be read is
+    likewise skipped rather than discarding what the other generation
+    yielded. ``limit`` > 0 returns only the most recent N across both
+    generations.
     """
     try:
-        path = member_dir(slug) / ACTIVITY_FILE_NAME
+        live = member_dir(slug) / ACTIVITY_FILE_NAME
     except MemberSlugError:
         return []
-    if not path.is_file():
-        return []
     out: list[dict] = []
+
+    # Hold a shared (non-blocking) lock on the rotation lock file while
+    # reading both generations.  This prevents a concurrent writer from
+    # rotating the live file into .1 between the two reads, which could
+    # cause records to be missed and duplicate session entries appended.
+    lock_fd: int = -1
+    lock_path = live.with_name(live.name + ".lock")
     try:
-        with open(path, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except (ValueError, TypeError):
-                    continue
-                if isinstance(row, dict):
-                    out.append(row)
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        if not platform_compat.try_acquire_lock(lock_fd, exclusive=False):
+            # Could not acquire; close and proceed without the lock.
+            os.close(lock_fd)
+            lock_fd = -1
     except OSError:
-        logger.debug("member activity log read failed for %r", slug, exc_info=True)
-        return []
+        lock_fd = -1
+
+    try:
+        for path in (live.with_name(live.name + ".1"), live):
+            if not path.is_file():
+                continue
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except (ValueError, TypeError):
+                            continue
+                        if isinstance(row, dict):
+                            out.append(row)
+            except OSError:
+                logger.debug("member activity log read failed for %r", slug, exc_info=True)
+                continue
+    finally:
+        if lock_fd != -1:
+            platform_compat.release_lock(lock_fd)
+            os.close(lock_fd)
+
     return out[-limit:] if limit > 0 else out

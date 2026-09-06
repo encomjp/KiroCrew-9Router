@@ -49,6 +49,19 @@ class _ActiveMeeting:
     def __init__(self) -> None:
         self.session: MeetingSession | None = None
         self.accepting_dispatches = False
+        #: The session whose ingress is closed FOR INITIALIZATION, if any.
+        #:
+        #: ``accepting_dispatches`` alone cannot answer "should this line be
+        #: refused?", because it is false for two opposite reasons: the meeting is
+        #: stopping/reviewing/expired (the line has nowhere to go — refuse it, which
+        #: is the gate issue #1981 added) or the meeting is STARTING and its agents
+        #: are not ready yet (the line is wanted — hold it). Conflating them is what
+        #: made a meeting refuse its own opening speech for ~46s.
+        #:
+        #: Stored as the SESSION rather than a bool so the state cannot outlive the
+        #: identity it describes: every install/teardown clears it, so a stale flag
+        #: can never make a later session buffer into a hold nobody drains.
+        self.buffering_session: MeetingSession | None = None
 
     def get(self, meeting_id: str = "") -> MeetingSession | None:
         """The live session, optionally requiring it to be *meeting_id*'s."""
@@ -63,15 +76,57 @@ class _ActiveMeeting:
         """The matching session only while its transcript ingress is open."""
         return self.get(meeting_id) if self.accepting_dispatches else None
 
-    def suspend_dispatches(self, session: MeetingSession | None = None) -> None:
-        """Close ingress for *session* without tearing down its agent queues."""
+    def get_for_buffering(self, meeting_id: str) -> MeetingSession | None:
+        """The matching session only while it is HOLDING speech through init.
+
+        The narrow complement of :meth:`get_for_dispatch`: a caller that was just
+        refused a direct fan-out asks this before answering 409. Returns None for
+        every other closed-ingress reason, so stop / reviewing / expired keep
+        refusing exactly as they did.
+        """
+        if self.accepting_dispatches:
+            return None
+        session = self.get(meeting_id)
+        return session if session is not None and self.buffering_session is session else None
+
+    @property
+    def buffering_dispatches(self) -> bool:
+        """Whether speech sent NOW would be held rather than refused.
+
+        Reported next to ``accepting_dispatches`` on the meeting poll: the
+        dashboard opens the microphone on "would speech land?", and during
+        initialization the answer became yes-by-holding rather than no.
+        """
+        return self.buffering_session is not None and self.buffering_session is self.session
+
+    def suspend_dispatches(
+        self, session: MeetingSession | None = None, *, buffer_speech: bool = False
+    ) -> None:
+        """Close ingress for *session* without tearing down its agent queues.
+
+        *buffer_speech* says WHY, and only the start path passes it: during agent
+        initialization the meeting wants the speech it cannot yet deliver, so the
+        dispatch endpoint holds the line instead of refusing it. Every other caller
+        (stop, reviewing, an expired session, replacing an outgoing session) leaves
+        it False and keeps the refusing behaviour.
+
+        Defaults to False so a caller added later refuses by default rather than
+        silently opting into a hold nothing drains.
+        """
         if session is not None and self.session is session:
             self.accepting_dispatches = False
+            self.buffering_session = session if buffer_speech else None
 
     def resume_dispatches(self, session: MeetingSession) -> None:
-        """Open ingress only if *session* is still the installed session."""
+        """Open ingress only if *session* is still the installed session.
+
+        Ends any hold in the same step: once direct fan-out is open, a line that
+        stayed in the buffer would be delivered out of order behind live speech.
+        The caller drains under this same lock acquisition.
+        """
         if self.session is session:
             self.accepting_dispatches = True
+            self.buffering_session = None
 
     def set(self, session: MeetingSession | None) -> None:
         """Install *session*, replacing any current one.
@@ -95,6 +150,10 @@ class _ActiveMeeting:
             previous.cancel_all()
         self.session = session
         self.accepting_dispatches = session is not None
+        # Never inherited: the outgoing session's hold belongs to a meeting that is
+        # gone, and leaving it set would make this session look like it were
+        # buffering into a list no drain will ever reach.
+        self.buffering_session = None
 
     def clear(self) -> MeetingSession | None:
         """Drop the session, CANCELLING anything still queued.
@@ -109,6 +168,7 @@ class _ActiveMeeting:
             previous.cancel_all()
         self.session = None
         self.accepting_dispatches = False
+        self.buffering_session = None
         return previous
 
     async def drain_and_clear(self) -> MeetingSession | None:

@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from kiro_crew.platform.interfaces import ImportSource, McpScope
 
 from kiro_crew import security, sso_status
-from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision
+from kiro_crew.platform.interfaces import CapabilityResult, InterceptDecision, OtlpDestination
 
 # ``agent``, ``sandbox``, ``embeddings``, ``apps.registry`` and ``slack.enterprise``
 # import ``kiro_crew.platform`` at module-load time, so importing them at the top
@@ -44,8 +44,18 @@ class DefaultProviderRegistry:
     def register_acp_backends(self) -> None:
         # The public edition registers no extra ACP backends.  The companion
         # re-registers a Claude backend here via the acp/client.py:_is_claude
-        # seam.
-        return None
+        # seam, and pairs it with
+        # ``acp_backends.register_selectable_backend(ACP_BACKEND_CLAUDE)`` so the
+        # dashboard switch, the PATCH allowlist and the config load path all see
+        # it — the provider alone is runnable but unreachable.
+        #
+        # Fork (kirocrew-customapi): OpenCode is a first-class selectable backend —
+        # the agent.provider="opencode" factory (config.loader.create_provider_factory)
+        # drives it, and the dashboard switch / PATCH allowlist / config load path all
+        # derive from this registry.
+        from kiro_crew.acp_backends import ACP_BACKEND_OPENCODE, register_selectable_backend
+
+        register_selectable_backend(ACP_BACKEND_OPENCODE)
 
 
 class DefaultPublishRegistry:
@@ -430,6 +440,24 @@ class DefaultTelemetryProvider:
 
     def frontend_rum_config(self) -> Optional[dict]:
         return None
+
+    def otlp_destinations(self, cfg: Any) -> "tuple[OtlpDestination, ...]":
+        # Byte-identical to the endpoint-only OTLP exporter this seam replaced:
+        # ONE destination when telemetry.otlp_endpoint is a non-empty string,
+        # NONE otherwise — so egress stays off by default and the standalone
+        # build reaches exactly the collector it reached before. Read with
+        # getattr so any telemetry-config shape works, and never logged here:
+        # the value can carry credentials in userinfo or query parameters.
+        endpoint = str(getattr(cfg, "otlp_endpoint", "") or "").strip()
+        if not endpoint:
+            return ()
+        return (
+            OtlpDestination(
+                name="telemetry.otlp_endpoint",
+                endpoint=endpoint,
+                signals=frozenset({"metrics"}),
+            ),
+        )
 
 
 class DefaultKnowledgeProvider:

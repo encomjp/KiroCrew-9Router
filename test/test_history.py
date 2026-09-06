@@ -91,18 +91,6 @@ class TestConversationLog:
         log = ConversationLog(base_dir=tmp_path)
         log.mark_consolidated("nonexistent", 5)  # should not raise
 
-    def test_load_transcript(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path)
-        log.append("t1", "user", "what is 2+2?")
-        log.append("t1", "assistant", "4")
-        transcript = log.load_transcript("t1")
-        assert "User: what is 2+2?" in transcript
-        assert "Assistant: 4" in transcript
-
-    def test_load_transcript_empty(self, tmp_path):
-        log = ConversationLog(base_dir=tmp_path)
-        assert log.load_transcript("nonexistent") == ""
-
     def test_safe_key_sanitizes(self, tmp_path):
         log = ConversationLog(base_dir=tmp_path)
         log.append("thread:with/special chars!", "user", "hi")
@@ -4077,7 +4065,7 @@ class TestTailReads:
         log._msg_cache.clear()
         log.recent("t1", max_messages=3)
         # Tail path returned a partial view — the full cache must stay empty
-        # so load_transcript()/search still parse the whole file.
+        # so search still parses the whole file.
         assert "t1" not in log._msg_cache
 
     def test_tail_window_grows_when_insufficient(self, tmp_path):
@@ -4514,6 +4502,89 @@ class TestDeleteSessionSummarySidecar:
         log.append("thread-nosum", "user", "hello")
         assert log.delete_session("thread-nosum") is True
         assert not log._summary_cache_path("thread-nosum").exists()
+
+    def test_delete_session_skip_pinned_protects_pinned_sessions(self, tmp_path):
+        """skip_pinned=True returns None for pinned sessions under the REAL lock.
+
+        Regression test for the layering fix: the pin-check-and-delete invariant
+        now lives in ConversationLog.delete_session rather than in a handler closure.
+        This test exercises the real _locked codepath, NOT a mocked context manager,
+        so a regression that breaks lock reentrancy will actually fail.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-pinned", "user", "important")
+        log.update_metadata("sess-pinned", {"pinned": True})
+        log.append("sess-unpinned", "user", "ephemeral")
+
+        # Pinned session: skip_pinned=True returns None, file survives
+        assert log.delete_session("sess-pinned", skip_pinned=True) is None
+        assert log._path("sess-pinned").exists()
+
+        # Unpinned session: skip_pinned=True returns True, file is deleted
+        assert log.delete_session("sess-unpinned", skip_pinned=True) is True
+        assert not log._path("sess-unpinned").exists()
+
+    def test_delete_session_skip_pinned_skips_unreadable_metadata(self, tmp_path):
+        """skip_pinned=True returns None when get_metadata_status returns unreadable.
+
+        Simulates a Windows indexer/AV hold that makes the metadata transiently
+        unreadable. The session is skipped (not deleted blind) and can be retried.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-transient", "user", "might be locked")
+
+        # Patch get_metadata_status to simulate transient unreadability
+        original = log.get_metadata_status
+
+        def _unreadable(key):
+            if key == "sess-transient":
+                return {}, False  # readable=False
+            return original(key)
+
+        log.get_metadata_status = _unreadable
+
+        # skip_pinned=True returns None, file survives
+        assert log.delete_session("sess-transient", skip_pinned=True) is None
+        assert log._path("sess-transient").exists()
+
+    def test_delete_session_skip_pinned_logs_on_exception(self, tmp_path, caplog):
+        """skip_pinned=True logs and returns None when get_metadata_status raises.
+
+        Corrupt metadata or permanent I/O failure should be diagnosable via logs.
+        """
+        import logging
+
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-corrupt", "user", "bad metadata")
+
+        # Patch to simulate corrupt metadata raising
+        def _corrupt_meta(key):
+            if key == "sess-corrupt":
+                raise ValueError("corrupt JSON")
+            return log.get_metadata(key), True
+
+        log.get_metadata_status = _corrupt_meta
+
+        with caplog.at_level(logging.WARNING):
+            result = log.delete_session("sess-corrupt", skip_pinned=True)
+
+        assert result is None
+        assert log._path("sess-corrupt").exists()
+        assert "unexpected error reading metadata" in caplog.text
+        assert "sess-corrupt" in caplog.text
+
+    def test_delete_session_skip_pinned_false_deletes_pinned(self, tmp_path):
+        """skip_pinned=False (default) deletes even pinned sessions.
+
+        Ensures the default behavior is unchanged for callers that don't use skip_pinned.
+        """
+        log = ConversationLog(base_dir=tmp_path)
+        log.append("sess-pinned-force", "user", "pinned but forced")
+        log.update_metadata("sess-pinned-force", {"pinned": True})
+
+        # Without skip_pinned, pinned sessions ARE deleted
+        assert log.delete_session("sess-pinned-force") is True
+        assert not log._path("sess-pinned-force").exists()
 
 
 @pytest.mark.asyncio

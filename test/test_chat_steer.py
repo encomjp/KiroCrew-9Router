@@ -12,6 +12,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_app, _make_state
 
@@ -61,6 +62,41 @@ class TestApiChatSteer:
         events = [c.args[0] for c in state.broadcast_ws.call_args_list]
         assert "steer_push" in events
         assert "queue_push" not in events  # steered, not queued
+
+    @pytest.mark.asyncio
+    async def test_app_authenticated_steer_falls_back_to_fail_closed_queue(
+        self, tmp_path, monkeypatch, _patch_sel
+    ):
+        """An app cannot inject into a live human-origin turn and inherit its
+        authority; its text waits as an automation-origin successor turn."""
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = _running_slot(state)
+        slot._app = "app-A"
+        client_mock = MagicMock()
+        client_mock.supports_steer = True
+        client_mock.steer = AsyncMock(return_value=True)
+        slot._acp_client = client_mock
+
+        @web.middleware
+        async def _inject_app(request, handler):
+            request["app"] = "app-A"
+            return await handler(request)
+
+        app = _make_app(state)
+        app.middlewares.insert(0, _inject_app)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/chat", json={"slot": "test", "message": "go left", "steer": True}
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data.get("queued") is True
+            assert data.get("steered") is not True
+
+        client_mock.steer.assert_not_awaited()
+        assert slot._queue[-1].get("_directive_user_origin") is not True
 
     @pytest.mark.asyncio
     async def test_steer_unavailable_falls_back_to_queue(self, tmp_path, monkeypatch, _patch_sel):
@@ -169,6 +205,160 @@ class TestApiChatSteer:
         assert any(m["role"] == "user" and m.get("meta", {}).get("steer") for m in slot.messages)
         events = [c.args[0] for c in state.broadcast_ws.call_args_list]
         assert "steer_push" in events
+
+    @staticmethod
+    def _steer_capable_state(tmp_path, monkeypatch):
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = _running_slot(state)
+        client_mock = MagicMock()
+        client_mock.supports_steer = True
+        client_mock.steer = AsyncMock(return_value=True)
+        slot._acp_client = client_mock
+        return state, slot
+
+    @staticmethod
+    def _steer_push_payload(state):
+        return next(
+            c.args[1] for c in state.broadcast_ws.call_args_list if c.args[0] == "steer_push"
+        )
+
+    @pytest.mark.asyncio
+    async def test_steer_send_id_persists_and_broadcasts(self, tmp_path, monkeypatch, _patch_sel):
+        """A client-minted meta.sendId rides the steer: the persisted steer row
+        and the steer_push broadcast both carry it, so the client can reconcile
+        its optimistic bubble by id instead of by text (#6075)."""
+        state, slot = self._steer_capable_state(tmp_path, monkeypatch)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat",
+                json={
+                    "slot": "test",
+                    "message": "go left",
+                    "steer": True,
+                    "meta": {"sendId": "s-abc-123"},
+                },
+            )
+            assert resp.status == 200
+            assert (await resp.json()).get("steered") is True
+
+        steer_row = next(m for m in slot.messages if m.get("meta", {}).get("steer"))
+        assert steer_row["meta"]["sendId"] == "s-abc-123"
+        assert self._steer_push_payload(state)["sendId"] == "s-abc-123"
+
+    @pytest.mark.asyncio
+    async def test_steer_without_send_id_keeps_prior_shape(self, tmp_path, monkeypatch, _patch_sel):
+        """No sendId in the request -> the persisted row's meta and the
+        steer_push payload keep exactly the pre-sendId shape (no key at all,
+        never a null): old clients see no new field."""
+        state, slot = self._steer_capable_state(tmp_path, monkeypatch)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat", json={"slot": "test", "message": "go left", "steer": True}
+            )
+            assert resp.status == 200
+            assert (await resp.json()).get("steered") is True
+
+        steer_row = next(m for m in slot.messages if m.get("meta", {}).get("steer"))
+        assert "sendId" not in steer_row["meta"]
+        assert "sendId" not in self._steer_push_payload(state)
+
+    @pytest.mark.asyncio
+    async def test_raced_steer_persists_send_id_on_new_turn_row(
+        self, tmp_path, monkeypatch, _patch_sel
+    ):
+        """A steer POST that lands on an IDLE slot (the POST raced chat_done)
+        falls onto the new-turn path, whose generic client-meta persistence must
+        carry the sendId onto the plain user row — with NO steer flag. That
+        non-steer row is exactly what the client reads as proof of the new-turn
+        path (#6075), so this pins the pass-through property the frontend half
+        of the fix rests on: an allowlist that later drops sendId from persisted
+        user meta would reopen the issue with every other test green.
+
+        ``?ws=1`` requests the JSON receipt instead of the SSE stream; the row
+        persistence under test happens before that response-shape fork.
+        """
+        monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+        state = _make_state(tmp_path)
+        state.broadcast_ws = MagicMock()
+        slot = state.get_or_create_slot("test")  # idle: no running task
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat?ws=1",
+                json={
+                    "slot": "test",
+                    "message": "raced text",
+                    "steer": True,
+                    "meta": {"sendId": "s-raced-1"},
+                },
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data.get("ok") is True
+            assert data.get("steered") is not True
+
+        user_row = next(m for m in slot.messages if m["role"] == "user")
+        assert user_row["meta"]["sendId"] == "s-raced-1"
+        assert not user_row["meta"].get("steer")
+        events = [c.args[0] for c in state.broadcast_ws.call_args_list]
+        assert "steer_push" not in events
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_send_id",
+        [
+            123,
+            "",
+            "x" * 129,
+            ["s-1"],
+            {"id": "s-1"},
+            "has spaces",
+            "a/b+c=",
+            "AKIAIOSFODNN7EXAMPLE",
+        ],
+        ids=[
+            "non-string",
+            "empty",
+            "oversized",
+            "list",
+            "dict",
+            "whitespace",
+            "base64-charset",
+            "credential-shaped",
+        ],
+    )
+    async def test_steer_send_id_invalid_treated_absent(
+        self, tmp_path, monkeypatch, _patch_sel, bad_send_id
+    ):
+        """sendId is raw client input that reaches slot history and the
+        steer_push broadcast WITHOUT the outbound redaction message text goes
+        through, so the sink refuses anything but the id alphabet — and, since
+        a bare alphanumeric key shape fits that alphabet, anything the
+        canonical credential scanner would redact (the AWS access-key-id case).
+        Every refused value is treated as absent (the old-client shape), never
+        persisted or echoed."""
+        state, slot = self._steer_capable_state(tmp_path, monkeypatch)
+
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat",
+                json={
+                    "slot": "test",
+                    "message": "go left",
+                    "steer": True,
+                    "meta": {"sendId": bad_send_id},
+                },
+            )
+            assert resp.status == 200
+            assert (await resp.json()).get("steered") is True
+
+        steer_row = next(m for m in slot.messages if m.get("meta", {}).get("steer"))
+        assert "sendId" not in steer_row["meta"]
+        assert "sendId" not in self._steer_push_payload(state)
 
 
 class TestFlushSegmentQuietPersist:

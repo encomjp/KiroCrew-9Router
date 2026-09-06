@@ -17,10 +17,15 @@ auditing happen IN THE GATEWAY (``computer_use/tools.py`` →
   ``hooks._governance_denial`` — the PreToolUse gate — is fail-**OPEN** by
   deliberate repo policy (a governance glitch must not wedge every tool call on
   every surface), so it cannot be the sole authorization point for a surface that
-  can read a password field's ``AXValue``. The authoritative gate
-  (``gate.require_computer_use``) fails CLOSED and needs the OS-resolved app
-  identity and the addressed element's role — which only the gateway-side tool
-  body has.
+  can read a password field's ``AXValue``. The fail-CLOSED gate is the keystone
+  primary enable, read at the top of ``computer_use/tools.py``'s ordered
+  chokepoint: a keystone that is missing, unreadable or disabled refuses the call
+  outright. ``gate.require_computer_use`` is audit-only — it unconditionally
+  permits and records the call, retained as the one place a future edition can
+  reintroduce a decision without touching every call site — and the refusals
+  downstream of the enable (the operator's target policy, the element and pointer
+  shape checks) need the OS-resolved app identity and the addressed element's
+  role, which only the gateway-side tool body has.
 * **Governance and the audit trail live where the platform context is composed.**
   The ceiling, the profile store and the SEL trust root are all gateway state.
 * **No native code in this process.** This module imports no ctypes, loads no
@@ -107,11 +112,10 @@ from kiro_crew.computer_use.types import (
 )
 from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.mcp_core import (
-    _api_base,
     _http_error_body,
     _internal_secret,
-    _invalidate_api_base,
-    _resolve_api_port,
+    _replay_target,
+    _resolve_api_target,
     _resolve_session_key_strict,
     _session_key_header_error,
 )
@@ -728,42 +732,45 @@ def _invoke(session_key: str, name: str, args: dict[str, Any]) -> dict[str, Any]
         "X-Session-Key": session_key,
     }
 
-    def _send_once(base: str):
+    def _send_once(target: tuple[str, str]):
+        base, socket_path = target
         request = urllib.request.Request(
             f"{base}{INVOKE_PATH}", data=body, headers=headers, method="POST"
         )
-        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_api_base(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never agent-controlled  # noqa: E501
-        with loopback_urlopen(request, timeout=INVOKE_TIMEOUT_SECS) as response:
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- URL is the loopback gateway (_resolve_api_target(): 127.0.0.1 plus a port from config/env or a run-marker whose ownership is re-verified per request) + a fixed internal path; never agent-controlled  # noqa: E501
+        with loopback_urlopen(
+            request, timeout=INVOKE_TIMEOUT_SECS, unix_socket_path=socket_path or None
+        ) as response:
             return json.loads(response.read())
 
-    api_base = _api_base()
+    # ONE resolution for this attempt, both transports derived from it — the
+    # unix socket lets the gateway kernel-verify this process against the
+    # session key it declares, and pairing it with the base from the SAME
+    # resolution keeps the two from naming different gateways.
+    target = _resolve_api_target()
     try:
-        decoded = _send_once(api_base)
+        decoded = _send_once(target)
     except urllib.error.HTTPError as exc:
         return _http_error_body(exc)
     except urllib.error.URLError as exc:
         detail = str(exc.reason) if isinstance(exc.reason, OSError) else str(exc)
         # The resolved base can predate the gateway: its port is recorded only in
-        # the run marker, so a refusal is worth one re-resolution before giving up.
+        # the run marker, so a refusal is worth one re-resolution before giving
+        # up. Whether that replay is ALLOWED is not restated here — it is
+        # mcp_core._replay_target's rule, shared with mcp_core._send, and None
+        # means do not replay. The wording of the refusal stays this shim's own.
         if isinstance(exc.reason, (ConnectionRefusedError, socket.gaierror)):
-            _invalidate_api_base()
-            retry_port, retry_source = _resolve_api_port()
-            # A default-source fall-through carries NO evidence: a listener on
-            # the default port could be any local process, and replaying would
-            # hand it the internal secret. Replay only chases positive
-            # evidence of a moved gateway. Same rule as mcp_core._send.
-            retry_base = f"http://127.0.0.1:{retry_port}"
-            if retry_source != "default" and retry_base != api_base:
-                try:
-                    decoded = _send_once(retry_base)
-                except urllib.error.HTTPError as retry_exc:
-                    # The replay REACHED the (moved) gateway and it answered with
-                    # a normal HTTP error — surface the structured body exactly
-                    # like a first-attempt HTTPError, not a stale "unreachable".
-                    return _http_error_body(retry_exc)
-                except Exception:
-                    return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
-            else:
+            retry_target = _replay_target(target[0])
+            if retry_target is None:
+                return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
+            try:
+                decoded = _send_once(retry_target)
+            except urllib.error.HTTPError as retry_exc:
+                # The replay REACHED the (moved) gateway and it answered with
+                # a normal HTTP error — surface the structured body exactly
+                # like a first-attempt HTTPError, not a stale "unreachable".
+                return _http_error_body(retry_exc)
+            except Exception:
                 return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}
         else:
             return {"error": ERR_GATEWAY_UNREACHABLE.format(detail=detail)}

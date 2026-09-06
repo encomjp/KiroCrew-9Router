@@ -73,8 +73,18 @@ export function runBelongsToSlot(sessionKey: string | undefined | null, slotKey:
   if (sessionKey === slotKey) return true
   if (sessionKey === `dashboard:${slotKey}`) return true
   // Tolerate a leading "dashboard:" / "dashboard_" prefix on either side.
-  const norm = (s: string) => s.replace(/^dashboard[:_]/, '')
-  return norm(sessionKey) === norm(slotKey)
+  return normalizeRunSessionKey(sessionKey) === normalizeRunSessionKey(slotKey)
+}
+
+/** Canonical form of a run's `session_key` — and of a slot key — for
+ *  cross-referencing the two without pairwise `runBelongsToSlot` scans: a map
+ *  of runs keyed by `normalizeRunSessionKey(session_key)` is looked up with
+ *  `normalizeRunSessionKey(slotKey)` and matches exactly the pairs
+ *  `runBelongsToSlot` accepts. Strips one leading "dashboard:" (the history
+ *  key the gateway tags chat-launched runs with) or "dashboard_" (persisted
+ *  key form) prefix. */
+export function normalizeRunSessionKey(s: string): string {
+  return s.replace(/^dashboard[:_]/, '')
 }
 
 /** Latest budget snapshot from the stream, if any. */

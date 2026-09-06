@@ -286,6 +286,7 @@ async def test_send_handler_sends_each_turn_exactly_once(monkeypatch):
         disk["messages"] = list(s.messages)
         s._dirty = False
         s._disk_window_len = len(s.messages)
+        return True
 
     monkeypatch.setattr(st, "save_slot_off_loop", _save)
 
@@ -829,6 +830,7 @@ async def test_bundle_flushes_a_dirty_slot_so_in_place_edits_travel(monkeypatch)
         disk["messages"] = list(s.messages)
         s._dirty = False
         s._disk_window_len = len(s.messages)
+        return True
 
     monkeypatch.setattr(st, "save_slot_off_loop", _save)
     bundle = await st.build_transfer_bundle_async(
@@ -1028,6 +1030,7 @@ async def test_bundle_refuses_when_the_slot_never_settles(monkeypatch):
         # edit leaves the slot dirty, so the next attempt flushes again.
         s._dirty = True
         s._dirty_gen += 1
+        return True
 
     monkeypatch.setattr(st, "save_slot_off_loop", _save_then_edit)
 
@@ -1059,6 +1062,7 @@ async def test_retry_reflushes_so_it_cannot_serialize_a_superseded_variant(monke
         disk[:] = [dict(m) for m in s.messages]
         s._disk_window_len = len(s.messages)
         s._dirty = False
+        return True
 
     monkeypatch.setattr(st, "save_slot_off_loop", _save)
 
@@ -1389,7 +1393,7 @@ async def test_import_creates_a_new_slot_with_no_project(monkeypatch):
     state.end_slot_construction = state._slots_under_construction.discard
 
     async def _save(*_a, **_k):
-        return None
+        return True
 
     monkeypatch.setattr(st, "save_slot_off_loop", _save)
     monkeypatch.setattr(st, "_sync_dashboard_slots", lambda _s: None)
@@ -2341,6 +2345,7 @@ async def test_layer_b_lands_before_the_transcript_is_persisted(monkeypatch):
 
     async def _save(*_a, **_k):
         order.append("save")
+        return True
 
     monkeypatch.setattr(st, "_write_layer_b_files", _mat)
     monkeypatch.setattr(st, "_join_layer_b", lambda *_a, **_k: True)
@@ -2543,7 +2548,7 @@ def _stub_state(st, monkeypatch, save=None):
     slot = _Slot()
 
     async def _save(*_a, **_k):
-        return None
+        return True
 
     monkeypatch.setattr(st, "save_slot_off_loop", save or _save)
     monkeypatch.setattr(st, "_sync_dashboard_slots", lambda _s: None)

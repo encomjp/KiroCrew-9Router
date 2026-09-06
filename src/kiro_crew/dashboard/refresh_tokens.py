@@ -341,9 +341,9 @@ class RefreshStateManager:
             try:
                 self._state_path.parent.mkdir(parents=True, exist_ok=True)
                 # Create-empty → tighten-DACL → write, NOT write-then-restrict:
-                # on Windows restrict_to_owner is a subprocess (icacls) that
-                # takes measurable time, so if the payload were written first
-                # the temp would carry the parent-inherited DACL during that
+                # on Windows restrict_to_owner REPLACES the file's DACL rather
+                # than setting it at create time, so if the payload were written
+                # first the temp would carry the parent-inherited DACL during that
                 # window and a local co-tenant able to enumerate ~/.kiro/crew
                 # could read the consumed-JTI + revoked-chain state (breaking
                 # RFC-6819 §5.2.2.3 reuse-detection secrecy) or, worse,
@@ -411,6 +411,8 @@ def generate_refresh_token(
     chain_id: str | None = None,
     ttl_seconds: int = MAX_REFRESH_TTL_SECS,
     boot: str = "",
+    require_peer: bool = False,
+    peer_key: str = "",
 ) -> tuple[str, str, str, float]:
     """Generate a refresh token.
 
@@ -426,6 +428,10 @@ def generate_refresh_token(
     function of the credential it was rotated from. Empty string means unbound,
     which is every caller that does not opt in.
     """
+    if require_peer and not peer_key:
+        raise ValueError("require_peer refresh tokens must carry their original peer_key")
+    if peer_key and not require_peer:
+        raise ValueError("peer_key requires require_peer")
     now = time.time()
     session_ttl = min(ttl_seconds, MAX_REFRESH_TTL_SECS)
     if chain_id is None:
@@ -448,6 +454,20 @@ def generate_refresh_token(
         # Omitted rather than written empty so an unbound chain's payload is
         # byte-identical to what it was before this claim existed.
         payload_dict["boot"] = boot
+    if require_peer:
+        # A chain whose safety rests on a daemon-verified tailnet identity rather
+        # than on process lifetime. ``api_auth_refresh`` refuses to rotate it
+        # while no peer resolves, so the long-lived credential can never be
+        # rotated by a caller whose identity could not be established. Omitted
+        # when false for the same byte-identity reason as ``boot``.
+        payload_dict["require_peer"] = "1"
+        if peer_key:
+            # The original daemon-verified device binding must survive a
+            # gateway restart along with the chain.  The HMAC-signed claim is
+            # authoritative; an in-memory access-token pin is only a hot-path
+            # mirror and cannot safely be re-created by whichever allowed node
+            # presents a stolen cookie first after restart.
+            payload_dict["peer_key"] = peer_key
     payload = json.dumps(payload_dict, separators=(",", ":")).encode()
     encoded_payload = _b64url_encode(payload)
     signature = _sign(payload)
@@ -540,6 +560,44 @@ def refresh_token_boot(token: str) -> str:
     if not isinstance(payload, dict):
         return ""
     value = payload.get("boot", "")
+    return value if isinstance(value, str) else ""
+
+
+def refresh_token_requires_peer(token: str) -> bool:
+    """Whether this chain may only rotate for a daemon-verified tailnet peer.
+
+    Set on the QR "persistent" session shape, whose credential is bounded by
+    identity rather than by this process's lifetime. Same read-only,
+    validate-first contract as :func:`refresh_token_boot`, and the same
+    conservative failure direction is NOT available here: a decode failure must
+    answer ``True``, not ``False``. Answering ``False`` would let an
+    undecodable-but-signed token rotate without the identity check the chain was
+    minted to require, which is the one outcome this claim exists to prevent.
+    """
+    try:
+        payload = json.loads(_b64url_decode(token.split(".")[0]))
+    except Exception:
+        return True
+    if not isinstance(payload, dict):
+        return True
+    return str(payload.get("require_peer", "")) == "1"
+
+
+def refresh_token_peer_key(token: str) -> str:
+    """Return the signed device binding carried by an identity-bound chain.
+
+    Callers use this only after :func:`validate_refresh_token` succeeds.  An
+    empty result is deliberately unusable for a ``require_peer`` chain: it
+    identifies a legacy token minted before peer bindings were carried across
+    restarts, and accepting it would restore first-verified-device takeover.
+    """
+    try:
+        payload = json.loads(_b64url_decode(token.split(".")[0]))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    value = payload.get("peer_key", "")
     return value if isinstance(value, str) else ""
 
 

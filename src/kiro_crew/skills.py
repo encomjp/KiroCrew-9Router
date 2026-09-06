@@ -219,12 +219,6 @@ def _emit_pending_consumed(payload: dict) -> None:
         logger.debug("pending-consumed hook failed", exc_info=True)
 
 
-# Derived lifecycle states for auto-skills (not persisted — computed from
-# usage recency at lifecycle-run time).
-SKILL_STATE_ACTIVE = "active"
-SKILL_STATE_STALE = "stale"
-SKILL_STATE_ARCHIVED = "archived"
-
 # Frontmatter field used to mark a skill as auto-generated.  Absence means
 # the skill is hand-authored (or legacy, pre-feature).
 AUTO_SKILL_SOURCE_VALUE = "auto"
@@ -279,24 +273,6 @@ class AutoSkillProvenance:
         if self.pinned:
             lines.append("pinned: true")
         return lines
-
-
-def _auto_name_from_title(raw: str) -> str:
-    """Convert a free-form title into a safe ``auto/<slug>`` skill name.
-
-    Strategy:
-    - lowercase
-    - replace any run of non-alphanumerics with a single hyphen
-    - strip leading/trailing hyphens
-    - truncate to 62 chars (leaves room for uniqueness suffix)
-
-    Returns the slug component only; caller prepends the namespace.
-    Returns an empty string if the input can't be sanitized.
-    """
-    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")[:62].rstrip("-")
-    if not _AUTO_NAME_PATTERN.match(slug):
-        return ""
-    return slug
 
 
 def _build_auto_skill_content(
@@ -1498,6 +1474,7 @@ class SkillsLoader:
         # slot would serve one session's project skills to a session working in
         # a different project for the whole TTL. (monotonic_deadline, results)
         self._iter_cache: dict[str, tuple[float, list[tuple[str, Path, str | None]]]] = {}
+        self._disabled_apps_cache: tuple[float, frozenset[str]] | None = None
         # (canonical key, allowed) pairs already audited, so the enforcement
         # record is written on first use rather than once per message.
         self._audited_projects: set[tuple[str, bool]] = set()
@@ -1640,6 +1617,27 @@ class SkillsLoader:
         self._iter_cache[key] = (time.monotonic() + _ITER_CACHE_TTL_SECS, results)
         return results
 
+    def _get_disabled_app_names(self) -> frozenset[str]:
+        now = time.monotonic()
+        if self._disabled_apps_cache is not None and now < self._disabled_apps_cache[0]:
+            return self._disabled_apps_cache[1]
+        disabled = _disabled_app_names()
+        self._disabled_apps_cache = (now + _ITER_CACHE_TTL_SECS, disabled)
+        return disabled
+
+    def _iter_visible(
+        self, project_dir: str | Path | None = None
+    ) -> list[tuple[str, Path, str | None]]:
+        """Return all ``(name, skill_file, within)`` pairs, filtering out disabled app skills."""
+        disabled_apps = self._get_disabled_app_names()
+        if not disabled_apps:
+            return self._iter(project_dir)
+        return [
+            (name, skill_file, within)
+            for name, skill_file, within in self._iter(project_dir)
+            if self._owning_app(name, skill_file) not in disabled_apps
+        ]
+
     def catalog_project_skills(self, project_dir: str | Path) -> list[dict]:
         """Return confined project rows without requiring or exercising trust.
 
@@ -1747,6 +1745,7 @@ class SkillsLoader:
         stale parse. Dropping it here keeps the mutator's edit immediately
         reflected in ``list_skills`` / ``get_triggered_skills``.
         """
+        self._disabled_apps_cache = None
         self._iter_cache = {}
         self._fm_cache.clear()
 
@@ -1900,7 +1899,7 @@ class SkillsLoader:
         size and cache token come from bytes admitted by the no-link reader.
         """
         skills: list[dict] = []
-        for name, skill_file, _within in self._iter(project_dir):
+        for name, skill_file, _within in self._iter_visible(project_dir):
             if _within is not None:
                 meta, size_bytes = self._confined_frontmatter_and_size(skill_file, _within)
             else:
@@ -3988,7 +3987,7 @@ class SkillsLoader:
         to the process working directory).
         """
         result: list[str] = []
-        for name, skill_file, _within in self._iter(project_dir):
+        for name, skill_file, _within in self._iter_visible(project_dir):
             meta = self._cached_frontmatter(skill_file, within=_within)
             if meta.get("always", "").lower() == "true":
                 scope = meta.get("repo_scope", "")
@@ -4023,21 +4022,11 @@ class SkillsLoader:
         Returns up to ``max_triggered`` skills sorted by best overlap score.
         """
         text_words = set(re.findall(r"\w+", text.lower()))
-        # Disabling an app must actually stop its skills loading. The skill tree
-        # an app bundles was never gated on the app's enabled state, so a
-        # disabled app's skills stayed in this index and kept matching into
-        # every turn's context on generic trigger words — burning tokens and
-        # polluting the prompt for an app the user explicitly opted out of,
-        # with no visible reason (#4023).
-        disabled_apps = _disabled_app_names()
-
         scored: list[tuple[str, float]] = []
         # Skills a negative trigger actively excluded — a permission DENY that
         # must still be audited (see the audit event below).
         negated_skills: list[str] = []
-        for name, skill_file, _within in self._iter(project_dir):
-            if disabled_apps and self._owning_app(name, skill_file) in disabled_apps:
-                continue
+        for name, skill_file, _within in self._iter_visible(project_dir):
             meta = self._cached_frontmatter(skill_file, within=_within)
             if meta.get("always", "").lower() == "true":
                 continue
@@ -4582,7 +4571,7 @@ class SkillsLoader:
         # _iter() already applies local > extra-path precedence and dedupes
         # by full key, so the first full key seen for a given leaf wins.
         leaf_to_name: dict[str, str] = {}
-        for name, _path, _within in self._iter(project_dir):
+        for name, skill_file, _within in self._iter_visible(project_dir):
             leaf = name.rsplit("/", 1)[-1].lower()
             leaf_to_name.setdefault(leaf, name)
 
@@ -4670,13 +4659,19 @@ class SkillsLoader:
         """Remove YAML frontmatter from markdown.
 
         A fence LOCATOR, not a field parser — deliberately outside
-        ``kiro_crew.frontmatter``. Its closer grammar is stricter than
-        ``_parse_frontmatter``'s (``---`` must be followed by a newline), so
-        a ``---junk`` closer parses fields yet strips nothing; editing either
-        grammar means revisiting the other.
+        ``kiro_crew.frontmatter``. Its closer grammar matches
+        ``frontmatter._COLUMN0_BLOCK_RE`` — the ``column0_fence`` extraction
+        that ``frontmatter.SKILL_LOADER`` binds to the skills surface: the
+        closer is the first line after the opener that STARTS with ``---`` —
+        trailing text on the closer line is tolerated and consumed (#6182). Anything
+        the display parser reads as frontmatter must also be stripped here:
+        a stricter closer (the old ``---`` must-be-followed-by-newline
+        grammar) let a ``---junk`` or ``--- `` closer parse fields in the UI
+        while the whole block leaked to the model. Editing either grammar
+        means revisiting the other.
         """
         if content.startswith("---"):
-            match = re.match(r"^---\n.*?\n---\n", content, re.DOTALL)
+            match = re.match(r"^---\n.*?\n---[^\n]*\n?", content, re.DOTALL)
             if match:
                 return content[match.end() :].strip()
         return content

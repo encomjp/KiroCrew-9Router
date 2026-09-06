@@ -13,13 +13,13 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, fireEvent, cleanup, within } from '@testing-library/react'
 
-const hoisted = vi.hoisted(() => ({ options: [] as { collapsed: boolean }[] }))
+const hoisted = vi.hoisted(() => ({ options: [] as { collapsed: boolean; diffStyle?: string }[] }))
 
 vi.mock('../pierre', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
   PierreFilePair: ({ oldFile, options, renderHeaderPrefix, renderHeaderFilenameSuffix, renderHeaderMetadata }: {
     oldFile: { name: string }
-    options: { collapsed: boolean }
+    options: { collapsed: boolean; diffStyle?: string }
     renderHeaderPrefix?: () => React.ReactNode
     renderHeaderFilenameSuffix?: () => React.ReactNode
     renderHeaderMetadata?: () => React.ReactNode
@@ -49,6 +49,9 @@ const cells = (c: HTMLElement, cls: string) => c.querySelectorAll(`.${cls}`).len
 
 beforeEach(() => {
   hoisted.options.length = 0
+  // The card's split/unified layout persists app-wide (`mc-diff-split`);
+  // start each test from the unseeded default.
+  localStorage.clear()
   cleanup()
 })
 
@@ -93,6 +96,34 @@ describe('expanded row header slots', () => {
       'This document is tracked as a session artifact, not a source-file change',
     )
     expect(badgesIn('/src/a.ts')).toHaveLength(0)
+  })
+})
+
+describe('card split/unified toggle', () => {
+  it('flips every row between split and unified and persists the choice', () => {
+    const { container, getByLabelText } = render(
+      <FileChangeChips fileChanges={[change('/a.ts', 'a', 'b'), change('/b.ts', 'a', 'b')]} />,
+    )
+    // Unseeded default is split — the shared `mc-diff-split` preference's
+    // default — and every row receives it.
+    const styles = () => hoisted.options.map(o => o.diffStyle)
+    expect(styles()).toEqual(['split', 'split'])
+
+    hoisted.options.length = 0
+    fireEvent.click(getByLabelText('Switch to unified view'))
+    expect(styles()).toEqual(['unified', 'unified'])
+    // The choice lands in the shared preference (#6024), not card-local state.
+    expect(localStorage.getItem('mc-diff-split')).toBe('0')
+    expect(within(container as HTMLElement).getByLabelText('Switch to split view')).toBeInTheDocument()
+  })
+
+  it('seeds the layout from the shared mc-diff-split preference', () => {
+    localStorage.setItem('mc-diff-split', '0')
+    const { getByLabelText } = render(
+      <FileChangeChips fileChanges={[change('/a.ts', 'a', 'b')]} />,
+    )
+    expect(hoisted.options[0].diffStyle).toBe('unified')
+    expect(getByLabelText('Switch to split view')).toBeInTheDocument()
   })
 })
 

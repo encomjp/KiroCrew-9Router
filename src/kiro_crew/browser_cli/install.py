@@ -1,11 +1,9 @@
 """Detection, installation, and the capability gate for ``@playwright/cli``.
 
-The CLI has no capability gating of its own — every command is always available
-to whoever can run the binary — so the capability cannot be narrowed after the
-fact. **Presence of ``playwright-cli`` is therefore consent**, whichever tool
-installed it, and :func:`available` is the whole gate. This module deliberately
-holds no toggle, flag, or consent file: a second gate would be a lie, because a
-binary on PATH is reachable from any shell turn regardless of what a flag says.
+The CLI has no capability gating of its own — every command is available to
+whoever can run the binary — so :func:`available` reports host capability only.
+It is not an approval decision: dashboard shell turns still follow the ordinary
+approval ladder unless the user has granted trust or enabled auto-approve.
 
 Installation is global (``npm install -g``) rather than ``npx``. ``npx``
 re-resolves the package through the registry on every invocation, so an expired
@@ -29,6 +27,7 @@ import os
 import re
 import subprocess
 from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -302,6 +301,62 @@ def _cli_package_dirs() -> list[Path]:
     return dirs
 
 
+_LIFECYCLE_SOURCE_MAX_BYTES = 32 * 1024 * 1024
+
+
+@lru_cache(maxsize=8)
+def _source_contains(path_text: str, mtime_ns: int, size: int, needle: bytes) -> bool:
+    """Whether one version-pinned installed source file contains *needle*."""
+    del mtime_ns  # cache-key only: invalidates the answer after an upgrade
+    if size <= 0 or size > _LIFECYCLE_SOURCE_MAX_BYTES:
+        return False
+    try:
+        return needle in Path(path_text).read_bytes()
+    except OSError:
+        return False
+
+
+def cli_lifecycle_env_supported() -> bool:
+    """Whether the installed CLI honors both stable lifecycle env variables.
+
+    The variable names are upstream test-prefixed seams rather than a declared
+    compatibility API. Checking the package that will actually launch the
+    daemon turns a future rename/removal into a loud fail-back instead of
+    silently putting sockets under scratch again. Answers false when the CLI is
+    absent or its serving playwright-core tree cannot be attributed.
+    """
+    packages = _cli_package_dirs()
+    if not packages:
+        return False
+    # _cli_package_dirs is most-specific-first: once an active launcher was
+    # attributed, never let a stale standalone fallback satisfy its contract.
+    package = packages[0]
+    manifest = _manifest_for_cli_package(package)
+    if manifest is None:
+        return False
+    core_root = manifest.parent
+    registry = core_root / "lib" / "tools" / "cli-client" / "registry.js"
+    bundle = core_root / "lib" / "coreBundle.js"
+    try:
+        registry_stat = registry.stat()
+        bundle_stat = bundle.stat()
+    except OSError:
+        return False
+    registry_ok = _source_contains(
+        str(registry),
+        registry_stat.st_mtime_ns,
+        registry_stat.st_size,
+        b"process.env.PWTEST_DAEMON_SESSION_DIR",
+    )
+    sockets_ok = _source_contains(
+        str(bundle),
+        bundle_stat.st_mtime_ns,
+        bundle_stat.st_size,
+        b"process.env.PWTEST_SOCKETS_DIR ||",
+    )
+    return registry_ok and sockets_ok
+
+
 def _manifest_for_cli_package(package: Path) -> Path | None:
     """The ``browsers.json`` of the ``playwright-core`` serving *package*.
 
@@ -540,11 +595,10 @@ def detect() -> dict[str, Any]:
 def available() -> bool:
     """Whether the browse capability exists on this host.
 
-    **This is the consent gate.** Presence of the binary is consent regardless
-    of who installed it — see the module docstring for why no additional gate is
-    possible. Node is not consulted: a host with the CLI installed and Node
-    broken has granted the capability and has a repairable environment, and
-    reporting that as "not consented" would send the operator to the wrong fix.
+    Presence is an availability signal, not consent to skip shell approval.
+    Node is not consulted: a host with the CLI installed and Node broken has a
+    repairable environment, and reporting that as absent would send the operator
+    to the wrong fix.
     """
     return cli_path() is not None
 
@@ -554,10 +608,12 @@ def available() -> bool:
 _STDERR_CAP = 2000
 
 
-# npm-specific credential shapes. MEASURED: the shared `redact_credentials` only
-# matches header-style secrets (`Authorization: Bearer ...`) and leaves every form
-# npm actually emits intact -- the registry query (`?_authToken=`), the .npmrc line
-# (`//host/:_authToken=`), an inline-credential proxy URL, and `*_TOKEN=` env echo.
+# npm-specific credential shapes. The shared `redact_credentials` matches
+# header-style secrets and (since the fetch-scheme widening) inline-credential
+# http(s)/ftp(s) URLs, but still leaves the npm-specific forms intact -- the
+# registry query (`?_authToken=`), the .npmrc line (`//host/:_authToken=`), and
+# `*_TOKEN=` env echo. The URL pattern below stays as a backstop for schemes
+# the shared alternation does not name.
 # Scoped here rather than added to the shared helper: this is the one surface that
 # emits npm output, and widening a security primitive every caller depends on is a
 # change that deserves its own review.

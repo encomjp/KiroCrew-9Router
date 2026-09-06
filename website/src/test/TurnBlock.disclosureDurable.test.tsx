@@ -44,7 +44,7 @@ function Transcript({ messages, running, mounted }: { messages: ChatMessage[]; r
                 turn={item}
                 renderItem={renderTurnItem}
                 disclosure={disclosure[k]}
-                onDisclosureChange={(next: boolean) => setFor(k, next)}
+                disclosureKey={k} onDisclosureChange={setFor}
               />
             </div>
           )

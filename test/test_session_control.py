@@ -767,6 +767,96 @@ class TestTheRoutesRequireTheInternalSecret:
         assert resp.status == 403, "a broken audit must not escalate a refusal to 500"
         assert self._body(resp)["code"] == "internal_secret_required"
 
+    def test_stop_with_the_secret_reaches_the_operation(self, tmp_path, monkeypatch):
+        """The stop ROUTE's success path, for the reason create's docstring gives:
+        only the 403 arm was covered, so a route-level defect on the reaching path
+        would ship dead."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/stop")
+
+        async def _ok(*_a, **_kw):
+            return {"ok": True, "target": "chat-2", "stopped": True}
+
+        monkeypatch.setattr(sc, "stop_target", _ok)
+        resp = asyncio.run(handlers_sc.api_session_control_stop(req))
+
+        assert resp.status == 200
+        assert self._body(resp)["target"] == "chat-2"
+
+    def test_stop_renders_a_refusal_as_its_status_not_a_500(self, tmp_path, monkeypatch):
+        """Same refusal contract the create and send routes hold."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/stop")
+
+        async def _boom(*_a, **_kw):
+            raise sc.SessionControlError(
+                "not addressable", status=403, code="linked_session_target"
+            )
+
+        monkeypatch.setattr(sc, "stop_target", _boom)
+        resp = asyncio.run(handlers_sc.api_session_control_stop(req))
+
+        assert resp.status == 403
+        assert self._body(resp)["code"] == "linked_session_target"
+
+    def test_send_without_the_secret_is_forbidden(self, tmp_path):
+        req = self._request(tmp_path, internal=False, path="/api/session-control/send")
+        resp = asyncio.run(handlers_sc.api_session_control_send(req))
+        assert resp.status == 403
+        assert self._body(resp)["code"] == "internal_secret_required"
+
+    def test_send_with_the_secret_delivers_to_the_target(self, tmp_path, monkeypatch):
+        """The send ROUTE needs its own test for the reason create's docstring gives:
+        a handler wired only in tests at the business layer ships dead if the route
+        itself refuses or never reaches the operation."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/send")
+        state = req.app["state"]
+        caller = state.get_slot("chat-1")
+        assert caller is not None
+        # Make chat-2 an addressable peer of the caller through the same helper the
+        # business-layer tests use, so this exercises the route rather than a
+        # hand-built slot that authorize_target would refuse for unrelated reasons.
+        _peer_target(state, "chat-2", caller)
+
+        async def _fake_run_chat(_state, _slot, _prompt):
+            return None
+
+        monkeypatch.setattr("kiro_crew.dashboard.chat_runner._run_chat", _fake_run_chat)
+
+        resp = asyncio.run(handlers_sc.api_session_control_send(req))
+
+        assert resp.status == 200, self._body(resp)
+        payload = self._body(resp)
+        assert payload["ok"] is True
+        assert payload["target"] == "chat-2"
+
+    def test_send_requires_a_non_empty_message(self, tmp_path):
+        """The message check lives in the ROUTE, not the business layer, so a
+        whitespace-only body must be refused here rather than delivered as a
+        blank turn."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/send")
+
+        async def _json():
+            return {"target": "chat-2", "message": "   "}
+
+        req.json = _json
+        resp = asyncio.run(handlers_sc.api_session_control_send(req))
+
+        assert resp.status == 400
+        assert self._body(resp)["code"] == "message_required"
+
+    def test_send_renders_a_refusal_as_its_status_not_a_500(self, tmp_path, monkeypatch):
+        """A SessionControlError from send comes back as its own refusal, the same
+        contract create's route holds."""
+        req = self._request(tmp_path, internal=True, path="/api/session-control/send")
+
+        async def _boom(*_a, **_kw):
+            raise sc.SessionControlError("busy", status=409, code="target_busy")
+
+        monkeypatch.setattr(sc, "send_to_target", _boom)
+        resp = asyncio.run(handlers_sc.api_session_control_send(req))
+
+        assert resp.status == 409
+        assert self._body(resp)["code"] == "target_busy"
+
     def test_read_without_the_secret_is_forbidden(self, tmp_path):
         req = self._request(
             tmp_path, internal=False, path="/api/session-control/read", method="GET"
@@ -1050,63 +1140,132 @@ def test_the_read_cursor_is_absolute_across_a_trimmed_window(tmp_path):
     """Window length freezes at the retention cap; `total` and the indexes must not.
 
     Mutation guard: deriving `total` from `len(slot.messages)` makes it freeze at
-    the cap, so a caller can no longer tell how much history exists.
+    the cap, so a caller can no longer tell how much history exists. Basing it on
+    `_disk_older_count` instead of the durable counter shifts every position by
+    the transient rows that were trimmed (here: 20), which this pins.
     """
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
     target = _peer_target(state, "chat-2", caller)
     for i in range(3):
         target.append("assistant", f"live {i}", "msg msg-a")
-    # Stand in for the trim: 5,000 rows already aged into the frozen prefix.
+    # Stand in for the trim: 5,000 rows aged into the frozen prefix, of which
+    # 20 were transient (never returned by a durable read).
     target._disk_older_count = 5000
+    target._disk_older_durable_count = 4980
 
     out = sc.read_messages(state, caller_session_key=_key(caller), target="chat-2")
 
-    assert out["total"] == 5003, "total must count the frozen prefix, not just the window"
-    assert [m["index"] for m in out["messages"]] == [5000, 5001, 5002]
-    # No cursor is offered once trimming has started, because positions built on
-    # `_disk_older_count` (which counts transient rows) cannot line up with
-    # durable-only indexes. Handing back a cursor the next call would reject is
-    # worse than admitting it is gone, and the ABSENCE of `next_since` is the
-    # whole signal -- no separate flag restates it.
-    assert "next_since" not in out
-    assert "cursor_exact" not in out, "absence of next_since is the only signal"
+    assert out["total"] == 4983, "total must count the DURABLE frozen prefix + the window"
+    assert [m["index"] for m in out["messages"]] == [4980, 4981, 4982]
+    # Positions are durable-only on both sides of the trim boundary, so the
+    # cursor stays exact and is still offered on a trimmed session.
+    assert out["next_since"] == 4983
+    assert "cursor_exact" not in out, "an exact cursor needs no caveat"
 
 
-def test_cursor_pagination_is_refused_once_rows_have_been_trimmed(tmp_path):
-    """A `since` read on a trimmed session must fail loudly, not duplicate a row.
+def test_cursor_pagination_stays_exact_once_rows_have_been_trimmed(tmp_path):
+    """Two consecutive `since` pages on a trimmed session never overlap.
 
-    `_disk_older_count` counts every trimmed row including transient ones, while
-    positions here are durable-only. Once a transient row is trimmed into the
-    frozen prefix the two disagree, every position shifts, and a `since` read
-    serves a durable message the caller already had.
+    This is the regression the durable counter exists for: `_disk_older_count`
+    counts every trimmed row including transient ones, so basing positions on it
+    advances the base with no durable row behind it — every position shifts and
+    a `since` read serves a durable message the caller already had. Basing on
+    the durable-only counter keeps the two spaces aligned.
 
-    Mutation guard: dropping the refusal silently returns the shifted window.
+    Mutation guard: swapping the base back to `_disk_older_count` makes the
+    second page re-serve the first page's rows (an overlap this asserts away);
+    on the pre-fix code the first `since` read raised `cursor_unavailable`.
     """
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
     target = _peer_target(state, "chat-2", caller)
-    for i in range(3):
+    for i in range(4):
         target.append("assistant", f"live {i}", "msg msg-a")
+    # A trim that folded transient rows into the frozen prefix: the all-rows
+    # counter and the durable counter disagree by 20.
     target._disk_older_count = 5000
+    target._disk_older_durable_count = 4980
+
+    first = sc.read_messages(
+        state, caller_session_key=_key(caller), target="chat-2", since=4980, limit=2
+    )
+    assert [m["content"] for m in first["messages"]] == ["live 0", "live 1"]
+    assert first["next_since"] == 4982
+
+    second = sc.read_messages(
+        state,
+        caller_session_key=_key(caller),
+        target="chat-2",
+        since=first["next_since"],
+        limit=2,
+    )
+    assert [m["content"] for m in second["messages"]] == ["live 2", "live 3"]
+
+    served_once = {m["index"] for m in first["messages"]}
+    assert served_once.isdisjoint(
+        {m["index"] for m in second["messages"]}
+    ), "consecutive since pages must never re-serve a row"
+
+
+def test_a_since_read_on_a_trimmed_session_returns_a_cursor_not_a_409(tmp_path):
+    """A trimmed session answers `since` reads exactly instead of refusing.
+
+    The old behaviour raised 409 `cursor_unavailable` for ANY `since` read once
+    the frozen-prefix base was non-zero, and withheld `next_since`, so pollers
+    on exactly the long-lived sessions worth polling fell back to inexact tail
+    reads forever. With a durable-only base the positions are exact again.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _peer_target(state, "chat-2", caller)
+    target.append("assistant", "the reply", "msg msg-a")
+    target._disk_older_count = 100
+    target._disk_older_durable_count = 90
+
+    out = sc.read_messages(state, caller_session_key=_key(caller), target="chat-2", since=90)
+
+    assert [m["content"] for m in out["messages"]] == ["the reply"]
+    assert out["next_since"] == 91
+    assert out["total"] == 91
+
+
+def test_a_cursor_under_the_trimmed_prefix_is_refused_not_skipped_over(tmp_path):
+    """A `since` below the durable base cannot be served from memory.
+
+    The rows in ``[since, base)`` exist only on disk; starting the read at the
+    window instead would silently skip them, which is the same silent-gap
+    failure the past-the-end refusal exists for. Refusing loudly sends the
+    caller to a tail read.
+
+    Mutation guard: clamping the offset to 0 returns the window as if it were
+    the rows asked for.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _peer_target(state, "chat-2", caller)
+    target.append("assistant", "newest", "msg msg-a")
+    target._disk_older_count = 100
+    target._disk_older_durable_count = 90
 
     with pytest.raises(sc.SessionControlError) as exc:
-        sc.read_messages(state, caller_session_key=_key(caller), target="chat-2", since=5000)
+        sc.read_messages(state, caller_session_key=_key(caller), target="chat-2", since=50)
     assert exc.value.code == "cursor_unavailable"
     assert exc.value.status == 409
 
     # The tail read is the documented fallback and still works.
     tail = sc.read_messages(state, caller_session_key=_key(caller), target="chat-2")
-    assert [m["content"] for m in tail["messages"]] == ["live 0", "live 1", "live 2"]
+    assert [m["content"] for m in tail["messages"]] == ["newest"]
 
 
 def test_an_untrimmed_session_still_reports_a_gap_free_cursor(tmp_path):
     """With nothing trimmed the cursor is exact, which is the common case.
 
-    The old version of this test asserted a `trimmed` gap report on a session
-    whose rows HAD aged out — that path is now refused outright (see
-    `cursor_unavailable`), because the gap count was derived from the same mixed
-    counter that made the positions wrong.
+    An even older version of this test asserted a `trimmed` gap report on a
+    session whose rows HAD aged out — that gap count was derived from the mixed
+    all-rows counter that made the positions wrong. Positions are now based on
+    the durable-only prefix counter, so trimmed sessions get exact cursors too
+    (see the trimmed-window tests above) and no gap report exists on any path.
     """
     state = _make_state(tmp_path)
     caller = _slot(state, "chat-1")
@@ -1353,6 +1512,179 @@ def test_stop_is_refused_for_a_session_out_of_bounds(tmp_path):
     _slot(state, "chat-hidden", memory_mode="incognito")
     with pytest.raises(sc.SessionControlError):
         asyncio.run(sc.stop_target(state, caller_session_key=_key(caller), target="chat-hidden"))
+
+
+# ── session_send ──
+
+
+def test_send_to_an_idle_target_starts_a_turn_with_provenance(tmp_path, monkeypatch):
+    """The delivered prompt carries the caller tag, and an idle target runs now.
+
+    Provenance is the load-bearing part: the target renders the message as a
+    user row, and without the tag it is indistinguishable from something the
+    person typed into that session themselves.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _peer_target(state, "chat-2", caller)
+
+    ran: dict[str, str] = {}
+
+    async def _fake_run_chat(_state, slot, prompt):
+        ran["slot"] = slot.key
+        ran["prompt"] = prompt
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner._run_chat", _fake_run_chat)
+
+    async def _drive():
+        out = await sc.send_to_target(
+            state, caller_session_key=_key(caller), target="chat-2", message="do the thing"
+        )
+        # Let the enqueue_or_run_prompt task actually execute the fake turn.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return out
+
+    out = asyncio.run(_drive())
+
+    assert out == {"ok": True, "target": "chat-2", "started": True}
+    assert ran["slot"] == "chat-2"
+    assert ran["prompt"].startswith("[sent by session ")
+    assert ran["prompt"].endswith("do the thing")
+    # The transcript shows the message as a user row, tag included.
+    assert any(
+        m.get("content", "").endswith("do the thing")
+        for m in target.messages
+        if m.get("role") == "user"
+    )
+
+
+def test_the_sent_body_passes_through_the_outbound_guard(tmp_path, monkeypatch):
+    """The message goes through `sanitize_outbound` before it is persisted.
+
+    It arrives from ANOTHER session's model, is appended to the target's
+    transcript as a user row and broadcast to every dashboard client, so this is
+    the same surface the steer path sanitizes before `slot.append`
+    (`chat_delivery`: "raw content must never reach an external surface"). A
+    credential-shaped string would otherwise be stored and displayed.
+
+    Mutation guard: dropping the `sanitize_outbound` call leaves the raw value.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _peer_target(state, "chat-2", caller)
+    monkeypatch.setattr(sc, "sanitize_outbound", lambda s: f"SANITIZED:{s}")
+
+    ran: dict[str, str] = {}
+
+    async def _fake_run_chat(_state, slot, prompt):
+        ran["prompt"] = prompt
+
+    monkeypatch.setattr("kiro_crew.dashboard.chat_runner._run_chat", _fake_run_chat)
+
+    async def _drive():
+        out = await sc.send_to_target(
+            state, caller_session_key=_key(caller), target="chat-2", message="tok=abc"
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        return out
+
+    asyncio.run(_drive())
+
+    assert ran["prompt"].endswith(
+        "SANITIZED:tok=abc"
+    ), "the sent body must pass through the outbound guard before it is delivered"
+    # The provenance tag is built by this function, not caller-supplied, so it is
+    # deliberately OUTSIDE the sanitized span.
+    assert ran["prompt"].startswith("[sent by session ")
+    assert any(
+        m.get("content", "").endswith("SANITIZED:tok=abc")
+        for m in target.messages
+        if m.get("role") == "user"
+    ), "the persisted transcript row must carry the sanitized body"
+
+
+def test_the_length_gate_measures_the_raw_body(tmp_path, monkeypatch):
+    """Validation happens on the RAW body, before redaction.
+
+    Redaction can only shrink the text, so gating the raw form is the honest
+    limit: a caller that sends 60K of credentials gets `message_too_long` rather
+    than silently passing because redaction squeezed it under the cap.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _peer_target(state, "chat-2", caller)
+    # A redactor that collapses everything would hide an oversized body.
+    monkeypatch.setattr(sc, "sanitize_outbound", lambda _s: "x")
+
+    with pytest.raises(sc.SessionControlError) as err:
+        asyncio.run(
+            sc.send_to_target(
+                state,
+                caller_session_key=_key(caller),
+                target="chat-2",
+                message="a" * (sc.MAX_SEND_MESSAGE_CHARS + 1),
+            )
+        )
+    assert err.value.code == "message_too_long"
+
+
+def test_send_to_a_busy_target_queues_instead_of_racing(tmp_path):
+    """A mid-turn target must not get a second concurrent turn — the message
+    queues, and the caller is told so (`started: False`), because "ran" and
+    "will run later" are different answers to a coordinator."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    target = _peer_target(state, "chat-2", caller)
+    _busy(target)
+
+    out = asyncio.run(
+        sc.send_to_target(
+            state, caller_session_key=_key(caller), target="chat-2", message="queued message"
+        )
+    )
+
+    assert out["started"] is False
+    assert any("queued message" in q.get("content", "") for q in target._queue)
+
+
+def test_send_is_refused_for_a_session_out_of_bounds(tmp_path):
+    """The same deny-by-default guard the other verbs share gates send too."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _slot(state, "chat-hidden", memory_mode="incognito")
+    with pytest.raises(sc.SessionControlError):
+        asyncio.run(
+            sc.send_to_target(
+                state, caller_session_key=_key(caller), target="chat-hidden", message="hi"
+            )
+        )
+
+
+def test_send_refuses_an_empty_or_oversized_message(tmp_path):
+    """Size gates live in the business layer, not only in the tool schema —
+    the HTTP route is callable without the MCP layer's validation."""
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    _peer_target(state, "chat-2", caller)
+
+    with pytest.raises(sc.SessionControlError) as empty_exc:
+        asyncio.run(
+            sc.send_to_target(state, caller_session_key=_key(caller), target="chat-2", message="  ")
+        )
+    assert empty_exc.value.code == "message_empty"
+
+    with pytest.raises(sc.SessionControlError) as long_exc:
+        asyncio.run(
+            sc.send_to_target(
+                state,
+                caller_session_key=_key(caller),
+                target="chat-2",
+                message="x" * (sc.MAX_SEND_MESSAGE_CHARS + 1),
+            )
+        )
+    assert long_exc.value.code == "message_too_long"
 
 
 def test_session_control_routes_are_strict_internal():
@@ -1697,6 +2029,78 @@ def test_the_slot_cap_is_re_checked_after_the_await(tmp_path, monkeypatch):
         asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
 
     assert err.value.code == "slot_cap_reached"
+
+
+def test_a_created_slot_records_the_caller_that_asked_for_it(tmp_path, monkeypatch):
+    """Attribution is what makes the per-creator ceiling countable at all.
+
+    Mutation guard: drop the ``_created_by`` write and every caller's count stays
+    0, so ``MAX_SLOTS_PER_CREATOR`` can never be reached and the cap is decorative.
+    """
+    state = _make_state(tmp_path)
+    caller = _slot(state, "chat-1")
+    caller.agent = "researcher"
+    _agent_resolves(monkeypatch, "default")
+
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(caller)))
+
+    child = state.get_slot(created["target"])
+    assert child is not None
+    # The resolved slot key, which is the identity `create_session` also audits --
+    # not the history key the caller presents. Write and count must agree, or the
+    # ceiling silently never binds.
+    assert getattr(child, "_created_by", "") == caller.key
+    assert state.creator_slot_count(caller.key) == 1
+
+
+def test_one_caller_cannot_consume_everybody_elses_slots(tmp_path, monkeypatch):
+    """The per-creator ceiling bounds the DISTRIBUTION, not just the total.
+
+    The global cap alone leaves an automated creator on a nudge loop able to hold
+    all ``MAX_LIVE_SLOTS`` itself, after which every later create -- the person
+    opening a new chat tab included -- gets the 429. A resource one caller can
+    exhaust is not bounded from anybody else's point of view, so this is the half
+    of the bound that keeps the verb safe to auto-approve.
+
+    Mutation guard: test the caller's count against ``MAX_LIVE_SLOTS`` instead of
+    ``MAX_SLOTS_PER_CREATOR`` and the first assertion stops refusing.
+    """
+    state = _make_state(tmp_path)
+    hog = _slot(state, "chat-hog")
+    hog.agent = "researcher"
+    other = _slot(state, "chat-other")
+    other.agent = "researcher"
+    _agent_resolves(monkeypatch, "default")
+
+    # Exactly what create_session writes, without paying for 50 real creates.
+    for i in range(sc.MAX_SLOTS_PER_CREATOR):
+        _slot(state, f"held-{i}")._created_by = hog.key
+
+    with pytest.raises(sc.SessionControlError) as err:
+        asyncio.run(sc.create_session(state, caller_session_key=_key(hog)))
+    assert err.value.code == "creator_slot_cap_reached"
+    assert err.value.status == 429, "a cap breach is a 429, not a 500"
+
+    # The global ceiling is nowhere near full, which is the point: the refusal came
+    # from this caller's own share, and everyone else still has room.
+    assert state.live_slot_count() < sc.MAX_LIVE_SLOTS
+    created = asyncio.run(sc.create_session(state, caller_session_key=_key(other)))
+    assert created["ok"] is True, "one caller's full share must not starve another"
+
+
+def test_slots_nobody_asked_for_are_charged_to_nobody(tmp_path):
+    """A person's own tab and a fork reach ``get_or_create_slot`` unattributed.
+
+    Two failure modes this pins at once: charging those to a caller would let
+    ordinary human use burn an automated caller's budget, and counting an empty
+    creator key would make every unattributed slot match at once -- so the first
+    ``create_session`` call would refuse on a tree the conductor never touched.
+    """
+    state = _make_state(tmp_path)
+    person = _slot(state, "chat-person")
+
+    assert state.creator_slot_count("") == 0, "an empty key must match nothing"
+    assert state.creator_slot_count(person.key) == 0
 
 
 def test_creation_never_loads_the_config_on_the_event_loop():

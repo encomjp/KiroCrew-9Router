@@ -35,6 +35,7 @@ from typing import Any, Awaitable, Callable
 import aiohttp
 from aiohttp import web
 
+from kiro_crew import link_unfurl
 from kiro_crew.sel import sel
 from kiro_crew.teams.attachments import quoted_reply_text
 from kiro_crew.teams.commands import STOP_ALIASES
@@ -659,19 +660,49 @@ class TeamsClient:
             self._notify_state(False, self.last_error)
 
     async def close(self) -> None:
+        """Shut down, closing BOTH owned sessions whatever the drain does.
+
+        In-flight turns are cancelled and awaited before the sessions they send
+        through are closed -- the transport-shutdown quiescence invariant in
+        ``docs/system-specs/modules/messaging.md``. That drain awaits, so a
+        ``CancelledError`` landing in it (a shutdown while this coroutine is
+        itself being cancelled) would leave ``close()`` before either session
+        close; ``CancelledError`` is a ``BaseException``, so nothing below it
+        runs. Hence the drain gets its own ``try`` and the closes live in the
+        ``finally``.
+
+        The two closes are then nested rather than consecutive, because this
+        client owns two sessions and ``ClientSession.close()`` can raise on a
+        connector whose transport the platform already tore down: as plain
+        consecutive statements, the first failure silently skipped the second.
+        Both still propagate -- a shutdown that swallows the error reports a
+        cleanup it did not perform.
+
+        A leaked session keeps its connector and open sockets for the process
+        lifetime (aiohttp reports "Unclosed client session" at GC), and for the
+        download session also its ``_VettedResolver`` and that resolver's SSRF
+        pin map.
+        """
         self._closed = True
-        handler_tasks = list(self._handler_tasks)
-        for task in handler_tasks:
-            task.cancel()
-        if handler_tasks:
-            await asyncio.gather(*handler_tasks, return_exceptions=True)
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
-            self._session = None
-        if self._download_session is not None and not self._download_session.closed:
-            # Closes the connector, which closes the resolver, which drops the pins.
-            await self._download_session.close()
-            self._download_session = None
+        try:
+            # Snapshot first: a cancelled handler's done-callback mutates the set.
+            handler_tasks = list(self._handler_tasks)
+            for task in handler_tasks:
+                task.cancel()
+            if handler_tasks:
+                # return_exceptions so one handler raising during unwind cannot
+                # abandon the others or skip the session closes below.
+                await asyncio.gather(*handler_tasks, return_exceptions=True)
+        finally:
+            try:
+                if self._session is not None and not self._session.closed:
+                    await self._session.close()
+                    self._session = None
+            finally:
+                if self._download_session is not None and not self._download_session.closed:
+                    # Closes the connector, which closes the resolver, which drops the pins.
+                    await self._download_session.close()
+                    self._download_session = None
 
     def _notify_state(self, connected: bool, error: str) -> None:
         """Publish a health transition to the dashboard badge.
@@ -1180,18 +1211,25 @@ class TeamsClient:
         except OSError as exc:
             raise ValueError("refusing unresolvable Teams attachment host") from exc
         for resolved in resolved_addresses:
-            try:
-                address = ipaddress.ip_address(resolved)
-            except ValueError:  # pragma: no cover - getaddrinfo returns literals
-                raise ValueError("refusing unparseable Teams attachment address")
-            if (
-                address.is_private
-                or address.is_loopback
-                or address.is_link_local
-                or address.is_reserved
-                or address.is_multicast
-                or address.is_unspecified
-            ):
+            # `link_unfurl`'s vet, not a local flag list. The category flags this
+            # used to enumerate approved two ranges that are plainly not public:
+            # `100.64.0.0/10` (RFC 6598 shared space -- what a Tailscale tailnet
+            # and most carrier NAT hand out, which CPython's `is_private` table
+            # omits and only `is_global` rejects) and `fec0::/10` (deprecated IPv6
+            # site-local, which reports `is_global=True`). It also evaluated the
+            # ipv4-mapped and 6to4 encodings as written, so `::ffff:127.0.0.1`
+            # passed a check whose whole purpose was to refuse loopback. That
+            # module already owns this decision for link unfurling and for the
+            # meetings calendar fetch, and its
+            # `test_vet_rejects_every_special_purpose_range` pins the refusal set
+            # against a table of IANA special-purpose prefixes -- so the next gap
+            # is found by the suite instead of by a reviewer, which a second
+            # implementation here would not inherit.
+            #
+            # It also subsumes the unparseable-address guard: it fails CLOSED on a
+            # literal it cannot read, which is the same refusal this reached the
+            # long way round via `ipaddress.ip_address`.
+            if link_unfurl.address_is_not_public(resolved):
                 raise ValueError("refusing local-network Teams attachment URL")
         return resolved_addresses
 

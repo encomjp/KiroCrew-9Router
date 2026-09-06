@@ -39,24 +39,51 @@ Callers: heartbeat callback, taskrunner lesson extraction.
 
 ### Multiplexed _bg runtime
 
-`get_bg_session()` acquires a `_bg` handle, dispatching by provider backend and
-returning `AcpSessionHandle | _ProviderBgSession`. Provider dispatch is via
-`_bg_provider_is_kiro()`, which resolves the `kirocrew-lite` agent backend:
+`get_bg_session()` acquires a `_bg` handle, dispatching by `agent.acp_backend`
+and returning `AcpSessionHandle | _ProviderBgSession`. Dispatch is via
+`_bg_backend_supports_runtime()` — positive membership in
+`ACP_BACKENDS_ACP_RUNTIME`, never an inequality (harness parity):
 
-- **kiro (`acp`)** — the only backend the multiplexed `AcpRuntime` supports.
-  Each caller (title generation, suggestions, folders, nav) gets its **own**
-  ephemeral `sessionId` multiplexed on a single shared `_bg_runtime` (an
-  `AcpRuntime`, kiro-cli only), created lazily under `_bg_runtime_lock`.
+- **runtime-capable backend** (`ACP_BACKENDS_ACP_RUNTIME`) — each caller (title
+  generation, suggestions, folders, nav) gets its **own** ephemeral `sessionId`
+  multiplexed on a single shared `_bg_runtime` (an `AcpRuntime` spawned under
+  the CONFIGURED backend), created lazily under `_bg_runtime_lock`.
   `create_session()` runs **outside** the lock so independent callers aren't
   serialized. The runtime is respawned-and-retried once on `AcpRuntimeDead`
   (`max_retries=1`, 2 attempts total).
-- **non-kiro** — falls back to a `_ProviderBgSession` over the shared
-  `BACKGROUND_KEY` `_Session`, serialized by its `Semaphore(1)`. `AcpRuntime` is
-  kiro-only, so any non-kiro backend must use the provider path. In the fork,
-  `agent.provider = "claude_code"` selects this branch (the custom LLM router
-  path — see [acp-client.md § Custom LLM router wiring (fork)](acp-client.md));
-  upstream it is the dormant fallback for the reserved `ACP_BACKEND_CLAUDE`
-  seam only.
+- **any other backend** — falls back to a `_ProviderBgSession` over the shared
+  `BACKGROUND_KEY` `_Session`, serialized by its `Semaphore(1)`. In the public
+  Kiro Crew edition `agent.provider` is fixed to `acp` and only kiro and KAS are
+  selectable, so this branch is the dormant fallback for the reserved
+  `ACP_BACKEND_CLAUDE` seam only. In the fork, `agent.provider = "claude_code"`
+  selects this branch (the custom LLM router path — see
+  [acp-client.md § Custom LLM router wiring (fork)](acp-client.md)).
+
+A backend switch displaces the cached `_bg_runtime`. The displacement policy
+has ONE implementation, `_displace_bg_runtime_locked()`, reached from
+`_retire_stale_backend_bg_runtime()` and from the mismatch check inside
+`get_bg_session()`'s runtime branch: a runtime whose `acp_backend` no longer
+matches config is killed if idle, and **parked on `_draining_bg_runtimes` if it
+has live or initializing handles** — parked runtimes never receive a new
+session (only `_bg_runtime` is offered to callers), their in-flight work
+finishes untouched (killing mid-turn would abort an in-flight title
+generation), and `_reap_drained_bg_runtimes_locked()` kills each once its last
+handle drains. Either way the slot is freed, so the very next background call
+runs under the configured backend even while the old runtime is still
+draining. Parked runtimes stay shielded from the orphan-PID sweep
+(`_companion_runtime_pids`), block the account-identity sweep's completeness
+(`_retire_kiro_bg_runtime`) while they drain, and are reaped by a periodic
+watchdog hook (`bg_drain_reap`) as the backstop for an idle gateway where no
+other trigger runs. `close_all()` detaches both holders atomically under
+`_bg_runtime_lock` and kills the detached snapshot; its counterpart `_closing`
+gate in `get_bg_session()` refuses to spawn or park once shutdown has started.
+Note there is currently no dashboard edit surface for
+`agent.acp_backend` (a file/CLI edit lands at the next gateway start, where
+`_cfg` is fresh); `refresh_defaults()` re-reads config, so any invocation of it
+picks up a backend change, and a future edit surface gets retirement for free
+by routing through it like the other `agent.*` defaults. The provider-path
+retirement trigger is dormant in the public edition for the same reason the
+`ACP_BACKEND_CLAUDE` branch is: every selectable backend is runtime-capable.
 
 Both paths yield `AcpEvent` through the shared
 `acp/_dispatch.parse_session_update` parser, so there is no behavioral drift
@@ -116,6 +143,30 @@ send time.
   pending synthesis, and the tag is merge-breaking so a nudge is never folded
   into a `[N queued messages merged]` user turn. At `_prompt_depth > 0` the ladder is disabled entirely (terminal
   notice on the first empty) to prevent nested-turn re-queue loops.
+- **Leaked tool-call notice** (dashboard chat runner, depth-0 turns only,
+  issue #6112): a turn that ends normally with an invoke block emitted as
+  TEXT and zero tool calls executed — the model wrote its invocation into the
+  prose channel instead of dispatching it (observed with deferred MCP tools
+  whose schema is not yet bound, and with large nested arguments) — surfaces
+  a visible notice card and is marked un-landed (no success recording, no
+  budget reset, no consolidation), so an unattended monitor/autonudge cycle
+  that leaked never lands silently. Detection is machine-shaped
+  (`chat_utils.has_leaked_tool_call`): an unquoted invoke open tag plus a
+  parameter or close tag, with fenced code blocks and inline code spans
+  stripped first so a pasted transcript or explained example never matches;
+  the gate (`should_notice_leaked_tool_call`) is claimed ahead of the
+  promise-only guard and excludes stage-execution turns (the orchestrator's
+  stage loop reads the turn result for stage accounting). Deliberately **notice-only** — no continuation is
+  queued, because an injected "re-issue that call" would carry runtime
+  authority into sessions where the call auto-approves (slot trust, global
+  yolo, or a static agent tool allowlist, the last invisible at the runner
+  layer, so no fail-closed downgrade condition exists) and the leaked block
+  may be untrusted external content the model merely reproduced. A loop loses
+  one cycle, visibly, and retries on its own schedule. Scope limit: the
+  notice/un-landing applies only to ZERO-tool-call turns — a mixed turn that
+  executed tools and then leaked its final dispatch as text lands normally
+  (un-landing a turn whose earlier calls had real side effects would
+  misdescribe it) and is logged at WARNING as a diagnostic instead.
 - **Context compaction**: at ≥ configured threshold (`session.autocompact_pct`, default 70%, valid 5–90), compacts **in place** on both
   backends: kiro-cli via a `/compact` **prompt** (`session/prompt` +
   `_kiro.dev/compaction/status` watch — never the string form of
@@ -191,7 +242,13 @@ send time.
   JSON appearing bumps the dir mtime) AND a TTL (`_AGENT_MODEL_CACHE_TTL`, for
   in-place edits that leave the dir mtime unchanged). Without invalidation an
   early `"auto"` miss (agent JSON not yet present) would be pinned forever, so a
-  later create/edit of the agent config would never be observed.
+  later create/edit of the agent config would never be observed. The scan reads
+  each spec through `agent_discovery._read_agent_spec`, the hardened reader that
+  module documents as the one reader for both agent scopes: `~/.kiro/agents` is
+  user-writable and shared with kiro-cli, so the read is size-capped and refuses
+  a link resolving onto a sensitive target rather than resolving a model out of
+  whatever the link names. A refused spec is skipped like a malformed one, so
+  the resolution falls through to `"auto"` exactly as an absent spec does.
 - **Idle cleanup**: expires sessions after `session.timeout_secs` (default
   60min). Never expires `BACKGROUND_KEY`. Dashboard per-tab sessions
   (`dashboard:{slot_key}`) idle-expire like any other session.
@@ -259,8 +316,8 @@ send time.
 | Method | Purpose |
 |--------|---------|
 | `start_pool(blocking=True)` | Pre-spawn warm + background sessions. `blocking=False` for non-blocking mode. |
-| `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False)` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. |
-| `check_context_usage(key, provider)` | Returns %. Triggers compaction at configured threshold (default 70%), warns one `CONTEXT_WARN_MARGIN_PCT` below it (50% on the default). |
+| `get_or_create(key, agent=None, approval_policy="", speculative=False, speculative_resume=False)` | Returns `(LLMProvider, is_new, resumed)`. Uses warm pool for new sessions (default agent only). Sessions with a resume mapping skip warm pool (cold start needed for `session/load`). A `reasoning_effort_override` also skips the warm pool (`bypass_effort`): a pre-warmed provider was built without the override and post-claim fixups never touch effort, so the override must reach a fresh provider-factory call to be delivered — which also keeps the factory's effort gate the single authority reporting a dropped level. Every decision is counted via `_record_pool_decision` (`kirocrew.session.pool.decision`) with the single disqualifying reason, so the pool's hit rate and the frequency of the `bypass_resume` case are observable. Non-default agents skip warm pool and resolve their model by precedence via `_model_fallback()` — caller model > per-agent pin > global default: `model=None` (defer to kiro's agent-JSON resolution) only when the agent pins its own model, otherwise the global default, unless that default is the `"auto"` sentinel (also `None`). The per-agent pin is resolved off the event loop via `run_in_executor` using `_resolve_named_agent_model`; blank agents inherit the global, and `kirocrew` is excluded (tracks the global). `approval_policy` is persisted on the new `_Session` — callers (e.g. subagent) pass parent policy so the session inherits it. `speculative=True` (eager spawn) pre-creates ahead of a real first turn: the one-shot `_Session.first_turn` observation — a single three-member `FirstTurnState` enum (`NOTHING_ARMED` / `FRESH` / `RESUMED`), so a resume marker on an already-claimed session is unrepresentable rather than forbidden by convention — is registered ARMED (`FRESH`) and never consumed by speculative callers, and a resumable key raises `SpeculativeResumeRefused` — unless `speculative_resume=True` (resume prefetch) opts in, in which case the speculative creator performs the `session/load` and registers the observation as `RESUMED` when the load restored the transcript. The observation is consumed in one read-then-clear by the first real claimant under the per-session semaphore (fast path and won-race path alike), with the returned booleans derived from it at the return boundary — so that turn observes `(is_new=True, resumed=True)` exactly as if it had resumed itself, preserving its history-injection decision. |
+| `check_context_usage(key, provider)` | Returns %. Triggers compaction at configured threshold (default 70%), warns one `CONTEXT_WARN_MARGIN_PCT` below it. |
 | `compact_if_needed(key)` | Awaitable twin of the `check_context_usage` trigger for callers that must not start their next turn while a compaction is pending (the task runner's between-steps check, #4686). Same gates in the same order — both entry points consume the shared `_compaction_gate_decision` ladder, the single owner of the gate order (its docstring documents each rung) — then AWAITS `_compact_session`. Returns the outcome: `"absent"`, `"reset"` (the settled verdict on the prior attempt was ineffective-and-still-critical and the promoted escalation reset the session here, awaited), `"cc_managed"` (checked before the threshold, mirroring `check_context_usage`), `"below_threshold"`, `"unconfirmed"`, `"in_progress"`, `"cooldown"`, `"ok"`, `"busy"`, `"recycled"`, `"failed"`. A `"busy"` decline means a turn holds the semaphore — the caller leaves the session alone and retries later, never falls back to a direct `provider.compact()`. |
 | `record_success(key)` / `record_failure(key)` | Circuit breaker tracking. |
 | `release(key)` | Release per-session semaphore (must call in `finally`). |
@@ -309,11 +366,15 @@ kiro-cli conversation history when a session is recycled.
 
 **Only long-lived conversational sessions are mapped.** Stateless sessions
 (cron, subagent, taskrunner, channel, secretary, side, heartbeat/background,
-`wf-pool:` warm workflow-pool workers) are excluded via `_STATELESS_PREFIXES`.
-The `wf-pool:` prefix keeps per-run pooled workers (workflows/agent_pool.py)
-from persisting a session_map entry or resuming a prior transcript — their
-hard-reset fallback must hand the next task a clean session, never a
-`session/load` replay of the previous task's conversation. The `side:` prefix is included so
+`wf-author:` workflow authoring, and `wf-pool:` warm workflow-pool workers) are
+excluded via `_STATELESS_PREFIXES`. A `wf-author:` session is also explicitly
+destroyed after each authoring attempt, which shuts down its provider, removes its
+registry entry, and deletes any stale map entry; stateless classification prevents
+resume lookup or persistence during acquisition. The `wf-pool:` prefix keeps
+per-run pooled workers (workflows/agent_pool.py) from persisting a session_map entry
+or resuming a prior transcript — their hard-reset fallback must hand the next task
+a clean session, never a `session/load` replay of the previous task's conversation.
+The `side:` prefix is included so
 `/side` conversations never resume across KiroCrew restarts — each cold-start
 triggers `is_first_turn=True` in `build_side_message` which re-seeds the
 parent snapshot + accumulated side history.
@@ -475,10 +536,12 @@ in a worker thread — the loop never pays the file write inline, and `_data`
 never crosses the thread boundary. Coalescing never drops a trailing mutation
 (the task loops until it observes a clean map), and a per-snapshot ticket keeps
 a slow in-flight write from landing an older map over a newer forced one.
-`SessionMap.flush()` (sync contexts) and `SessionMap.aflush()` (awaited, for
-loop-side shutdown paths — `SessionManager.close_all()` uses it) are the
-deterministic durability points; off the loop (CLI, tests, worker threads)
-every mutation still writes inline. Losing a pending
+`SessionMap.flush()` (sync contexts) and `SessionMap.aflush()` (awaited) are the
+deterministic durability points. `SessionMap.aclose()` is the shutdown boundary
+used by `SessionManager.close_all()`: it cancels and awaits the registered
+debounce task, preserves an unstarted or claimed-but-unwritten snapshot, lands
+it through `aflush()`, and returns only after the task registration is retired.
+Off the loop (CLI, tests, worker threads) every mutation still writes inline. Losing a pending
 flush on a crash leaves a well-formed older map, never a truncated file.
 
 **Auto-prune:** `SessionMap.get()` auto-removes entries whose `.json` file
@@ -573,7 +636,11 @@ when that exists, so a thread active across the migration keeps one log file.
 opens a DM thread, links the session, and posts the last 5 messages as context.
 
 **Dashboard state:** `ChatSlot.summary()` includes `slack_linked: bool` so
-the frontend can show a link indicator.
+the frontend can show a link indicator. `_ChatSlot.task` publishes ownership through a
+property that increments `_turn_generation` for every new non-null task. The counter is
+process-local and monotonic for the slot lifetime; unlike `task`, normal turn teardown
+does not clear it, so code spanning an await can detect a turn that started and finished
+inside that interval.
 
 **Slash commands** (`slack/events.py`):
 - `/kirocrew sessions` — lists active sessions with Slack link status
@@ -913,7 +980,7 @@ Security properties (enforced in `session_directive.decode` plus the applier):
 - **Native sub-agent calls refused**: they surface as flat events in the parent loop but have no independently bindable slot, so the applier declines them.
 - **SEL audit on every application**: `apply_session_directive` emits a tool-invocation event tagged `source="mcp-directive"` with outcome `success` / `denied` (e.g. a `set_project` sensitive-path block) / `error`, since the effect now runs in the consumer rather than in the tool body or an HTTP endpoint.
 
-The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions").
+The applier reuses the SAME effect cores the HTTP endpoints call — `authorize_and_add_nudge` / `authorize_and_update_nudge` / `svc.remove` for the monitor trio, `slot.project` plus the recent-projects save for `set_project`, `deliver_ws_owners` for `suggest_followup`, and `post_question_card` for `ask_question` — so behavior is unchanged except that `ask_question` is now non-blocking (full contract in `learn-cron-dashboard.md` → "Agent Questions"). `set_project` additionally requires structural user-turn provenance: injected cron, task-runner, sub-agent, auto-nudge, orchestration, app-authenticated unattended turns, and app-authored Spec Builder seed/handoff prompts cannot retarget a borrowed destination slot even when its session key is user-facing. Spec Builder rejects app-token message and decision submissions before they can enter its human-provenance relay or durable decision ledger. Queue entries preserve this provenance, replacement text adopts the editor's provenance, and mixed or untagged merges fail closed.
 
 Gateway-off (the default topology this targets), the model's tool result is the tool's OWN returned line delivered over kiro-cli's MCP pipe; the applier's confirmation string and SEL audit are recorded on KiroCrew's own surfaces (transcript / WS / hooks) and do NOT rewrite the model's tool result. Each tool therefore phrases its own message as a *request* that the consumer applies (and may refuse — no interactive session, invalid/sensitive path, capped/paused loop) rather than asserting the effect already landed.
 
@@ -1008,11 +1075,14 @@ see [security](security.md) § Conditional Python-interpreter env strip.
 | TaskRunner acceptance | `taskrunner:{task_id}:acceptance` | Seconds | Own kiro-cli |
 | Warm spare | _(in pool queue)_ | Until assigned | Pre-started kiro-cli |
 
-**Cold-start semaphore**: `_start_sem = Semaphore(2)` limits concurrent
-`provider.start()` calls to 2 for memory safety. This
-prevents resource exhaustion when multiple sessions cold-start simultaneously,
-while still allowing 3 parallel subagents to all run concurrently once started
-(they queue briefly during cold-start).
+**Cold-start admission**: `SessionManager._start_sem` bounds provider starts local
+to one manager. The narrower common runtime chokepoint adds a gateway-wide
+`AcpRuntime.spawn()` coordinator capped at 2 concurrent spawn + `initialize`
+handshakes, matching worker-pool `max_starting=min(workers, 2)`. Authoring,
+interactive, background, shared-runtime, and unpooled callers therefore share the
+same expensive-start bound even when they bypass this manager or a worker pool.
+Queued cancellation returns the permit, and runtime startup retains its existing
+subprocess cleanup on cancellation or failure.
 
 **Parallel step throttling**: TaskRunner limits concurrent step sessions
 to `max_parallel_steps` (default 2) via `asyncio.Semaphore`. Cold starts

@@ -59,7 +59,7 @@ export default function UpdatePill() {
       type="button"
       data-testid="update-pill"
       className="flex items-center gap-1.5 h-7 px-2.5 rounded-xl shrink-0 cursor-pointer text-[12px] whitespace-nowrap border border-accent/30 bg-accent-subtle text-accent hover:opacity-90 transition-opacity"
-      onClick={() => navigate('/settings?tab=about')}
+      onClick={() => navigate('/settings/about')}
       title={i18nT('components.updatePill.open_update_settings')}
       aria-label={i18nT('components.updatePill.open_update_settings')}
     >

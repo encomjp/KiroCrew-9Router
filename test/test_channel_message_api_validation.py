@@ -61,3 +61,70 @@ async def test_post_keeps_string_trim_and_length_limit(manager):
     assert response.status == 200
     assert _body(response)["message"]["content"] == "a" * 10000
     assert channel.messages[-1].content == "a" * 10000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mention",
+    [False, 7, {"id": "agent-1"}, ["ok", 7], ["ok", {"id": "agent-1"}], [["nested"]]],
+)
+async def test_post_rejects_non_string_mention_before_mutation(manager, monkeypatch, mention):
+    channel = manager.create("incident")
+    post_spy = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {}))
+    monkeypatch.setattr(channel, "post", post_spy)
+
+    response = await _invoke(_request(manager, {"content": "hi", "mention": mention}, channel.id))
+
+    assert response.status == 400
+    assert _body(response)["code"] == "channel_message_mention_type_invalid"
+    assert channel.messages == []
+    post_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("thread_id", [{"id": "m1"}, ["m1"], 7, True])
+async def test_post_rejects_non_string_thread_id_before_mutation(manager, monkeypatch, thread_id):
+    channel = manager.create("incident")
+    post_spy = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {}))
+    monkeypatch.setattr(channel, "post", post_spy)
+
+    response = await _invoke(
+        _request(manager, {"content": "hi", "thread_id": thread_id}, channel.id)
+    )
+
+    assert response.status == 400
+    assert _body(response)["code"] == "channel_message_thread_id_type_invalid"
+    assert channel.messages == []
+    post_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_still_drops_unknown_mention_and_thread_id(manager):
+    channel = manager.create("incident")
+
+    response = await _invoke(
+        _request(
+            manager,
+            {"content": "hi", "mention": "nobody", "thread_id": "no-such-message"},
+            channel.id,
+        )
+    )
+
+    assert response.status == 200
+    posted = channel.messages[-1]
+    assert posted.mention is None
+    assert posted.thread_id is None
+
+
+@pytest.mark.asyncio
+async def test_post_accepts_empty_string_optional_fields(manager):
+    channel = manager.create("incident")
+
+    response = await _invoke(
+        _request(manager, {"content": "hi", "mention": "", "thread_id": ""}, channel.id)
+    )
+
+    assert response.status == 200
+    posted = channel.messages[-1]
+    assert posted.mention is None
+    assert posted.thread_id == ""

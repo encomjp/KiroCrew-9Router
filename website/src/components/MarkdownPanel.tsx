@@ -24,6 +24,7 @@ import { api } from '../api/client'
 import { fileReadUrl, fileDownloadUrl } from '../utils/fileReadUrl'
 import { loadCommentDrafts, saveCommentDrafts, setCommentsForFile } from '../utils/commentDrafts'
 import { copyToClipboard } from '../utils/clipboard'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
 // ── CSS Custom Highlight API accessors ───────────────────────────────────────
 // Preview find highlights matches via the browser-native CSS Custom Highlight
@@ -42,10 +43,10 @@ const cssHighlights: { set(n: string, h: FindHighlight): void; delete(n: string)
     ? (CSS as unknown as { highlights?: { set(n: string, h: FindHighlight): void; delete(n: string): boolean } }).highlights
     : undefined
 const FIND_HL_SUPPORTED = !!FindHighlightCtor && !!cssHighlights
-// Global registry names. Assumes a single active markdown preview at a time
-// (the panel's findActiveRef already encodes that assumption); a second
-// concurrent preview find would share these names — a harmless visual overlap,
-// never a crash.
+// Global registry names, shared by every mounted panel. Only one panel ever has
+// find open, because the `active` gate refuses the chord in every tab but the
+// visible one — so the names cannot be contended. Were two previews ever to
+// search at once they would overlap visually, never crash.
 const FIND_HL_ALL = 'mc-find'
 const FIND_HL_CURRENT = 'mc-find-current'
 
@@ -192,6 +193,12 @@ interface Props {
   onDiffModeChange?: (diffMode: boolean) => void
   /** Render as a SidePanel tab body (fills parent, no resize handle/border). */
   embedded?: boolean
+  /** Is this panel the VISIBLE tab? A host that keeps background tabs mounted
+   *  and merely hides them has several live panels at once, and each installs
+   *  its own document-level key handlers — so without this every hidden tab
+   *  also answers Cmd+F, Escape and Cmd+S. Hosts that mount a single panel can
+   *  leave this unset. */
+  active?: boolean
   /** File-browser rail (grip + tree column) rendered to the RIGHT of the
    *  content, under the shared full-width header — the file-tab body owns the
    *  rail's data and open handling; this panel only places it. */
@@ -751,11 +758,11 @@ function useFileArtifactState(filePath: string, content: string) {
  * listener already picks up — no editor-specific selection bridge needed. */
 /** Diff mode with nothing to show: the file matches its baseline, so the diff
  *  canvas would render empty. Say so and offer the way out. */
-function ZeroDiffNotice({ onExitDiff }: { onExitDiff: () => void }) {
+function ZeroDiffNotice({ onExitDiff, message }: { onExitDiff: () => void; message?: string }) {
   return (
     <div className="h-full flex flex-col items-center justify-center gap-2.5 text-muted px-6 text-center">
       <FileDiff size={20} className="opacity-50" />
-      <span className="text-[12.5px]">{i18nT('components.markdownPanel.no_changes_in_file')}</span>
+      <span className="text-[12.5px]">{message ?? i18nT('components.markdownPanel.no_changes_in_file')}</span>
       <button
         className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium text-muted hover:text-text border border-border bg-transparent cursor-pointer transition-colors"
         onClick={onExitDiff}
@@ -804,6 +811,7 @@ const CommentOverlayBlock = memo(function CommentOverlayBlock({ popover, addComm
   popover: { x: number; y: number } | null; addComment: (text: string) => void; setPopover: (v: null) => void
   onSubmitComments?: (message: string) => void; comments: InlineComment[]; editComment: (id: string, text: string) => void; removeComment: (id: string) => void; submitAllComments: (extraPrompt?: string) => void; containerRef?: React.RefObject<HTMLElement | null>; scrollRef?: React.RefObject<HTMLElement | null>
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   return (
     <>
       {popover && (
@@ -829,12 +837,13 @@ export interface MarkdownPanelHandle {
   requestNavigate: (nav: (stillClean: () => boolean) => void) => void
 }
 
-export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
+export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPanel({ filePath, content, onContentChange, onDiskContent, onSave, onClose, liveWatch, onSubmitComments, onRefresh, reserveWidth, initialDiffMode, onDiffModeChange, embedded, active = true, savedBaseline, revealLine, onRevealConsumed, browserRail, railOpen, onRailToggle, scrollMemoryKey }: Props, ref) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ime = useImeGuard()
   const qc = useQueryClient()
   // Code files (non-rich, non-markdown) have no meaningful preview — their
   // "preview" was just a read-only render of the same text. They open
-  // straight in source mode and the View Preview toggle is hidden for them.
+  // straight in source mode and the Edit/Preview toggle is hidden for them.
   //
   // A requested line forces source mode: a line number only means something
   // against the source, and the rendered markdown preview has no per-line element
@@ -1007,8 +1016,14 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   const findInputRef = useRef<HTMLInputElement>(null)
   const findRangesRef = useRef<Range[]>([])
   // Is this panel the region the cursor is in? Defaults true so Cmd+F right
-  // after opening the doc searches the doc (the reported expectation). Flips
-  // based on where the last pointer-down landed.
+  // after opening the doc searches the doc. Flips based on where the last
+  // pointer-down landed.
+  //
+  // The selector is deliberately unscoped. It answers "did the pointer land in
+  // SOME markdown panel", which every mounted instance answers identically —
+  // and that is sufficient because the `active` gate below already refuses the
+  // chord in every panel but the visible one, and a pointer cannot land inside
+  // a `display:none` sibling.
   const findActiveRef = useRef(true)
 
   useEffect(() => {
@@ -1019,6 +1034,12 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     document.addEventListener('pointerdown', onPointer, true)
     return () => document.removeEventListener('pointerdown', onPointer, true)
   }, [])
+
+  // Becoming the visible tab is itself the signal that the user is looking at
+  // this document — the same reason the ref defaults to true on mount. Without
+  // this, a click in a sibling tab before the switch would leave the now-visible
+  // panel out of its own find region.
+  useEffect(() => { if (active) findActiveRef.current = true }, [active])
 
   // Highlights are external (CSS.highlights), so clearing never touches the
   // React-owned DOM — no reconciliation hazard.
@@ -1107,12 +1128,17 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
   // the editor's own find takes over cleanly.
   useEffect(() => { if (editing || diffMode) closeFind() }, [editing, diffMode, closeFind])
 
+  // A backgrounded tab must not keep a find bar the user cannot see, nor hold
+  // the module-global highlight names away from the visible panel.
+  useEffect(() => { if (!active) closeFind() }, [active, closeFind])
+
   // Capture-phase Cmd+F: fires before ChatPage's bubble-phase chat-find. We
   // only steal the key in markdown preview when this panel is the active
   // region; otherwise we let it bubble (chat-find) or let the editor handle it.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!hasCommandModifier(e) || e.key.toLowerCase() !== 'f') return
+      if (!active) return                                   // hidden tab: never claim the key
       if (editing || diffMode || !isMarkdown) return       // editor owns it; non-markdown skip
       if (!findActiveRef.current) return                    // cursor is in chat → let chat-find handle
       e.preventDefault()
@@ -1122,7 +1148,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     }
     document.addEventListener('keydown', onKey, true)
     return () => document.removeEventListener('keydown', onKey, true)
-  }, [editing, diffMode, isMarkdown])
+  }, [active, editing, diffMode, isMarkdown])
 
   const findBar = findOpen ? (
     <div data-mc-mdpanel className="absolute top-2 right-3 z-30 flex items-center gap-1.5 bg-bg-elevated border border-border focus-within:border-accent rounded-lg shadow-md px-2.5 py-1.5 text-[13px]">
@@ -1168,10 +1194,30 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     staleTime: 10_000,
   })
   const originalContent = diffData?.original ?? ''
+  // The backend reports WHY there is nothing to diff against. `not_git` means
+  // the file is outside any git work tree, so there is no baseline at all —
+  // rendering the diff would present the whole file as added against a
+  // baseline that does not exist ("untracked" keeps the all-added rendering:
+  // there the repo IS the baseline and all-added is the true answer). `error`
+  // means git itself failed, which must stay distinguishable from a clean
+  // file's empty diff. Deliberately NOT gated on diffChecking: a background
+  // refetch (window refocus past staleTime) keeps the cached data while
+  // isFetching is true, and collapsing this state mid-refetch would flash the
+  // exact all-added rendering this branch exists to suppress.
+  const diffUnavailable = diffMode && (diffData?.status === 'not_git' || diffData?.status === 'error')
+    ? diffData.status as 'not_git' | 'error' : null
   // Diff mode on a file identical to its baseline renders an empty canvas in
   // BOTH view and edit modes — show a notice instead. Editing past the
   // baseline (content diverges) flips this off automatically.
-  const zeroDiff = diffMode && !diffChecking && diffData != null && originalContent === content
+  const zeroDiff = diffMode && !diffChecking && diffData != null && !diffUnavailable && originalContent === content
+  // Resolved in render position so a language switch re-renders it; the notice
+  // reuses ZeroDiffNotice so the "Show full file" escape hatch is identical
+  // across all three empty-diff states.
+  const diffUnavailableText = diffUnavailable === 'not_git'
+    ? i18nT('components.markdownPanel.diff_no_baseline_not_git')
+    : diffUnavailable === 'error'
+      ? i18nT('components.markdownPanel.diff_failed_to_compute')
+      : null
   // Auto-open diff mode once for a genuine edit unless this file tab already
   // carries an explicit choice. File-tab metadata survives ChatPage unmounts,
   // so returning to a session restores preview/source instead of re-enabling
@@ -1589,6 +1635,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
+      // A background tab is mounted but invisible, so neither key may reach it:
+      // Escape would close — or raise a discard prompt for — a document the user
+      // cannot see, and Cmd+S would let a hidden dirty editor answer a save the
+      // user aimed at the tab in front of them.
+      if (!active) return
       // While the discard-confirm dialog is open, the keyboard belongs to it.
       // Escape dismisses it via the dialog's own handler (re-running the guard
       // here would re-open the dialog the same keystroke just closed), and the
@@ -1600,7 +1651,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
     }
     document.addEventListener('keydown', h)
     return () => document.removeEventListener('keydown', h)
-  }, [guardedClose, editing, dirty, fullscreen, popover, clearHighlightMarks, confirmOpen])
+  }, [active, guardedClose, editing, dirty, fullscreen, popover, clearHighlightMarks, confirmOpen])
 
   const handleChange = useCallback((v: string) => { onContentChange(v); setDirty(true) }, [onContentChange])
   const clearPopover = useCallback(() => { setPopover(null); clearHighlightMarks() }, [clearHighlightMarks])
@@ -1655,7 +1706,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
         /* Single-bar toolbar: the tab chip owns
            identity + close, so this bar carries a static breadcrumb + dirty
            dot + diff stats on the left, and library actions (star /
-           knowledge), View Source/Preview toggle, diff toggle, and the ⋯
+           knowledge), Edit/Preview toggle, diff toggle, and the ⋯
            overflow on the right. In source mode a second row pops down
            (grid-rows transition — compositor-friendly in Electron, unlike
            height auto) with the editor options and Save / Cancel so the
@@ -1671,7 +1722,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
                 </span>
               ))}
             </span>
-            {diffMode && (diffStats.added > 0 || diffStats.removed > 0) && (
+            {diffMode && !diffUnavailable && (diffStats.added > 0 || diffStats.removed > 0) && (
               <span className="text-[11px] font-mono font-semibold shrink-0">
                 {diffStats.added > 0 && <span className="text-ok">+{diffStats.added}</span>}
                 {diffStats.removed > 0 && <span className="text-danger ml-1.5">-{diffStats.removed}</span>}
@@ -1690,7 +1741,7 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
                 className="px-2.5 h-[26px] rounded-md text-[11.5px] font-medium text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none cursor-pointer transition-colors shrink-0"
                 onClick={() => setEditing(!editing)}
                 aria-pressed={editing}
-              >{editing ? i18nT('components.markdownPanel.view_preview') : i18nT('components.markdownPanel.view_source')}</button>
+              >{editing ? i18nT('components.markdownPanel.preview') : i18nT('components.markdownPanel.edit')}</button>
             )}
             {!isRichType && (
               <button className={barIconBtn(diffMode)} onClick={toggleDiffMode} title={i18nT('components.markdownPanel.toggle_diff_view')} aria-label={i18nT('components.markdownPanel.toggle_diff_view')} aria-pressed={diffMode}><FileDiff size={14} /></button>
@@ -1751,10 +1802,11 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
               pr-6 keeps the text clear of the ticks. */}
           <div ref={sidePanelScrollRef} onScroll={scrollMemory.onScroll} className={`flex-1 min-h-0 overflow-auto ${isMarkdown && !editing ? 'scrollbar-overlay pr-6' : ''}`}>
             {zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
-            {!zeroDiff && !diffChecking && !isRichType && (
+            {diffUnavailableText && !editing && <ZeroDiffNotice message={diffUnavailableText} onExitDiff={toggleDiffMode} />}
+            {!zeroDiff && !diffUnavailable && !diffChecking && !isRichType && (
               <DiffViewBlock flush sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />
             )}
-            {!zeroDiff && (!diffMode || editing) && <ContentRenderer flush isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
+            {!zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer flush isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
               diffBase={diffMode && editing ? (originalContent || null) : undefined} diffSplit={diffSplit} diffExpandUnchanged={!collapseUnchanged}
               previewRef={previewRef} displayContent={displayContent} isMarkdown={isMarkdown} markdownClassName="msg-content text-sm leading-relaxed" editorRef={setRevealEditor} />}
           </div>
@@ -1825,8 +1877,9 @@ export default memo(forwardRef<MarkdownPanelHandle, Props>(function MarkdownPane
           {findBar}
           <div ref={fullscreenBodyRef} className="h-full overflow-auto px-16 py-4">
             {zeroDiff && <ZeroDiffNotice onExitDiff={toggleDiffMode} />}
-            {!zeroDiff && !isRichType && <DiffViewBlock sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />}
-            {!zeroDiff && (!diffMode || editing) && <ContentRenderer isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
+            {diffUnavailableText && !editing && <ZeroDiffNotice message={diffUnavailableText} onExitDiff={toggleDiffMode} />}
+            {!zeroDiff && !diffUnavailable && !isRichType && <DiffViewBlock sideBySide={diffSplit} diffMode={diffMode && !editing} fileName={fileName} originalContent={originalContent} content={content} lineNums={lineNums} wordWrap={wordWrap} collapseUnchanged={collapseUnchanged} />}
+            {!zeroDiff && (!diffUnavailable || editing) && (!diffMode || editing) && <ContentRenderer isRichType={isRichType} fileType={fileType} filePath={filePath} content={content} editing={editing} lang={lang} lineNums={lineNums} wordWrap={wordWrap} onChange={handleChange} onSave={handleSave}
               diffBase={diffMode && editing ? (originalContent || null) : undefined} diffSplit={diffSplit} diffExpandUnchanged={!collapseUnchanged}
               previewRef={fullscreenPreviewRef} displayContent={displayContent} isMarkdown={isMarkdown} previewStyle={mdPreviewStyle} editorRef={setRevealEditor} />}
           </div>

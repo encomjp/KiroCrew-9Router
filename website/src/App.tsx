@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, useMemo, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo, useSyncExternalStore, createContext, lazy, Suspense, type HTMLAttributes, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Routes, Route, Navigate, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -13,10 +13,12 @@ import { getBuiltinSurfaces, getBuiltinSurface, selectSurfaceBadgeCount, selectS
 import { createSlot, appendSlotMessage, setAgentSwitchNotice, setSlotRunning, switchSlot, selectActiveSlotProject } from './store/chatSlice'
 import { queryComposer } from './pages/chat/composerFocus'
 import { setNavIntentHandler as setArtifactNavIntentHandler } from './utils/artifactPopout'
-import { applyNavIntentInMain } from './utils/navIntent'
+import { applyNavIntentInMain, chatDeepLinkSlot } from './utils/navIntent'
 import { installSoftNavigate } from './utils/errorReport'
 import { agentSwitchFailureMessage } from './utils/agentSwitchFeedback'
+import { readSendReceipt } from './utils/sendDelivery'
 import { updateAffordance } from './utils/updateAffordance'
+import { isNewSection } from './utils/releaseVersion'
 import { metricColor } from './utils/metricColor'
 import { fetchNotifications, ackNotification, armBootNotificationsFallback } from './store/notificationsSlice'
 import { useWebSocket } from './hooks/useWebSocket'
@@ -41,7 +43,7 @@ import type { KiroCreditUsage, KiroUsagePayload } from './api/client'
 import { safeSetItem } from './utils/safeStorage'
 import { gcOrphanedStorage } from './utils/storageGc'
 import { isMetricNumber, metricNumber } from './utils/metrics'
-import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, LayoutGrid, Fullscreen, SquareTerminal, Bot, Search as SearchIcon } from 'lucide-react'
+import { Rocket, Bell, Code, RefreshCw, Package, Loader2, Download, Hammer, XCircle, Check, AlertTriangle, CheckCircle, X, AudioWaveform, ChevronUp, MoreHorizontal, Coins, ArrowLeftToLine, Compass, LayoutGrid, Fullscreen, SquareTerminal, Bot, Search as SearchIcon } from 'lucide-react'
 import { GithubIcon, DiscordIcon } from './components/BrandIcon'
 import { Toggle } from './components/ui'
 import OnboardingFlow from './components/OnboardingFlow'
@@ -72,7 +74,10 @@ import LogsPage from './pages/LogsPage'
 import HooksPage from './pages/HooksPage'
 import WebhooksPage from './pages/WebhooksPage'
 import CapabilitiesPage from './pages/CapabilitiesPage'
-import KnowledgePage from './pages/KnowledgePage'
+// Lazy: /members is a standalone surface not needed at startup, and the main
+// chunk sits at its size budget — the import() boundary keeps the page (and
+// its drawer/roster tree) out of the initial bundle.
+const MembersPage = lazy(() => import('./pages/members/MembersPage'))
 import ArtifactsPage from './pages/ArtifactsPage'
 import ArtifactDetailPage from './pages/ArtifactDetailPage'
 import RemoteArtifactDetailPage from './pages/RemoteArtifactDetailPage'
@@ -93,9 +98,9 @@ import UpdateModal from './components/UpdateModal'
 import ComputerUseLiveView from './components/ComputerUseLiveView'
 import BottomTerminalPanel, { TerminalDetachedBar } from './components/BottomTerminalPanel'
 import { toggleBottomTerminal, useBottomTerminalOpen, useTerminalPosition } from './hooks/useBottomTerminal'
+import { toggleTerminalByChord } from './lib/terminalChordFocus'
 import { useTerminalPoppedOut, focusPopout as focusTerminalPopout } from './utils/terminalPopout'
 import { setTerminalEnabledFlag } from './utils/terminalRegistry'
-import AppsPage from './pages/AppsPage'
 import AppPage from './pages/AppPage'
 import AppDetailPage from './pages/AppDetailPage'
 import MigrationPage from './pages/MigrationPage'
@@ -122,6 +127,13 @@ import { i18nT } from './i18n/t'
 import { appNavTarget } from './appNav'
 import { resolveSlotOverlays, type SlotOwners } from './apps/overlaySlots'
 import { fmtCompact, fmtPercent } from './i18n/format'
+// Static on purpose, and the tradeoff is real: the sidebar updates badge
+// needs `registryQueryFn` (its own fetch boundary — a badge that only lights
+// after a store-page visit does not do its job), and importing it pulls the
+// store data layer into the eager App chunk. Accepted: the bundle-size gate
+// still passes, and a second raw fetcher under the same query key would win
+// React Query's one-queryFn-per-key registration and poison the cache shape.
+import { countUpdatables, registryQueryFn, type UpdatableInstalledRow } from './pages/apps/useAppsData'
 
 // Lazy on purpose: the update-found popup (its policy module, Trans runtime
 // wiring, and mutation plumbing) is dead weight for every session without an
@@ -132,6 +144,12 @@ const UpdateFoundModal = lazy(() => import('./components/UpdateFoundModal'))
 // Same boundary, same reason: the pill renders nothing without an update,
 // so its code rides the on-demand chunk instead of the app core.
 const UpdatePill = lazy(() => import('./components/UpdatePill'))
+
+// Route-level code splitting for the App Store split (PR1): Discover and
+// Library are independent surfaces, and neither belongs in the app-core
+// chunk -- each rides its own on-demand chunk fetched on first navigation.
+const DiscoverPage = lazy(() => import('./pages/apps/DiscoverPage'))
+const LibraryPage = lazy(() => import('./pages/apps/LibraryPage'))
 
 const MAX_KIRO_BONUS_GRANT_NAME_CHARS = 100
 const MAX_KIRO_BONUS_CREDITS = 1_000_000
@@ -627,8 +645,8 @@ function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
   // offers to re-collapse rather than reveal "0 more".
   const showsCollapse = expanded || hiddenCount === 0
   const Icon = showsCollapse ? ChevronUp : MoreHorizontal
-  const labelText = showsCollapse ? i18nT('app.show_less') : `${hiddenCount} more`
-  const titleText = showsCollapse ? i18nT('app.show_fewer_apps') : `Show ${hiddenCount} more app${hiddenCount === 1 ? '' : 's'}`
+  const labelText = showsCollapse ? i18nT('app.show_less') : i18nT('app.n_more', { count: hiddenCount })
+  const titleText = showsCollapse ? i18nT('app.show_fewer_apps') : i18nT('app.show_more_apps', { count: hiddenCount })
   return (
     <button ref={rowRef}
       className="group/nav relative flex items-center rounded-md cursor-pointer text-sm font-medium whitespace-nowrap gap-2.5 py-2 pl-3 pr-3 transition-colors duration-200 text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none w-full"
@@ -643,7 +661,10 @@ function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
       // click), so it also clears a label that focus had just re-armed.
       onClick={() => { dismissTip(); onClick() }}
       aria-expanded={expanded}
-      aria-label={titleText}
+      // WCAG 2.5.3 Label in Name: while the text label is visible the accessible
+      // name must contain it, so the name IS the label; collapsed (icon-only)
+      // mode uses the fuller title instead.
+      aria-label={collapsed ? titleText : labelText}
       title={titleText}
       onMouseEnter={showTip}
       onMouseLeave={hideTip}
@@ -803,7 +824,7 @@ function NotificationsBellButton() {
         ref={bellRef}
         className={`flex items-center justify-center w-7 h-7 rounded-md hover:bg-bg-hover transition-colors bg-transparent border-none cursor-pointer shrink-0 relative ${open ? 'text-accent' : 'text-muted hover:text-text'}`}
         onClick={() => { if (open) closePanel(); else openPanel() }}
-        title={unacked.length > 0 ? `${unacked.length} notification${unacked.length === 1 ? '' : 's'}` : i18nT('app.notifications')}
+        title={unacked.length > 0 ? i18nT('app.notification_count', { count: unacked.length }) : i18nT('app.notifications')}
         aria-label={i18nT('app.notifications')}
         aria-haspopup="dialog"
         aria-expanded={open}
@@ -1617,6 +1638,44 @@ export default function App() {
     setAppBadges(prev => prev.projects === approvalCount ? prev : { ...prev, projects: approvalCount })
   }, [approvalCount])
 
+  // Pending app-update count for the sidebar Discover badge — the SAME count
+  // the Discover Updates sub-tab shows, via the shared `countUpdatables`
+  // derivation. The registry read is an ACTIVE query on the shared
+  // `registryQueryFn` boundary (one normalize path, so either observer may
+  // fetch and both see the same shape): a passive cache read only ever fires
+  // after a store page has populated the cache, which is the one place the
+  // count is already visible — a badge that cannot appear in a fresh session
+  // does not do its job. `mc:apps-changed` invalidation above refetches it.
+  // `['apps']` stays a passive read: refreshAppNav in this shell already
+  // writes it on every fetch.
+  const { data: registryBadgeData } = useQuery({
+    queryKey: ['registry'],
+    queryFn: registryQueryFn,
+    staleTime: 5 * 60_000,
+    refetchOnWindowFocus: false,
+  })
+  const subscribeQueryCache = useCallback(
+    (onStoreChange: () => void) => queryClient.getQueryCache().subscribe(onStoreChange),
+    [queryClient],
+  )
+  const installedSnapshot = useSyncExternalStore(
+    subscribeQueryCache,
+    () => queryClient.getQueryData<UpdatableInstalledRow[]>(['apps']),
+  )
+  const appUpdatesCount = useMemo(
+    () => countUpdatables(registryBadgeData?.apps, installedSnapshot),
+    [registryBadgeData, installedSnapshot],
+  )
+  // Merged only into the badge map the two Discover rows read — NOT into the
+  // `appBadges` state: that map feeds the tab-title `totalAttention` sum, and
+  // a pending app update is not an attention item the way an approval or an
+  // unread message is. `NavBadge` hides at count 0 (BadgeIndicator renders
+  // null), so an empty count leaves the row badge-free.
+  const discoverBadges = useMemo(
+    () => (appUpdatesCount > 0 ? { ...appBadges, apps: appUpdatesCount } : appBadges),
+    [appBadges, appUpdatesCount],
+  )
+
   const [updating, setUpdating] = useState(false)
   const [showUpdateModal, setShowUpdateModal] = useState(false)
   const [kiroUsageOpen, setKiroUsageOpen] = useState(false)
@@ -1824,6 +1883,22 @@ export default function App() {
     onToggleLeftSidebar: () => toggleNav(),
     onToggleSessionPanel: () => window.dispatchEvent(new Event('toggle-pin-chat-sidebar')),
     onToggleSidePanel: () => window.dispatchEvent(new Event('toggle-activity-panel')),
+    // Same command as the nav rail's Terminal row: focus the popped-out window
+    // when the panel lives there, otherwise toggle the docked panel with the
+    // active session's project as the shell's cwd. Left undefined when the
+    // terminal is disabled, which the hook reads as UNBOUND: the chord is not
+    // claimed at all, so it falls through to the browser rather than being
+    // swallowed on behalf of a panel the rest of the UI hides.
+    //
+    // Also unbound in a popout or embedded pane, which render no docked terminal
+    // of their own. `useBottomTerminal`'s state is localStorage-backed AND
+    // cross-window synced (it listens for `storage` on `mc-bottom-terminal`), so
+    // a chord fired in a popout would not be a local no-op — it would open or
+    // close the terminal in the MAIN window, out of sight of the person pressing
+    // the key.
+    onToggleTerminal: terminalEnabled && !isPopout && !isEmbed
+      ? () => { if (terminalPoppedOut) focusTerminalPopout(); else toggleTerminalByChord(activeSlotProject) }
+      : undefined,
   })
   // Cmd+1..9 (⌘ mac / Ctrl win-linux) switches instance panes: 1=Local,
   // 2=first remote, … — matching the InstanceTabBar left-to-right tab order.
@@ -1843,7 +1918,7 @@ export default function App() {
   // backend cache has not warmed yet" (null) apart from "the request failed"
   // (undefined) — both are falsy. Without it a failing endpoint renders as a
   // spinner that never resolves, since the 30s refetch keeps retrying forever.
-  const { data: kiroUsage, isError: kiroUsageFailed } = useQuery<KiroCreditUsage | 'none' | null>({
+  const { data: kiroUsage, isError: kiroUsageFailed } = useQuery<KiroCreditUsage | 'none' | 'api-key' | null>({
     queryKey: ['kiro-usage'],
     queryFn: () => api.sessionsUsage().then(d => {
       const u: KiroUsagePayload = d?.usage || {}
@@ -1912,8 +1987,11 @@ export default function App() {
         }
         return normalized
       }
-      // Non-Kiro provider (kiro-cli absent) -> hide. Empty cache (Kiro warming) -> spinner.
-      if (u.available === false) return 'none' as const
+      // Non-Kiro provider (kiro-cli absent) -> hide. API-key auth -> terminal
+      // "not available for this auth type" (the pill and modal explain instead
+      // of hiding, because for this account type the state is permanent, not a
+      // warming cache). Empty cache (Kiro warming) -> spinner.
+      if (u.available === false) return u.reason === 'api_key_auth' ? ('api-key' as const) : ('none' as const)
       return null
     }),
     refetchInterval: 30_000,
@@ -1980,16 +2058,35 @@ export default function App() {
     const electronAPI = (window as Window & { electronAPI?: { setDevMode?: (v: boolean) => void } }).electronAPI
     electronAPI?.setDevMode?.(devMode)
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
-  // Native app-menu navigation (Settings…, About): the Electron main process
-  // sends an in-app path; route to it. Accept only plain absolute app paths —
-  // rejects protocol-relative ("//host") and external URLs by construction.
+  // Native app-menu navigation (Settings…, About) and the Crew Companion's "Open
+  // session" CTA: the Electron main process sends an in-app path; route to it.
+  // Accept only plain absolute app paths — rejects protocol-relative ("//host")
+  // and external URLs by construction.
+  //
+  // A session deep link takes the same route a popout's nav intent does — select
+  // the session, then navigate — rather than a bare navigate. `?sid=` is read by
+  // ChatPage only while it MOUNTS, so from an already-open /chat a bare navigate
+  // would surface the dashboard with the previous session still on screen: the
+  // window comes forward and the notification appears to have opened nothing.
   useEffect(() => {
     const electronAPI = (window as Window & { electronAPI?: { onNavigate?: (cb: (path: string) => void) => () => void } }).electronAPI
     if (!electronAPI?.onNavigate) return
     return electronAPI.onNavigate(path => {
-      if (typeof path === 'string' && /^\/(?!\/)/.test(path)) navigate(path)
+      if (typeof path !== 'string' || !/^\/(?!\/)/.test(path)) return
+      const slotKey = chatDeepLinkSlot(path)
+      if (slotKey) {
+        applyNavIntentInMain(
+          // `path` is deliberately dropped in favour of the bare route: a
+          // NavIntent carries no query string, and ChatPage writes `?sid=` back
+          // into the URL itself once the session is active.
+          { path: '/chat', slotKey },
+          { navigate, switchSlot: (key) => { dispatch(switchSlot(key)) } },
+        )
+        return
+      }
+      navigate(path)
     })
-  }, [navigate])
+  }, [navigate, dispatch])
   // Dismiss the dev-page notification dot once the user visits /developer
   useEffect(() => {
     if (location.pathname === '/developer') setDevPageSeen(true)
@@ -2032,21 +2129,35 @@ export default function App() {
     if (lastSeen === version) return
     // First visit — no baseline to diff, just record current version
     if (!lastSeen) { safeSetItem('mc-last-version', version); return }
-    // Version changed — show only new entries since lastSeen
+    // Version changed — show the sections in `lastSeen < v <= version`, and
+    // nothing else. Both bounds are load-bearing, and the missing UPPER one is
+    // the reported bug: `main` is bumped a minor ahead of the released line and a
+    // release's notes are written when it ships, so the newest section in the
+    // file is routinely OLDER than the running build. A 0.6.0 build was opening a
+    // modal headed `[0.4.0]` — the last released line — offering to update to it.
+    //
+    // The lower bound is a version COMPARISON rather than the old equality test
+    // against the last-seen heading. Every build between two releases has no
+    // section of its own, so equality matched nothing and the slice ran to
+    // end-of-file, which is how the stale section got in.
     api.changelog().then(d => {
       if (!d.content) return
-      const lines = d.content.split('\n')
       const filtered: string[] = []
       let include = false
-      for (const line of lines) {
-        if (line.startsWith('## [')) {
-          const v = line.match(/## \[([^\]]+)\]/)?.[1]
-          if (v && lastSeen && v === lastSeen) break
-          include = true
+      for (const line of d.content.split('\n')) {
+        // ANY level-2 heading ends the preceding section, matching the renderer
+        // (`changelog.py:_H2_RE`). Keying only on `## [` left an unversioned
+        // heading and its body inside whichever section came before it.
+        if (/^##\s+\S/.test(line)) {
+          const v = line.match(/^##\s+\[([^\]]+)\]/)?.[1]
+          include = !!v && isNewSection(v, lastSeen, version)
         }
         if (include) filtered.push(line)
       }
       const text = filtered.join('\n').trim()
+      // No qualifying section means this build's release has no notes yet, which
+      // is the normal state on a dev build. Say nothing: the modal exists to
+      // deliver notes, and one carrying someone else's is worse than none.
       if (text) { setChanges(text); setShowChangelog(true) }
     }).catch(() => {}).finally(() => safeSetItem('mc-last-version', version))
   }, [version])  
@@ -2140,10 +2251,14 @@ export default function App() {
     } catch { /* Send the visible request even if hidden context is unavailable. */ }
     try {
       const r = await api.sendChat(visibleMessage, slot, colorTheme)
-      const body = await r.json().catch(() => ({}))
+      const { body, outcome } = await readSendReceipt(r)
       // Resolution is not success: the server accepted neither `ok` nor
-      // `queued`, so no turn started and no WS response is coming.
-      if (!body.ok && !body.queued) reportFailedSend(typeof body.error === 'string' ? body.error : undefined)
+      // `queued`, so no turn started and no WS response is coming. An UNKNOWN
+      // outcome (a 2xx whose body would not parse) is deliberately silent — the
+      // request WAS accepted, so a turn may be running, and this row is the only
+      // signal the pill has: claiming a failure it cannot prove tells the user to
+      // resend a request that already went out.
+      if (outcome === 'refused') reportFailedSend(typeof body.error === 'string' ? body.error : undefined)
     } catch { reportFailedSend() }
   }, [dispatch, navigate, colorTheme, appStore])
 
@@ -2187,10 +2302,21 @@ export default function App() {
   // the two cluster refs this used to keep are gone with the measurement.
   const closeMobileNav = isMobile ? () => setMobileNavOpen(false) : undefined
   const activePath = location.pathname
+  // App Store split (PR1): two sidebar entries share the /apps namespace.
+  //  - Library owns /apps/library and everything under it.
+  //  - Discover owns the store root plus the detail/migrate flows — both are
+  //    storefront surfaces reached from Discover cards, not installed-app UI.
+  //  - Installed-app pages (/apps/:name) highlight NEITHER entry: each
+  //    installed app has its own rail row below (sortedAppGroup, prefix
+  //    match), and before the split the store entry already used an exact
+  //    `=== '/apps'` match, so an app page never lit the store link. Keeping
+  //    that mapping means exactly one row lights at a time.
+  const libraryNavActive = activePath === '/apps/library' || activePath.startsWith('/apps/library/')
+  const discoverNavActive = activePath === '/apps' || activePath.startsWith('/apps/-/') || activePath.startsWith('/apps/detail/') || activePath.startsWith('/apps/migrate/')
   const isChat = activePath === '/chat' || activePath.startsWith('/chat/') || activePath === '/'
   // /webhooks is a full-height rail-and-detail shell (like /capabilities), so it
   // owns its own scrolling and must not sit inside <main>'s scroll container.
-  const needsFixedHeight = isChat || activePath === '/settings' || activePath === '/developer' || activePath === '/capabilities' || activePath === '/webhooks'
+  const needsFixedHeight = isChat || activePath === '/settings' || activePath.startsWith('/settings/') || activePath === '/developer' || activePath === '/capabilities' || activePath === '/webhooks'
 
   // Render one standard nav row (used by the top-fixed mains, the Apps list,
   // and the bottom-fixed section). Active-state, mobile close, chat pin
@@ -2243,8 +2369,10 @@ export default function App() {
     ) : (
     /* h-dvh (100vh fallback) so the shell tracks the visible viewport on
        mobile: a 100vh shell extends under the browser's collapsible UI,
-       which hides the bottom row (the chat composer) on phones. */
-    <div className="h-screen supports-[height:100dvh]:h-dvh w-screen flex flex-col overflow-hidden bg-bg">
+       which hides the bottom row (the chat composer) on phones.
+       w-full, not w-screen: 100vw resolves independently of layout, so it can
+       disagree with the `(max-width: 767px)` query this shell branches on. */
+    <div className="h-screen supports-[height:100dvh]:h-dvh w-full flex flex-col overflow-hidden bg-bg">
       {/* Embedded remote panes receive their switcher model from the parent via
           this bridge (option B) — no-op in the top-level dashboard. */}
       <EmbeddedHostBridge />
@@ -2421,7 +2549,7 @@ export default function App() {
           <button
             type="button"
             onClick={commandPalette.openPalette}
-            className="h-7 flex-1 min-w-0 px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-hover transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
+            className="h-7 flex-1 min-w-0 px-3 rounded-md border border-border bg-card text-muted hover:text-text hover:border-border-strong transition-colors flex items-center justify-center gap-2 cursor-pointer shadow-none"
             /* The trigger has to describe the surface it actually opens. While an app
                owns the quick-search slot the gesture opens a launcher -- typing runs
                commands and does not search the corpora this label promises -- so
@@ -2512,7 +2640,15 @@ export default function App() {
             </ErrorBoundary>
           ) : null
         })()}
-        <div className="tb-right relative">
+        {/* `tb-has-update` shifts the collapse ladder's rungs (index.css): the
+            update pill is a conditional, non-shrinking sibling of the ladder,
+            so while it is mounted the group's fixed content is wider by the
+            pill's footprint and every rung must fire that much earlier. The
+            class keys off the same selector the pill itself reads, so they
+            move together; during the pill's lazy-chunk fetch the class can
+            lead the pill by a moment, which costs readout room briefly and
+            harms nothing. */}
+        <div className={`tb-right relative${updateAvailable ? ' tb-has-update' : ''}`}>
 
           {/* Theme decoration: extra aside control (e.g. a stardate / clock). */}
           {branding?.topBarAside && !(branding?.topBarHideOnMobile && isMobile) && (
@@ -2531,7 +2667,14 @@ export default function App() {
               this fork's usage pill is Kiro-credits-only.) */}
           {(() => {
             const offline = !connected
-            const seg = `flex items-center gap-1 -my-0.5 px-1.5 py-0.5 rounded-md bg-transparent border-none cursor-pointer transition-colors hover:bg-bg-hover ${offline ? 'opacity-70' : ''}`
+            // whitespace-nowrap is the ladder's backstop for the BUILT-IN
+            // segments that share this class string: if the group is ever
+            // narrower than its contents (a locale wider than the measured
+            // budget, the dev-only pseudolocale), a squeezed segment must clip
+            // at the edge, never wrap into two lines the capsule's fixed h-7
+            // then crops. Extension segments bring their own class strings and
+            // are bounded by the capsule's terminal rung instead.
+            const seg = `flex items-center gap-1 -my-0.5 px-1.5 py-0.5 rounded-md bg-transparent border-none cursor-pointer transition-colors hover:bg-bg-hover whitespace-nowrap ${offline ? 'opacity-70' : ''}`
             const segments: ReactNode[] = []
             // The dot doubles as the capsule's collapse toggle: click to
             // fold the readouts down to just the dot, click again to expand.
@@ -2654,6 +2797,13 @@ export default function App() {
                 // spinner are both dropped: without it the failed and warming
                 // states are one coin glyph apart in opacity alone.
                 segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_unavailable')} aria-label={i18nT('app.kiro_credit_usage_unavailable')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
+              } else if (kiroUsageState === 'api-key') {
+                // API-key auth: the usage API needs an SSO/OIDC token this
+                // account type never has, so this is a PERMANENT state, not a
+                // failure. Same terminal dash as 'failed' (nothing is in
+                // flight), but the label says why, and clicking through opens
+                // the modal's fuller explanation.
+                segments.push(<button key="usage" className={`${seg} text-muted opacity-60`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_api_key')} aria-label={i18nT('app.kiro_credit_usage_api_key')}><Coins size={12} /> <span className="font-mono text-[11px] tabular-nums">—</span></button>)
               } else if (!kiroUsageState) {
                 segments.push(<button key="usage" className={`${seg} text-muted`} onClick={() => setKiroUsageOpen(true)} title={i18nT('app.kiro_credit_usage_checking')} aria-label={i18nT('app.kiro_credit_usage_checking_2')}><Coins size={12} /> {!isMobile && <Loader2 size={11} className="animate-spin" />}</button>)
               } else {
@@ -2785,36 +2935,34 @@ export default function App() {
               <div className="text-sm font-bold text-text-strong"><Package className="lucide-inline" /> {i18nT('app.v')}{version}</div>
               <button aria-label={i18nT('app.close')} className="text-muted text-[13px] cursor-pointer hover:text-text" onClick={() => { setShowChangelog(false); setShowFull(false) }}><X className="lucide-inline" /></button>
             </div>
+            {/* The notes are this modal's PAYLOAD, not a garnish on an update
+                offer, so they are no longer gated on `updateAvailable`. The
+                modal opens on a version CHANGE — the reader already has the
+                build — and the common case right after an update is that no
+                further update is pending, which is exactly when the old gate
+                replaced the notes with "You're on the latest version" and
+                delivered nothing. Availability is a separate fact and now has
+                its own row below. */}
+            <div className="text-[13px] font-medium text-muted uppercase tracking-wider mb-2">{i18nT('app.what_s_new')}</div>
+            <div className="p-3 bg-bg rounded-lg border border-border max-h-56 overflow-y-auto mb-4">
+              <div className="text-[13px] text-text leading-relaxed"><MarkdownRenderer content={changes} /></div>
+            </div>
             {updateAvailable ? (
-              <>
-                {changes ? (
-                  <>
-                    <div className="text-[13px] font-medium text-muted uppercase tracking-wider mb-2">{i18nT('app.what_s_new')}</div>
-                    <div className="p-3 bg-bg rounded-lg border border-border max-h-56 overflow-y-auto mb-4">
-                      <div className="text-[13px] text-text leading-relaxed"><MarkdownRenderer content={changes} /></div>
-                    </div>
-                  </>
-                ) : (
-                  <div className="p-3 bg-bg rounded-lg border border-border mb-4">
-                    <div className="text-[13px] text-muted leading-relaxed">{i18nT('app.a_newer_version_is_available_no_changelog_entry')}</div>
-                  </div>
-                )}
-                {affordance === 'apply' ? (
-                  <button className="w-full py-2 rounded-lg text-[13px] font-medium cursor-pointer bg-accent text-accent-fg border-none hover:opacity-90 transition-opacity" onClick={handleUpdate}>
-                    {i18nT('app.update_now')}
-                  </button>
-                ) : affordance === 'command' ? (
-                  // This install cannot replace its own code from here: `POST
-                  // /api/update` is git fetch + reset, so a wheel install answers
-                  // 400/409 and a desktop bundle is owned by its own updater.
-                  // Settings > About carries the same command with an explanation
-                  // and a copy button.
-                  <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
-                    data-testid="modal-update-command">
-                    {updateCommand}
-                  </div>
-                ) : null}
-              </>
+              affordance === 'apply' ? (
+                <button className="w-full py-2 rounded-lg text-[13px] font-medium cursor-pointer bg-accent text-accent-fg border-none hover:opacity-90 transition-opacity" onClick={handleUpdate}>
+                  {i18nT('app.update_now')}
+                </button>
+              ) : affordance === 'command' ? (
+                // This install cannot replace its own code from here: `POST
+                // /api/update` is git fetch + reset, so a wheel install answers
+                // 400/409 and a desktop bundle is owned by its own updater.
+                // Settings > About carries the same command with an explanation
+                // and a copy button.
+                <div className="p-2.5 bg-bg rounded-lg border border-border font-mono text-[12px] text-text break-all"
+                  data-testid="modal-update-command">
+                  {updateCommand}
+                </div>
+              ) : null
             ) : (
               <div className="text-sm text-muted py-4 text-center"><CheckCircle className="lucide-inline" /> {i18nT('app.you_re_on_the_latest_version')}</div>
             )}
@@ -3029,31 +3177,46 @@ export default function App() {
               the big logo alone separates well). */}
           {!effectiveCollapsed && <div aria-hidden="true" className="h-px bg-border shrink-0 mb-[7px]" />}
           {advertisedNavItems.filter(n => n.group === 'Main').map(n => <div key={n.id}>{renderNavRow(n)}</div>)}
-          {/* Apps section header. "Explore" (the App Store) rides the header
-              row in accent when expanded; collapsed it becomes a regular
-              muted icon row like its neighbors. No shared-layout fly-across:
-              the header link simply unmounts and the collapsed row fades in
-              and slides up into place. */}
+          {/* Apps section: the old single "Explore" header link split into two
+              nav rows — Discover (the storefront, /apps) and Library
+              (installed-app management, /apps/library). Expanded keeps the
+              muted "Apps" section label above them; collapsed renders the two
+              rows as regular icon rows like their neighbors. The unread-updates
+              badge rides Discover (navId "apps"), matching where update
+              discovery lives. NavItem carries data-onboarding-nav={navId}, so
+              the onboarding anchor "apps" stays on the Discover row. */}
           {!effectiveCollapsed ? (
-            <div className="nav-section flex items-center justify-between gap-2 pl-3 pr-1 pt-3 pb-1">
-              <span
-                // `overflow-hidden` + `whitespace-nowrap` means this clips
-                // silently once the label grows — which it does in a longer
-                // locale. The `title` keeps the full string reachable instead
-                // of losing the tail with no affordance.
-                title={i18nT('app.apps')}
-                className="text-[13px] font-medium text-muted whitespace-nowrap overflow-hidden"
-              >{i18nT('app.apps')}</span>
-              <Clickable
-                data-onboarding-nav="apps"
-                onClick={() => { closeMobileNav?.(); navigate('/apps') }}
-                className={`flex items-center gap-1.5 px-1.5 py-1 rounded-md cursor-pointer text-[12px] font-medium whitespace-nowrap transition-colors ${activePath === '/apps' ? 'text-accent bg-accent-subtle' : 'text-accent hover:bg-bg-hover'}`}
-                aria-label={i18nT('app.explore_apps')}
-              >
-                <LayoutGrid size={14} className="shrink-0" />
-                {i18nT('app.explore')}
-              </Clickable>
-            </div>
+            <>
+              <div className="nav-section flex items-center pl-3 pr-1 pt-3 pb-1">
+                <span
+                  // `overflow-hidden` + `whitespace-nowrap` means this clips
+                  // silently once the label grows — which it does in a longer
+                  // locale. The `title` keeps the full string reachable instead
+                  // of losing the tail with no affordance.
+                  title={i18nT('app.apps')}
+                  className="text-[13px] font-medium text-muted whitespace-nowrap overflow-hidden"
+                >{i18nT('app.apps')}</span>
+              </div>
+              <NavItem
+                navId="apps"
+                path="/apps"
+                label={i18nT('nav.discover')}
+                icon={<Compass size={16} />}
+                active={discoverNavActive}
+                collapsed={false}
+                onClick={closeMobileNav}
+                badge={<NavBadge navId="apps" collapsed={false} appBadges={discoverBadges} />}
+              />
+              <NavItem
+                navId="apps-library"
+                path="/apps/library"
+                label={i18nT('nav.library')}
+                icon={<LayoutGrid size={16} />}
+                active={libraryNavActive}
+                collapsed={false}
+                onClick={closeMobileNav}
+              />
+            </>
           ) : (
             <motion.div
               className="mt-4"
@@ -3064,12 +3227,21 @@ export default function App() {
               <NavItem
                 navId="apps"
                 path="/apps"
-                label={i18nT('app.explore_apps')}
-                icon={<LayoutGrid size={16} />}
-                active={activePath === '/apps'}
+                label={i18nT('nav.discover')}
+                icon={<Compass size={16} />}
+                active={discoverNavActive}
                 collapsed
                 onClick={closeMobileNav}
-                badge={<NavBadge navId="apps" collapsed appBadges={appBadges} />}
+                badge={<NavBadge navId="apps" collapsed appBadges={discoverBadges} />}
+              />
+              <NavItem
+                navId="apps-library"
+                path="/apps/library"
+                label={i18nT('nav.library')}
+                icon={<LayoutGrid size={16} />}
+                active={libraryNavActive}
+                collapsed
+                onClick={closeMobileNav}
               />
             </motion.div>
           )}
@@ -3193,7 +3365,7 @@ export default function App() {
                 path={s.path}
                 label={surfaceLabel(s)}
                 icon={s.icon}
-                active={activePath === s.path}
+                active={activePath === s.path || activePath.startsWith(s.path + '/')}
                 collapsed={effectiveCollapsed}
                 onClick={closeMobileNav}
                 badge={updateAvailable ? <span title={i18nT('app.update_available')} role="status" aria-label={i18nT('app.update_available_2')} className={effectiveCollapsed ? 'absolute top-1 right-1 w-2 h-2 bg-accent rounded-full z-10' : 'absolute top-1/2 -translate-y-1/2 right-2 w-2 h-2 bg-accent rounded-full z-10'} /> : undefined}
@@ -3362,8 +3534,10 @@ export default function App() {
             <Route path="/chat/:slug?" element={<ErrorBoundary><ChatPage /></ErrorBoundary>} />
             <Route path="/orchestrated/:slug?" element={<OrchestratedRedirect />} />
             <Route path="/notifications" element={<ErrorBoundary><NotificationsPage /></ErrorBoundary>} />
-            <Route path="/knowledge" element={<ErrorBoundary><KnowledgePage /></ErrorBoundary>} />
-            <Route path="/overview" element={<Navigate to="/settings?tab=overview" replace />} />
+            {/* Knowledge moved into Agent Capabilities; old bookmarks land on its tab. */}
+            <Route path="/knowledge" element={<Navigate to="/capabilities?tab=knowledge" replace />} />
+            <Route path="/members" element={<ErrorBoundary><Suspense fallback={null}><MembersPage /></Suspense></ErrorBoundary>} />
+            <Route path="/overview" element={<Navigate to="/settings/overview" replace />} />
             <Route path="/schedule" element={<SchedulePage />} />
             {/* Agents and Connections live in the Agent Capabilities panel. */}
             <Route path="/agents" element={<Navigate to="/capabilities" replace />} />
@@ -3375,12 +3549,23 @@ export default function App() {
             <Route path="/webhooks" element={<ErrorBoundary><WebhooksPage /></ErrorBoundary>} />
             <Route path="/capabilities" element={<CapabilitiesPage />} />
             {/* Instances setup moved into Settings; switching happens via the header tab strip. */}
-            <Route path="/instances" element={<Navigate to="/settings?tab=instances" replace />} />
-            <Route path="/apps" element={<AppsPage />} />
+            <Route path="/instances" element={<Navigate to="/settings/instances" replace />} />
+            {/* Static segments (library, detail, migrate) MUST stay registered
+                before the /apps/:name installed-app catch-all -- they are
+                reserved app-name words enforced server-side. The '-/' prefix
+                (e.g. /apps/-/updates) needs NO server-side reservation: '-' is
+                not a valid app name, so it can never collide with an installed
+                app -- the reserved set stays frozen at 'library'. */}
+            <Route path="/apps" element={<Suspense fallback={null}><DiscoverPage /></Suspense>} />
+            <Route path="/apps/-/updates" element={<Suspense fallback={null}><DiscoverPage /></Suspense>} />
+            <Route path="/apps/library" element={<Suspense fallback={null}><LibraryPage /></Suspense>} />
             <Route path="/apps/detail/:name" element={<AppDetailPage />} />
             <Route path="/apps/migrate/:name" element={<MigrationPage />} />
             <Route path="/apps/:name" element={<AppPage />} />
-            <Route path="/settings" element={<SettingsPage />} />
+            {/* Splat route: SettingsPage parses the trailing segments itself
+                (segment[0] = tab, segment[1] = sub; deeper segments reserved).
+                Matches bare /settings too (empty splat). */}
+            <Route path="/settings/*" element={<SettingsPage />} />
             <Route path="/developer" element={<DeveloperPage />} />
             <Route path="/artifacts" element={<ArtifactsPage />} />
             <Route path="/artifacts/deploy" element={<Navigate to="/deploy" replace />} />

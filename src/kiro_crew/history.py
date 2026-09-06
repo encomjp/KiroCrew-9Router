@@ -22,7 +22,7 @@ from collections.abc import Callable, Container, Iterator
 from collections.abc import Set as AbstractSet
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, Literal, NamedTuple, TypeVar, overload
 
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
@@ -1830,6 +1830,14 @@ _METADATA_READ_RETRY_SECS = 0.02
 _V = TypeVar("_V")
 
 
+class _FileChangeCacheEntry(NamedTuple):
+    """Lightweight projection of one unchanged transcript revision."""
+
+    stamp: tuple[int, int, int, int]
+    generation: int
+    messages: list[dict]
+
+
 class _LRUCache(Generic[_V]):
     """A tiny bounded LRU cache with a dict-compatible surface.
 
@@ -2173,6 +2181,12 @@ class ConversationLog:
         #: staleness (an append bumps the file mtime, so the entry is
         #: recomputed on the next call). Own ``_LRUCache`` → own internal lock.
         self._recent_cache: _LRUCache[tuple[float, list[dict]]] = _LRUCache(cache_max)
+        #: Bounded memo of lightweight message projections containing only
+        #: ``ts`` and ``meta.file_changes``. The Artifacts "All" view scans
+        #: every session, so routing it through ``_msg_cache`` retains the full
+        #: parsed transcript corpus. The file stamp includes inode and size in
+        #: addition to nanosecond mtime so rotations and atomic rewrites miss.
+        self._file_change_cache: _LRUCache[_FileChangeCacheEntry] = _LRUCache(cache_max)
         #: Bounded memo of ``(mtime, gen, doc_chars, casefolded_blob)`` per
         #: session, consumed only by :meth:`search_sessions`. ``gen`` is the
         #: invalidation generation (:meth:`_cache_gen`) the entry was folded
@@ -3492,17 +3506,6 @@ class ConversationLog:
             )
         return failures, retry_at
 
-    def load_transcript(self, key: str) -> str:
-        """Load full session as formatted text for LLM summarization."""
-        messages = self._read_messages(key)
-        if not messages:
-            return ""
-        lines: list[str] = []
-        for m in messages:
-            role = m["role"].title()
-            lines.append(f"{role}: {m['content']}")
-        return "\n\n".join(lines)
-
     @staticmethod
     def _canonical_key(key: str) -> str:
         """Collapse stacked ``dashboard_`` prefixes to a single one.
@@ -4160,6 +4163,74 @@ class ConversationLog:
         """
         return self._read_messages(key)
 
+    def read_file_change_messages(self, key: str) -> list[dict]:
+        """Return lightweight rows that carry ``meta.file_changes``.
+
+        Transcript lines without the serialized key are skipped as raw bytes;
+        only candidate lines are decoded and parsed. This keeps the Artifacts
+        session-document scan proportional in memory to the file-change rows,
+        not to every message and tool result in every session, and never warms
+        :attr:`_msg_cache`.
+
+        The returned list may be the shared cached object; callers must treat it
+        as read-only. An unreadable file propagates ``OSError`` so a caller can
+        distinguish it from a valid session with no document changes.
+        """
+        path = self._path(key)
+        gen = self._cache_gen(key)
+        try:
+            before = path.stat()
+        except FileNotFoundError:
+            self._file_change_cache.pop(key, None)
+            return []
+        stamp = (before.st_mtime_ns, before.st_size, before.st_ino, before.st_dev)
+        cached = self._file_change_cache.get(key)
+        if (
+            cached is not None
+            and cached.stamp == stamp
+            and cached.generation == self._cache_gen(key)
+        ):
+            return cached.messages
+
+        messages: list[dict] = []
+        with open(path, "rb") as handle:
+            for raw in handle:
+                if b'"file_changes"' not in raw:
+                    continue
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(data, dict) or data.get("_type") == "metadata":
+                    continue
+                meta = data.get("meta")
+                if not isinstance(meta, dict):
+                    continue
+                file_changes = meta.get("file_changes")
+                if not isinstance(file_changes, list):
+                    continue
+                messages.append(
+                    {
+                        "ts": data.get("ts"),
+                        "meta": {"file_changes": file_changes},
+                    }
+                )
+
+        try:
+            after = path.stat()
+        except OSError:
+            return messages
+        after_stamp = (after.st_mtime_ns, after.st_size, after.st_ino, after.st_dev)
+        if after_stamp == stamp:
+            self._publish_if_current(
+                self._file_change_cache,
+                key,
+                _FileChangeCacheEntry(stamp, gen, messages),
+                key=key,
+                gen=gen,
+            )
+        return messages
+
     def read_messages_chained(self, key: str) -> list[dict]:
         """Read messages from all session files sharing the same ``tab_id``.
 
@@ -4367,7 +4438,28 @@ class ConversationLog:
             if chained not in keys:
                 keys.append(chained)
 
-    def delete_session(self, key: str) -> bool:
+    @overload
+    def delete_session(
+        self,
+        key: str,
+        *,
+        skip_pinned: Literal[False] = ...,
+    ) -> bool: ...
+
+    @overload
+    def delete_session(
+        self,
+        key: str,
+        *,
+        skip_pinned: Literal[True],
+    ) -> bool | None: ...
+
+    def delete_session(
+        self,
+        key: str,
+        *,
+        skip_pinned: bool = False,
+    ) -> bool | None:
         """Delete a session file. Returns True if a file was removed.
 
         The existence check and unlink run under ``_locked`` so a concurrent
@@ -4380,10 +4472,42 @@ class ConversationLog:
         between our existence check and the unlink). On a wedged holder the lock
         acquire raises ``HistoryLockTimeout``; we report "not removed" rather
         than delete unlocked (the very clobber this lock prevents).
+
+        Args:
+            skip_pinned: If True, check the session's metadata under the same
+                lock and return None (skip) if pinned=True OR if the metadata
+                is transiently unreadable. This makes the pin-check-and-delete
+                atomic so a concurrent pin cannot sneak in between.
+
+        Returns:
+            True if a file was removed, False if nothing to remove or unlink
+            failed, None if skipped due to skip_pinned + (pinned OR unreadable).
         """
         existed = False
         try:
             with self._locked(key):
+                if skip_pinned:
+                    try:
+                        meta, readable = self.get_metadata_status(key)
+                    except Exception:
+                        # Corrupt metadata, permanent I/O failure — skip (don't
+                        # delete blind). Log so aggregate 'skipped' count is
+                        # diagnosable.
+                        logger.warning(
+                            "delete_session: unexpected error reading metadata "
+                            "for %s, skipping",
+                            key,
+                            exc_info=True,
+                        )
+                        return None
+                    if not readable:
+                        # Transient read failure (Windows indexer/AV hold) — skip
+                        # quietly so the caller can retry later.
+                        return None
+                    if not isinstance(meta, dict):
+                        return None  # malformed -> skip
+                    if meta.get("pinned"):
+                        return None  # pinned -> skip
                 path = self._path(key)
                 existed = path.exists()
                 try:
@@ -5206,6 +5330,7 @@ class ConversationLog:
         for ident in idents:
             self._msg_cache.pop(ident, None)
             self._meta_cache.pop(ident, None)
+            self._file_change_cache.pop(ident, None)
             # The tab_id memo's mtime guard cannot see a write that goes through
             # this class, because those restore the pre-write mtime. This pop is
             # what does -- under every spelling, for the same reason as the rest:
@@ -5242,8 +5367,22 @@ class ConversationLog:
     #: Max characters returned in a last-message preview.
     _PREVIEW_MAX_CHARS = 120
 
-    def last_message_preview(self, key: str) -> str:
+    def last_message_preview(self, key: str, sanitize=None) -> str:
         """Return a short preview of the session's last message ('' if none).
+
+        Thin wrapper over :meth:`last_message_info` — see it for the tail-read
+        mechanics and the ``sanitize`` ordering contract.
+        """
+        return self.last_message_info(key, sanitize=sanitize)[0]
+
+    def last_message_info(self, key: str, sanitize=None) -> tuple[str, float]:
+        """Return ``(preview, message_ts)`` for the session's newest message.
+
+        ``message_ts`` is the epoch seconds of the SAME row the preview came
+        from — the newest user/assistant message — so a caller ordering rows by
+        it sorts by what the preview shows, not by the file's mtime (which any
+        non-message write also bumps). ``0.0`` when the row has no parseable
+        ``ts`` (pre-timestamp transcripts) or no message exists.
 
         Reads only the tail of the JSONL file (bounded), scanning backwards
         for the newest parseable message line — cheap even on large sessions.
@@ -5252,12 +5391,20 @@ class ConversationLog:
         If the initial tail window yields nothing parseable (a single trailing
         line larger than the window), retries once with a 16× window before
         giving up.
+
+        ``sanitize`` (a ``str -> str`` callable) runs on the FULL extracted
+        text BEFORE the length cap. Order is load-bearing: a credential that
+        straddles the truncation boundary leaves a partial token the caller's
+        pattern-based redactors can no longer match, so redaction after
+        truncation lets a raw credential prefix through. Callers inject the
+        redaction chain here (a callable, so this module never imports the
+        security layer).
         """
         path = self._path(key)
         try:
             size = path.stat().st_size
         except OSError:
-            return ""
+            return "", 0.0
         for window in (self._PREVIEW_TAIL_BYTES, self._PREVIEW_TAIL_BYTES * 16):
             try:
                 with open(path, "rb") as f:
@@ -5266,7 +5413,7 @@ class ConversationLog:
                         f.readline()  # discard the (likely partial) first line
                     tail = f.read().decode("utf-8", errors="replace")
             except OSError:
-                return ""
+                return "", 0.0
             for line in reversed(tail.splitlines()):
                 line = line.strip()
                 if not line:
@@ -5283,12 +5430,24 @@ class ConversationLog:
                 preview = strip_markdown_preview(text)
                 if not preview:
                     continue
+                if sanitize is not None:
+                    # Full text first, cap second — see the docstring.
+                    preview = sanitize(preview)
                 if len(preview) > self._PREVIEW_MAX_CHARS:
                     preview = preview[: self._PREVIEW_MAX_CHARS].rstrip() + "…"
-                return preview
+                ts_raw = data.get("ts")
+                ts_epoch = 0.0
+                if isinstance(ts_raw, str) and ts_raw:
+                    try:
+                        ts_epoch = datetime.fromisoformat(
+                            ts_raw.strip().replace("Z", "+00:00")
+                        ).timestamp()
+                    except ValueError:
+                        pass  # unparseable ts — the row still previews
+                return preview, ts_epoch
             if size <= window:
                 break  # the window already covered the whole file — no retry
-        return ""
+        return "", 0.0
 
     @staticmethod
     def _content_text(content: object) -> str:
@@ -5336,15 +5495,15 @@ class ConversationLog:
     def _pause_for_transient_retry(self) -> None:
         """Pause briefly before retrying a transient read, but ONLY off the loop.
 
-        Shared by :meth:`_read_metadata` and :meth:`_read_messages`. Both are
-        reached ON the event loop by ``restore_open_slots_async`` (which keeps
-        the whole restore on the loop deliberately: creating a slot broadcasts
-        through ``asyncio.Queue.put_nowait`` / ``Event.set``, neither
-        thread-safe). A kernel sleep there stops ``_loop_heartbeat`` from petting
-        the LoopStallWatchdog -- whose ``exit_after`` timer then kills the
-        gateway, the exact crash-loop the async restore exists to prevent. So
-        sleep only when NOT on a running loop; on the loop the retry is
-        immediate (a stat plus an open -- cheap enough to be worth taking).
+        Shared by :meth:`_read_metadata` and :meth:`_read_messages`. Since #895
+        the startup restore prefetches both in ``asyncio.to_thread``, so the
+        common bulk-restore caller lands here OFF the loop and gets the patient
+        path. On-loop callers remain (any read reached directly from a coroutine),
+        and for them a kernel sleep stops ``_loop_heartbeat`` from petting the
+        LoopStallWatchdog -- whose ``exit_after`` timer then kills the gateway,
+        the exact crash-loop the async restore exists to prevent. So sleep only
+        when NOT on a running loop; on the loop the retry is immediate (a stat
+        plus an open -- cheap enough to be worth taking).
         """
         on_loop = True
         try:

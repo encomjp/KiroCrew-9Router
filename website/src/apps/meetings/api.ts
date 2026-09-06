@@ -13,7 +13,7 @@ const API = '/api/apps/meetings'
 export type MeetingStatus = 'idle' | 'active' | 'paused' | 'reviewing' | 'ended'
 export type WidgetType = 'markdown' | 'html' | 'chat'
 export type TaskPriority = 'high' | 'medium' | 'low'
-export type TranscriptSource = 'speech' | 'typed'
+export type TranscriptSource = 'speech' | 'typed' | 'system'
 
 /**
  * Full literal catalog keys per enum value, not a suffix interpolated at the call
@@ -63,6 +63,28 @@ export interface MeetingsConfig {
   default_preset: string
   poll_interval_active: number
   poll_interval_idle: number
+  /** Target language for live transcript translation; `''` means off (the default). */
+  translation_language: string
+}
+
+/** One translated transcript line. `text` is `''` when the translation failed. */
+export interface TranslationLine {
+  n: number
+  source: string
+  text: string
+  at?: string
+}
+
+export interface TranslationsResponse {
+  language: string
+  /** The language's endonym, resolved server-side. `''` when translation is off. */
+  language_label: string
+  lines: TranslationLine[]
+  /** Cursor to send back as `since` on the next poll. */
+  next_n: number
+  /** Lines waiting on the model, and lines dropped because the backlog was full. */
+  pending: number
+  dropped: number
 }
 
 export interface ProviderRow {
@@ -76,6 +98,8 @@ export interface ConfigResponse {
   task_providers: ProviderRow[]
   calendar_providers: ProviderRow[]
   stt_providers: ProviderRow[]
+  /** Accepted live-translation targets. Labels are endonyms, not translated. */
+  translation_languages: ProviderRow[]
 }
 
 export interface Attachment {
@@ -122,10 +146,15 @@ export interface LiveStatus {
   agents: Record<string, AgentQueueStatus>
   agents_paused: boolean
   expired: boolean
-  /** Whether a dispatch sent now would be admitted (transcript ingress open).
+  /** Whether a dispatch sent now would be fanned out to the agents directly.
    *  Present on the meeting poll (`GET /meetings/{id}`), whose consumer gates
    *  the microphone on it; absent from the bare `/status` endpoint. */
   accepting_dispatches?: boolean
+  /** Whether a dispatch sent now would be HELD until the agents finish
+   *  initializing, rather than refused with a 409. Speech lands either way, so
+   *  the microphone gate is this OR `accepting_dispatches` — see
+   *  `canOpenTranscription`. */
+  buffering_dispatches?: boolean
 }
 
 export interface Task {
@@ -275,6 +304,15 @@ export const meetingsApi = {
   transcript: (id: string, cursor = 0) =>
     request<TranscriptResponse>(
       `/meetings/${encodeURIComponent(id)}/transcript${cursor ? `?cursor=${cursor}` : ''}`,
+    ),
+  /**
+   * Translated lines newer than `since`. Cursor-based rather than full-document:
+   * the panel polls while it is open and a long meeting accumulates hundreds of
+   * lines, so resending all of them each time would grow linearly for no gain.
+   */
+  translations: (id: string, since = 0) =>
+    request<TranslationsResponse>(
+      `/meetings/${encodeURIComponent(id)}/translations?since=${encodeURIComponent(String(since))}`,
     ),
   attachments: (id: string, body: { action: 'add' | 'remove'; attachments?: Attachment[]; index?: number }) =>
     post<{ attachments: Attachment[] }>(`/meetings/${encodeURIComponent(id)}/attachments`, body),

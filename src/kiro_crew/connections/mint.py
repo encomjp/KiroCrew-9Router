@@ -42,7 +42,6 @@ be called straight from a coroutine without failing the suite.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -52,7 +51,6 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, TypedDict
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 # ``kiro_crew.agent`` is imported as a MODULE, not as symbols: the agents dir and
@@ -60,11 +58,12 @@ from uuid import uuid4
 # path) can substitute them. ``from ... import f`` would freeze this module's own
 # binding.
 from kiro_crew import agent as _agent
-from kiro_crew import hooks as _hooks
 from kiro_crew.acp.client import AcpClient
+from kiro_crew.agent_discovery import _read_agent_spec
 from kiro_crew.agent_files import AGENT_FILENAME, OWNED_KIRO_AGENT_FILES
 from kiro_crew.config.loader import data_home
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.mcp_grant import grant_observed
 from kiro_crew.mcp_utils import mcp_server_alias
 from kiro_crew.security import oauth_url_contains_credential
 from kiro_crew.sel import sel
@@ -92,16 +91,6 @@ _MINT_SPEC_ORPHAN_SECONDS = _MINT_TTL_SECONDS * 2
 # Serializes this process's manifest read-modify-writes.
 _MINT_MANIFEST_LOCK = threading.Lock()
 
-# kiro-cli's MCP OAuth artifact directory, and the paired suffixes it writes per
-# authorized server.
-_KIRO_OAUTH_CACHE_RELATIVE = (".aws", "sso", "cache")
-_TOKEN_SUFFIX = ".token.json"
-_REGISTRATION_SUFFIX = ".registration.json"
-_DEFAULT_HTTPS_PORT = 443
-# SEL label for the grant-presence stat, registered in
-# ``hooks._AUDIT_ONLY_READ_IDS``. Emitting with an unregistered id records nothing.
-_GRANT_PRESENCE_READ_ID = "connections_mint.oauth_grant_presence"
-
 
 class MintState(TypedDict, total=False):
     """A mint's row. The holdings are released on teardown, never served."""
@@ -116,6 +105,14 @@ class MintState(TypedDict, total=False):
     agent: str  # ephemeral spec name
     spec_path: str  # the exact file this flow wrote, and the only one it deletes
     pid: int  # sweep-protected for as long as the process is held
+    # Set only by the warm table (:mod:`kiro_crew.connections.warm`). A shared row
+    # owns no ``client``: its URL was minted on a process it shares with every
+    # other card, so redeemability is judged by generation AND activation liveness
+    # instead. Declared here because the table itself is shared, and a row type
+    # that cannot describe half its rows pushes every read through a cast.
+    shared: bool
+    generation: int  # the shared process that holds this row's PKCE verifier
+    activation: int  # the session that owns this row's loopback listener
 
 
 _mints: dict[str, MintState] = {}
@@ -135,93 +132,9 @@ def _new_mint_token() -> str:
     return uuid4().hex
 
 
-def kiro_oauth_cache_dir(*, home: Path | None = None) -> Path:
-    """The directory kiro-cli writes MCP OAuth artifacts into."""
-    return (home or Path.home()).joinpath(*_KIRO_OAUTH_CACHE_RELATIVE)
-
-
-def grant_key(mcp_url: str) -> str:
-    """kiro-cli's cache key for ``mcp_url``.
-
-    Mirrors ``mcp_client::oauth_util::compute_key``: sha256 over the URL's ASCII
-    origin serialization concatenated with its path. The default HTTPS port is
-    omitted and an empty path normalizes to ``/`` -- both are what the Rust
-    ``url`` crate does before hashing, and getting either wrong makes the key
-    miss, which reports a granted provider as ungranted.
-    """
-    parts = urlsplit(mcp_url)
-    origin = f"{parts.scheme.lower()}://{(parts.hostname or '').lower()}"
-    if parts.port is not None and parts.port != _DEFAULT_HTTPS_PORT:
-        origin = f"{origin}:{parts.port}"
-    return hashlib.sha256(f"{origin}{parts.path or '/'}".encode("utf-8")).hexdigest()
-
-
-def grant_artifact_paths(mcp_url: str, *, cache_dir: Path | None = None) -> tuple[Path, Path]:
-    """The paired grant artifact paths for ``mcp_url`` (token, registration).
-
-    The single source of the artifact layout, shared with the status module so
-    its indeterminacy probe cannot drift from what :func:`grant_present` stats.
-    """
-    directory = cache_dir if cache_dir is not None else kiro_oauth_cache_dir()
-    key = grant_key(mcp_url)
-    return (
-        directory / f"{key}{_TOKEN_SUFFIX}",
-        directory / f"{key}{_REGISTRATION_SUFFIX}",
-    )
-
-
-def grant_present(mcp_url: str, *, cache_dir: Path | None = None) -> bool:
-    """Whether kiro-cli holds a persisted grant for ``mcp_url``.
-
-    Presence only: the paired artifacts are stat-ed and never opened, so token
-    material cannot reach this process. Both must exist -- a lone token file also
-    matches the single-file SSO naming this directory mixes in.
-
-    Blocking: the stats are sub-millisecond against a local home but stall for as
-    long as the mount does against a network-mounted one, so async callers run this
-    through ``asyncio.to_thread`` rather than on the event loop.
-    """
-    token, registration = grant_artifact_paths(mcp_url, cache_dir=cache_dir)
-    return token.is_file() and registration.is_file()
-
-
 def _acp_client_factory() -> Any:
     """Indirection so tests can substitute a fake client class."""
     return AcpClient
-
-
-async def _grant_observed(mcp_url: str) -> bool:
-    """:func:`grant_present` off the loop, SEL-audited when a grant is observed.
-
-    Audited on the TRUE result only, and deliberately NOT once per stat. The
-    watcher polls every ``_MINT_GRANT_POLL_SECONDS`` for up to the TTL, so a
-    per-stat audit would write up to ``_MINT_TTL_SECONDS //
-    _MINT_GRANT_POLL_SECONDS`` events for a single flow, each one synchronous by
-    design (``hooks._emit_internal_read_audit`` marks the event critical so it
-    drains the queue and cannot be silently lost). A negative poll observed
-    nothing and changed nothing; the access that owes a trail is the one a caller
-    ACTS on -- it moves a row to ``granted`` or short-circuits a Connect -- and
-    that one is recorded.
-
-    Best-effort, NOT fail-closed, which is a deliberate departure from
-    :func:`hooks.safe_read_file_internal`. That gate denies on an unrecordable
-    audit because a success there hands back live credential BYTES; nothing
-    sensitive crosses this boundary at all -- the artifacts are stat-ed, never
-    opened -- so denying would convert an SEL outage into a Connect that never
-    completes after the user actually consented. An unaudited boolean is the
-    lesser failure, and it still leaves a warning behind.
-    """
-    present = await asyncio.to_thread(grant_present, mcp_url)
-    if present:
-        recorded = await asyncio.to_thread(
-            _hooks.emit_internal_read_audit, _GRANT_PRESENCE_READ_ID, "success"
-        )
-        if not recorded:
-            logger.warning(
-                "grant-presence audit for %r could not be recorded; proceeding unaudited",
-                mcp_url,
-            )
-    return present
 
 
 def _mint_spec_name(alias: str) -> str:
@@ -447,11 +360,30 @@ def _write_mint_agent_spec(slug: str) -> tuple[str, str]:
     this provider's challenge, all of it on the path the card waits on.
 
     Falls back to the main agent name when ``slug`` has no entry in the main spec
-    yet, so a mint never ends up with FEWER servers than it needs.
+    yet, so a mint never ends up with FEWER servers than it needs. A main spec
+    that exists but is REFUSED by the hardened reader raises ``OSError`` instead:
+    the fallback would hand the refused file to the spawned child to reload.
     """
     agents_dir = _agent.kiro_agents_dir_path()
     alias = mcp_server_alias(slug)
-    entry = (_agent._load_json(agents_dir / AGENT_FILENAME).get("mcpServers") or {}).get(alias)
+    # Hardened reader (#6736). A REFUSED main spec (oversize, sensitive symlink,
+    # non-object) must NOT reach the main-agent fallback: that fallback spawns
+    # ``kiro-cli --agent kirocrew``, and the child would reload the very file the
+    # gateway just refused to read -- uncapped and unguarded. Raising instead
+    # lands in the mint flow's failure path (retryable ``failed`` row, holdings
+    # disposed, no child spawned). The fallback below stays reserved for what it
+    # always meant: the file or the alias entry being genuinely absent.
+    spec = _read_agent_spec(
+        agents_dir / AGENT_FILENAME,
+        operation="connections_mint",
+        source="dashboard",
+    )
+    if spec is None:
+        if (agents_dir / AGENT_FILENAME).exists():
+            logger.warning("Main agent spec unusable; refusing to mint for %r", alias)
+            raise OSError("main agent spec unusable")
+        spec = {}
+    entry = (spec.get("mcpServers") or {}).get(alias)
     if not isinstance(entry, dict):
         logger.debug("No %r entry in the main agent spec; minting with %r", alias, _MAIN_AGENT_NAME)
         return _MAIN_AGENT_NAME, ""
@@ -552,7 +484,7 @@ async def _mint_watcher(slug: str, mcp_url: str, token: str) -> None:
         deadline = time.monotonic() + _MINT_TTL_SECONDS
         while time.monotonic() < deadline:
             await asyncio.sleep(_MINT_GRANT_POLL_SECONDS)
-            if await _grant_observed(mcp_url):
+            if await grant_observed(mcp_url):
                 doomed: MintState | None = None
                 async with _mints_lock:
                     entry = _mints.get(slug)
@@ -590,8 +522,8 @@ def _log_mint_outcome(slug: str, outcome: str, detail: str) -> None:
 
     Blocking on FIRST use: the append itself is queued to SEL's writer thread, but
     the first ``sel()`` of a process constructs the log -- trust-dir creation, key
-    validation, a backward scan of the existing log, and on Windows an ``icacls``
-    subprocess. Async callers go through ``asyncio.to_thread``.
+    validation, a backward scan of the existing log, and on Windows the owner-only
+    DACL on the key file. Async callers go through ``asyncio.to_thread``.
     """
     sel().log_api_access(
         caller="dashboard",
@@ -703,7 +635,7 @@ async def start_oauth_mint(
     # aged orphans. Off-loop: it reads and rewrites the manifest, and may unlink.
     await asyncio.to_thread(_sweep_mint_specs)
 
-    if await _grant_observed(mcp_url):
+    if await grant_observed(mcp_url):
         # Consent already exists (a reconnect): no URL is needed.
         async with _mints_lock:
             if _mints.get(slug, {}).get("token") == my_token:
@@ -896,7 +828,17 @@ def _agent_spec_entry_missing(slug: str) -> bool:
     through ``asyncio.to_thread``.
     """
     agents_dir = _agent.kiro_agents_dir_path()
-    servers = _agent._load_json(agents_dir / AGENT_FILENAME).get("mcpServers") or {}
+    # Hardened reader (#6736): a refused main spec reads as absent, so the entry
+    # counts as missing -- the same degrade-as-absent direction as before.
+    spec = (
+        _read_agent_spec(
+            agents_dir / AGENT_FILENAME,
+            operation="connections_mint",
+            source="dashboard",
+        )
+        or {}
+    )
+    servers = spec.get("mcpServers") or {}
     return mcp_server_alias(slug) not in servers
 
 

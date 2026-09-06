@@ -13,7 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import web
 
-from kiro_crew.dashboard.refresh_tokens import REFRESH_COOKIE_PREFIX, refresh_cookie_name
+from kiro_crew.dashboard.refresh_tokens import (
+    REFRESH_COOKIE_PREFIX,
+    refresh_cookie_name,
+    refresh_token_peer_key,
+)
 from kiro_crew.dashboard.token_auth import (
     MAX_CONCURRENT_NONCES,
     MAX_SESSION_TTL_SECS,
@@ -23,10 +27,12 @@ from kiro_crew.dashboard.token_auth import (
     app_token_path_allowed,
     bind_token_ip,
     check_token_ip,
+    claims_an_app_unverified,
     generate_token,
     is_consumed,
     mark_consumed,
     parse_duration,
+    required_peer_key_unverified,
     revoke_access_cookie,
     revoke_all_sessions,
     token_auth_middleware,
@@ -204,6 +210,41 @@ def test_session_exp_still_valid_after_link_window() -> None:
     assert uid == "user6b"
 
 
+def test_link_window_never_outlives_a_short_session() -> None:
+    """The link-click window clamps to the session TTL, never exceeds it.
+
+    The query-param path validates against ``exp`` alone (the nonce set is
+    membership-only), so an uncapped 5-minute window would let the raw link
+    keep authenticating after ``session_exp`` passed. A token whose session
+    lifetime was capped by its caller's own bounds (the mobile-link and
+    tailnet-QR mints lend the caller's remaining lifetime) would then outlive
+    the session that authorized it by up to the full window — the residual
+    half of the laundering those mints exist to prevent.
+    """
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        token = generate_token("user6c", ttl_seconds=60)
+    # Past the short session but still inside the nominal 5-minute window:
+    # the LINK path must refuse too, not just the cookie path.
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0 + 61
+        link_valid, _, link_reason = validate_token(token)
+        cookie_valid, _, _ = validate_token(token, use_session_exp=True)
+    assert link_valid is False
+    assert "expired" in link_reason
+    assert cookie_valid is False
+    # A full-length session keeps the whole window: the clamp only ever
+    # tightens, so ordinary links are unaffected.
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        long_token = generate_token("user6d", ttl_seconds=3600)
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0 + 299
+        valid, uid, _ = validate_token(long_token)
+    assert valid is True
+    assert uid == "user6d"
+
+
 def test_tampered_token_rejected() -> None:
     token = generate_token("user7")
     tampered = token[:-1] + ("A" if token[-1] != "A" else "B")
@@ -321,6 +362,32 @@ async def test_embed_parent_port_claim_survives_session_exchange() -> None:
     req.__setitem__.assert_any_call("embed_parent_port", "5476")
 
 
+@pytest.mark.asyncio
+async def test_no_refresh_claim_survives_session_exchange() -> None:
+    """The ``no_refresh`` bound must survive the link→cookie exchange like
+    ``boot`` does. The exchange already honors it by never minting the refresh
+    chain, but a downstream consumer that reads the SESSION cookie to learn the
+    caller's bounds (the mobile-link mint) would otherwise see an unbounded
+    session and re-mint an unbounded, refresh-chained credential — laundering
+    the exact ceiling the claim encodes."""
+    import json as _json
+
+    from kiro_crew.dashboard.token_auth import _b64url_decode
+
+    mw = token_auth_middleware()
+    token = generate_token("qruser", ttl_seconds=300, extra={"no_refresh": "1"})
+    req = _make_request(query={"token": token}, remote="10.0.0.1")
+
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+
+    cookie_header = resp.cookies.get("mc_token_5476")
+    assert cookie_header is not None
+    assert cookie_header.value != token
+    claims = _json.loads(_b64url_decode(cookie_header.value.split(".", 1)[0]))
+    assert claims["no_refresh"] == "1"
+
+
 # -- Property 7: Cookie not re-set when already matching --
 
 
@@ -337,6 +404,147 @@ async def test_cookie_not_reset_when_present() -> None:
     assert resp.status == 200
     # Cookie should NOT be re-set on cookie-based auth
     assert "mc_token_5476" not in resp.cookies
+
+
+# -- Stale ?token= must not veto a valid session cookie (query→cookie fallback) --
+
+
+@pytest.mark.asyncio
+async def test_expired_query_token_falls_back_to_valid_cookie() -> None:
+    """Re-opening a bookmarked link replays a long-expired ``?token=`` alongside
+    the still-valid session cookie that link was exchanged for. The dead query
+    token must be ignored, not act as a one-vote veto over the live cookie."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("staleuser", ttl_seconds=300)
+    cookie = generate_token("staleuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(query={"token": stale}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+    # Fallback lands on the COOKIE path: no token→session exchange, no re-set.
+    assert "mc_token_5476" not in resp.cookies
+
+
+@pytest.mark.asyncio
+async def test_expired_query_token_without_cookie_still_denied() -> None:
+    """The fallback adds no capability: a dead query token alone stays denied
+    (the SPA-shell carve-out aside — this data path is not a shell request)."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("staleuser2", ttl_seconds=300)
+    req = _make_request(path="/api/status", query={"token": stale})
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_expired_query_token_with_expired_cookie_denied() -> None:
+    """When BOTH credentials are dead, the query token's failure reason stands
+    (the credential the caller actually presented) and the request is denied."""
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("staleuser3", ttl_seconds=300)
+        dead_cookie = generate_token("staleuser3", ttl_seconds=300)
+    req = _make_request(
+        path="/api/status", query={"token": stale}, cookies={"mc_token_5476": dead_cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_valid_query_token_still_wins_over_cookie() -> None:
+    """The fallback fires only on an INVALID query token. A valid one keeps
+    today's precedence — including its token→session exchange (fresh cookie)."""
+    mw = token_auth_middleware()
+    fresh = generate_token("precedence", ttl_seconds=300)
+    cookie = generate_token("someoneelse", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+    req = _make_request(query={"token": fresh}, cookies={"mc_token_5476": cookie})
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+    assert resp.cookies.get("mc_token_5476") is not None
+
+
+@pytest.mark.asyncio
+async def test_internal_path_expired_query_token_falls_back_to_cookie() -> None:
+    """The internal-path helper (_extract_and_validate_token) applies the same
+    rule: a stale ``?token=`` on a polled internal path must not 401 a request
+    whose session cookie is still valid."""
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale = generate_token("intuser", ttl_seconds=300)
+    cookie = generate_token("intuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+    mw = token_auth_middleware(internal_paths=frozenset({"/api/spawn"}), internal_secret="s")
+    req = _make_request(
+        path="/api/spawn", query={"token": stale}, cookies={"mc_token_5476": cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_expired_app_token_does_not_fall_back_to_user_cookie() -> None:
+    """An expired APP token must NOT adopt the dashboard user's cookie.
+
+    An installed app's UI is served from this same origin, so the browser sends
+    the user's session cookie alongside the app's own ``?token=``. If the
+    fallback fired here, ``app_name`` would come back empty, the app-scope gate
+    would become a no-op, and an app whose token merely expired would silently
+    gain the user's full API reach. It must stay denied so the app re-exchanges
+    its secret instead.
+    """
+    mw = token_auth_middleware()
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale_app = generate_token("appsub", ttl_seconds=300, app="someapp")
+    cookie = generate_token("realuser", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+
+    req = _make_request(
+        path="/api/status", query={"token": stale_app}, cookies={"mc_token_5476": cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_internal_path_expired_app_token_does_not_fall_back_to_cookie() -> None:
+    """The internal-path helper applies the same app-token exception."""
+    with patch("kiro_crew.dashboard.token_auth.time") as mock_time:
+        mock_time.time.return_value = 1000.0
+        stale_app = generate_token("appsub2", ttl_seconds=300, app="someapp")
+    cookie = generate_token("realuser2", ttl_seconds=3600)
+    bind_token_ip(cookie, "127.0.0.1")
+    mark_consumed(cookie)
+    mw = token_auth_middleware(internal_paths=frozenset({"/api/spawn"}), internal_secret="s")
+    req = _make_request(
+        path="/api/spawn", query={"token": stale_app}, cookies={"mc_token_5476": cookie}
+    )
+    resp = await mw(req, _ok_handler)
+    assert resp.status in (401, 403)
+
+
+def test_claims_an_app_unverified_only_ever_refuses() -> None:
+    """The unverified reader answers True only for a payload that names an app.
+
+    Garbage and app-less payloads answer False, so the claim can never widen the
+    fallback — it can only withhold it.
+    """
+    assert claims_an_app_unverified(generate_token("u", ttl_seconds=60, app="a")) is True
+    assert claims_an_app_unverified(generate_token("u", ttl_seconds=60)) is False
+    assert claims_an_app_unverified("not-a-token") is False
+    assert claims_an_app_unverified("") is False
 
 
 # -- Cookie keyed by browser-facing (Host) port for tunneled multi-instance --
@@ -400,6 +608,7 @@ async def test_cookie_server_port_name_denied_when_host_differs() -> None:
         "/fonts/AWSDiatype-Regular.woff2",
         "/vendor/tailwindcss-browser.js",
         "/logo.png",
+        "/favicon.ico",
         "/manifest.json",
         "/sw.js",
         "/icon-192.png",
@@ -1042,7 +1251,7 @@ def test_signing_secret_persisted_across_loads(tmp_path, monkeypatch) -> None:
     assert key_file.exists()
     assert len(s1) >= 32
     # Owner-only permissions. POSIX enforces this via chmod 0o600; Windows applies
-    # an owner DACL (icacls) that does not surface in st_mode (files report
+    # an owner DACL that does not surface in st_mode (files report
     # 0o666), so the POSIX-bit assertion is only meaningful off Windows (the
     # Windows DACL path is covered by test_platform_compat::TestRestrictToOwner).
     if os.name != "nt":
@@ -1105,7 +1314,7 @@ def test_signing_secret_concurrent_first_init_converges(tmp_path, monkeypatch) -
     assert all(r == on_disk for r in results), "concurrent inits diverged from the on-disk key"
     assert len(set(results)) == 1, "more than one distinct signing key was issued"
     # Winner's create still locked the file down to owner-only. POSIX enforces
-    # this via chmod 0o600; Windows applies an owner-only DACL (icacls) that does
+    # this via chmod 0o600; Windows applies an owner-only DACL that does
     # NOT surface in st_mode (files report 0o666), so the POSIX-bit assertion is
     # only meaningful off Windows — the Windows DACL path has direct coverage in
     # test_platform_compat::TestRestrictToOwner.
@@ -1422,6 +1631,8 @@ async def test_non_api_path_gets_html_403() -> None:
     resp = await mw(req, _ok_handler)
     assert resp.status == 403
     assert resp.content_type == "text/html"
+    assert b"Settings \xe2\x86\x92 Security \xe2\x86\x92 Sign in on mobile" in resp.body
+    assert b"kirocrew token" in resp.body
 
 
 # -- Property 12b: SPA shell is public so the app can cold-start refresh --
@@ -1582,6 +1793,49 @@ def test_no_get_route_outside_shell_exclusions() -> None:
         f"shell unauthenticated: {offenders}. Add their namespace to "
         f"SPA_FALLBACK_EXCLUDED_PREFIXES (or _APPS_SPA_EXCLUDED_RE for /apps/ "
         f"sub-paths) in token_auth.py."
+    )
+
+
+def test_apps_routes_get_paths_are_matched_by_the_apps_spa_regex() -> None:
+    """Every ``/apps/`` GET registered in ``apps/routes.py`` must be matched by
+    ``_APPS_SPA_EXCLUDED_RE`` once its placeholders are filled in.
+
+    The sibling guard above only scans ``server.py``, and its ``"{" in p``
+    escape hatch treats any pattern route as a real handler without ever asking
+    the regex. So nothing coupled the regex to the app routes it exists to
+    describe: adding ``/apps/{name}/art/{path:.*}`` to ``apps/routes.py`` while
+    leaving the regex at ``(?:api|ui)`` left the route registered and
+    unreachable — ``_is_spa_shell_request`` classified it as a React Router
+    navigation and the middleware answered the SPA shell, so an ``<img>``
+    pointed at it received HTML with a 200 and rendered nothing. Silent by
+    construction: the route works under a token, the handler is never the thing
+    that fails, and no existing test looks at this pair.
+
+    Instantiating the pattern is the whole point — the regex requires a
+    lowercase app name AND a following slash, so only a concrete path can
+    exercise it.
+    """
+    import re as _re
+
+    import kiro_crew.apps.routes as app_routes
+    import kiro_crew.dashboard.token_auth as ta
+
+    source = open(app_routes.__file__, encoding="utf-8").read()
+    get_paths = [p for p in _re.findall(r'add_get\(\s*["\']([^"\']+)["\']', source)]
+    apps_paths = [p for p in get_paths if p.startswith("/apps/")]
+    assert apps_paths, "expected /apps/ add_get route literals in apps/routes.py"
+
+    def concrete(pattern: str) -> str:
+        """Fill each ``{…}`` placeholder with a value the regex would accept."""
+        out = _re.sub(r"\{name[^}]*\}", "demo-app", pattern)
+        return _re.sub(r"\{[^}]+\}", "assets/icon.webp", out)
+
+    unmatched = [p for p in apps_paths if not ta._APPS_SPA_EXCLUDED_RE.match(concrete(p))]
+    assert not unmatched, (
+        f"/apps/ GET route(s) in apps/routes.py that _APPS_SPA_EXCLUDED_RE does not "
+        f"match: {unmatched}. The middleware will answer these with the SPA shell "
+        f"instead of the handler — add the sub-namespace verb to the regex in "
+        f"token_auth.py."
     )
 
 
@@ -2019,7 +2273,7 @@ def test_revoked_store_locks_the_file_down_to_its_owner(tmp_path, monkeypatch) -
     locked: list[tuple[str, int]] = []
     real_restrict = platform_compat.restrict_to_owner
 
-    def _spy(path) -> None:
+    def _spy(path, **_kw) -> None:
         # Record the size at lockdown time: the nonce list must not be sitting
         # in the file yet (see the ordering assertion below).
         locked.append((str(path), os.path.getsize(str(path))))
@@ -2038,9 +2292,9 @@ def test_revoked_store_locks_the_file_down_to_its_owner(tmp_path, monkeypatch) -
     )
     locked_path, size_at_lockdown = locked[0]
     assert size_at_lockdown == 0, (
-        "the denylist was written before the lockdown applied; on Windows "
-        "restrict_to_owner shells out to icacls, so the nonces would sit under "
-        "the parent-inherited DACL for the length of that call"
+        "the denylist was written before the lockdown applied; on Windows the "
+        "lockdown replaces the DACL rather than setting it at create time, so "
+        "the nonces would sit under the parent-inherited DACL until it landed"
     )
     assert locked_path.startswith(
         str(state_path)
@@ -2639,8 +2893,8 @@ def test_warm_auth_singletons_primes_both_off_loop(monkeypatch) -> None:
     the middleware serves requests.
 
     Both lazily do blocking file I/O on first use (read/create
-    token_signing.key + read the nonce denylist; on Windows an icacls
-    subprocess to lock the DACL). They are NO LONGER warmed synchronously in
+    token_signing.key + read the nonce denylist; on Windows also the owner-only
+    DACL). They are NO LONGER warmed synchronously in
     the token_auth_middleware() factory, because that factory runs on the loop
     via the async start_dashboard()/start_api_server(). The async startup paths
     await this helper instead, so the first auth op hits warm singletons with
@@ -3000,6 +3254,43 @@ async def test_daemon_failure_degrades_to_token_ip_path(_tailnet_env) -> None:
 
 
 @pytest.mark.asyncio
+async def test_require_peer_link_refuses_daemon_failure_before_cookie_exchange(
+    _tailnet_env,
+) -> None:
+    """A persistent QR link must not become a shared loopback session when
+    whois is unavailable during its first exchange."""
+    _tailnet_env(None)
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token("tsuser", ttl_seconds=300, extra={"require_peer": "1"})
+    resp = await mw(_peer_request(query={"token": token}), _ok_handler)
+    assert resp.status == 403
+    assert b"tailnet identity unverified" in resp.body
+    assert resp.cookies.get("mc_token_5476") is None
+
+
+@pytest.mark.asyncio
+async def test_require_peer_link_exchanges_for_verified_allowed_peer(_tailnet_env) -> None:
+    """The fail-closed claim still permits the intended verified peer and the
+    exchanged access cookie keeps the identity-required claim."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    _tailnet_env(_whois_payload())
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token("tsuser", ttl_seconds=300, extra={"require_peer": "1"})
+    resp = await mw(_peer_request(query={"token": token}), _ok_handler)
+    assert resp.status == 200
+    cookie = resp.cookies.get("mc_token_5476")
+    assert cookie is not None
+    assert _ta.requires_verified_peer_unverified(cookie.value) is True
+    expected = "ts:node:you@example.com|phone.tail.ts.net"
+    assert required_peer_key_unverified(cookie.value) == expected
+    assert _ta._state._peer_bindings[cookie.value][0] == expected
+    refresh = resp.cookies.get(refresh_cookie_name("5476"))
+    assert refresh is not None
+    assert refresh_token_peer_key(refresh.value) == expected
+
+
+@pytest.mark.asyncio
 async def test_non_tailscale_tunnel_behaviour_is_unchanged(_tailnet_env) -> None:
     """Loopback peer + XFF with identity trust OFF: byte-for-byte today's
     behaviour — pin ip:127.0.0.1, posture SHARED, no daemon call."""
@@ -3146,6 +3437,124 @@ async def test_restart_first_use_repins_verified_peer_cookie(_tailnet_env) -> No
     )
     assert resp2.status == 403
     assert b"device identity mismatch" in resp2.body
+
+
+@pytest.mark.asyncio
+async def test_restart_require_peer_cookie_refuses_unverified_first_use(
+    _tailnet_env,
+) -> None:
+    """After restart, an unbound persistent cookie waits for verified whois;
+    it cannot claim the proxy's loopback identity during a daemon outage."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    _tailnet_env(None)
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token("tsuser", ttl_seconds=300, extra={"require_peer": "1"})
+    mark_consumed(token)
+    # No bind_token_peer call: simulates the post-restart in-memory state.
+    resp = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
+    assert resp.status == 403
+    assert b"tailnet identity unverified" in resp.body
+    assert token not in _ta._state._peer_bindings
+
+
+@pytest.mark.asyncio
+async def test_restart_signed_require_peer_cookie_rehydrates_only_for_original_device(
+    _tailnet_env,
+) -> None:
+    """The signed original-device claim, not first arrival, rebuilds the hot pin."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    expected = "ts:node:you@example.com|phone.tail.ts.net"
+    set_whois = _tailnet_env
+    set_whois(_whois_payload())
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token(
+        "tsuser",
+        ttl_seconds=300,
+        peer_key=expected,
+        extra={"require_peer": "1"},
+        register_nonce=False,
+    )
+
+    assert token not in _ta._state._peer_bindings
+    response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
+    assert response.status == 200
+    assert _ta._state._peer_bindings[token][0] == expected
+
+    # Simulate another restart, then let a different but still allowlisted node
+    # arrive first.  It cannot claim the empty in-memory map.
+    _ta._state._peer_bindings.pop(token, None)
+    set_whois(_whois_payload(node="other-node.tail.ts.net"))
+    replay = await mw(
+        _peer_request(forwarded="100.64.0.6", cookies={"mc_token_5476": token}),
+        _ok_handler,
+    )
+    assert replay.status == 403
+    assert b"device identity mismatch" in replay.body
+    assert token not in _ta._state._peer_bindings
+
+
+@pytest.mark.asyncio
+async def test_restart_legacy_claimless_require_peer_cookie_cannot_claim_device(
+    _tailnet_env,
+) -> None:
+    """Pre-fix cookies must re-scan instead of accepting the first allowed node."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    _tailnet_env(_whois_payload())
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust())
+    token = generate_token(
+        "tsuser", ttl_seconds=300, extra={"require_peer": "1"}, register_nonce=False
+    )
+    response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
+    assert response.status == 403
+    assert b"tailnet session device binding missing" in response.body
+    assert token not in _ta._state._peer_bindings
+
+
+@pytest.mark.asyncio
+async def test_claimless_require_peer_link_cannot_enroll_on_mixed_internal_path(
+    _tailnet_env,
+) -> None:
+    """Only the main QR exchange path may turn a claimless link into a session."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    _tailnet_env(_whois_payload())
+    mw = token_auth_middleware(
+        mixed_internal_paths=frozenset({"/api/spawn"}),
+        tailnet_trust=_tailnet_trust(),
+    )
+    token = generate_token("tsuser", ttl_seconds=300, extra={"require_peer": "1"})
+    request = _peer_request(query={"token": token})
+    request.path = "/api/spawn"
+    response = await mw(request, _ok_handler)
+    assert response.status == 403
+    assert b"tailnet session device binding missing" in response.body
+    assert not response.cookies
+    assert token not in _ta._state._peer_bindings
+
+
+@pytest.mark.asyncio
+async def test_signed_login_scope_survives_operator_pin_scope_change(_tailnet_env) -> None:
+    """An issued login-scoped session keeps its signed scope after config changes."""
+    from kiro_crew.dashboard import token_auth as _ta
+
+    expected = "ts:login:you@example.com"
+    _tailnet_env(_whois_payload(node="replacement-phone.tail.ts.net"))
+    # Today's config is node-scoped, but the signed credential was issued with
+    # login scope and therefore remains usable after a phone re-enrolment.
+    mw = token_auth_middleware(tailnet_trust=_tailnet_trust(pin_scope="node"))
+    token = generate_token(
+        "tsuser",
+        ttl_seconds=300,
+        peer_key=expected,
+        extra={"require_peer": "1"},
+        register_nonce=False,
+    )
+    response = await mw(_peer_request(cookies={"mc_token_5476": token}), _ok_handler)
+    assert response.status == 200
+    assert _ta._state._peer_bindings[token][0] == expected
 
 
 @pytest.mark.asyncio

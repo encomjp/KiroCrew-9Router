@@ -37,6 +37,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from kiro_crew.atomic_write import atomic_write
+
 logger = logging.getLogger(__name__)
 
 _REGISTRY_FILE = Path(__file__).resolve().parent / "model_registry.json"
@@ -331,8 +333,18 @@ def persist_kiro_windows() -> None:
 
     Separated from :func:`refresh_kiro_windows` so an async caller can offload
     ONLY this filesystem step to an executor while keeping the in-memory update
-    synchronous. Atomic (tmp + ``os.replace``); a persist failure is logged, not
-    raised — the in-memory cache is authoritative for this process either way.
+    synchronous. Atomic via the shared :func:`kiro_crew.atomic_write.atomic_write`
+    helper; a persist failure is logged, not raised — the in-memory cache is
+    authoritative for this process either way.
+
+    The helper replaces a hand-rolled temp-write-and-rename whose temp name was
+    derived from the destination (``model_windows.json.tmp``), so two processes
+    persisting the cache raced on one filename, and which missed the helper's
+    bounded retry for the Windows rename window. Durability and permission
+    semantics are unchanged: no ``fsync`` (best-effort by contract, per the note
+    above) and no explicit ``mode``, so the sidecar still lands at the umask
+    default. The helper creates the parent directory itself and raises ``OSError``
+    on failure — the same class the ``except`` below already absorbed.
 
     Thread-safety: this runs on an executor thread while ``refresh_kiro_windows``
     mutates ``_KIRO_WINDOWS`` on the event-loop thread. Snapshot with ``dict(...)``
@@ -343,11 +355,7 @@ def persist_kiro_windows() -> None:
     try:
         snapshot = dict(_KIRO_WINDOWS)  # atomic under the GIL; safe vs. concurrent mutation
         path = _kiro_windows_cache_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f)
-        tmp.replace(path)
+        atomic_write(path, json.dumps(snapshot))
     except OSError:  # pragma: no cover - disk full / perms
         logger.debug("Could not persist kiro window cache", exc_info=True)
 
@@ -698,6 +706,53 @@ def is_canonical_key(name: str) -> bool:
     Auto sentinel check for it separately.
     """
     return name in _REGISTRY
+
+
+# Region/vendor routing prefix a Bedrock inference-profile id carries
+# (``global.anthropic.claude-opus-4-8[1m]``, ``us.anthropic.…``). A
+# provider-prefixed id is not itself a registry key/alias, so :func:`canonical_key`
+# peels this and retries the lookup. Same shape the frontend shares via
+# ``fmtTurnModel`` (chat/AssistantMessage.tsx) and ``canonicalKey``
+# (providers/modelRegistry.ts).
+_ROUTING_PREFIX_RE = re.compile(
+    r"^(?:(?:us|eu|apac|global)\.)?(?:anthropic|amazon|openai|bedrock)\."
+)
+
+
+def canonical_key(name: str) -> str | None:
+    """Canonical registry key for ``name``, resolved provider-aware, or ``None``.
+
+    Resolution order is the acp (kiro-cli) index FIRST, then ``claude_code`` --
+    the SAME order :func:`_registry_window` uses, and for the same reason: the
+    ``claude_code`` index deliberately aliases kiro's distinct models onto one
+    canonical for claude-agent-acp dropdown dedup (``claude-haiku-4.5`` /
+    ``claude-sonnet-4.5`` / ``claude-sonnet-4`` -> ``sonnet-4.6-1m``;
+    ``claude-opus-4.6`` -> ``opus-4.8-1m``), while kiro -- the fork's shipping
+    harness -- serves each as a DISTINCT real model with its own acp-index
+    canonical entry. Resolving the acp view first keeps those apart.
+
+    Accepts a canonical key (resolves to itself), a registry alias, or a
+    per-provider id -- with or without a region/vendor routing prefix
+    (``us.anthropic.…``, ``global.anthropic.…``) -- and returns ``None`` for
+    anything the registry does not list. A provider-prefixed id is not itself a
+    registry key/alias, so the prefix is peeled and the lookup retried (the "fold
+    a provider/partition prefix" half of #5339). This is the single "which
+    registry model is this id?" fold shared by ``_normalize_model_key``
+    (dashboard/handlers/agents.py) and the frontend ``canonicalKey``
+    (providers/modelRegistry.ts) -- the peel lives HERE so any backend caller of
+    this documented fold gets both #5339 halves, not just the dashboard handler.
+    """
+    for provider in ("acp", "claude_code"):
+        key = _resolve_canonical(name, provider)
+        if key is not None:
+            return key
+    stripped = _ROUTING_PREFIX_RE.sub("", name)
+    if stripped != name:
+        for provider in ("acp", "claude_code"):
+            key = _resolve_canonical(stripped, provider)
+            if key is not None:
+                return key
+    return None
 
 
 def canonicalize_for_provider(stored_model: str, provider: str) -> str:

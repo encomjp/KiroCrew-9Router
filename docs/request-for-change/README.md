@@ -17,10 +17,15 @@ were added
 2026-08-18 and verified against `e6b06685e`; the other rows have
 not been re-audited since 2026-08-03. The durable-run-coordinator row was added
 2026-08-22 and the orchestrator-chat-sessions row was re-audited at
-`c4f253891`.
+`c4f253891`; the `rfc-token-efficient-monitors` row was added 2026-08-22 and
+verified against `6d3e30bbbd`. The `rfc-global-workflow-library` row was added
+2026-08-25 and audited against `749468d42`; its implementation exists only in
+the active detached worktree. The `rfc-crew-agent-sdk-boundary` row was added 2026-08-28 and verified against `dc88f142b`.
 
 | Document | Status | What is actually on main |
 |---|---|---|
+| [rfc-crew-agent-sdk-boundary.md](rfc-crew-agent-sdk-boundary.md) | `draft` | Nothing. Audited at `dc88f142b`: `providers/base.py:30` still aliases `AcpEvent` as the "provider-agnostic" event type, 68 direct `kiro_crew.acp` import edges remain across 42 files outside `acp/` and `providers/`, and `acp/worker_pool.py:49` still imports back from `session_pid.py` behind a cycle guard. No `agent_sdk` package and no import ratchet exist |
+| [rfc-global-workflow-library.md](rfc-global-workflow-library.md) | `in-progress` | Nothing. The active detached worktree adds the global definition library, local adaptation and lineage, exact `/workflow <name>` invocation, MCP/HTTP contracts, and the Agent Capabilities management surface |
 | [rfc-durable-run-coordinator.md](rfc-durable-run-coordinator.md) | `draft` | Nothing. Design and seven-PR additive migration stack only; the existing in-memory manager and run folders remain authoritative |
 | [rfc-issue-radar-crews.md](rfc-issue-radar-crews.md) | `draft` | Nothing. Design of record only; `crew_brief.md` and `crew_ledger_spec.md` sit beside the Issue Radar backend as companion specs, also unimplemented |
 | [rfc-orchestrator-chat-sessions.md](rfc-orchestrator-chat-sessions.md) | `partial` | Crew Mode shipped in [#1295](https://github.com/kirodotdev/KiroCrew/pull/1295) and has since received store and routing fixes. The implementation deliberately diverges from the RFC in at least three places: no snapshot-generation CAS, no `release` decision action, and immediate per-result delivery instead of burst coalescing |
@@ -38,6 +43,7 @@ not been re-audited since 2026-08-03. The durable-run-coordinator row was added
 | [rfc-app-sandbox-isolation.md](rfc-app-sandbox-isolation.md) | `draft` | Nothing. Apps still run in-process with full privileges (see `src/kiro_crew/docs/app-platform-trust-model.md`); no isolation code exists |
 | [rfc-issue-radar-dispatch.md](rfc-issue-radar-dispatch.md) | `draft` | Nothing. Issue Radar has Investigate and Review; no verb produces work, and issues carry no link to the change that resolves them |
 | [rfc-perpetual-agent.md](rfc-perpetual-agent.md) | `draft` | Nothing. Verified at `9ac3716a`: no schedule kind self-reschedules, and `binding_key_for` has no `cron:` branch |
+| [rfc-token-efficient-monitors.md](rfc-token-efficient-monitors.md) | `draft` | Nothing. Probe-first replacement for token-heavy babysit loops; implementation begins in a stacked series after this RFC |
 | [rfc-tailnet-dashboard-access.md](rfc-tailnet-dashboard-access.md) | `partial` | Phase 1 landed ([#1761](https://github.com/kirodotdev/KiroCrew/pull/1761), `f8afcff7`) — reports the pin's real scope, does not fix it. Phases 2–4 unstarted; the pin repair is tracked as [#1762](https://github.com/kirodotdev/KiroCrew/issues/1762) |
 | [rfc-pluggable-model-providers.md](rfc-pluggable-model-providers.md) | `draft` | Nothing, by design. `agent.provider` is still fixed to `acp` and `AGENTS.md` lists "Other providers" under *Never re-add*. This document **recommends** supporting provider choice and asks the maintainers to amend that rule; it proposes no design, and an exploratory implementation is shelved pending the answer ([#1693](https://github.com/kirodotdev/KiroCrew/issues/1693)) |
 | [rfc-s3-backup.md](rfc-s3-backup.md) | `draft` | Nothing. Verified at `f4d3327a7`: `VALID_COMPONENTS` carries no session component and no code path writes crew state to a remote store |

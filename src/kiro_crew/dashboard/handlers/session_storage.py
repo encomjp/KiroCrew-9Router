@@ -175,7 +175,11 @@ async def _json_body(request: web.Request) -> dict[str, Any] | None:
 
 def _report_payload() -> dict[str, Any]:
     index = _build_index()
-    report = measure(index)
+    # One trash pass serves both the totals inside measure() and the wire array
+    # below: list_trash reads every batch manifest per call, and two calls could
+    # bracket a concurrent stage/empty and ship totals that contradict the array.
+    batches = list_trash()
+    report = measure(index, batches=batches)
     return {
         "total_bytes": report.total_bytes,
         "total_sessions": report.total_sessions,
@@ -203,7 +207,7 @@ def _report_payload() -> dict[str, Any]:
                     "sessions": batch.sessions,
                     "bytes": batch.bytes,
                 }
-                for batch in list_trash()
+                for batch in batches
             ],
         },
     }
@@ -679,7 +683,10 @@ def _inventory_payload(state: DashboardState) -> dict[str, Any]:
     # The same pass answers both halves of the screen. Measuring separately would
     # re-enumerate a store that reaches half a million files, and would let the
     # totals describe a different instant than the rows printed beneath them.
-    report = measure(index, units=units)
+    # The trash gets the identical treatment: one list_trash() pass feeds both
+    # the totals and the batches array, for the same one-instant reason.
+    batches = list_trash()
+    report = measure(index, units=units, batches=batches)
 
     # Replay-only units — subagent runs — are what a long-lived install accumulates
     # by the hundred thousand, and this screen folds every one of them into a single
@@ -779,7 +786,7 @@ def _inventory_payload(state: DashboardState) -> dict[str, Any]:
                     "sessions": batch.sessions,
                     "bytes": batch.bytes,
                 }
-                for batch in list_trash()
+                for batch in batches
             ],
         },
     }
@@ -843,8 +850,18 @@ def _classify(uids: list[str], index: SessionIndex, now: float) -> tuple[list[st
     guarantee is NOT weakened: it still re-reads the session map inside the lock
     and still refuses anything live, so this pre-pass can only ever be more
     conservative than the authority, never less.
+
+    That property requires the enumeration below to be UNCACHED — in both
+    halves. The co-tenant contribution to ``active`` is served from a 30s cache
+    on ordinary read paths, and a pre-pass fed a stale co-tenant set would
+    classify a just-claimed session as eligible — the authority would still
+    refuse it, but as the all-or-nothing batch failure this function exists to
+    prevent. The STORE half fails the same way on its own: ``age_days`` reads
+    the scan's mtime, so a session appended to after a cached pass reads
+    stale-older here and ``too_fresh`` inside the move. A perf change that
+    re-caches either half re-opens the batch failure.
     """
-    by_uid = {u.uid: u for u in list_units(index)}
+    by_uid = {u.uid: u for u in list_units(index, cached=False)}
     eligible: list[str] = []
     refused: list[dict] = []
     for uid in uids:

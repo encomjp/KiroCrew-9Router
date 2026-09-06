@@ -160,6 +160,50 @@ describe('App — version-change changelog gate', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }))
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Changelog' })).toBeNull())
   })
+
+  it('shows nothing when the running build is ahead of every section', async () => {
+    // The reported bug. `main` is bumped a minor ahead of the released line and
+    // a release's notes are written when it ships, so between releases the
+    // newest section in the file is OLDER than the running build: a 0.6.0 build
+    // opened a modal titled `v0.6.0` whose body was headed `[0.4.0]` and offered
+    // to update to it. There is nothing to say here, so nothing is said.
+    vi.mocked(api.status).mockResolvedValue({ ...STATUS, version: '0.6.0' } as never)
+    localStorage.setItem('mc-last-version', '0.5.0')
+    renderWithProviders(<App />, { route: '/chat' })
+
+    await screen.findByTestId('dashboard-shell')
+    // The baseline still advances, so the check does not re-run every load.
+    await waitFor(() => expect(localStorage.getItem('mc-last-version')).toBe('0.6.0'))
+    expect(screen.queryByRole('dialog', { name: 'Changelog' })).toBeNull()
+  })
+
+  it('keeps an unversioned heading out of the section above it', async () => {
+    // Any level-2 heading ends the preceding section, matching the renderer.
+    // Keying only on `## [` left this body inside 0.4.0's notes.
+    vi.mocked(api.changelog).mockResolvedValue({
+      content: '## [0.4.0]\n- adds the resource capsule\n\n## Notes\n- housekeeping prose\n',
+    } as never)
+    renderShell()
+
+    const dialog = await changelogDialog()
+    expect(within(dialog).getByText(/adds the resource capsule/)).toBeInTheDocument()
+    expect(within(dialog).queryByText(/housekeeping prose/)).toBeNull()
+  })
+
+  it('delivers the notes when no further update is pending', async () => {
+    // The state right after a successful update is "current", and the body used
+    // to be gated on an update being available -- so the one moment the modal
+    // exists for replaced its notes with "You're on the latest version".
+    vi.mocked(api.status).mockResolvedValue({
+      ...STATUS, update_available: false, update_can_apply: false,
+    } as never)
+    renderShell()
+
+    const dialog = await changelogDialog()
+    expect(within(dialog).getByText(/adds the resource capsule/)).toBeInTheDocument()
+    expect(within(dialog).getByText("You're on the latest version")).toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: 'Update Now' })).toBeNull()
+  })
 })
 
 describe('App — changelog modal controls', () => {
@@ -407,6 +451,24 @@ describe('App — Electron bridges', () => {
     // Protocol-relative targets are refused by construction, so the route holds.
     act(() => navigateFromMenu?.('//example.com/steal'))
     expect(screen.getByTestId('logs-page')).toBeInTheDocument()
+  })
+
+  it('a session deep link SELECTS the session, not just the route', async () => {
+    // The Crew Companion's "Open session" CTA arrives on this same channel. A
+    // bare navigate would be enough only from another page: ChatPage reads `?sid`
+    // while it MOUNTS, so from an already-open /chat the window would come
+    // forward with the previous session still on screen — the notification would
+    // appear to have opened nothing, which is the bug the CTA is meant to fix.
+    let navigateFromMain: ((path: string) => void) | undefined
+    setElectronBridge({ onNavigate: cb => { navigateFromMain = cb; return () => { navigateFromMain = undefined } } })
+    const { store } = renderWithProviders(<App />, { route: '/chat' })
+    await screen.findByTestId('chat-page')
+    expect(store.getState().chat.activeSlot).not.toBe('chat-2-200')
+
+    act(() => navigateFromMain?.('/chat?sid=chat-2-200'))
+
+    expect(store.getState().chat.activeSlot).toBe('chat-2-200')
+    expect(screen.getByTestId('chat-page')).toBeInTheDocument()
   })
 })
 

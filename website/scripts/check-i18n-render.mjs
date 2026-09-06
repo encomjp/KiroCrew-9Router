@@ -351,6 +351,38 @@ const FIXTURE_OVERRIDES = async (language, path, route) => {
     return done({ builtins: [], user_added: [], policy_pinned: [] })
   }
   if (path === '/api/security/posture') return done({ posture: {} })
+  // The speech-to-text panel's model rows and its download line come from here.
+  // The fallback `{}` renders neither, so the surface would be scanned without the
+  // model names, the byte units and the availability sentence that are most of its
+  // localisable copy. A model deliberately marked absent keeps the "not on this
+  // machine yet" line in the frame, which is the one a first-run user reads.
+  if (path === '/api/stt/status') {
+    return done({
+      provider: 'local',
+      available: true,
+      code: '',
+      detail: '',
+      model: 'base',
+      model_present: false,
+      model_bytes: 147951465,
+      engine_loaded: false,
+      models: [
+        { name: 'tiny', size_bytes: 77691713, present: false },
+        { name: 'base', size_bytes: 147951465, present: false },
+        { name: 'small', size_bytes: 487601967, present: false },
+        { name: 'large-v3-turbo', size_bytes: 1624555275, present: false },
+      ],
+      download: { step: 'idle', model: '', downloaded_bytes: 0, total_bytes: 0, error: '' },
+    })
+  }
+  // KnowledgePage treats any resolved value as a stats object. The shared stub's
+  // unknown-path fallback is `[]`, which is truthy: depending on whether its query
+  // settles before the scanner runs, the stats row appears in only one of the HEAD
+  // and base sweeps and creates a false diff. Use the real endpoint shape so both
+  // bundles deterministically expose the same translated row to the scanner.
+  if (path === '/api/knowledge/stats') {
+    return done({ items: 35, entities: 120, relations: 88, sources: 3 })
+  }
   // BUILTIN APP COLLECTION SHAPES. `handleBootRoute`'s fallback answers an
   // unknown path with `[]` (or `{}` for a config-ish name), and for most app
   // endpoints that is fine — the panel renders its empty state, which is exactly

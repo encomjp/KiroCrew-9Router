@@ -63,7 +63,7 @@ Starts the Socket Mode listener. Blocks until SIGINT/SIGTERM. When `no_crons=Tru
 
 The gateway runs a single asyncio loop, so any blocking call on the loop thread freezes the whole backend. Two mechanisms contain this (see `dashboard/loop_watchdog.py`, `executors.py`):
 
-- **`LoopStallWatchdog`** — armed only when `faulthandler.is_enabled()` (the real `gateway` entrypoint; not `chat`/`tui`). The async heartbeat (`dashboard/server.py`, 5s interval) `beat()`s it each tick, re-arming a C-level `dump_traceback_later(exit_after=25s, exit=True)` timer that dumps all thread stacks and `_exit()`s if the loop goes silent — kept just under the Electron liveness probe's kill window so the in-process dump wins. A daemon-thread soft dump at `stall_after=30s` is a fallback for when the armed timer is disabled/unarmable.
+- **`LoopStallWatchdog`** — armed only when `faulthandler.is_enabled()` (the real `gateway` entrypoint; not `chat`/`tui`). The async heartbeat (`dashboard/server.py`, 5s interval) `beat()`s it each tick, re-arming a C-level `dump_traceback_later(exit=True)` timer that dumps all thread stacks and `_exit()`s if the loop goes silent. Desktop/foreground launches automatically use 25s; managed systemd/launchd gateways automatically use 90s because they have no Electron probe and WSL, VM, or heavy disk pressure can suspend scheduling long enough to make 25s a false death. The config value is nullable/automatic so an unrelated full config save cannot pin either launch-class default; any explicit `dashboard.loop_stall_exit_after_secs` value, including 25, overrides both. Older full-config saves may have materialized the former 25-second default; Kiro Crew reports that through the read-only superseded-default warning and `doctor` rather than guessing whether the value was deliberate. The managed path emits a non-fatal all-thread dump to stderr at `stall_after=30s`, never to the fatal crash-sentinel file, then exits at its service budget if the loop has not recovered. If the hard timer is disabled or fails to arm, that soft-only fallback is written to the dedicated dump file as well as stderr so it remains discoverable. `KIROCREW_SERVICE_MANAGED=1` in the generated systemd unit or launchd plist is the sole managed-launch authority; inherited systemd metadata is deliberately ignored because descendants receive it too. `kirocrew doctor` detects an installed definition without the marker and tells the operator to run `kirocrew service install` once to regenerate it and adopt the managed-service default.
 - **Bounded executors** — blocking maintenance work is offloaded off the default executor (which the loop uses for DNS) into two separate bounded pools: `maintenance_executor()` (`mc-maint`, fast orphan-reaping sweeps + agent-overlay rewrites) and `cron_executor()` (`mc-cron`, long/concurrent cron command & script jobs). Kept separate so a burst of cron jobs cannot starve the orphan sweeps. MCP `probe_all()` fan-out is bounded by `asyncio.Semaphore(5)`.
 
 ### `handle_message(slack, sessions, channel, text, thread_ts, msg_ts, user_id, approval_mode, ..., subagent_manager) -> None`
@@ -241,12 +241,10 @@ Slack `file_share` messages are processed in `_route_message()` after dedup + au
 
 ### Voice / Audio (`transcribe.py`)
 - **Mimetypes**: `audio/*`, `video/webm`
-- **Flow**: Download via `SlackClientOps.download_file()` → local whisper CLI → transcription text prepended as `[Voice memo transcription]...[End of transcription]`
-- **Config**: Enabled by default (`stt.enabled = true`). Actual availability gated by whisper binary presence.
-  On AL2, install whisper via `brew install openai-whisper` (see `docs/reference/kiro-cli/chat/voice.md`).
-  Model default: `turbo` (~1.6 GB download, 809M params, ~8x faster than large).
-  Device, timeout configurable.
-- **Security**: Transcription output run through `redact_credentials()` + `redact_exfiltration_urls()` before injection. Audio file suffix sanitized to alphanumeric only.
+- **Flow**: Download via `SlackClientOps.download_file()` → `transcribe.transcribe_audio()` → transcription text prepended as `[Voice memo transcription]...[End of transcription]`
+- **Config**: Enabled by default (`stt.enabled = true`). `stt.provider` decides where recognition runs, and the default `local` runs it in this process on a resident whisper.cpp model, so a memo costs one model download (`stt.model`, `base` by default) and nothing after that. A stored retired provider degrades to `local`; there is no binary to put on `PATH`. Availability per provider comes from `transcribe.availability_detail()`, which distinguishes a missing `voice` extra from a platform with no prebuilt recognizer and from a macOS too old for the `apple` provider, because those need different fixes. The pinned `imageio-ffmpeg` wheel decodes the memo's ogg/Opus or webm internally and is bundled in desktop releases; users do not install system FFmpeg. Setup: [configuration](../../../src/kiro_crew/docs/configuration.md) § Speech-to-text.
+- **Provider-independent guards**: `transcribe_audio` refuses a sensitive `audio_path` and redacts every provider's output before returning, both before/after dispatch rather than inside a branch, so a provider cannot be added that skips either. See [stt-streaming](../features/stt-streaming.md).
+- **Security**: Transcription output run through `redact_credentials()` + `redact_exfiltration_urls()` before injection. Audio file suffix sanitized to alphanumeric only. `_transcribe_audio_files` records a `slack.download_file` and a transcription SEL entry per memo.
 
 ### Images (`files.py`)
 - **Mimetypes**: `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/bmp` (aligned with `AcpClient._send_prompt()` regex)
@@ -372,10 +370,7 @@ A channel-neutral dispatch path that replaces the native `handle_message` stream
 ## Tool Approval Flow
 
 1. ACP sends `permission_request` event during streaming
-2. Behavior depends on `approval_mode`:
-   - `"auto"` (default in `AgentConfig`): silently auto-approves (no UI)
-   - `"interactive"` (hardcoded in gateway): posts Block Kit buttons
-   - Gateway always uses `APPROVAL_INTERACTIVE` regardless of config
+2. `events.py:_resolve_approval_mode()` evaluates runtime YOLO, then the CLI `--approval` override, then `agent.approval_mode`; only an explicit auto policy yields `APPROVAL_AUTO`, otherwise it yields `APPROVAL_INTERACTIVE`. Native and transport dispatch both use this chokepoint, preventing an operator policy from being silently bypassed.
 3. Handler posts Block Kit message with ✅ Approve / 🤝 Trust / 🚀 YOLO / 🚫 Reject buttons
 4. `events.py` routes `interactive` Socket Mode event to `interactions.dispatch()`
 5. Approval/rejection sent to ACP, streaming resumes or stops
@@ -412,7 +407,7 @@ A parent session born on any other channel (Telegram, Discord, `unified:` DM buc
 
 ## Tool Approval via Slack
 
-Background task approvals (subagent/cron/taskrunner) post approval buttons to Slack DM via `_interactive_approval()`, racing with dashboard approval:
+Background task approvals (subagent, cron, task runner, and AutoNudge) post approval buttons to Slack DM via `_interactive_approval()`, racing with dashboard approval:
 
 1. Posts ✅ Approve / 🚫 Reject buttons to owner DM
 2. Creates `_PendingApproval` entry for interactive handler
@@ -424,19 +419,18 @@ Background task approvals (subagent/cron/taskrunner) post approval buttons to Sl
 
 `_interactive_approval(source)` is used by both interactive UI/slack and
 **unattended** background sources. For background sources there is no human
-responder, so waiting the full 2h human window (`_APPROVAL_TIMEOUT`) on every
-approval would stall cron/heartbeat/taskrunner turns for hours.
+responder, so waiting the interactive approval window on every approval would
+stall cron, heartbeat, task-runner, or AutoNudge turns.
 
-- `_BACKGROUND_APPROVAL_SOURCES = {"cron", "heartbeat", "taskrunner", ""}` (module
+- `_BACKGROUND_APPROVAL_SOURCES = {"cron", "heartbeat", "taskrunner", "autonudge", ""}` (module
   constant in `gateway.py`). `is_background = source in _BACKGROUND_APPROVAL_SOURCES`.
 - `subagent` is **NOT** background: subagent approvals route to the dashboard
   where the spawning human is present (via the parent slot), so they keep the long
   interactive window.
 - When `is_background`, both the Slack `wait_for(pending.future, ...)` and
   `DashboardState.request_approval(..., is_background=True)` use
-  `_BACKGROUND_APPROVAL_TIMEOUT_SECS` (180s / 3 min) and then **deny** on expiry —
-  letting the turn proceed/fail rather than hang. Interactive sources are
-  unchanged (`_APPROVAL_TIMEOUT`, 2h).
+  `DashboardState._BACKGROUND_APPROVAL_TIMEOUT_SECS` and then **deny** on expiry —
+  letting the turn proceed/fail rather than hang. `test/test_dashboard_approval.py::TestBackgroundApprovalDenyFast` pins the bounded background window and the unchanged interactive window.
 - The Slack and dashboard windows reference `DashboardState._BACKGROUND_APPROVAL_TIMEOUT_SECS`
   / `DashboardState._APPROVAL_TIMEOUT` as the single source of truth.
 
@@ -513,6 +507,23 @@ The setting is independent of `tunnel.enabled` (which controls whether the
 tunnel itself runs). A user may run a tunnel for direct browser access while
 keeping Slack links pointed at the local origin.
 
+`--no-tunnel` overrides it. When `use_tunnel_url` is on, the box is
+localhost-only and no tunnel is live, `send_dashboard_link()` offers a composed
+edition an on-demand provisioning seam (`current_context().tunnel
+.ensure_available()`) — a second door out that bypasses `setup_tunnel` entirely,
+provisioning straight on the provider without ever constructing a
+`TunnelManager`. On a process booted with `--no-tunnel` that seam is not reached
+at all (`tunnel.publish_disabled()`), the refusal is SEL-audited as
+`tunnel.provision_denied` / `no_tunnel_boot_flag` — the same control as the boot
+refusal, so neither door's denials are missing from the trail — and the link is
+composed from the local origin instead. The DM also carries a line naming
+`--no-tunnel` and the `ssh -L` form: every other route to a local link can still
+become reachable (the edition seam re-issues once its tunnel connects), but this
+one never will, so without it the requester taps a link that times out every time
+with the explanation only in the log. Without that check the flag would be a
+promise the product does not keep: an instance that refused to publish at boot
+would publish the first time anyone asked for a dashboard link.
+
 **Slack connect is non-fatal** (`GatewayOrchestrator._connect_slack`): the
 initial socket-mode `connect()` is wrapped so a network/proxy/timeout failure
 (e.g. a stale `HTTPS_PROXY` in the launching shell — slack_sdk's aiohttp client
@@ -548,7 +559,7 @@ Config example (remote access via URL):
 - **Interactive payload access check**: `interactions.dispatch()` uses deny-by-default — rejects unless the clicking user is positively confirmed as allowed. Non-allowed users receive an ephemeral message ("⛔ You are not authorized to use these buttons.") and the original buttons remain intact for the owner to click later.
 - Dedup cache (`SeenCache`) prevents processing duplicate Slack events
 - Bot self-message filtering via `bot_id` check
-- **Trusted bot IDs** (`slack.trusted_bot_ids` in config): allows specific bot IDs to bypass the blanket `bot_id` filter, enabling multi-node mesh communication. Empty list = all bot messages dropped (default). Protected by: self-echo guard (lazy `auth_test()` to detect own bot_id) and auth bypass via `from_trusted_bot` flag — trusted bot messages bypass `is_allowed_user()` and are granted equivalent access to allowed users; authorization is explicit via the `trusted_bot_ids` config allowlist, not the `slack_allowed_users` list. All trusted-bot permission decisions emit SEL audit events. Cross-bot loop prevention is handled at the agent layer via envelope protocol, not the gateway.
+- **Trusted bot IDs** (`slack.trusted_bot_ids` in config): allows specific bot IDs to bypass the blanket `bot_id` filter, enabling multi-node mesh communication. Empty list = all bot messages dropped (default), and a bot id NOT in the list is denied exactly as with no list (fail-closed, `error=untrusted_bot`). Admission requires a positive `bot_id` match against the allowlist; the match sets `from_trusted_bot`, which lets the `bot_id` stand in as `sender_id` and grants access equivalent to an allowed user — authorization is explicit via the `trusted_bot_ids` config allowlist, not the `slack_allowed_users` list. All trusted-bot permission decisions emit SEL audit events (allowed decisions carry `resources="trusted_bot"` so the decision basis is traceable). Echo protection: error replies to trusted-bot messages are suppressed on both dispatch routes — the native path (`from_trusted_bot` in `handle_message`) and the default transport path (`from_trusted_bot` in `handle_message_transport`, threaded through the immediate call, both session queues, and `_dispatch_queued`; the error message is suppressed but the thread status is still cleared). Successful-reply loops are bounded by the **per-thread turn cap** (`slack.trusted_bot_turn_limit`, default 5, minimum 1): a thread that has run that many consecutive trusted-bot turns admits no more (`error=trusted_bot_turn_limit_reached`) until an allowed human posts in it, which resets the count — without the cap, two mutually trusted gateways would admit each other's replies as fresh turns indefinitely. Only a message that actually dispatches a turn moves the count (Slack retries, message/app_mention duplicate pairs, and activation-dropped messages do not). Review-mode channels deny trusted bots outright (`error=trusted_bot_denied_in_review_channel`): the review draft flow delivers via an ephemeral to the sender, which requires a human user id. The gateway's own bot id (cached from the startup `auth.test` that enterprise validation already performs) is never trusted even when listed (`error=own_bot_id_never_trusted`) — otherwise every reply would re-enter the handler as fresh input, a self-reply loop; when `auth.test` was unavailable the self identity is unverified and the admission FAILS CLOSED, trusting nobody (`error=trusted_bot_requires_verified_self_id`) — the same posture enterprise validation takes for a configured allowlist with unverifiable workspace identity.
 - Socket Mode — no public URL exposed
 - Credentials stored in `~/.kiro/crew/.env` with `chmod 600`
 

@@ -7,6 +7,20 @@ import re as _re
 from dataclasses import dataclass, field
 from typing import Any
 
+# Backend identifiers + the selectable registry live in the leaf module
+# ``kiro_crew.acp_backends`` (it imports nothing from this package, which is what
+# lets the config loader and the dashboard read them). Re-exported here so every
+# existing ``from kiro_crew.acp.types import ACP_BACKEND_*`` call site is
+# unchanged — see the "ACP Backend Identifiers" section below for why they moved.
+from kiro_crew.acp_backends import (  # noqa: F401 - re-exported for existing importers
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+    ACP_BACKEND_OPENCODE,
+    ACP_BACKENDS_KNOWN,
+    selectable_backends,
+)
+
 # ── ACP Event Kinds ──
 
 EVENT_TEXT_CHUNK = "text_chunk"
@@ -69,17 +83,8 @@ METHOD_SET_CONFIG_OPTION = "session/set_config_option"
 #: ``session/set_model``, so this is the only way to switch a model on it.
 MODEL_CONFIG_ID = "model"
 
-#: KAS→client auth callback (server-initiated REQUEST) sent when KAS is launched
-#: with ``--auth=acp-callback``. Connection-level: it carries NO sessionId, so
-#: the runtime answers it directly rather than routing it to a session. Note the
-#: single-underscore ``_kiro/`` namespace, distinct from the ``_kiro.dev/`` ones.
-METHOD_KAS_AUTH_GET_ACCESS_TOKEN = "_kiro/auth/getAccessToken"
 #: JSON-RPC 2.0 reserved error code for an unrecognized method.
 JSONRPC_METHOD_NOT_FOUND = -32601
-#: JSON-RPC error code returned when the auth callback cannot be fulfilled. KAS
-#: treats any rejection as an expired-token signal, so the exact code is not
-#: load-bearing; -32000 is the ACP server-error range.
-KAS_AUTH_CALLBACK_ERROR_CODE = -32000
 
 # kiro-cli exposes its task/TODO list as an ordinary tool call whose real name
 # arrives in `_meta.kiro.toolName` (the visible `title` is a prose sentence like
@@ -114,36 +119,19 @@ ACP_CLIENT_CAPABILITIES: dict = {
 }
 
 # ── ACP Backend Identifiers ──
-
-ACP_BACKEND_CLAUDE = "claude"
-ACP_BACKEND_KAS = "kas"
-# Fork: OpenCode driven through its own ACP binary (openai/anthropic wire
-# format selectable via agent.provider_api_format).
-ACP_BACKEND_OPENCODE = "opencode"
-# The kiro-cli backend is spelled as the empty string throughout, so name it
-# rather than leaving every call site to infer it from "not claude".
-ACP_BACKEND_KIRO = ""
-# Membership gate for the ``acp_backend`` kwarg. An unrecognized value would
-# otherwise fall through every ``_is_<backend>`` check and silently spawn
-# kiro-cli, so provider construction rejects it instead.
-ACP_BACKENDS_KNOWN = frozenset(
-    {
-        ACP_BACKEND_KIRO,
-        ACP_BACKEND_CLAUDE,
-        ACP_BACKEND_KAS,
-        # Fork: OpenCode driven through its own ACP binary (standalone session,
-        # one client per session — see the capability sets below for what it
-        # deliberately does NOT inherit).
-        ACP_BACKEND_OPENCODE,
-    }
-)
-# What an operator may actually persist in ``agent.acp_backend``, which is a
-# narrower question than what the code understands: ``ACP_BACKEND_CLAUDE`` is a
-# dormant seam reached by its own provider, not something to select here. Config
-# resolution degrades an unselectable value to the default, so a typo costs a log
-# line rather than a gateway that will not start.
-# Fork: opencode is operator-selectable alongside kiro/kas.
-ACP_BACKENDS_SELECTABLE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_OPENCODE})
+# DEFINED in :mod:`kiro_crew.acp_backends` and re-exported from the import block
+# at the top of this module, so the ~19 existing
+# ``from kiro_crew.acp.types import ACP_BACKEND_*`` call sites are unchanged.
+#
+# The definitions had to move out of this package: importing anything under
+# ``kiro_crew.acp`` executes its ``__init__`` (client + runtime), so the loader's
+# field metadata and the dashboard's PATCH allowlist could not read them and each
+# kept a literal copy of the selectable list instead. ``acp_backends`` imports
+# nothing from this package, so it can be the single code owner.
+#
+# The selectable set is no longer a constant either: it is a REGISTRY an edition
+# extends (``register_selectable_backend``). A frozen ``ACP_BACKENDS_SELECTABLE``
+# snapshot here would be read before boot registration and silently miss it.
 
 # ── Capability membership (harness-parity H6, H7) ──
 # Every capability a backend may claim is an OPT-IN set here, never a negation at
@@ -173,6 +161,13 @@ ACP_BACKENDS_STEER = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # claiming it for a harness with no internal sandbox hands isolation to a layer
 # that never starts and leaves the agent process unconfined. Only kiro-cli
 # qualifies; a Node or Python harness does not, however it is spawned.
+#
+# KAS is NOT a member even though Crew now spawns it as ``kiro-cli acp
+# --agent-engine v3`` and the process on the end of the argv IS kiro-cli. The
+# relay spawns the KAS server without an ``--sandbox`` argument, and KAS's
+# sandbox factory resolves an absent config to its no-op backend, so no OS
+# sandbox starts inside — adding KAS here would skip Crew's seatbelt in favour of
+# a layer that does not exist. See :mod:`kiro_crew.acp.kas_transport`.
 ACP_BACKENDS_INTERNAL_SANDBOX = frozenset({ACP_BACKEND_KIRO})
 
 # Backends served by AcpRuntime + AcpSessionHandle — the kiro-agent family
@@ -194,11 +189,15 @@ ACP_BACKENDS_ACP_RUNTIME = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 # is already running. Membership is what authorizes retiring a live session's
 # child when that store starts naming a different account: a harness
 # authenticated some other way must not be recycled on a store it never reads.
-# KAS is deliberately NOT a member — it is a separate Node entry point
-# (``build_kas_argv``), and nothing here establishes that it authenticates from
-# kiro-cli's store; it opts in when someone demonstrates that it does. Positive
-# membership rather than "not claude" (harness-parity H5).
-ACP_BACKENDS_KIRO_IDENTITY_STORE = frozenset({ACP_BACKEND_KIRO})
+# KAS is a member: it is spawned as ``kiro-cli acp --agent-engine v3
+# --auth-method cli`` (see :mod:`kiro_crew.acp.kas_transport`), and that
+# ``--auth-method cli`` is precisely the demonstration this set waits for — the
+# relay resolves every access token from kiro-cli's own store, so a logout that
+# invalidates the kiro backend invalidates a running KAS relay identically.
+# Excluding it would let a KAS session keep serving turns on the previous
+# account's credentials. Positive membership rather than "not claude"
+# (harness-parity H5).
+ACP_BACKENDS_KIRO_IDENTITY_STORE = frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
 
 # ── Provider labels ──
 # The backend identity key persisted in the session map. It indexes three
@@ -223,7 +222,6 @@ KAS_CLIENT_CAPABILITIES: dict = {
     **ACP_CLIENT_CAPABILITIES,
     "_meta": {"kiro": {"settings": {}}},
 }
-ACP_BACKEND_OPENCODE = "opencode"
 
 # ── Claude backend permission modes ──
 # Values an edition writes into a per-session settings.local.json
@@ -305,6 +303,13 @@ STOP_REASON_STALE_RECOVER = "stale_recover"
 # generic error handling; chat_runner routes it to a dedicated recovery
 # (continue-nudge, NOT a verbatim re-run of the original message).
 STOP_REASON_TOOL_STALL = "error: tool stall"
+# Signalled by the ACP layer when automatic compaction reported `failed`
+# and the backend then abandoned the turn (no prompt response, no
+# end_turn) past the post-failure budget. Kept in the "error:" family so
+# callers without a dedicated branch fall back to generic error handling;
+# it deliberately triggers NO retry — the user-visible compaction notice
+# already explains what happened, and this only releases the slot.
+STOP_REASON_COMPACTION_FAILED = "error: compaction failed"
 
 # ── Approval Modes ──
 
@@ -492,6 +497,11 @@ class AcpEvent:
     request_id: str | int = ""
     options: list[dict[str, str]] = field(default_factory=list)
     tool_input: str = ""
+    #: True when the provider-facing tool input had secret/exfiltration bytes
+    #: removed before it was placed in ``tool_input``.  This is provenance only:
+    #: the original bytes never ride this display event.  Approval surfaces use
+    #: it to refuse a durable command grant for a value the user could not see.
+    tool_input_redacted: bool = False
     tool_output: str = ""
     tool_final: bool = False  # True when this tool_result is the final (status=completed) update
     usage: TurnUsage = field(default_factory=TurnUsage)
@@ -532,6 +542,15 @@ class AcpEvent:
     #: classification (cache hit), not the miss-default False.
     raw_params_trusted: bool = False
     shell_classified: bool = False
+    #: mcp_identity_trusted: mcp_server_name/tool_name below were populated
+    #: from a provenance-verified source — the origin-scoped tool_call caches
+    #: (permission path) or ``_meta.kiro`` on the tool_call frame itself —
+    #: never an inline/agent-authored fallback. Mirrors ``raw_params_trusted``:
+    #: ``child_mcp_identity_trusted`` requires this flag IN ADDITION to
+    #: non-empty identity fields, so a future population path that forgets it
+    #: fails CLOSED (identity not counted as verified) instead of silently
+    #: passing on non-emptiness alone.
+    mcp_identity_trusted: bool = False
     # Canonical, NON-model-authored tool identity from ``_meta.kiro`` (see
     # ``_dispatch._kiro_tool_name``). ``title`` is LLM-authored prose — for shell
     # tools ``select_tool_title`` even prefers the model's ``description`` — so a
@@ -633,6 +652,70 @@ class AcpEvent:
             return True
         return False
 
+    @property
+    def child_mcp_identity_trusted(self) -> bool:
+        """True for a child MCP event whose IDENTITY is verified even when its
+        arguments are not.
+
+        ``child_low_fidelity`` conflates two independent provenances: the tool's
+        identity and its arguments. A remote (HTTP) MCP server's ``tool_call``
+        frame legitimately streams an empty ``rawInput``, so the params cache
+        stays empty and every such child permission request is low-fidelity —
+        yet the ``_meta.kiro`` server/tool identity from that same frame DID
+        reach the caches and is non-model-authored. This property isolates that
+        verified-identity half so UNCONDITIONAL grant paths — ones whose approve
+        decision consumes no agent-authored event data (session trust-all,
+        global YOLO, ``parent_policy=auto``, per-source auto-approve) — can
+        honor the grant, while every content-matching path (trusted patterns,
+        trust-reads, title-keyed ``auto_approve_tools``) stays gated on the
+        composite ``child_low_fidelity``: for those the agent-authored title or
+        inline params ARE the matched input, and a forged title must never
+        satisfy them.
+
+        Requirements, each fail-closed on its cache: a child origin
+        (``sub_session_id``), a RESOLVED non-shell classification
+        (``shell_classified`` and not ``is_shell`` — an unclassified event
+        defaults to non-shell and must not pass as one; a shell tool's deny
+        gates need the command bytes this event lacks), the canonical
+        ``mcp_server_name`` + ``tool_name`` pair recovered from the tool_call
+        cache (empty on a miss, and populated only for genuinely MCP-served
+        tools — a host shell/builtin can never carry a server name), and the
+        explicit ``mcp_identity_trusted`` provenance flag set by the trusted
+        population sites — non-emptiness alone is NOT proof of provenance, so
+        an identity pair written by any future inline/agent-authored fallback
+        stays untrusted until that site earns the flag. A
+        non-child event returns False: parents never need the split.
+        """
+        return bool(
+            self.sub_session_id
+            and self.shell_classified
+            and not self.is_shell
+            and self.mcp_identity_trusted
+            and self.mcp_server_name
+            and self.tool_name
+        )
+
+    @property
+    def child_unconditional_grant_eligible(self) -> bool:
+        """True when an UNCONDITIONAL grant path may honor this event.
+
+        An unconditional grant is one whose approve decision consumes no
+        agent-authored event data: session trust-all, global YOLO / the
+        ``--approval yolo`` override, ``parent_policy=auto``, per-source
+        auto-approve. Such a grant is eligible when the event has full
+        fidelity (``not child_low_fidelity``) OR its canonical MCP identity is
+        verified (``child_mcp_identity_trusted``) — for the latter only the
+        ARGUMENTS remain unverified, which the grant never reads (the same
+        blindness the interactive card has; the identity split changes WHO
+        approves, not what any gate can scan). Content-MATCHING paths —
+        trusted patterns, trust-reads, title-keyed ``auto_approve_tools``, the
+        'reads' classification — must stay gated on the composite
+        ``child_low_fidelity`` instead: the agent-authored title or inline
+        params ARE their matched input, and a forged title must never satisfy
+        them. Non-child events are always eligible (never low-fidelity).
+        """
+        return not self.child_low_fidelity or self.child_mcp_identity_trusted
+
 
 @dataclass
 class AcpPromptStats:
@@ -662,6 +745,22 @@ class AcpPromptStats:
     # Per-turn billing credits summed from kiro's _kiro.dev/metadata
     # meteringUsage (unit="credit"). 0 for providers that bill in tokens.
     credits: float = 0.0
+    # Per-turn token counts from the PromptResponse (the claude-agent-acp
+    # adapter reports them there; kiro-cli's response carries none, so these
+    # stay 0 on the kiro path). Accumulated like ``credits``; reset per turn
+    # by ``carry_over()``.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    # Per-turn cost delta in USD, derived from the adapter's session-cumulative
+    # ``usage_update.cost.amount`` via ``apply_cost_cumulative``. Reset per turn
+    # by ``carry_over()``.
+    cost_usd: float = 0.0
+    # Last seen session-cumulative cost — the baseline the next reading is
+    # delta'd against. SESSION state: survives ``carry_over()`` like the
+    # context fields, or every turn would re-bill the whole session's spend.
+    cost_session_usd: float = 0.0
     # True while ``context_pct`` reads 0.0 only because a compaction dropped the
     # counts and no fresh telemetry has re-derived them. Distinguishes "the
     # transcript is empty" from "the transcript's size is unknown" — the two are
@@ -683,6 +782,7 @@ class AcpPromptStats:
             context_window_tokens=self.context_window_tokens,
             context_tokens_from_usage=self.context_tokens_from_usage,
             context_pct_unknown=self.context_pct_unknown,
+            cost_session_usd=self.cost_session_usd,
         )
 
     def reset_context_state(self) -> None:
@@ -712,6 +812,11 @@ class AcpPromptStats:
         self.context_window_tokens = 0
         self.context_tokens_from_usage = False
         self.context_pct_unknown = False
+        # The adapter's cumulative cost counter belongs to the OLD session; the
+        # fresh session/new starts it at zero, so a kept baseline would
+        # under-count the first turns (any new reading below the stale baseline
+        # only survives via the monotonic reset guard).
+        self.cost_session_usd = 0.0
 
     def note_pct_reported(self) -> None:
         """Mark ``context_pct`` as backed by real telemetry.
@@ -721,6 +826,64 @@ class AcpPromptStats:
         what the compacted transcript actually costs.
         """
         self.context_pct_unknown = False
+
+    def apply_cost_cumulative(self, cumulative: float) -> None:
+        """Fold a session-cumulative cost reading into the per-turn delta.
+
+        The adapter reports cost as a running session total, so the per-turn
+        figure is the movement since the last reading. Monotonic guard: a
+        reading BELOW the stored baseline means the adapter's counter reset
+        (process restart) — the new total is then entirely spend since the
+        reset, so it is taken whole rather than producing a negative delta.
+        The caller validates the value (finite, non-negative) at the
+        ``parse_usage_cost`` chokepoint.
+        """
+        delta = cumulative - self.cost_session_usd
+        if delta < 0:
+            delta = cumulative
+        self.cost_usd += delta
+        self.cost_session_usd = cumulative
+
+    def apply_prompt_token_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+    ) -> None:
+        """Accumulate the PromptResponse's turn-scoped token counts.
+
+        Accumulated (not assigned) to mirror ``credits``: the counters are
+        per-turn and ``carry_over()`` zeroes them at the turn boundary, so a
+        turn that sees one response reads identically either way, and one that
+        sees several sums them. Callers validate at the
+        ``parse_prompt_token_usage`` chokepoint.
+        """
+        self.input_tokens += int(input_tokens)
+        self.output_tokens += int(output_tokens)
+        self.cache_read_tokens += int(cache_read_tokens)
+        self.cache_write_tokens += int(cache_write_tokens)
+
+    def to_turn_usage(self) -> "TurnUsage":
+        """One ``TurnUsage`` carrying every billing dimension this turn filled.
+
+        The single source of truth for stats → event conversion: every
+        ``EVENT_COMPLETE`` construction site uses this instead of hand-filling
+        fields, so a backend that bills in cost/tokens (the claude seam) and
+        one that bills in credits (kiro) both surface whatever they reported.
+        A backend that sends neither cost nor token counts leaves the new
+        dimensions at their zero defaults, so the result is byte-identical to
+        ``TurnUsage(credits=...)`` (harness parity).
+        """
+        return TurnUsage(
+            input_tokens=self.input_tokens,
+            output_tokens=self.output_tokens,
+            cache_read_tokens=self.cache_read_tokens,
+            # Anthropic's "cache write" is a cache-creation charge.
+            cache_creation_tokens=self.cache_write_tokens,
+            cost_usd=self.cost_usd,
+            credits=self.credits,
+        )
 
     @staticmethod
     def sanitize_pct(value: object) -> float | None:

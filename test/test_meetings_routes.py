@@ -3282,3 +3282,477 @@ class TestATeardownNeverClearsAReplacement:
         drained = await active.drain_and_clear()
         assert drained is session
         assert active.get() is None
+
+
+def _held_lines(session) -> list[str]:
+    """Just the text of an init hold, dropping each entry's recipient snapshot."""
+    return [line for line, _recipients in session.init_buffer]
+
+
+class TestSpeechDuringAgentInitIsHeldNotRefused:
+    """Issue #4610: the opening of a meeting must survive agent initialization.
+
+    ``handle_start_meeting`` persists ``active``, installs the session, then awaits
+    ``init_agents`` — a sequence of model turns measured at ~46s. Ingress is shut
+    for that whole span, so every line spoken into it was answered 409 and lost:
+    the notes and tasks began partway through the first topic with nothing to show
+    a turn had been dropped.
+
+    Speech in that window is now HELD and replayed in arrival order. The hold is
+    bounded by line count, overflows by dropping the OLDEST, and announces a drop
+    to both readers — the agents and the durable transcript.
+    """
+
+    @staticmethod
+    async def _start_paused_in_init(
+        client, monkeypatch: pytest.MonkeyPatch, meeting_id: str = "standup"
+    ):
+        """Begin a start that blocks INSIDE ``init_agents``.
+
+        Returns ``(start_task, release)``: the in-flight request, and the event that
+        lets initialization finish. Mirrors the real window — the session is
+        installed and the meeting reads ``active``, but no agent knows its output
+        file yet.
+        """
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_init_agents = sess.init_agents
+
+        async def blocking_init(session, meta, root=None):
+            entered.set()
+            await release.wait()
+            await real_init_agents(session, meta, root)
+
+        monkeypatch.setattr(sess, "init_agents", blocking_init)
+        await client.post(f"{BASE}/meetings/{meeting_id}/init", json={"title": "Standup"})
+        start = asyncio.create_task(
+            client.post(f"{BASE}/meetings/{meeting_id}/start", json={})
+        )
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        return start, release
+
+    @pytest.mark.asyncio
+    async def test_speech_mid_init_is_buffered_and_delivered_in_order(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The core regression: three lines spoken during init reach the agents.
+
+        RED on origin/main — each dispatch answers 409 ``no_active_meeting`` and the
+        lines never enter a queue at all.
+        """
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+
+            for line in ("first the agenda", "then the blockers", "and the owners"):
+                resp = await client.post(
+                    f"{BASE}/meetings/standup/dispatch", json={"text": line}
+                )
+                assert resp.status == 200, await resp.text()
+                body = await resp.json()
+                # Held, not fanned out — and already durable either way. The hold is
+                # observed on the session below; the response says only that nothing
+                # reached an agent yet.
+                assert body["dispatched"] == 0
+                assert body["segment"]["source"] == k.TRANSCRIPT_SOURCE_SPEECH
+
+            session = _common.ACTIVE.get("standup")
+            assert session is not None
+            assert _held_lines(session) == [
+                "first the agenda",
+                "then the blockers",
+                "and the owners",
+            ]
+
+            release.set()
+            assert (await start).status == 200
+
+            # Drained into every unmuted queue, in the order they were spoken.
+            assert session.init_buffer == []
+            for agent_id in ("note-taker", "sketch-artist", k.TASK_EXTRACTOR_ID):
+                assert session.agents[agent_id].queue == [
+                    "first the agenda",
+                    "then the blockers",
+                    "and the owners",
+                ]
+
+    @pytest.mark.asyncio
+    async def test_the_transcript_holds_every_line_spoken_during_init(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The durable record is written at ARRIVAL, so a reader loses nothing."""
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+            await client.post(
+                f"{BASE}/meetings/standup/dispatch", json={"text": "opening remarks"}
+            )
+            # Readable BEFORE initialization finishes — the user sees their own words.
+            body = await (await client.get(f"{BASE}/meetings/standup/transcript")).json()
+            assert [s["text"] for s in body["segments"]] == ["opening remarks"]
+
+            release.set()
+            assert (await start).status == 200
+
+    @pytest.mark.asyncio
+    async def test_a_typed_line_mid_init_keeps_its_chat_marking(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A held line goes through the same recorder as a live one."""
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+            body = await (
+                await client.post(
+                    f"{BASE}/meetings/standup/dispatch",
+                    json={"text": "the owner is Bob", "chat": True},
+                )
+            ).json()
+            assert body["dispatched"] == 0
+            assert body["text"].startswith(k.CHAT_PREFIX)
+            assert body["segment"]["source"] == k.TRANSCRIPT_SOURCE_TYPED
+
+            release.set()
+            assert (await start).status == 200
+
+    @pytest.mark.asyncio
+    async def test_a_held_line_is_still_redacted(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The hold must not become a way for a credential to reach an agent unredacted."""
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+            body = await (
+                await client.post(
+                    f"{BASE}/meetings/standup/dispatch",
+                    json={"text": "rotate AKIAIOSFODNN7EXAMPLE today"},
+                )
+            ).json()
+            assert "AKIAIOSFODNN7EXAMPLE" not in body["text"]
+            assert "AKIAIOSFODNN7EXAMPLE" not in body["segment"]["text"]
+
+            session = _common.ACTIVE.get("standup")
+            assert session is not None
+            assert not any("AKIAIOSFODNN7EXAMPLE" in line for line in _held_lines(session))
+
+            release.set()
+            assert (await start).status == 200
+
+    @pytest.mark.asyncio
+    async def test_the_hold_is_bounded_and_drops_the_oldest(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The cap holds, and overflow discards the OLDEST lines — never the newest.
+
+        The bound is the security property: ``POST .../dispatch`` takes untrusted
+        text, so an unbounded hold on that path would be a memory-exhaustion lever.
+        """
+        monkeypatch.setattr(k, "MAX_INIT_BUFFER_LINES", 3)
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+
+            for index in range(5):
+                resp = await client.post(
+                    f"{BASE}/meetings/standup/dispatch", json={"text": f"line number {index}"}
+                )
+                assert resp.status == 200
+
+            session = _common.ACTIVE.get("standup")
+            assert session is not None
+            # Never more than the cap, and it is the TAIL that survived.
+            assert len(session.init_buffer) == 3
+            assert _held_lines(session) == ["line number 2", "line number 3", "line number 4"]
+            assert session.init_dropped == 2
+
+            release.set()
+            assert (await start).status == 200
+
+    @pytest.mark.asyncio
+    async def test_an_overflow_marks_the_gap_for_the_agents_and_the_transcript(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A drop is announced to BOTH readers — a silent truncation is the real bug.
+
+        The marker leads the drained lines, because drop-oldest puts the gap at the
+        head of what survived.
+        """
+        monkeypatch.setattr(k, "MAX_INIT_BUFFER_LINES", 2)
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+            for index in range(4):
+                await client.post(
+                    f"{BASE}/meetings/standup/dispatch", json={"text": f"line number {index}"}
+                )
+
+            session = _common.ACTIVE.get("standup")
+            assert session is not None
+            release.set()
+            assert (await start).status == 200
+
+            expected_marker = k.SYSTEM_INIT_BUFFER_OVERFLOW.format(count=2, limit=2)
+            # The agents are told first, then given what survived.
+            assert session.agents["note-taker"].queue == [
+                expected_marker,
+                "line number 2",
+                "line number 3",
+            ]
+            assert session.init_dropped == 0  # the tally is consumed by the drain
+
+            # And the human transcript states it too, under a source the reader
+            # keeps: `read_transcript_page` drops unrecognized sources, so a marker
+            # written outside `VALID_TRANSCRIPT_SOURCES` would vanish on read.
+            body = await (await client.get(f"{BASE}/meetings/standup/transcript")).json()
+            markers = [
+                s for s in body["segments"] if s["source"] == k.TRANSCRIPT_SOURCE_SYSTEM
+            ]
+            assert len(markers) == 1
+            assert markers[0]["text"] == expected_marker
+            # Every spoken line is still in the transcript — only the AGENTS lost two.
+            assert [s["text"] for s in body["segments"] if s["source"] != "system"] == [
+                "line number 0",
+                "line number 1",
+                "line number 2",
+                "line number 3",
+            ]
+
+    @pytest.mark.asyncio
+    async def test_no_marker_when_the_hold_did_not_overflow(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A meeting that fits inside the bound gets no system noise at all."""
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+            await client.post(
+                f"{BASE}/meetings/standup/dispatch", json={"text": "just the one line"}
+            )
+            release.set()
+            assert (await start).status == 200
+
+            body = await (await client.get(f"{BASE}/meetings/standup/transcript")).json()
+            assert [s["source"] for s in body["segments"]] == [k.TRANSCRIPT_SOURCE_SPEECH]
+
+    @pytest.mark.asyncio
+    async def test_the_poll_reports_the_hold_so_the_microphone_can_open(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """``buffering_dispatches`` is the flag the dashboard's mic gate needs.
+
+        Without it the client keeps the microphone shut for the whole window (its
+        gate reads ``accepting_dispatches``), so nothing would ever reach the hold
+        and the server-side fix would be unreachable.
+        """
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+            live = (await (await client.get(f"{BASE}/meetings/standup")).json())["live"]
+            # Direct fan-out is shut, but speech LANDS — held.
+            assert live["accepting_dispatches"] is False
+            assert live["buffering_dispatches"] is True
+
+            release.set()
+            assert (await start).status == 200
+
+            live = (await (await client.get(f"{BASE}/meetings/standup")).json())["live"]
+            assert live["accepting_dispatches"] is True
+            assert live["buffering_dispatches"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_reviewing_meeting_still_refuses_instead_of_buffering(
+        self, app, fake_sessions
+    ):
+        """The #1981 gate is untouched: only INITIALIZATION holds a line.
+
+        A reviewing meeting has nowhere to put the line — its agents were told to
+        finalize — so it must keep answering 409 rather than quietly accumulating
+        speech nothing will drain.
+        """
+        async with client_for(app) as client:
+            await _start(client)
+            status = await client.post(
+                f"{BASE}/meetings/standup/status", json={"status": k.STATUS_REVIEWING}
+            )
+            assert status.status == 200
+
+            resp = await client.post(
+                f"{BASE}/meetings/standup/dispatch", json={"text": "too late"}
+            )
+            assert resp.status == 409
+            assert (await resp.json())["code"] == "no_active_meeting"
+
+            live = (await (await client.get(f"{BASE}/meetings/standup")).json())["live"]
+            assert live["accepting_dispatches"] is False
+            assert live["buffering_dispatches"] is False
+
+    @pytest.mark.asyncio
+    async def test_an_outgoing_session_being_replaced_does_not_buffer(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Replacing a lapsed meeting suspends the OUTGOING session to refuse, not hold.
+
+        Its transcript is being flushed and its session dropped; a line held against
+        it would be drained by nobody.
+        """
+        async with client_for(app) as client:
+            await _start(client, "the-old-one")
+            outgoing = _common.ACTIVE.get("the-old-one")
+            assert outgoing is not None
+            monkeypatch.setattr(
+                type(outgoing), "expired", property(lambda _self: True)
+            )
+
+            start, release = await self._start_paused_in_init(
+                client, monkeypatch, "the-new-one"
+            )
+            # The replaced meeting refuses; only the starting one holds.
+            stale = await client.post(
+                f"{BASE}/meetings/the-old-one/dispatch", json={"text": "orphan line"}
+            )
+            assert stale.status == 409
+            held = await client.post(
+                f"{BASE}/meetings/the-new-one/dispatch", json={"text": "live line"}
+            )
+            assert held.status == 200
+            starting = _common.ACTIVE.get("the-new-one")
+            assert starting is not None
+            assert _held_lines(starting) == ["live line"]
+
+            release.set()
+            assert (await start).status == 200
+
+    @pytest.mark.asyncio
+    async def test_filler_does_not_consume_a_slot_and_evict_real_speech(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Recognizer filler must not push the opening out of a bounded hold.
+
+        Filtering ran at DRAIN, so ``"uh"`` occupied a slot until initialization
+        finished and only then was discarded — meaning a burst of filler could
+        evict the genuine speech the cap was supposed to be protecting. A live
+        line is filtered the instant it arrives; a held one must be too.
+        """
+        monkeypatch.setattr(k, "MAX_INIT_BUFFER_LINES", 3)
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+
+            await client.post(
+                f"{BASE}/meetings/standup/dispatch", json={"text": "the real agenda"}
+            )
+            for filler in ("uh", "um", "ok so uh", "hmm"):
+                resp = await client.post(
+                    f"{BASE}/meetings/standup/dispatch", json={"text": filler}
+                )
+                assert resp.status == 200
+
+            session = _common.ACTIVE.get("standup")
+            assert session is not None
+            # Four filler lines went in and none of them displaced anything.
+            assert _held_lines(session) == ["the real agenda"]
+            assert session.init_dropped == 0
+
+            release.set()
+            assert (await start).status == 200
+            assert session.agents["note-taker"].queue == ["the real agenda"]
+
+    @pytest.mark.asyncio
+    async def test_a_mute_during_init_does_not_rob_earlier_speech(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Recipients are the ones the line HAD, not the ones it finds at drain.
+
+        Resolving recipients at drain let a mute applied mid-initialization reach
+        backwards: a line spoken while the agent was listening silently vanished
+        from its output. The live path cannot produce that, because it fans out
+        before the mute exists.
+        """
+        async with client_for(app) as client:
+            start, release = await self._start_paused_in_init(client, monkeypatch)
+            await client.post(
+                f"{BASE}/meetings/standup/dispatch", json={"text": "said while listening"}
+            )
+
+            mute = await client.post(
+                f"{BASE}/meetings/standup/mute",
+                json={"agent_id": "note-taker", "muted": True},
+            )
+            assert mute.status == 200
+
+            await client.post(
+                f"{BASE}/meetings/standup/dispatch", json={"text": "said after the mute"}
+            )
+
+            session = _common.ACTIVE.get("standup")
+            assert session is not None
+            release.set()
+            assert (await start).status == 200
+
+            # The note-taker keeps what it was addressed, and gains nothing after.
+            assert session.agents["note-taker"].queue == ["said while listening"]
+            # An agent unmuted throughout got both lines.
+            assert session.agents["sketch-artist"].queue == [
+                "said while listening",
+                "said after the mute",
+            ]
+
+
+class TestMuteCannotLandInsideADispatch:
+    """A mute may not change the audience of a line already being recorded.
+
+    `handle_mute_agent` wrote `session.muted_agents` with no lock, while both
+    dispatch paths resolve their recipients from that set AFTER an awaited
+    transcript write. A mute arriving inside that window re-addressed a line to
+    the mute state of a moment after it was spoken — delivered to the wrong agent
+    set on the live path, and recorded-then-replayed to the wrong set on the
+    initialization hold (issue #4610).
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_mute_racing_the_transcript_write_keeps_the_line_s_audience(
+        self, app, fake_sessions, monkeypatch: pytest.MonkeyPatch
+    ):
+        async with client_for(app) as client:
+            start, release = await (
+                TestSpeechDuringAgentInitIsHeldNotRefused._start_paused_in_init(
+                    client, monkeypatch
+                )
+            )
+            session = _common.ACTIVE.get("standup")
+            assert session is not None
+
+            entered_append = threading.Event()
+            allow_append = threading.Event()
+            real_append = store.append_transcript
+
+            def blocking_append(*args, **kwargs):
+                """Hold the worker thread inside the transcript write."""
+                entered_append.set()
+                allow_append.wait(5)
+                return real_append(*args, **kwargs)
+
+            monkeypatch.setattr(store, "append_transcript", blocking_append)
+
+            dispatch = asyncio.create_task(
+                client.post(
+                    f"{BASE}/meetings/standup/dispatch",
+                    json={"text": "said while the note-taker was listening"},
+                )
+            )
+            # The dispatch now holds DISPATCH_LOCK and is parked in the append.
+            await asyncio.to_thread(entered_append.wait, 5)
+
+            mute = asyncio.create_task(
+                client.post(
+                    f"{BASE}/meetings/standup/mute",
+                    json={"agent_id": "note-taker", "muted": True},
+                )
+            )
+            # It must not be able to apply while the dispatch holds admission.
+            await asyncio.sleep(0.05)
+            assert not mute.done(), "the mute applied inside the dispatch's window"
+
+            allow_append.set()
+            assert (await dispatch).status == 200
+            assert (await mute).status == 200
+
+            # The held line kept the audience it had when it was spoken.
+            recipients = [names for _line, names in session.init_buffer]
+            assert len(recipients) == 1
+            assert "note-taker" in recipients[0]
+
+            release.set()
+            assert (await start).status == 200

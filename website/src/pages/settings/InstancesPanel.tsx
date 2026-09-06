@@ -10,7 +10,7 @@
  * tab strip can obtain the iframe token independently without sharing in-memory
  * state with this panel.
  */
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Server,
@@ -26,8 +26,8 @@ import {
 } from 'lucide-react'
 import { api, ApiError, type InstanceView, type InstanceTunnelStatus } from '../../api/client'
 import { Card, Btn } from '../../components/ui'
-import { useAppDispatch } from '../../store'
-import { removeWarm } from '../../store/instancesSlice'
+import { useAppDispatch, useAppSelector } from '../../store'
+import { removeWarm, setCrewAddForm } from '../../store/instancesSlice'
 
 import { i18nT } from '../../i18n/t'
 import { fmtDuration, fmtUnit } from '../../i18n/format'
@@ -38,6 +38,7 @@ import { SettingRef } from '../../components/settingRef/SettingRef'
 import {
   InstanceFormFields,
   useInstanceFormState,
+  isBlankInstanceForm,
   EMPTY_INSTANCE_FORM,
 } from './InstanceFormFields'
 const STATE_DOT: Record<InstanceTunnelStatus['state'], string> = {
@@ -70,11 +71,34 @@ export function StatusBadge({ status }: { status: InstanceTunnelStatus }) {
 }
 
 export function AddInstanceForm({ onAdded }: { onAdded: () => void }) {
-  const form = useInstanceFormState(EMPTY_INSTANCE_FORM)
+  // Resume what the user typed before a hand-off navigated them away. Read once
+  // per mount: a later read would fight the live form state.
+  const dispatch = useAppDispatch()
+  const stored = useAppSelector(s => s.instances.crewForms?.add ?? null)
+  const [restored] = useState(() => stored)
+  const form = useInstanceFormState(EMPTY_INSTANCE_FORM, restored)
+
+  // Hold the values on every change, not only when this card's own banner hands
+  // off. The navigation unmounts the WHOLE panel, so the crew rows above carry
+  // their own "Ask the agent" links that destroy this form just as thoroughly — as
+  // does a sidebar click or the browser's back button. Making this a property of
+  // the form rather than of one button covers every exit instead of the one wired.
+  //
+  // Undebounced deliberately: there is no write to batch. This is a store dispatch
+  // rather than storage, so running per keystroke costs a reducer call — while any
+  // debounce window is a window where a sibling row's button loses the fields.
+  useEffect(() => {
+    // Erasing the form erases the held values, or navigating away and back would
+    // restore text the user deliberately cleared.
+    dispatch(setCrewAddForm(isBlankInstanceForm(form.values) ? null : { ...form.values }))
+  }, [form.values, dispatch])
 
   const addMutation = useMutation({
     mutationFn: () => api.addInstance(form.body()),
     onSuccess: () => {
+      // The values described a crew that now exists; keeping them would pre-fill
+      // the next add with the one just created.
+      dispatch(setCrewAddForm(null))
       form.reset(EMPTY_INSTANCE_FORM)
       onAdded()
     },
@@ -91,7 +115,15 @@ export function AddInstanceForm({ onAdded }: { onAdded: () => void }) {
         <Plus className="lucide-inline" /> {i18nT('pages.settings.instancesPanel.add_instance')}
       </div>
       <InstanceFormFields idPrefix="add-instance" form={form} />
-      <ErrorNotice message={err} className="mt-3" />
+      {/* `askAgent` is safe here BECAUSE the typed values live above the route: the
+          hand-off navigates away and unmounts this form, and a first-time user has
+          just typed up to nine fields by hand. Nothing has to be persisted at click
+          time, so there is no failure to veto — coming back re-seeds from the store. */}
+      <ErrorNotice
+        message={err}
+        className="mt-3"
+        askAgent
+      />
       <div className="mt-3">
         <Btn primary onClick={() => addMutation.mutate()} disabled={addMutation.isPending || !form.valid}>
           {addMutation.isPending ? i18nT('pages.settings.instancesPanel.adding') : i18nT('pages.settings.instancesPanel.add_remote_crew')}

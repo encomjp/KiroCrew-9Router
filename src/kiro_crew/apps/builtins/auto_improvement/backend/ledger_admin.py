@@ -42,10 +42,17 @@ import json
 import logging
 import os
 import re
-import threading
 import time
 from typing import Any
 
+# The ONE process-wide lock that serializes read → decide → append against the ledger
+# file, SHARED with the loop's own filing writer: :meth:`spine.ledger.Ledger.record`
+# acquires the SAME object, so an operator forget / purge / manual-filed / commit here
+# cannot interleave with the loop's `record()` on the same file (#6716). It lives in the
+# stdlib-only leaf :mod:`spine.ledger_lock` precisely so both layers share one object
+# without this module pulling the spine engine (the driver / agent runner / PR pipeline).
+# Aliased to the historical name so the four `with _LEDGER_LOCK:` sites read unchanged.
+from ..spine.ledger_lock import LEDGER_WRITE_LOCK as _LEDGER_LOCK
 from . import store
 
 logger = logging.getLogger(__name__)
@@ -85,10 +92,6 @@ _PR_URL_RE = re.compile(r"^https://[^\s]+/(?:pull|merge_requests)/\d+", re.IGNOR
 #: Anchored with ``\Z``, not ``$``: ``$`` also matches immediately BEFORE a trailing
 #: newline, so ``"abc\n"`` would pass and reach a path interpolation.
 _FP_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
-
-#: Serializes read → decide → append against the ledger file. Module-level because
-#: the ledger is a process-wide singleton; the gateway runs these in worker threads.
-_LEDGER_LOCK = threading.Lock()
 
 #: Artifact families addressed by fingerprint. ``results/candidates/*`` is NOT here:
 #: those files are named after the ``cand_id``, not the fingerprint, so removing them
@@ -464,26 +467,88 @@ def record_committed(fp: str, *, branch: str, sha: str) -> bool:
         # `validate_fingerprint` RAISES on a bad shape rather than returning falsy.
         logger.warning("ledger: refusing to record a commit for a malformed fingerprint")
         return False
-    prior = {}
-    for record in latest_records():
-        if str(record.get("fp")) == safe_fp:
-            prior = record
-            break
+    with _LEDGER_LOCK:
+        kind, target = _prior_kind_target(_load_events(), safe_fp)
+        try:
+            _append_event(
+                {
+                    "fp": safe_fp,
+                    # Carried over so the row stays identifiable rather than becoming an
+                    # anonymous fingerprint in the timeline (as in `_purged_event`).
+                    "kind": kind,
+                    "target": target,
+                    "status": STATUS_COMMITTED,
+                    "cr": sha,
+                    "note": f"committed to {branch} ({sha})"[:200],
+                    "ts": time.time(),
+                }
+            )
+        except OSError as exc:
+            logger.error("ledger: could not record the commit of %s: %s", safe_fp, exc)
+            return False
+    return True
+
+
+def _prior_kind_target(events: list[dict[str, Any]], fp: str) -> tuple[str, str]:
+    """The ``kind`` and ``target`` from ``fp``'s most recent event, or empty strings.
+
+    Both are REQUIRED fields on ``spine.ledger.LedgerEntry``; a row missing either
+    raises ``TypeError`` inside ``_load()``'s torn-line handler and is silently dropped,
+    so every writer must carry them forward. Reading from the already-loaded ``events``
+    (rather than ``latest_records()``) keeps the read inside the caller's ``_LEDGER_LOCK``
+    critical section — one consistent read → decide → append, not a second file scan that
+    could observe a row a concurrent writer appended in between.
+    """
+    latest = _latest_event(events, fp)
+    if latest is None:
+        return "", ""
+    return str(latest.get("kind") or ""), str(latest.get("target") or "")
+
+
+def record_filed(fp: str, pr_ref: str) -> bool:
+    """Append a ``filed`` ledger row carrying a pull-request reference, under the lock.
+
+    The manual-draft path (``backend/routes.ledger_admin_record``) records a filed PR the
+    same way the loop's own filing does. It MUST share ``_LEDGER_LOCK`` with
+    :func:`forget` / :func:`purge`: those read the latest event, decide, and append while
+    holding the lock, so a filed write in a DIFFERENT lock domain can slip its row in
+    between a ``forget``'s read and its ``purged`` append. That interleaving lands
+    ``filed(real PR)`` then ``purged`` — last-write-wins makes ``purged`` current, which
+    hides the live pull request and re-opens the locus, so the loop drafts a SECOND PR for
+    a change already up for review. Serialized here, ``forget`` instead either runs before
+    this write (and this row supersedes its purge) or after it (and refuses on
+    ``has_pull_request``).
+
+    The reference goes in ``cr`` (never ``pr``) and ``kind``/``target`` are always present
+    for the reason in :func:`_purged_event`: ``LedgerEntry(**row)`` is a fixed-field
+    dataclass, so a row spelled ``pr`` or missing either field raises ``TypeError`` in
+    ``_load()``'s torn-line handler and the ``filed`` marker never enters the dedup index.
+    Readers accept both spellings, so the UI link still renders.
+
+    Returns True iff the row was written; a write failure is logged, never raised — the
+    pull request already exists, so a bookkeeping problem must not surface as an error the
+    operator might act on.
+    """
     try:
-        _append_event(
-            {
-                "fp": safe_fp,
-                # Carried over so the row stays identifiable rather than becoming an
-                # anonymous fingerprint in the timeline (as in `_purged_event`).
-                "kind": prior.get("kind") or "",
-                "target": prior.get("target") or "",
-                "status": STATUS_COMMITTED,
-                "cr": sha,
-                "note": f"committed to {branch} ({sha})"[:200],
-                "ts": time.time(),
-            }
-        )
-    except OSError as exc:
-        logger.error("ledger: could not record the commit of %s: %s", safe_fp, exc)
+        safe_fp = validate_fingerprint(fp)
+    except ValueError:
+        logger.warning("ledger: refusing to record a filed PR for a malformed fingerprint")
         return False
+    with _LEDGER_LOCK:
+        kind, target = _prior_kind_target(_load_events(), safe_fp)
+        try:
+            _append_event(
+                {
+                    "fp": safe_fp,
+                    "kind": kind,
+                    "target": target,
+                    "status": STATUS_FILED,
+                    "cr": pr_ref,
+                    "note": "manually drafted from the queued change",
+                    "ts": time.time(),
+                }
+            )
+        except OSError as exc:
+            logger.error("ledger: could not record the filed PR of %s: %s", safe_fp, exc)
+            return False
     return True

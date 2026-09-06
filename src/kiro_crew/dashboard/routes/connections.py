@@ -18,7 +18,12 @@ from kiro_crew.dashboard import (
     handlers_instances,
     handlers_project,
 )
-from kiro_crew.dashboard.handlers.auth_refresh import api_auth_logout, api_auth_me, api_auth_refresh
+from kiro_crew.dashboard.handlers.auth_mobile import api_auth_mobile_link
+from kiro_crew.dashboard.handlers.auth_refresh import (
+    api_auth_logout,
+    api_auth_me,
+    api_auth_refresh,
+)
 from kiro_crew.platform import current_context, safe_context_call
 
 
@@ -85,9 +90,10 @@ def register(app: web.Application) -> None:
 
     # OAuth-style refresh tokens for dashboard auth. POST /api/auth/refresh and
     # POST /api/auth/logout self-authenticate via the refresh cookie (the
-    # token_auth middleware exempts them); GET /api/auth/me is gated by the
-    # standard access-cookie auth.
+    # token_auth middleware exempts them); GET /api/auth/me and POST
+    # /api/auth/mobile-link are gated by the standard access-cookie auth.
     app.router.add_get("/api/auth/me", api_auth_me)
+    app.router.add_post("/api/auth/mobile-link", api_auth_mobile_link)
     app.router.add_post("/api/auth/refresh", api_auth_refresh)
     app.router.add_post("/api/auth/logout", api_auth_logout)
 
@@ -110,6 +116,12 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/instances/{id}/restart", handlers_instances.api_instances_restart)
     app.router.add_post(
         "/api/instances/{id}/send-session", handlers_instances.api_instances_send_session
+    )
+    # Generic chat proxy — the carrier for the remote-crew chat view. Forwards
+    # a bounded slice of the peer's /api surface over the already-open tunnel;
+    # method/path policy lives in the handler (see api_instances_proxy).
+    app.router.add_route(
+        "*", "/api/instances/{id}/proxy/{path:.*}", handlers_instances.api_instances_proxy
     )
 
     # Cloud provisioning (owner-only, user-initiated) — provision a Kiro Crew

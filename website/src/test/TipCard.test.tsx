@@ -172,7 +172,7 @@ describe('TipCard (single-line strip)', () => {
       <TipCard tip={mockTip} onDismiss={onDismiss} />,
     )
     const link = screen.getByRole('link', { name: /tip settings/i }) as HTMLAnchorElement
-    expect(link.getAttribute('href')).toBe('/settings?tab=chat')
+    expect(link.getAttribute('href')).toBe('/settings/chat')
   })
 
   it('dismiss calls tipsFeedback(id, "dismiss") and hides on success', async () => {

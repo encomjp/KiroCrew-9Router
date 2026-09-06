@@ -308,7 +308,8 @@ describe('DevFleetPage', () => {
       worktrees: FLEET.worktrees.map((w) =>
         w.name === 'unprov' ? { ...w, provision_run_id: 'run-prov-dead' } : w),
     }
-    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+    let dismissBody: unknown = null
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url, opts) => {
       const u = typeof url === 'string' ? url : (url as Request).url
       if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_WITH_FAILED), { status: 200 }))
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
@@ -316,6 +317,10 @@ describe('DevFleetPage', () => {
         return Promise.resolve(new Response(JSON.stringify({
           status: 'done', exit_code: 1, output: ['npm ERR! build failed'], started: Date.now() / 1000 - 300,
         }), { status: 200 }))
+      }
+      if (u.includes('/pod/provision/dismiss')) {
+        dismissBody = JSON.parse(String(opts?.body))
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
       }
       return Promise.resolve(new Response('{}', { status: 200 }))
     })
@@ -325,6 +330,64 @@ describe('DevFleetPage', () => {
     // The last log line renders twice (inline strip + expanded <pre> panel).
     await waitFor(() => expect(screen.getByText('Provision failed (exit 1)')).toBeInTheDocument(), { timeout: 3000 })
     expect(screen.getAllByText('npm ERR! build failed').length).toBeGreaterThanOrEqual(2)
+    fireEvent.click(screen.getByLabelText('Dismiss provision status'))
+    await waitFor(() => expect(dismissBody).toEqual({ name: 'unprov', run_id: 'run-prov-dead' }))
+    await waitFor(() => expect(screen.queryByText('Provision failed (exit 1)')).toBeNull())
+  })
+
+  it('a slow dismiss does not erase a replacement failure that arrived while it was in flight', async () => {
+    // Regression: dismissProv awaits the server round-trip, so a REPLACEMENT
+    // provision can fail and reattach to the same worktree before the response
+    // lands. Deleting the strip unconditionally then hid the NEW failure (and
+    // its log) until the next reload. The clear is now guarded on the run id
+    // the user actually dismissed.
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    let rid = 'run-prov-dead'
+    let releaseDismiss: (() => void) | null = null
+    const dismissPending = new Promise<void>((resolve) => { releaseDismiss = resolve })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((url) => {
+      const u = typeof url === 'string' ? url : (url as Request).url
+      if (u.includes('/fleet')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          ...FLEET,
+          worktrees: FLEET.worktrees.map((w) => (w.name === 'unprov' ? { ...w, provision_run_id: rid } : w)),
+        }), { status: 200 }))
+      }
+      if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/run?id=run-prov-dead')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'done', exit_code: 1, output: ['old failure'], started: Date.now() / 1000 - 300,
+        }), { status: 200 }))
+      }
+      if (u.includes('/run?id=run-prov-new')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          status: 'done', exit_code: 2, output: ['new failure'], started: Date.now() / 1000 - 10,
+        }), { status: 200 }))
+      }
+      if (u.includes('/pod/provision/dismiss')) {
+        return dismissPending.then(() => new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
+      }
+      return Promise.resolve(new Response('{}', { status: 200 }))
+    })
+    try {
+      renderPage()
+      await waitFor(() => expect(screen.getByText('Provision failed (exit 1)')).toBeInTheDocument(), { timeout: 3000 })
+
+      // Dismiss the OLD failure; the POST stays in flight.
+      fireEvent.click(screen.getByLabelText('Dismiss provision status'))
+
+      // A replacement provision fails and the next fleet poll reattaches it.
+      rid = 'run-prov-new'
+      await act(async () => { await vi.advanceTimersByTimeAsync(13000) })
+      await waitFor(() => expect(screen.getByText('Provision failed (exit 2)')).toBeInTheDocument(), { timeout: 3000 })
+
+      // The stale dismissal now resolves — it must leave the new strip alone.
+      releaseDismiss!()
+      await act(async () => { await vi.advanceTimersByTimeAsync(50) })
+      expect(screen.getByText('Provision failed (exit 2)')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('reattached polling keeps the fetched log prefix and marks a scrolled gap', async () => {
@@ -660,7 +723,7 @@ describe('DevFleetPage', () => {
     const item = within(await screen.findByRole('menu')).getByText('Make live')
     fireEvent.click(item)
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument())
-    expect(screen.getByText('Make "feature-x" live?')).toBeInTheDocument()
+    expect(screen.getByText('Make “feature-x” live?')).toBeInTheDocument()
   })
 
   it('hides "Make live" for the worktree that is already live', async () => {
@@ -831,7 +894,7 @@ describe('DevFleetPage', () => {
     expect(btn).toBeInTheDocument()
     fireEvent.click(btn)
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument())
-    expect(screen.getByText('Make "main" live?')).toBeInTheDocument()
+    expect(screen.getByText('Make “main” live?')).toBeInTheDocument()
   })
 
   it('hides "Make live" on the MAIN row when main IS live', async () => {
@@ -960,7 +1023,7 @@ describe('DevFleetPage', () => {
     fireEvent.click(screen.getByLabelText('More actions'))
     fireEvent.click(within(await screen.findByRole('menu')).getByText('Make live'))
     await waitFor(() => expect(screen.getByRole('dialog')).toBeInTheDocument())
-    expect(screen.getByText('Make "feature-x" live?')).toBeInTheDocument()
+    expect(screen.getByText('Make “feature-x” live?')).toBeInTheDocument()
   })
 
   it('outside-click closes the portaled row-actions menu', async () => {
@@ -1169,6 +1232,143 @@ describe('DevFleetPage', () => {
     expect(pop.style.top).toBe('')
   })
 
+  /* ─── Row-actions menu: focus containment (#2533) ─── */
+  // ConfirmBtn's half of #2533 landed separately (see the confirm-dialog
+  // role=dialog/Escape test above); MenuBtn was left with Escape-only
+  // handling, so all three parts — focus entry, Tab containment, and focus
+  // return — are implemented here for the menu.
+
+  it('row-actions menu moves focus onto the first item when it opens, and Tab wraps within it', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    menuItems[menuItems.length - 1].focus()
+    fireEvent.keyDown(menu, { key: 'Tab' })
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'Tab', shiftKey: true })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+  })
+
+  it('row-actions menu ArrowDown/ArrowUp cycle focus through items and wrap at both ends', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    // Down walks forward one item at a time.
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[1]).toHaveFocus()
+    // Down on the last item wraps to the first.
+    menuItems[menuItems.length - 1].focus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[0]).toHaveFocus()
+    // Up on the first item wraps to the last.
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    // Up walks backward one item at a time.
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 2]).toHaveFocus()
+  })
+
+  it('row-actions menu Home/End jump to the first/last item', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'End' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'Home' })
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu declines an arrow that belongs to an IME composition', async () => {
+    // On WebKit the keydown that moves through composition candidates can
+    // arrive AFTER compositionend with `isComposing` already false — an
+    // unguarded arrow branch would move menu focus mid-composition. Menu
+    // items are non-editable today; this pins the claim stays load-bearing
+    // if the menu ever grows a focusable text field.
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.compositionStart(menuItems[0])
+    fireEvent.compositionEnd(menuItems[0])
+    fireEvent.keyDown(document, { key: 'ArrowDown' })
+    // Declined: focus stays put instead of moving to the second item.
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu arrows enter the list when focus is outside it: Down to first, Up to last', async () => {
+    // Reachable edge: the fleet page polls, so an item holding focus can
+    // unmount mid-open and drop activeElement to <body>.
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    document.body.focus()
+    fireEvent.keyDown(menu, { key: 'ArrowUp' })
+    expect(menuItems[menuItems.length - 1]).toHaveFocus()
+    document.body.focus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('row-actions menu lets modified arrows through untouched (OS/browser shortcuts)', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    fireEvent.click(screen.getByLabelText('More actions'))
+    const menu = await screen.findByRole('menu')
+    const menuItems = within(menu).getAllByRole('button')
+    expect(menuItems[0]).toHaveFocus()
+    fireEvent.keyDown(menu, { key: 'ArrowDown', metaKey: true })
+    fireEvent.keyDown(menu, { key: 'ArrowDown', ctrlKey: true })
+    fireEvent.keyDown(menu, { key: 'End', altKey: true })
+    // Not the menu's keys: focus did not move.
+    expect(menuItems[0]).toHaveFocus()
+  })
+
+  it('selecting a row-actions menu item returns focus to the trigger', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByLabelText('More actions')
+    fireEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    fireEvent.click(within(menu).getAllByRole('button')[0])
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(trigger).toHaveFocus()
+  })
+
+  it('scroll-closing the row-actions menu restores focus to the trigger instead of orphaning it', async () => {
+    mockFleet(FLEET_MENU)
+    renderPage()
+    await waitFor(() => expect(screen.getByText('feature-x')).toBeInTheDocument())
+    const trigger = screen.getByLabelText('More actions')
+    fireEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    // Focus-entry put focus inside the menu; a wheel scroll moves no DOM
+    // focus, so without the restore the unmount would drop focus to <body>.
+    expect(within(menu).getAllByRole('button')[0]).toHaveFocus()
+    fireEvent.scroll(window)
+    await waitFor(() => expect(screen.queryByRole('menu')).toBeNull())
+    expect(trigger).toHaveFocus()
+  })
+
   /* ─── Provision progress: expandable log panel + failure persistence ─── */
   // 'unprov' is the only non-main has_dist:false row, so it renders the single
   // "Provision" button. Provision polling uses real 2s sleeps, hence the
@@ -1203,6 +1403,7 @@ describe('DevFleetPage', () => {
       const u = typeof url === 'string' ? url : (url as Request).url
       if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET), { status: 200 }))
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision/dismiss')) return Promise.resolve(new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
       if (u.includes('/pod/provision')) return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-f' }), { status: 200 }))
       if (u.includes('/run?id=run-f')) return Promise.resolve(new Response(JSON.stringify({ status: 'done', exit_code: 1, output: ['npm ERR! boom', 'FATAL: npm run build failed'] }), { status: 200 }))
       return Promise.resolve(new Response('{}', { status: 200 }))
@@ -1397,7 +1598,9 @@ describe('DevFleetPage', () => {
     expect(screen.getByText('Pruned 1 worktree(s)')).toBeInTheDocument()
     expect(screen.queryByText(/Prune: \d+ failed/)).not.toBeInTheDocument()
     // The forced name went out in force_names, not the regular names list.
-    expect(runBody).toEqual({ names: [], force_names: ['wt-kept'] })
+    // pruneExecute now always includes discard_untracked_paths as a MAP (empty
+    // here: wt-kept carries no untracked-only scratch classification).
+    expect(runBody).toEqual({ names: [], force_names: ['wt-kept'], discard_untracked_paths: {} })
   }, 15000)
 
   it('refetches the fleet with fresh=1 once a prune finishes', async () => {
@@ -1851,6 +2054,9 @@ describe('provision singleflight guard (issue #5294)', () => {
       const u = typeof url === 'string' ? url : (url as Request).url
       if (u.includes('/fleet')) return Promise.resolve(new Response(JSON.stringify(FLEET_UNPROV), { status: 200 }))
       if (u.includes('/disk')) return Promise.resolve(new Response(JSON.stringify({ total_mb: 51200 }), { status: 200 }))
+      if (u.includes('/pod/provision/dismiss')) {
+        return Promise.resolve(new Response(JSON.stringify({ ok: true, dismissed: true }), { status: 200 }))
+      }
       if (u.includes('/pod/provision')) {
         posts++
         return Promise.resolve(new Response(JSON.stringify({ ok: true, run_id: 'run-retry-' + posts }), { status: 200 }))

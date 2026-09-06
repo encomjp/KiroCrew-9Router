@@ -158,9 +158,8 @@ MAX_EVENTS_PER_ARTIFACT = 500
 #: are dropped (a thread root + its replies together), never a reply orphaned.
 MAX_COMMENTS_PER_ARTIFACT = 500
 
-#: Maximum number of tags per artifact, and max length per tag.
+#: Maximum number of tags per artifact. Per-tag length is bounded by ``_TAG_RE``.
 MAX_TAGS = 16
-MAX_TAG_LEN = 64
 
 # Slug pattern: lowercase letters, digits, hyphens. 1-80 chars. No leading or
 # trailing hyphen. Single-character slugs are allowed for trivial names.
@@ -983,16 +982,41 @@ def _sniff_webp_dimensions(data: bytes) -> tuple[int | None, int | None]:
 # ── Store ────────────────────────────────────────────────────────────────────
 
 
+#: One lock per resolved artifact root, shared across every ``ArtifactStore``
+#: instance pointed at that root -- not just the process-wide singleton
+#: (:func:`get_default_store`). A caller that constructs its own
+#: ``ArtifactStore()`` against the default root (as opposed to threading the
+#: singleton through) would otherwise get its own private
+#: ``threading.Lock()``, unserialized against every other instance on the
+#: same root: two writers (or a writer and a reader) could interleave their
+#: file operations, corrupting a version or serving a stale read. Keyed by
+#: the resolved root path so distinct roots (tests' isolated tmp_path stores)
+#: still get independent locks.
+_root_locks: dict[str, threading.Lock] = {}
+_root_locks_guard = threading.Lock()
+
+
+def _lock_for_root(root: Path) -> threading.Lock:
+    key = str(root)
+    with _root_locks_guard:
+        lock = _root_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _root_locks[key] = lock
+        return lock
+
+
 class ArtifactStore:
     """File-system backed store for artifacts.
 
-    Thread-safe via a coarse-grained lock; concurrent writes to the same
-    artifact are serialized.
+    Thread-safe via a coarse-grained lock, shared across every instance
+    pointed at the same root (see :func:`_lock_for_root`) -- concurrent
+    writes to the same artifact are serialized regardless of how many
+    ``ArtifactStore`` objects address it.
     """
 
     def __init__(self, root: Path | None = None) -> None:
         self._root = (root or (config_dir() / "artifacts")).expanduser()
-        self._lock = threading.Lock()
         # Optional change-listener fired after a content-affecting mutation
         # (create / content-update / delete). Lets the gateway observe every
         # write path — agent (MCP-proxied), dashboard, bookmark, CLI, and the
@@ -1005,6 +1029,9 @@ class ArtifactStore:
         resolved = self._root.resolve(strict=False)
         if is_sensitive_path(str(resolved)):
             raise ArtifactError(f"refusing to use sensitive path as artifact root: {resolved}")
+        # Keyed by the RESOLVED root so a symlinked alias of the same
+        # directory still shares the lock, not just a literal path match.
+        self._lock = _lock_for_root(resolved)
         self._root.mkdir(parents=True, exist_ok=True)
 
     # ── public API ────────────────────────────────────────────────────────
@@ -3905,13 +3932,6 @@ def get_default_store() -> ArtifactStore:
         return _default_store
 
 
-def reset_default_store() -> None:
-    """Drop the cached default store (test-only helper)."""
-    global _default_store
-    with _default_store_lock:
-        _default_store = None
-
-
 _default_folder_store: "ArtifactFolderStore | None" = None
 _default_folder_store_lock = threading.Lock()
 
@@ -3923,10 +3943,3 @@ def get_default_folder_store() -> "ArtifactFolderStore":
         if _default_folder_store is None:
             _default_folder_store = ArtifactFolderStore()
         return _default_folder_store
-
-
-def reset_default_folder_store() -> None:
-    """Drop the cached default folder store (test-only helper)."""
-    global _default_folder_store
-    with _default_folder_store_lock:
-        _default_folder_store = None

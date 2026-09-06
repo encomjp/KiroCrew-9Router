@@ -258,6 +258,7 @@ describe('narrow-first layout baseline', () => {
     const CONTENT_WIDTH_VAR = '--mc-content-width'
     const NEAR = 200
     const offenders: string[] = []
+    const matchedWrappers: string[] = []
     for (const { file, src } of await SOURCES) {
       for (const m of src.matchAll(/className=(?:"([^"]*)"|\{`([^`]*)`\})/g)) {
         const tokens = (m[1] ?? m[2] ?? '').split(/\s+/)
@@ -265,6 +266,7 @@ describe('narrow-first layout baseline', () => {
         const near = src.slice(Math.max(0, m.index! - NEAR), m.index! + m[0].length + NEAR)
         if (!near.includes(CONTENT_WIDTH_VAR)) continue
         const px = tokens.find((t) => /^px-\d+(?:\.\d+)?$/.test(t))
+        if (px) matchedWrappers.push(file.slice(SRC.length + 1))
         if (px && px !== `px-${gutter![1]}`) {
           offenders.push(`${file.slice(SRC.length + 1)}: ${px}`)
         }
@@ -276,6 +278,16 @@ describe('narrow-first layout baseline', () => {
         + `${CONTENT_WIDTH_VAR}) but do not carry its gutter (px-${gutter![1]}), so they `
         + `render a second left edge inside one column`,
     ).toEqual([])
+    // The proximity scan is intentionally structural rather than a named-file
+    // allowlist, but that means a refactor can move the width declaration beyond
+    // NEAR (or into CSS) and silently make a wrapper disappear. Pin the measured
+    // floor so coverage shrinkage is an explicit review decision rather than a
+    // green test that now checks fewer surfaces.
+    expect(
+      matchedWrappers.length,
+      `the ${CONTENT_WIDTH_VAR} proximity scan covered fewer chat-column wrappers; `
+        + `inspect the moved wrappers before lowering this floor`,
+    ).toBeGreaterThanOrEqual(16)
   })
 
   it('lands the top bar glyphs on the page gutter, derived not hand-typed', async () => {

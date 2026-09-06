@@ -91,7 +91,14 @@ const registry = vi.hoisted(() => ({
   ensureTerminalConnection: vi.fn(),
   disposeTerminalConnection: vi.fn(),
   getTerminalCwd: vi.fn<(id: string) => string | undefined>(() => undefined),
+  connStatus: { value: undefined as 'connected' | 'reconnecting' | 'disconnected' | undefined },
+  manualRetry: { value: false },
+  useTerminalConnStatus: vi.fn<() => 'connected' | 'reconnecting' | 'disconnected' | undefined>(),
+  useTerminalManualRetry: vi.fn<() => boolean>(),
+  retryTerminalConnection: vi.fn<(id: string) => void>(),
 }))
+registry.useTerminalConnStatus.mockImplementation(() => registry.connStatus.value)
+registry.useTerminalManualRetry.mockImplementation(() => registry.manualRetry.value)
 vi.mock('../utils/terminalRegistry', () => registry)
 
 // Both children own their own xterm hooks and are covered by their own suites;
@@ -246,6 +253,9 @@ beforeEach(() => {
   registry.disposeTerminalConnection.mockClear()
   registry.getTerminalCwd.mockReset()
   registry.getTerminalCwd.mockReturnValue(undefined)
+  registry.retryTerminalConnection.mockClear()
+  registry.connStatus.value = undefined
+  registry.manualRetry.value = false
   xt.FakeTerminal.instances = []
   xt.FakeFitAddon.instances = []
   touch.value = false
@@ -367,6 +377,70 @@ describe('CliPanel mount', () => {
     sizes.offsetHeight = 0 // collapsed / hidden pane
     notify()
     expect(fit.fit).toHaveBeenCalledTimes(1) // no second fit
+  })
+})
+
+/* ── disconnected banner ──────────────────────────────────────────────────── */
+
+describe('CliPanel disconnected banner', () => {
+  const DISCONNECTED_LABEL = i18nT('components.cliPanel.disconnected_message')
+  const RECONNECT_LABEL = i18nT('components.cliPanel.reconnect')
+  const RECONNECTING_LABEL = i18nT('components.cliPanel.reconnecting')
+
+  it('shows no banner while connected or during an AUTOMATIC reconnect', () => {
+    registry.connStatus.value = 'connected'
+    mount()
+    expect(screen.queryByText(DISCONNECTED_LABEL)).toBeNull()
+    expect(screen.queryByText(RECONNECTING_LABEL)).toBeNull()
+    cleanup()
+    // Automatic reconnect: reconnecting status but NOT a user-initiated retry.
+    registry.connStatus.value = 'reconnecting'
+    registry.manualRetry.value = false
+    mount()
+    expect(screen.queryByRole('status')).toBeNull()
+  })
+
+  it('renders the disconnected banner with an enabled Reconnect button once the socket is dead', () => {
+    registry.connStatus.value = 'disconnected'
+    mount()
+    expect(screen.getByRole('status')).toHaveTextContent(DISCONNECTED_LABEL)
+    const button = screen.getByRole('button', { name: RECONNECT_LABEL })
+    expect(button).toBeInTheDocument()
+    expect(button).toBeEnabled()
+  })
+
+  it('re-arms the connection for this session when Reconnect is clicked', () => {
+    registry.connStatus.value = 'disconnected'
+    const { sessionId } = mount()
+    fireEvent.click(screen.getByRole('button', { name: RECONNECT_LABEL }))
+    expect(registry.retryTerminalConnection).toHaveBeenCalledWith(sessionId)
+  })
+
+  it('shows the Reconnecting… banner with a disabled button during a MANUAL retry', () => {
+    // The user clicked Reconnect and the dial is in flight: manualRetry is set
+    // while the status is 'reconnecting'.
+    registry.connStatus.value = 'reconnecting'
+    registry.manualRetry.value = true
+    mount()
+    expect(screen.getByRole('status')).toHaveTextContent(RECONNECTING_LABEL)
+    expect(screen.getByRole('button', { name: RECONNECT_LABEL })).toBeDisabled()
+  })
+
+  it('returns to the disconnected presentation when a manual retry fails', () => {
+    // Manual retry in flight → Reconnecting… with a disabled button.
+    registry.connStatus.value = 'reconnecting'
+    registry.manualRetry.value = true
+    const { rerender, sessionId } = mount({ sessionId: 'pty-manual-fail' })
+    expect(screen.getByText(RECONNECTING_LABEL)).toBeInTheDocument()
+
+    // The dial fails: status flips back to disconnected and the manual flag
+    // clears, so the banner returns to its disconnected (retryable) form.
+    registry.connStatus.value = 'disconnected'
+    registry.manualRetry.value = false
+    rerender(<CliPanel sessionId={sessionId} visible />)
+    expect(screen.getByText(DISCONNECTED_LABEL)).toBeInTheDocument()
+    expect(screen.queryByText(RECONNECTING_LABEL)).toBeNull()
+    expect(screen.getByRole('button', { name: RECONNECT_LABEL })).toBeEnabled()
   })
 })
 

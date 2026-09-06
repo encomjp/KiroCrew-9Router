@@ -53,27 +53,31 @@ const overrideLabels = (): string[] => [
  *  description are catalog keys below, resolved per render for the same reason
  *  `PRESET_LABEL_KEY` holds keys. */
 const CATEGORY_ROWS: SoundCategory[] = [
-  'all', 'turn', 'cron', 'approval', 'hook', 'heartbeat', 'subagent', 'taskrunner',
+  'all', 'turn', 'agent', 'cron', 'approval', 'hook', 'heartbeat', 'subagent', 'taskrunner', 'skills',
 ]
 const CATEGORY_LABEL_KEY: Record<SoundCategory, string> = {
   all: 'pages.settings.notificationsPanel.category_all',
   turn: 'pages.settings.notificationsPanel.category_turn',
+  agent: 'pages.settings.notificationsPanel.category_agent',
   cron: 'pages.settings.notificationsPanel.category_cron',
   approval: 'pages.settings.notificationsPanel.category_approval',
   hook: 'pages.settings.notificationsPanel.category_hook',
   heartbeat: 'pages.settings.notificationsPanel.category_heartbeat',
   subagent: 'pages.settings.notificationsPanel.category_subagent',
   taskrunner: 'pages.settings.notificationsPanel.category_taskrunner',
+  skills: 'pages.settings.notificationsPanel.category_skills',
 }
 const CATEGORY_DESCRIPTION_KEY: Record<SoundCategory, string> = {
   all: 'pages.settings.notificationsPanel.category_all_description',
   turn: 'pages.settings.notificationsPanel.category_turn_description',
+  agent: 'pages.settings.notificationsPanel.category_agent_description',
   cron: 'pages.settings.notificationsPanel.category_cron_description',
   approval: 'pages.settings.notificationsPanel.category_approval_description',
   hook: 'pages.settings.notificationsPanel.category_hook_description',
   heartbeat: 'pages.settings.notificationsPanel.category_heartbeat_description',
   subagent: 'pages.settings.notificationsPanel.category_subagent_description',
   taskrunner: 'pages.settings.notificationsPanel.category_taskrunner_description',
+  skills: 'pages.settings.notificationsPanel.category_skills_description',
 }
 
 /** Sentinel for "this channel has no priority override". It is the select's
@@ -139,7 +143,7 @@ function ChannelsSection() {
 
   return (
     <SettingsSection title={i18nT('pages.settings.notificationsPanel.sources')}>
-      <div className="text-[12px] text-muted -mt-1 mb-2">{i18nT('pages.settings.notificationsPanel.mute_notification_sources_or_override_their_prio')}</div>
+      <div className="text-[12px] text-muted -mt-1 mb-2" data-setting-label={i18nT('pages.settings.notificationsPanel.sources')}>{i18nT('pages.settings.notificationsPanel.mute_notification_sources_or_override_their_prio')}</div>
       {sources.map((source, i) => (
         <SettingsCard key={source} index={i}>
           <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-[.05em] text-muted pb-1 border-b border-border">
@@ -243,7 +247,7 @@ export function NotificationsPanel() {
             checked={settings.enabled}
             onChange={v => update({ enabled: v })}
           />
-          <div className="flex flex-col gap-1.5 py-1.5">
+          <div className="flex flex-col gap-1.5 py-1.5" data-setting-label={i18nT('pages.settings.notificationsPanel.volume')}>
             {/* Slider is correctly associated via htmlFor+id (a range input can't be nested); label-has-for's nesting requirement is a false positive here. */}
             {/* eslint-disable-next-line jsx-a11y/label-has-for */}
             <label htmlFor="mc-volume-slider" className="text-[13px] font-semibold text-text">{i18nT('pages.settings.notificationsPanel.volume')}</label>

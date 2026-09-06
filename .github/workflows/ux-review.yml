@@ -67,7 +67,14 @@ jobs:
         run: |
           set -euo pipefail
           changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
-          if printf '%s\n' "$changed" | grep -qE '^(website/|temp-screenshots/|\.github/screenshots/)'; then
+          # Here-string, NOT `printf … | grep -q`: under `pipefail` a matching
+          # `grep -q` exits as soon as it has its answer, closing the pipe while
+          # `printf` is still writing. `printf` then dies on SIGPIPE and the
+          # pipeline reports 141 for input that DID match, so a UI change is
+          # silently classified as not-UI-relevant and this review skips green.
+          # A here-string takes the writer out of the pipeline entirely, so no
+          # exit status can be manufactured by pipe timing.
+          if grep -qE '^(website/|temp-screenshots/|\.github/screenshots/)' <<< "$changed"; then
             echo "ui=true" >> "$GITHUB_OUTPUT"
             echo "UI-relevant changes detected; running UX review."
           else
@@ -120,7 +127,7 @@ jobs:
         # (merge is gated by human review). The always()-run steps below still
         # post a leak-safe comment and log the outcome regardless.
         if: github.actor != 'dependabot[bot]' && steps.scope.outputs.ui == 'true' && steps.human_override.outputs.active != 'true'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
         with:
           # Inference via Amazon Bedrock. Model id form (bare, regional `us.`
           # inference profile, no `[1m]` tag) is load-bearing — see the
@@ -192,6 +199,23 @@ jobs:
             only to surface findings. If a lens raises no finding, it produces
             NO output. Lenses 11–12 apply only when their surface is present.)
 
+            0. PRODUCT COHERENCE (run FIRST, before every other lens): put the
+               change next to the product it is joining. Open the sibling
+               surfaces that already do the closest job (Grep/Read
+               website/src; committed screenshots of existing pages when
+               present) and compare:
+               - LOOK — the new surface matches the product's established
+                 look: spacing, container shapes, elevation, typography,
+                 tokens.
+               - INFORMATION ARCHITECTURE — the same jobs use the same
+                 patterns: panel/sidebar toggles, close affordances, header
+                 layout, list rows, iconography. A user who has learned the
+                 rest of the product must not find this page strange.
+               - EARN EVERY ELEMENT — every button, label, and line of copy
+                 has a job a user needs done. Anything present without one is
+                 a finding.
+               Divergence from the product's established look or patterns is
+               a finding unless the PR states why this surface must differ.
             1. FIRST-TIME COMPREHENSION (the cold-read test): would a user
                seeing this for the first time understand what each label says
                and what each feature does?
@@ -475,6 +499,7 @@ jobs:
           OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
           ACTOR: ${{ github.actor }}
           UI_SCOPE: ${{ steps.scope.outputs.ui }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
         run: |
           if [ "$HUMAN_OVERRIDE" = "true" ]; then
             OV_MARKER="<!-- ux-review -->"
@@ -541,6 +566,19 @@ jobs:
           # Machine-parse the verdict header the prompt requires (case-insensitive).
           verdict="$(printf '%s\n' "$summary" | grep -iE '^UX-Verdict:' | head -n1 | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr '[:lower:]' '[:upper:]')"
           [ -z "$verdict" ] && verdict="UNKNOWN"
+          # Require the CURRENT-HEAD proof marker before honouring that verdict.
+          # The prompt emits `[UX-REVIEWED] <sha>`, but parsing the
+          # `UX-Verdict:` header alone made the marker decorative: a reply
+          # carrying a stale or rewritten marker still scored as a verdict for
+          # THIS revision, so a UX verdict earned on older code could be
+          # presented as current. Absent or mismatched -> fall through to the
+          # existing non-blocking "could not complete" path rather than
+          # inventing a verdict. Here-string, not `printf | grep`, so a long
+          # summary cannot manufacture a SIGPIPE status under `pipefail`.
+          if ! grep -qF "[UX-REVIEWED] $HEAD" <<< "$summary"; then
+            echo "verdict header present but no [UX-REVIEWED] $HEAD marker; treating as UNKNOWN"
+            verdict="UNKNOWN"
+          fi
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           case "$verdict" in
             PASS) badge="✅ PASS" ;;
@@ -564,11 +602,23 @@ jobs:
             # detail (AWS account ids, ARNs, endpoints, stack traces) into a
             # public comment. Post a generic, leak-safe notice; humans read
             # the job logs.
+            # Name the cause from the model step's OWN outcome instead of
+            # asserting one: this branch is reached both when the model ran and
+            # returned nothing usable and when the model was never called at all,
+            # and "the model call errored" sent contributors to debug a call that
+            # had not happened.
+            case "${REVIEW_OUTCOME:-}" in
+              skipped) why="the review step never ran, because an earlier step in this job failed — no model call was made" ;;
+              failure) why="the review step failed" ;;
+              cancelled) why="the review step was cancelled" ;;
+              success) why="the review step completed but returned no verdict header" ;;
+              *)       why="the review step reported no outcome" ;;
+            esac
             {
               echo "$MARKER"
               echo "## UX Review (Fable 5) — ⚠️ could not complete"
               echo
-              echo "_The UX review did not produce a verdict for \`$HEAD\` (the model call errored or returned no verdict header). See the UX Review job logs. Advisory — does not block merge._"
+              echo "_The UX review did not produce a verdict for \`$HEAD\` ($why). See the UX Review job logs. Advisory — does not block merge._"
             } > /tmp/ux-comment.md
           fi
           # Defense-in-depth: scrub credential shapes AND AWS account ids /

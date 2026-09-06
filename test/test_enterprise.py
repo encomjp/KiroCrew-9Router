@@ -100,6 +100,29 @@ def test_auth_test_failure_no_allowlist_defaults_open(tmp_path):
     assert enterprise.check_message_origin("T_WHATEVER") is True
 
 
+def test_self_identity_cached_from_auth_test_and_reset_on_failure(tmp_path):
+    """auth.test's bot_id is cached for the trusted-bot self-exclusion guard.
+
+    The accessor must answer "" after a failed re-validation: the trusted-bot
+    admission fails CLOSED on an unverified self identity, so a stale cached
+    id surviving a failed auth.test would report an identity the current
+    token no longer proves.
+    """
+    resp = {
+        "team_id": "T_GOOD",
+        "team": "Good Co",
+        "url": "https://x",
+        "bot_id": "B_SELF",
+    }
+    _write_allowlist(tmp_path, [])
+    with _install_fake_slack_sdk(resp):
+        assert enterprise.validate_enterprise("xoxb-token") is True
+    assert enterprise.validated_self_bot_id() == "B_SELF"
+    with _install_fake_slack_sdk(raise_exc=True):
+        enterprise.validate_enterprise("xoxb-token")
+    assert enterprise.validated_self_bot_id() == ""
+
+
 # --------------------------------------------------------------------------
 # Allowlist configured + auth.test succeeds
 # --------------------------------------------------------------------------

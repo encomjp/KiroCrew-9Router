@@ -94,6 +94,35 @@ class TestContextBuilder:
         # backwards once clicked.
         assert "in the USER's voice" in ctx
 
+    def test_option_labels_must_be_self_contained(self, tmp_path):
+        """Each [OPTIONS:] chip carries its own send control, so any single
+        option can be sent alone -- and only that option's text goes out. An
+        option written as a modifier of its sibling ("Include the stop button
+        too" next to "Build the Loops strip") names no action when sent by
+        itself, so both the critical-rules block and the per-turn interactive
+        reminder must require self-contained labels."""
+        builder = ContextBuilder(
+            memory=MemoryStore(workspace=tmp_path / "ws"),
+            skills=SkillsLoader(skills_path=tmp_path / "skills", install_builtins=False),
+            lessons=LessonStore(base_dir=tmp_path),
+        )
+        ctx = builder.build_session_context()
+        assert "SELF-CONTAINED" in ctx, "critical rules missing self-contained option rule"
+        # The rule qualifies the label rules, so it must come after the voice
+        # rule it extends -- before it, it reads as a standalone non sequitur.
+        assert ctx.index("in the USER's voice") < ctx.index("SELF-CONTAINED")
+        # The per-turn reminder is the version most models actually act on;
+        # it must carry the same constraint.
+        msg, _ = builder.build_message(
+            "pick one", is_new_session=False, interactive=True
+        )
+        assert "self-contained" in msg, "interactive reminder missing self-contained rule"
+        # Non-interactive turns get no OPTIONS reminder at all, so no rule either.
+        auto_msg, _ = builder.build_message(
+            "pick one", is_new_session=False, interactive=False
+        )
+        assert "self-contained" not in auto_msg
+
     def test_url_backtick_carve_out_follows_the_path_rule(self, tmp_path):
         """A backticked URL is a click-to-copy chip, not a link.
 
@@ -194,7 +223,13 @@ class TestContextBuilder:
             "done", is_new_session=False, interactive=True, session_key="dashboard:chat-1"
         )
         assert "ask_question" in dash, "dashboard session must get the question nudge"
-        assert "BEFORE" in dash and "ENDING" in dash
+        # Pin the CONTRACT, not a keyword. The wording this replaces ("BEFORE you
+        # can continue the current turn") described a blocking round-trip the tool
+        # does not perform, so the nudge has to say the card does not block, that
+        # the agent ends its turn, and that [OPTIONS:] is the end-of-turn choice.
+        assert "END YOUR TURN" in dash
+        assert "does not block" in dash
+        assert "[OPTIONS:]" in dash
         assert "suggest_followup" in dash, "dashboard session must get the follow-up nudge"
 
         for sk in (None, "cron:job-1", "subagent:abc", "slack:C123"):

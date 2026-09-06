@@ -127,6 +127,10 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
         # by slot._disk_older_count. Validate inputs against the chained
         # length so error messages match what the user sees, and translate
         # back to a slot.messages-relative index for the truncation below.
+        # Deliberately the all-rows counter: the frontend's index space is the
+        # chained DISK read plus the raw window, so on-disk-line units are the
+        # ones that line up (the durable-only counter measures a different,
+        # role-filtered space).
         disk_older = getattr(slot, "_disk_older_count", 0)
         chained_len = disk_older + len(msgs)
 
@@ -254,7 +258,14 @@ async def api_chat_slot_rewind(request: web.Request) -> web.Response:
             ),
         )
 
-        task = asyncio.create_task(_run_chat(state, slot, redacted_content))
+        task = asyncio.create_task(
+            _run_chat(
+                state,
+                slot,
+                redacted_content,
+                _directive_user_origin=not bool(request_app),
+            )
+        )
         slot.task = task
         state._background_tasks.add(task)
         task.add_done_callback(state._background_tasks.discard)

@@ -59,7 +59,7 @@ describe('InvestigateButton', () => {
     await waitFor(() => expect(button).toHaveProperty('disabled', false))
     await userEvent.click(button)
 
-    await waitFor(() => expect(investigate).toHaveBeenCalledWith(REF, ISSUE, null))
+    await waitFor(() => expect(investigate).toHaveBeenCalledWith(REF, ISSUE, null, false))
     // Written under the scope key, which carries provider + host — a bare
     // owner/repo key would be shared with a same-slug repo on another host.
     const key = ['issue-radar', 'investigation', 'github:github.com:zzq-org/zzq-pkg', 'issue', 4242]
@@ -117,6 +117,6 @@ describe('InvestigateButton', () => {
 
     const button = await screen.findByRole('button', { name: /Resume/ })
     await userEvent.click(button)
-    await waitFor(() => expect(investigate).toHaveBeenCalledWith(REF, ISSUE, existing))
+    await waitFor(() => expect(investigate).toHaveBeenCalledWith(REF, ISSUE, existing, false))
   })
 })

@@ -1,71 +1,57 @@
-"""KAS spawn contract: asset resolution, argv, and client capabilities.
+"""KAS spawn contract: relay argv, sandbox classification, capabilities, demux.
+
+Kiro Crew reaches KAS through kiro-cli's own ACP relay
+(``kiro-cli acp --agent-engine v3 --auth-method cli``) rather than by locating
+kiro-cli's extracted KAS bundle and running ``node acp-server.js`` itself. See
+:mod:`kiro_crew.acp.kas_transport` for why, and for the frame-parity measurement
+that preceded the switch.
 
 The invocation proof lives in ``TestKasInvocation``: it spawns a real
 ``AcpRuntime`` configured for the KAS backend against a stub agent that speaks
-KAS's dialect, and completes ``initialize`` -> ``session/new`` -> ``session/prompt``
--> turn end. That exercises OUR spawn path, argv, capabilities and demux; it does
-not exercise the real KAS build, which is not present on a machine whose kiro-cli
-has never unpacked it.
+KAS's dialect, and completes ``initialize`` -> ``session/new``. That exercises
+OUR spawn path, argv, capabilities and demux; it does not exercise the real KAS
+build, which is kiro-cli's to ship.
 
-Driving the REAL build is deliberately NOT a test here. KAS is launched with
-``--auth=acp-callback``, so a real prompt makes it call back for a token, which
-the runtime answers by shelling out to ``kiro-cli chat _ get-kas-token`` — that
-touches the operator's live credential store, state no ``tmp_path`` contains, and
-an env-var opt-in is not enough protection when that variable can be set in a
-shell profile or a CI matrix and then reached by an ordinary ``pytest`` run.
-Faking the callback proves nothing about the real auth path either.
+Driving the REAL build is deliberately NOT a test here: a real prompt turn spends
+the operator's credits and needs their live credential store, state no
+``tmp_path`` contains, and an env-var opt-in is not enough protection when that
+variable can be set in a shell profile or a CI matrix and then reached by an
+ordinary ``pytest`` run.
 
-When working on the backend, run it by hand instead::
+When working on the backend, drive it by hand instead -- with the relay this
+needs no asset overrides and no token plumbing, because kiro-cli owns both::
 
-    python - <<'EOF'
-    import asyncio
-    from kiro_crew.acp.runtime import AcpRuntime
-    from kiro_crew.acp.types import ACP_BACKEND_KAS
-
-    async def main():
-        rt = AcpRuntime(work_dir="/tmp/kas-check", sandbox_mode="off",
-                        acp_backend=ACP_BACKEND_KAS)
-        await rt.spawn()                      # initialize against the real build
-        print("loadSession:", rt._can_load_session)
-        await rt.create_session(cwd="/tmp/kas-check", agent="kirocrew")
-        await rt.kill()
-    asyncio.run(main())
-    EOF
-
-That call now succeeds: Crew injects its agent through ``_meta.kiro.customAgents``
-on ``session/new`` and activates it with ``session/set_mode``, and with
-``--auth=acp-callback`` a real prompt round-trip completes (the host answers KAS's
-token callback by shelling out to kiro-cli). ``agent.acp_backend`` accepts ``kas``.
+    kiro-cli acp --agent-engine v3 --auth-method cli
 """
 
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
-from kiro_crew.acp import kas_assets
 from kiro_crew.acp import session_handle as sh
-from kiro_crew.acp.kas_assets import (
-    ENV_KAS_NODE,
-    ENV_KAS_SCRIPT,
-    KAS_NODE_FLAGS,
-    KAS_TRANSPORT_ARG,
-    KasAssetsMissing,
+from kiro_crew.acp.kas_transport import (
+    KAS_RELAY_AUTH_OWNER,
+    KAS_RELAY_ENGINE,
+    KAS_RELAY_SUBCMD,
     build_kas_argv,
-    resolve_kas_entry,
 )
 from kiro_crew.acp.runtime import AcpRuntime
 from kiro_crew.acp.types import (
     ACP_BACKEND_KAS,
+    ACP_BACKENDS_KIRO_IDENTITY_STORE,
     ACP_CLIENT_CAPABILITIES,
     KAS_CLIENT_CAPABILITIES,
 )
 from kiro_crew.config.paths import kiro_agents_dir
+
+#: Inlined rather than imported: the relay owns this frame, so Crew has no
+#: production consumer for the name and only this test still needs the literal.
+METHOD_KAS_AUTH_GET_ACCESS_TOKEN = "_kiro/auth/getAccessToken"
 
 
 @pytest.fixture(autouse=True)
@@ -81,89 +67,143 @@ def _fast_no_report_ceiling(monkeypatch):
     monkeypatch.setattr(sh, "_MCP_DRAIN_NO_REPORT_CEILING", 0.05)
 
 
-class TestAssetResolution:
-    def test_env_overrides_win(self, tmp_path, monkeypatch):
-        node = tmp_path / "node"
-        script = tmp_path / "acp-server.js"
-        node.write_text("")
-        script.write_text("")
-        monkeypatch.setenv(ENV_KAS_NODE, str(node))
-        monkeypatch.setenv(ENV_KAS_SCRIPT, str(script))
-        assert resolve_kas_entry() == (node, script)
-
-    def test_missing_assets_raise_with_actionable_guidance(self, tmp_path, monkeypatch):
-        monkeypatch.delenv(ENV_KAS_NODE, raising=False)
-        monkeypatch.delenv(ENV_KAS_SCRIPT, raising=False)
-        # Point every discovery root at an empty dir so the probe finds nothing.
-        monkeypatch.setattr(kas_assets, "_kiro_data_dirs", lambda: [tmp_path])
-        with pytest.raises(KasAssetsMissing) as exc:
-            resolve_kas_entry()
-        message = str(exc.value)
-        assert "kiro-cli" in message
-        assert ENV_KAS_NODE in message or ENV_KAS_SCRIPT in message
-
-    def test_discovers_the_newest_extracted_bundle(self, tmp_path, monkeypatch):
-        """Replicates kiro-cli 2.18.0's real layout.
-
-        The bundle is staged as a trimmed ``node_modules`` tree, so the entry
-        script sits at the package's npm path — NOT at the top of the version
-        directory. Both facts were confirmed against an extracted 2.18.0 bundle.
-        """
-        monkeypatch.delenv(ENV_KAS_SCRIPT, raising=False)
-        kas_root = tmp_path / "kas"
-        rel = Path("node_modules/@kiro/agent/dist/server/acp-server.js")
-        old_dir = kas_root / "2.17.0-aaaa"
-        new_dir = kas_root / "2.18.0-bbbb"
-        for d in (old_dir, new_dir):
-            (d / rel.parent).mkdir(parents=True)
-            (d / rel).write_text("")
-        os.utime(old_dir, (1_000, 1_000))
-        os.utime(new_dir, (2_000, 2_000))
-        monkeypatch.setattr(kas_assets, "_kiro_data_dirs", lambda: [tmp_path])
-        found = kas_assets.find_kas_server_script()
-        assert found is not None
-        assert "2.18.0-bbbb" in str(found)
-        assert found.name == "acp-server.js"
-
-    def test_kiro_cli_data_dir_is_searched(self):
-        """2.18.0 writes ``~/.local/share/kiro-cli``, not ``~/.local/share/kiro``."""
-        names = [p.name for p in kas_assets._kiro_data_dirs()]
-        assert "kiro-cli" in names
-        assert names.index("kiro-cli") < names.index("kiro")
-
-
 class TestArgv:
-    def test_shape(self, tmp_path):
-        argv = build_kas_argv(tmp_path / "node", tmp_path / "acp-server.js")
-        assert argv[0].endswith("node")
-        assert KAS_TRANSPORT_ARG in argv
-        for flag in KAS_NODE_FLAGS:
-            assert flag in argv
+    def test_shape_is_the_cli_acp_relay(self):
+        argv = build_kas_argv("/usr/bin/kiro-cli")
+        assert argv[0] == "/usr/bin/kiro-cli"
+        assert argv[1] == KAS_RELAY_SUBCMD
 
-    def test_auth_acp_callback_is_passed(self, tmp_path):
-        """We now launch KAS with --auth=acp-callback.
+    def test_engine_is_pinned_explicitly(self):
+        """``acp`` defaults to kiro-cli's own agent loop, not KAS.
 
-        KAS then keeps no refresh token and asks this host for an access token
-        over ACP (``_kiro/auth/getAccessToken``), which the runtime answers by
-        shelling out to kiro-cli. This works on a cli-only machine, unlike the
-        file auth provider (omit --auth) whose SSO-cache token ``kiro-cli login``
-        does not write.
+        Relying on the default would let a kiro-cli release silently serve a
+        different engine while every frame still looked well-formed, so the
+        engine is always stated.
         """
-        argv = build_kas_argv(tmp_path / "node", tmp_path / "acp-server.js")
-        assert "--auth=acp-callback" in argv
+        argv = build_kas_argv("/usr/bin/kiro-cli")
+        assert "--agent-engine" in argv
+        assert argv[argv.index("--agent-engine") + 1] == KAS_RELAY_ENGINE
 
-    def test_no_agent_flag_is_passed(self, tmp_path):
-        argv = build_kas_argv(tmp_path / "node", tmp_path / "acp-server.js")
-        assert "--agent" not in argv
+    def test_auth_owner_is_the_cli(self):
+        """The relay resolves tokens from kiro-cli's own store.
+
+        This is what removes Crew from the credential path: without it the engine
+        expects its host to answer ``_kiro/auth/getAccessToken``.
+        """
+        argv = build_kas_argv("/usr/bin/kiro-cli")
+        assert "--auth-method" in argv
+        assert argv[argv.index("--auth-method") + 1] == KAS_RELAY_AUTH_OWNER
+
+    def test_no_agent_flag_is_passed(self):
+        """Crew binds its agent over the wire, not by naming a kiro-cli mode.
+
+        ``--agent`` would select a mode kiro-cli found on disk; the wire-injected
+        agent is the one Crew's governance ceiling actually filtered.
+        """
+        assert "--agent" not in build_kas_argv("/usr/bin/kiro-cli")
+
+    def test_no_model_flag_is_passed(self):
+        """One process hosts N sessions, so a start-time model would bind all of
+        them; the model is chosen per session over the wire."""
+        assert "--model" not in build_kas_argv("/usr/bin/kiro-cli")
+
+    def test_empty_binary_is_refused(self):
+        """A falsy path must not become argv[0]="" and a confusing exec error."""
+        with pytest.raises(ValueError):
+            build_kas_argv("")
+
+
+class TestAuthOwnership:
+    """Crew must not serve KAS's credential callback any more.
+
+    The relay owns it (``--auth-method cli``), so the frame no longer arrives.
+    These tests pin the consequence rather than the absence: nothing in Crew
+    resolves a KAS token, and a connection-level request that does arrive is
+    answered rather than left to hang.
+    """
+
+    def test_no_token_resolver_remains_in_the_runtime(self):
+        """The shell-out to kiro-cli's hidden token verb is gone.
+
+        Asserted on the module surface because a re-added helper is exactly the
+        regression this switch is meant to prevent.
+        """
+        from kiro_crew.acp import runtime as runtime_mod
+
+        for gone in (
+            "_answer_get_access_token",
+            "_deliver_kas_access_token",
+            "resolve_kas_access_token",
+        ):
+            assert not hasattr(AcpRuntime, gone), f"AcpRuntime.{gone} should be gone"
+            assert not hasattr(runtime_mod, gone), f"runtime.{gone} should be gone"
+
+    def test_the_kas_auth_module_is_gone(self):
+        """No importable KAS credential path is left anywhere in the package."""
+        with pytest.raises(ModuleNotFoundError):
+            __import__("kiro_crew.acp.kas_auth")
+
+    def test_kas_is_retired_by_an_external_kiro_cli_logout(self):
+        """Auth moved INTO kiro-cli, so KAS inherits its identity lifetime.
+
+        ``--auth-method cli`` resolves every token from kiro-cli's own store, so
+        a ``kiro-cli logout`` or account switch invalidates a running KAS relay
+        exactly as it invalidates the kiro backend. Without this membership the
+        identity sweep would leave the relay serving turns on the previous
+        account's credentials.
+        """
+        assert ACP_BACKEND_KAS in ACP_BACKENDS_KIRO_IDENTITY_STORE
+
+    def test_the_runtime_declares_the_identity_capability(self, tmp_path):
+        """The sweep reads the declared property, not the frozenset directly."""
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "ident",
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+        )
+        assert runtime.uses_kiro_identity_store is True
+
+    @pytest.mark.asyncio
+    async def test_ownerless_auth_request_is_answered_not_hung(self, tmp_path):
+        """A sessionId-less request gets -32601 from the ownerless answerer.
+
+        Previously ``_kiro/auth/getAccessToken`` had a bespoke branch here. With
+        the relay owning auth it takes the ordinary unroutable-request path, and
+        the property that matters is that SOMETHING answers: a silent drop would
+        wedge whichever peer sent it.
+
+        No spawn: the answerer's only side effect is the patched ``send_error``,
+        so driving it against a constructed runtime keeps this covered on Windows
+        too (the stub launcher is a POSIX shell script).
+        """
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "auth",
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+        )
+        sent: list[tuple[object, int, str]] = []
+
+        async def record_error(request_id, code, message):
+            sent.append((request_id, code, message))
+
+        with patch.object(runtime, "send_error", side_effect=record_error):
+            await runtime._answer_ownerless_request(99, METHOD_KAS_AUTH_GET_ACCESS_TOKEN)
+        assert sent and sent[0][0] == 99
+        assert sent[0][1] == -32601
 
 
 class TestSandboxClassification:
     """KAS must not be declared to the sandbox as kiro-cli.
 
-    On macOS ``wrap_argv`` skips its own seatbelt when told the child is
-    kiro-cli and kiro's internal sandbox is on, because the two cannot nest.
-    Node has no internal sandbox, so that claim would leave KAS running with no
-    isolation at all rather than with one of the two layers.
+    ``wrap_argv`` skips Crew's own seatbelt when told the child is kiro-cli with
+    its internal sandbox on, because on macOS the two cannot nest. The relay DOES
+    spawn a kiro-cli binary now, which makes the claim look tempting -- and it is
+    wrong. kiro-cli spawns the KAS server with no ``--sandbox`` argument, and KAS
+    resolves an absent sandbox config to its no-op backend, so nothing starts an
+    OS sandbox inside. There is therefore nothing to nest (no EPERM risk) and
+    nothing to delegate to: this membership test fails OPEN, so claiming it would
+    skip Crew's seatbelt in favour of a layer that never exists and leave KAS
+    unconfined on macOS. False is the load-bearing answer, not the cautious one.
     """
 
     class _Abort(Exception):
@@ -199,12 +239,8 @@ class TestSandboxClassification:
         async def fake_bin():
             return "/usr/bin/kiro-cli"
 
-        monkeypatch.setattr(
-            "kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin
-        )
-        monkeypatch.setattr(
-            "kiro_crew.acp.runtime.ensure_agent_materialized", lambda _agent: None
-        )
+        monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin)
+        monkeypatch.setattr("kiro_crew.acp.runtime.ensure_agent_materialized", lambda _agent: None)
         runtime = AcpRuntime(work_dir=tmp_path / "sbx2", sandbox_mode="off")
         with patch("kiro_crew.acp.runtime.wrap_argv", side_effect=fake_wrap):
             with pytest.raises(self._Abort):
@@ -236,7 +272,7 @@ class TestCapabilities:
 #: A stub agent speaking KAS's dialect: it echoes the client's protocolVersion,
 #: advertises loadSession, and ends a turn with session_info_update/turn_end
 #: rather than kiro-cli's standalone completion frame.
-_STUB_AGENT = '''
+_STUB_AGENT = """
 import json, sys
 
 def send(obj):
@@ -275,7 +311,7 @@ for line in sys.stdin:
         send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
     elif mid is not None:
         send({"jsonrpc": "2.0", "id": mid, "result": {}})
-'''
+"""
 
 
 #: The one agent spec ``session/new`` projects onto KAS. Minimal on purpose: this
@@ -291,34 +327,37 @@ _STUB_AGENT_SPEC = {
 
 @pytest.fixture
 def kas_stub(tmp_path, monkeypatch):
-    """Point the KAS asset overrides at a stub agent run by this interpreter.
+    """Stand in for the kiro-cli binary the KAS relay argv is built around.
 
-    Redirects the kiro agent home and puts a spec in it, because the projection reads
-    one and nothing in a test can make production write it: ``ensure_agent_materialized``
-    REFUSES to write the shared agent home from an ephemeral instance -- a checkout plus
-    a temp data home, which describes every test -- and logs "This instance will use the
-    existing specs instead". Without the redirect, "the existing specs" are the
-    developer's own installed agents, so this test's verdict depended on which of them
-    were present and whether their ``file://`` prompt files still resolved: it failed
-    with an ``AcpRuntimeError`` naming a prompt file in an unrelated worktree.
+    The launcher ignores its arguments -- ``acp --agent-engine v3 --auth-method
+    cli`` -- and runs the stub agent on this interpreter. Argv fidelity is
+    asserted separately in ``TestArgv``, so swallowing them here costs no
+    coverage and keeps the stub independent of flag order.
 
-    ``KIRO_HOME`` rather than patching ``Path.home()``: it is the documented override
-    and it reaches the resolver this path uses. Note its scope caveat
-    (``config/paths.py``) -- today only the agents directory follows it, so it moves
-    where kiro-cli WRITES without moving where Kiro Crew reads. That is enough here,
-    because the agents directory is the whole dependency. The rootdir conftest does NOT
-    pin it: the variable outranks ``Path.home()``, and many tests isolate this resolver
-    by patching that instead.
+    Also redirects the kiro agent home and puts a spec in it, because the
+    projection reads one and nothing in a test can make production write it:
+    ``ensure_agent_materialized`` REFUSES to write the shared agent home from an
+    ephemeral instance -- a checkout plus a temp data home, which describes every
+    test -- and logs "This instance will use the existing specs instead". Without
+    the redirect, "the existing specs" are the developer's own installed agents,
+    so this test's verdict depended on which of them were present and whether
+    their ``file://`` prompt files still resolved.
+
+    ``KIRO_HOME`` rather than patching ``Path.home()``: it is the documented
+    override and it reaches the resolver this path uses. Note its scope caveat
+    (``config/paths.py``) -- today only the agents directory follows it, which is
+    enough here because the agents directory is the whole dependency.
     """
     script = tmp_path / "kas_stub.py"
     script.write_text(_STUB_AGENT)
-    launcher = tmp_path / "node-stub"
-    # The launcher swallows KAS's node flags and transport arg, then runs the
-    # stub: argv fidelity is asserted separately in TestArgv.
+    launcher = tmp_path / "kiro-cli-stub"
     launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}"\n')
     launcher.chmod(0o755)
-    monkeypatch.setenv(ENV_KAS_NODE, str(launcher))
-    monkeypatch.setenv(ENV_KAS_SCRIPT, str(script))
+
+    async def fake_bin() -> str:
+        return str(launcher)
+
+    monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin)
     monkeypatch.setenv("KIRO_HOME", str(tmp_path / "kiro-home"))
     agents_dir = kiro_agents_dir()
     agents_dir.mkdir(parents=True, exist_ok=True)
@@ -362,3 +401,32 @@ class TestKasInvocation:
             assert runtime.is_alive()
         finally:
             await runtime.kill()
+
+    @pytest.mark.asyncio
+    async def test_spawn_argv_is_the_relay_invocation(self, kas_stub, tmp_path):
+        """End-to-end: the argv the runtime actually resolves is the relay one."""
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "ws3",
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+        )
+        argv = await runtime._resolve_spawn_argv()
+        assert argv == build_kas_argv(str(kas_stub))
+        assert Path(argv[0]).name == "kiro-cli-stub"
+
+    @pytest.mark.asyncio
+    async def test_missing_kiro_cli_fails_with_an_actionable_error(self, tmp_path, monkeypatch):
+        """No kiro-cli means no relay, and the message must say which binary."""
+        from kiro_crew.acp.session_handle import AcpRuntimeError
+
+        async def no_bin() -> None:
+            return None
+
+        monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", no_bin)
+        runtime = AcpRuntime(
+            work_dir=tmp_path / "ws4",
+            sandbox_mode="off",
+            acp_backend=ACP_BACKEND_KAS,
+        )
+        with pytest.raises(AcpRuntimeError, match="kiro-cli"):
+            await runtime._resolve_spawn_argv()

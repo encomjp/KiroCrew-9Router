@@ -118,6 +118,13 @@ async def handle_get_config(request: web.Request) -> web.Response:
             "task_providers": taskprov.available_task_providers(),
             "calendar_providers": cal.available_calendar_providers(),
             "stt_providers": [{"id": k.STT_PROVIDER_KIROCREW, "label": "Kiro Crew speech-to-text"}],
+            # Served from here rather than hardcoded in the frontend, for the same
+            # reason the provider registries are: the backend is what validates the
+            # saved value, so it must also be what publishes the accepted set.
+            # Labels are endonyms and deliberately not translated.
+            "translation_languages": [
+                {"id": code, "label": label} for code, label in k.TRANSLATION_LANGS
+            ],
         }
     )
 
@@ -170,6 +177,12 @@ async def handle_put_config(request: web.Request) -> web.Response:
     if default_preset and default_preset not in presets:
         default_preset = ""
 
+    translation_language = field_str(
+        incoming, "translation_language", default=k.DEFAULT_TRANSLATION_LANG, max_len=16
+    )
+    if translation_language not in k.TRANSLATION_LANG_CODES:
+        translation_language = k.DEFAULT_TRANSLATION_LANG
+
     config = {
         "meeting_agents": agents,
         "stt_provider": k.STT_PROVIDER_KIROCREW,  # the only provider; not client-settable
@@ -189,6 +202,10 @@ async def handle_put_config(request: web.Request) -> web.Response:
         "poll_interval_idle": field_int(
             incoming, "poll_interval_idle", default=30_000, low=5000, high=600_000
         ),
+        # Validated against the published set, with anything unrecognised meaning
+        # OFF rather than falling back to a language nobody chose — this decides
+        # whether the app makes a model call per spoken line.
+        "translation_language": translation_language,
     }
     # A single write, wrapped inline: the replacement config is built entirely from
     # the validated request body, so there is nothing read from disk to keep it

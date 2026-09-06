@@ -366,15 +366,17 @@ def test_the_updater_offers_exactly_the_channels_that_publish_windows() -> None:
         for job in _workflow("release.yml")["jobs"].values()
         if str(job.get("uses", "")).endswith("publish-windows.yml")
     )
-    # Both of release.yml's channels publish, and stable must reach the lane
-    # through PROMOTION rather than a fresh build: it republishes the bundle
-    # resolve-promotion verified, so the caller has to gate on that job and pass
-    # promote plus the base version the manifest is checked against.
+    # Both of release.yml's channels publish. Stable reaches the lane by either
+    # mode: a rebuild builds and signs a fresh installer, while byte reuse
+    # republishes the bundle resolve-promotion verified -- so the caller gates on
+    # rebuild OR on that job, and passes promote plus the base version the
+    # manifest is checked against.
     assert "channel == 'insider'" in release["if"]
-    assert "channel == 'stable'" in release["if"]
+    assert "outputs.rebuild == 'true'" in release["if"]
+    assert "outputs.promote_mode == 'true'" in release["if"]
     assert "needs.resolve-promotion.result == 'success'" in release["if"]
     assert "resolve-promotion" in release["needs"]
-    assert "channel == 'stable'" in release["with"]["promote"]
+    assert "promote_mode == 'true'" in release["with"]["promote"]
     assert release["with"]["promotion_base_version"], "stable promotion needs a base version"
     # The stable installer comes from the verified handoff artifact, never from a
     # fresh build-windows upload.
@@ -617,6 +619,17 @@ def test_the_hook_refuses_a_partially_configured_environment() -> None:
     assert re.search(
         r"missing\.length > 0[\s\S]{0,400}throw new Error", source
     ), "a partially configured environment must throw, not skip"
+
+
+def test_the_hook_preserves_the_pinned_ffmpeg_payload_before_signing() -> None:
+    """Authenticode must not invalidate runtime's pinned upstream digest."""
+    source = SIGN_HOOK.read_text(encoding="utf-8")
+    decoder_guard = "fileName === 'ffmpeg-win-x86_64-v7.1.exe'"
+    assert decoder_guard in source
+    assert source.index(decoder_guard) < source.index("const REQUIRED_ENV"), (
+        "the exact decoder must return before any configured signing path; "
+        "otherwise Authenticode rewrites the bytes runtime authenticates"
+    )
 
 
 def test_promotion_verifies_the_whole_bundle_before_reading_the_installer() -> None:

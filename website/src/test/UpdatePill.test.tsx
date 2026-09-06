@@ -65,6 +65,6 @@ describe('UpdatePill', () => {
   it('clicking deep-links to Settings › About', async () => {
     await mount({ status: { update_available: true } })
     fireEvent.click(pill()!)
-    expect(navigate).toHaveBeenCalledWith('/settings?tab=about')
+    expect(navigate).toHaveBeenCalledWith('/settings/about')
   })
 })

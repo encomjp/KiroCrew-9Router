@@ -12,6 +12,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { screen, fireEvent, waitFor } from '@testing-library/react'
 import { renderWithProviders } from './helpers'
 import CollapsibleToolGroup from '../pages/chat/CollapsibleToolGroup'
+import { ApiError } from '../api/client'
 import { i18nT } from '../i18n/t'
 
 const T = (k: string, vars?: Record<string, unknown>) => i18nT(`pages.chat.collapsibleToolGroup.${k}`, vars)
@@ -118,7 +119,84 @@ describe('CollapsibleToolGroup approval dispatch', () => {
     // Back to "approval needed", with the buttons live again.
     await waitFor(() => expect(screen.getByText(T('approve'))).not.toBeDisabled())
     expect(screen.queryByText(T('approved'))).not.toBeInTheDocument()
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      i18nT('components.approvalCard.decision_failed'),
+    )
+    expect(screen.getByText(T('approve'))).toHaveFocus()
     expect(err).toHaveBeenCalled()
+  })
+
+  it('restores focus to Reject after a failed rejection, never to Approve', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const onApprove = vi.fn().mockRejectedValue(new Error('zzq gateway down'))
+    renderWithProviders(
+      <CollapsibleToolGroup count={1} hasPermission onApprove={onApprove}>
+        <div>zzq-child</div>
+      </CollapsibleToolGroup>,
+    )
+
+    fireEvent.click(screen.getByText(T('reject')))
+
+    await screen.findByRole('alert')
+    await waitFor(() => expect(screen.getByText(T('reject'))).toHaveFocus())
+    expect(screen.getByText(T('approve'))).not.toHaveFocus()
+  })
+
+  it.each([
+    [404, 'not found'],
+    [400, 'no pending approval'],
+  ])('treats a non-auth-required %i %s refusal as terminal', async (status, message) => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const onApprove = vi.fn().mockRejectedValue(new ApiError(status, message))
+    renderWithProviders(
+      <CollapsibleToolGroup count={1} hasPermission onApprove={onApprove}>
+        <div>zzq-child</div>
+      </CollapsibleToolGroup>,
+    )
+
+    fireEvent.click(screen.getByText(T('approve')))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      i18nT('components.approvalCard.approval_no_longer_pending'),
+    )
+    expect(screen.queryByText(T('approve'))).not.toBeInTheDocument()
+    expect(screen.queryByText(T('reject'))).not.toBeInTheDocument()
+  })
+
+  it('keeps an auth-required 404 retryable and shows the server refusal', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const refusal = new ApiError(404, 'session expired', '', true)
+    const onApprove = vi.fn().mockRejectedValue(refusal)
+    renderWithProviders(
+      <CollapsibleToolGroup count={1} hasPermission onApprove={onApprove}>
+        <div>zzq-child</div>
+      </CollapsibleToolGroup>,
+    )
+
+    fireEvent.click(screen.getByText(T('reject')))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      i18nT('components.approvalCard.decision_not_recorded_error', { error: refusal.message }),
+    )
+    await waitFor(() => expect(screen.getByText(T('reject'))).toHaveFocus())
+  })
+
+  it('shows a retryable ApiError message and restores the attempted action', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const refusal = new ApiError(500, 'zzq gateway refused')
+    const onApprove = vi.fn().mockRejectedValue(refusal)
+    renderWithProviders(
+      <CollapsibleToolGroup count={1} hasPermission onApprove={onApprove}>
+        <div>zzq-child</div>
+      </CollapsibleToolGroup>,
+    )
+
+    fireEvent.click(screen.getByText(T('approve')))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      i18nT('components.approvalCard.decision_not_recorded_error', { error: refusal.message }),
+    )
+    await waitFor(() => expect(screen.getByText(T('approve'))).toHaveFocus())
   })
 
   it('pretty-prints a structured tool_input in the preview', () => {

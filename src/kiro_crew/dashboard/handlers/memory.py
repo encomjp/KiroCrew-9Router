@@ -41,11 +41,13 @@ from kiro_crew.embeddings import (
 from kiro_crew.executors import embed_executor, run_in_embed_pool
 from kiro_crew.history import is_incognito_transcript
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.platform_compat import kill_and_reap
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
     cgroup_scope_argv,
     create_subprocess_limited,
     wrap_argv,
+    wrap_argv_async,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -240,9 +242,10 @@ async def _get_vector_store_async(state: DashboardState):
     """Async facade over ``_get_vector_store`` honouring init's caller contract.
 
     ``VectorMemoryStore.init()`` documents that async callers must offload it
-    (the Windows path shells out to icacls, freezing the loop for seconds), so
-    the standalone fallback inside ``_get_vector_store`` must not run inline in
-    a handler (#5221). Fast path: when a store is already resolvable without
+    (it is blocking file IO end to end — sqlite connect, migrations, the
+    owner-only lockdown pass), so the standalone fallback inside
+    ``_get_vector_store`` must not run inline in a handler (#5221). Fast path:
+    when a store is already resolvable without
     running ``init()`` — the context_builder supplied one, or a prior call
     cached the standalone fallback on ``state`` — delegate synchronously, so
     the common request path pays no thread hop. In both fast-path cases
@@ -255,7 +258,7 @@ async def _get_vector_store_async(state: DashboardState):
     # inside the worker would race a concurrent loop-side ``_get_memory`` into
     # publishing a second MemoryStore, detaching ``vector_store`` from the
     # object every other handler reads. MemoryStore's own ``init()`` is a
-    # cheap mkdir+seed (not the icacls-bearing one this wrapper offloads) and
+    # cheap mkdir+seed (not the lockdown-bearing one this wrapper offloads) and
     # ran on the loop for every request before #5221.
     mem = _get_memory(state)
     if mem.vector_store or hasattr(state, "_standalone_vector"):
@@ -876,9 +879,10 @@ async def _ensure_pip_available() -> tuple[bool, str]:
     except ImportError:
         pass
     try:
-        sandboxed_argv, cleanup = wrap_argv(
+        sandboxed_argv, cleanup = await wrap_argv_async(
             [sys.executable, "-m", "ensurepip", "--upgrade"],
             mode="standard",
+            _prepare=wrap_argv,
         )
     except SandboxUnavailableError as exc:
         # Fail-closed sandbox (any host with no OS backend). Report it as a
@@ -896,8 +900,7 @@ async def _ensure_pip_available() -> tuple[bool, str]:
         try:
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            await kill_and_reap(proc)
             logger.warning("ensurepip bootstrap timed out")
             return False, "pip bootstrap (ensurepip) timed out"
         if proc.returncode != 0:
@@ -1002,10 +1005,11 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
                     {"error": f"{pip_err}. Click Enable to retry."}, status=500
                 )
             try:
-                sandboxed_argv, cleanup = wrap_argv(
+                sandboxed_argv, cleanup = await wrap_argv_async(
                     [sys.executable, "-m", "pip", "install", "-q",
                      "faiss-cpu", "--only-binary=:all:"],
                     mode="standard",
+                    _prepare=wrap_argv,
                 )
             except SandboxUnavailableError:
                 # faiss is a pure accelerator; episodic recall still works via
@@ -1041,8 +1045,7 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
                     try:
                         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
                     except asyncio.TimeoutError:
-                        proc.kill()
-                        await proc.wait()
+                        await kill_and_reap(proc)
                         logger.warning("faiss-cpu install timed out")
                         _embedding_setup_status = {
                             "step": "idle",

@@ -10,8 +10,8 @@ import { test, expect } from '@playwright/test'
  *  /orchestrated/:slug? → /chat/:slug? (OrchestratedRedirect, preserves slug + search)
  *
  * NOT covered (handled by sibling specs):
- *  /overview    → /settings?tab=overview  (settings.spec.ts)
- *  /instances   → /settings?tab=instances (settings.spec.ts)
+ *  /overview    → /settings/overview  (settings.spec.ts)
+ *  /instances   → /settings/instances (settings.spec.ts)
  *  /artifacts/deploy → /deploy            (artifacts.spec.ts)
  */
 

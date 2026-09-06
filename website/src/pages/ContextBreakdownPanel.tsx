@@ -4,6 +4,9 @@ import { useQuery } from '@tanstack/react-query'
 import { api } from '../api/client'
 import { fmtNumber, fmtPercent, fmtUnit } from '../i18n/format'
 import { i18nT } from '../i18n/t'
+import type { SubagentActivity } from '../types'
+import { SessionBreakdownTree } from './SessionBreakdownTree'
+import { SOURCE_MUTE, sourceFg, sourceFill } from './contextSourceColors'
 
 /**
  * One turn's injection record, as GET /api/telemetry/context-trace returns it.
@@ -120,16 +123,19 @@ export function rampShade(rank: number, count: number): { fill: string; fg: stri
   return { fill: `var(--ctx-k${step})`, fg: `var(--ctx-fg${step})` }
 }
 
-/** Stable colour per label, ranked by WHOLE-SESSION size so a block keeps one
- *  shade across every row. */
+/** Colour per label from the shared per-SOURCE hue map (see
+ *  `contextSourceColors`), so every composition bar — the per-turn rows here AND
+ *  the Session Breakdown tree above — colours a source the same way. Hue is the
+ *  data channel; the long tail of unrecognised blocks shares the neutral mute.
+ *  (Previously a size-ranked grey ramp, which made the two surfaces disagree and
+ *  buried the composition signal.) */
 function buildColorMap(totals: Record<string, number>): Map<string, { fill: string; fg: string }> {
   const grouped = groupBlocks(totals)
-  const ranked = Object.entries(grouped)
-    .filter(([label]) => label !== USER_LABEL)
-    .sort((a, b) => b[1] - a[1])
-    .map(([label]) => label)
   const map = new Map<string, { fill: string; fg: string }>()
-  ranked.forEach((label, i) => map.set(label, rampShade(i, ranked.length)))
+  for (const label of Object.keys(grouped)) {
+    if (label === USER_LABEL) continue
+    map.set(label, { fill: sourceFill(label), fg: sourceFg() })
+  }
   return map
 }
 
@@ -348,8 +354,8 @@ export function ContextBreakdownPanel({
 
 function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
   const colorMap = buildColorMap(trace.totals)
-  const darkest = rampShade(1, 1)
-  const colorOf = (label: string) => colorMap.get(label) ?? darkest
+  const fallback = { fill: SOURCE_MUTE, fg: sourceFg() }
+  const colorOf = (label: string) => colorMap.get(label) ?? fallback
 
   const totalWindow = trace.injected_chars + trace.estimated_other_chars
   const kirocrewAdded = Math.max(0, trace.injected_chars - trace.user_chars)
@@ -542,7 +548,7 @@ function ContextBreakdownCard({ trace }: { trace: ContextTrace }) {
  *  per-turn drill-down — it made the reader pick a session before the view could
  *  say anything.
  */
-export function ContextBreakdownTab({ slot }: { slot: string }) {
+export function ContextBreakdownTab({ slot, subagents }: { slot: string; subagents?: Record<string, SubagentActivity> }) {
   const { data, isLoading } = useQuery<ContextTrace>({
     queryKey: ['context-trace', slot],
     queryFn: () => api.telemetryContextTrace(slot),
@@ -553,6 +559,7 @@ export function ContextBreakdownTab({ slot }: { slot: string }) {
 
   return (
     <div className="h-full overflow-auto p-3">
+      <SessionBreakdownTree subagents={subagents ?? {}} />
       <ContextBreakdownPanel trace={data} isLoading={isLoading} />
     </div>
   )

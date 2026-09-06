@@ -255,7 +255,23 @@ class TestControlFrames:
     async def test_ping_is_answered_with_pong_and_closes(self, peer_ok):
         writer = _FakeWriter()
         await _handle(_ScriptedReader({"type": "ping"}, {"type": "ping"}), writer, _fake_pool())
-        assert writer.frames() == [{"type": "pong"}]
+        frames = writer.frames()
+        assert len(frames) == 1
+        assert frames[0]["type"] == "pong"
+
+    @pytest.mark.asyncio
+    async def test_pong_reports_the_target_map_so_an_adopter_can_check_it(
+        self, peer_ok, monkeypatch
+    ):
+        """``GatewayManager`` adopts any process answering ``pong`` without a
+        version handshake, and adoption is the one path that never applies the
+        spec's ``mcp_target_env``. Without this field the adopter cannot tell a
+        daemon that predates a ``stub_servers`` change from a current one, which
+        is how a stale daemon silently removed a whole server's tools."""
+        monkeypatch.setenv("KIROCREW_MCP_TARGET_KIROCREW_CORE", "kirocrew mcp-core")
+        writer = _FakeWriter()
+        await _handle(_ScriptedReader({"type": "ping"}), writer, _fake_pool())
+        assert "KIROCREW_CORE" in writer.frames()[0]["targets"]
 
     @pytest.mark.asyncio
     async def test_stats_merges_the_warm_pool_hit_tally(self, peer_ok, monkeypatch):
@@ -572,10 +588,16 @@ class TestEnsureBackendRejections:
         "exc,expected_reason,fallback,audit",
         [
             (
+                # Fallback-ELIGIBLE: at the pre-flight no real MCP frame has
+                # been forwarded, and an unknown target here can only be map
+                # drift (a stub exists only because the rewriter wrapped that
+                # server, and it holds the real --target-command on its argv).
+                # Tagging it terminal is what killed the server outright instead
+                # of degrading it to a per-session exec.
                 gw._TargetUnknown("no target mapping for server 'demo-mcp'"),
                 "no target mapping for server 'demo-mcp'",
-                False,
-                "_audit_pool_rejected",
+                True,
+                "_audit_pool_fallback",
             ),
             (
                 BackendUnavailable("circuit breaker OPEN"),
@@ -1023,3 +1045,48 @@ class TestRunGatewaydLifecycle:
             await asyncio.wait_for(daemon, timeout=15)
 
         assert any("connection handler crashed" in rec.message for rec in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_an_abrupt_client_disconnect_is_not_logged_as_a_crash(
+        self, short_sock_dir, monkeypatch, caplog
+    ):
+        socket_path = short_sock_dir / "gw-reset.sock"
+        handled = asyncio.Event()
+
+        async def _reset(*args, **kwargs):
+            handled.set()
+            raise ConnectionResetError(104, "Connection reset by peer")
+
+        monkeypatch.setattr(gw, "_handle_connection", _reset)
+
+        stop_event = asyncio.Event()
+        daemon = asyncio.create_task(
+            gw.run_gatewayd(
+                socket_path,
+                max_backends=2,
+                idle_timeout_secs=300,
+                stop_event=stop_event,
+                target_resolver=_resolver,
+            )
+        )
+        try:
+            for _ in range(500):
+                if socket_path.exists():
+                    break
+                await asyncio.sleep(0.02)
+            assert socket_path.exists(), "the daemon never bound its endpoint"
+            with caplog.at_level(logging.ERROR, logger=gw.logger.name):
+                _, writer = await asyncio.open_unix_connection(str(socket_path))
+                writer.close()
+                await asyncio.wait_for(handled.wait(), timeout=10)
+                # A reset peer is routine: the accept loop still serves.
+                _, writer2 = await asyncio.open_unix_connection(str(socket_path))
+                writer2.close()
+                await asyncio.sleep(0.05)
+        finally:
+            stop_event.set()
+            await asyncio.wait_for(daemon, timeout=15)
+
+        assert not any(
+            "connection handler crashed" in rec.message for rec in caplog.records
+        )

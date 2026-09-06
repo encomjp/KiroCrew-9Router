@@ -18,7 +18,7 @@
  * by a test double that skips the scan.
  */
 import { describe, it, expect } from 'vitest'
-import reducer, { sseThinkingChunk, sseChatMessage, refreshSlot } from '../store/chatSlice'
+import reducer, { sseThinkingChunk, sseChatMessage, refreshSlot, appendMessage } from '../store/chatSlice'
 
 type State = ReturnType<typeof reducer>
 
@@ -147,5 +147,66 @@ describe('mergePreservedThinking anchoring across a steer', () => {
     const roles = s.messages.map(m => m.role)
     expect(roles.indexOf('thinking')).toBeLessThan(roles.indexOf('assistant'))
     expect(s.messages[s.messages.length - 1].role).not.toBe('thinking')
+  })
+
+  it('drops the pre-steer chip when the covered page proves the steer raced onto the new-turn path (#6075)', () => {
+    // The steer POST lands after chat_done: the bubble was appended
+    // optimistically with a client-minted sendId, but slot.running was already
+    // false server-side, so the text was persisted as a PLAIN user row (new
+    // turn) carrying that same sendId — no steer_push echo ever arrives. The
+    // pre-steer reasoning belongs to the FINISHED turn; the page covering its
+    // id-proven boundary must drop the chip (a reload shows no reasoning)
+    // instead of stranding it at the tail forever.
+    let s = withOpenTurn()
+    s = reducer(s, sseThinkingChunk({ slot: SLOT, content: 'stranded reasoning' }))
+    s = reducer(s, appendMessage({ role: 'user', content: 'next thing', cls: 'msg msg-u', ts: new Date().toISOString(), meta: { steer: true, optimistic: true, sendId: 'sid-race' } }))
+
+    s = refreshWith(s, [
+      { role: 'user', content: 'do the thing', ts: '100' },
+      { role: 'user', content: 'next thing', ts: '200', meta: { sendId: 'sid-race', mid: 'm-race' } },
+      { role: 'assistant', content: 'new turn answer', ts: '201' },
+    ])
+
+    expect(thinkingRows(s)).toHaveLength(0)
+    expect(s.messages[s.messages.length - 1].role).not.toBe('thinking')
+  })
+
+  it('scans past an id-proven ACCEPTED steer and anchors above the post-steer answer (#6075)', () => {
+    // The page holds a STEER row carrying the bubble's sendId: acceptance is
+    // proven, the steer does not end the block's turn, and the scan continues
+    // to the real anchor below — the block lands above the answer, never at
+    // the tail and never dropped.
+    let s = withOpenTurn()
+    s = reducer(s, sseThinkingChunk({ slot: SLOT, content: 'pre-steer reasoning' }))
+    s = reducer(s, appendMessage({ role: 'user', content: 'also check X', cls: 'msg msg-u', ts: new Date().toISOString(), meta: { steer: true, optimistic: true, sendId: 'sid-acc' } }))
+    s = reducer(s, sseChatMessage({ slot: SLOT, role: 'assistant', content: 'the answer', ts: '102' }))
+
+    s = refreshWith(s, [
+      { role: 'user', content: 'do the thing', ts: '100' },
+      { role: 'user', content: 'also check X', ts: '101', meta: { steer: true, sendId: 'sid-acc', mid: 'm-acc' } },
+      { role: 'assistant', content: 'the answer', ts: '102' },
+    ])
+
+    const roles = s.messages.map(m => m.role)
+    const thinkingIdx = roles.indexOf('thinking')
+    expect(thinkingIdx).toBeGreaterThanOrEqual(0)
+    expect(thinkingIdx).toBeLessThan(roles.indexOf('assistant'))
+    expect(thinkingRows(s)).toHaveLength(1)
+  })
+
+  it('declines to guess when the page holds no row for the bubble id (#6075)', () => {
+    // The steer is still in flight: the bubble carries a sendId but the page
+    // has no persisted row with it (neither path has landed). Id identity is
+    // the ONLY licensed resolution, so an unmatched id keeps the default:
+    // break, no boundary, no drop — over-keep, never over-drop.
+    let s = withOpenTurn()
+    s = reducer(s, sseThinkingChunk({ slot: SLOT, content: 'live reasoning' }))
+    s = reducer(s, appendMessage({ role: 'user', content: 'pending steer', cls: 'msg msg-u', ts: new Date().toISOString(), meta: { steer: true, optimistic: true, sendId: 'sid-pending' } }))
+
+    s = refreshWith(s, [
+      { role: 'user', content: 'do the thing', ts: '100' },
+    ])
+
+    expect(thinkingRows(s).map(m => m.content)).toEqual(['live reasoning'])
   })
 })

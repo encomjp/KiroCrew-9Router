@@ -160,7 +160,9 @@ The word "save" means three different things here, and only the last needs a but
 1. **Disk.** A note edit is written to the file after `SAVE_DEBOUNCE_MS` (1s) of quiet,
    and flushed unconditionally before anything that could lose it — opening another note,
    switching vaults, moving/renaming/deleting, syncing, and `beforeunload`. The user never
-   saves the file by hand.
+   saves the file by hand. Disk saves are single-flight: a mutation that reaches its flush
+   barrier while the debounced save is active joins that request, so a failed save cannot be
+   hidden by a competing write that lets the mutation proceed.
 2. **Local git history (autosave).** `POST /api/commit` runs every `AUTO_COMMIT_MINS`
    (5) while `LS.autoCommit` is on — **default ON** (`DEFAULT_AUTO_COMMIT`). It commits and
    stops; it cannot reach a remote. It stages **exactly** the changed `.md` paths it saves,

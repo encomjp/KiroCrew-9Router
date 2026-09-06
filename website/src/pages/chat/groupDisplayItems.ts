@@ -9,6 +9,45 @@ import { isSubagentCompletionMessage } from './subagentCompletion'
 export const GROUPABLE = new Set(['permission'])
 
 /**
+ * The reasoning roles, and what "content-bearing reasoning" means. These are
+ * THE single definition of the classification, shared by every display-layer
+ * site that acts on it:
+ *
+ *  - the wrap gate below (`contentThinkingCount` via `isReasoningBurst`, which
+ *    decides when a batch is routed into a {kind:'turn'} wrapper),
+ *  - the per-turn fold that gate feeds (`mergeTurnThinking` in TurnBlock.tsx,
+ *    which folds a turn's bursts into one hoisted row),
+ *  - ChatPage's `renderMessage` (content-bearing → ThinkingBlock, empty
+ *    placeholder → nothing, via `hasReasoningContent` + `isReasoningRole`),
+ *  - the shared-transcript registry entry (`transcriptRenderers.tsx`, whose
+ *    `roles` key and render guard both derive from here).
+ *
+ * These sites used to keep hand-written copies of the same condition; any
+ * future refinement (a new reasoning role, a whitespace guard, a meta flag)
+ * must happen HERE so the wrap threshold, the fold, and the row renderers can
+ * never drift apart — that drift is exactly how the duplicate
+ * "Thought process" rows of #6376 would regrow. (The store's burst-lifecycle
+ * mechanics in chatSlice are a different concern — they manage streaming
+ * placeholders, not display classification — and deliberately stay separate.)
+ */
+export const REASONING_ROLES = ['thinking'] as const
+
+const REASONING_ROLE_SET: ReadonlySet<string> = new Set(REASONING_ROLES)
+
+/** Is this message a reasoning trace (regardless of whether it has content)?
+ *  Structurally typed so raw-snapshot (wire-shape) surfaces can reuse it. */
+export const isReasoningRole = (msg: { role: string }): boolean =>
+  REASONING_ROLE_SET.has(msg.role)
+
+/** A content-bearing reasoning message; empty placeholders render nothing and never count. */
+export const hasReasoningContent = (msg: { role: string; content: string }): boolean =>
+  isReasoningRole(msg) && !!msg.content
+
+/** Item-level form of {@link hasReasoningContent} for TurnItem scans. */
+export const isReasoningBurst = (t: TurnItem): t is Extract<TurnItem, { kind: 'single' }> =>
+  t.kind === 'single' && hasReasoningContent(t.msg)
+
+/**
  * Roles that OPEN a turn, and are therefore the rows a reader can be anchored to.
  *
  * `nudge` and `subagent` are machine-injected but they ARE the thing that started
@@ -81,8 +120,28 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
       (t.kind === 'single' && (t.msg.role === 'tool' || t.msg.role === 'assistant' || t.msg.role === 'streaming')) ||
       t.kind === 'group'
     )
+  // A batch that carries TWO OR MORE content-bearing reasoning bursts must be
+  // wrapped as a {kind:'turn'}, even when it has no tool/assistant "working
+  // steps" and even when it is short. The per-turn reasoning-burst dedup
+  // (mergeTurnThinking in TurnBlock) — which folds a turn's many `thinking`
+  // bursts into ONE row hoisted above the answer — runs ONLY on {kind:'turn'}
+  // items. Left as loose singles (the else branch), each burst renders as its
+  // own standalone "Thought process" row via ChatPage's renderMessage,
+  // bypassing the dedup entirely: the duplicate-row wall of #6376. This bites a
+  // reasoning-only trailing turn (a monitor/nudge cycle that has only emitted
+  // reasoning so far) and any turn whose reasoning bursts land as a short/
+  // answerless batch — and it became common because finer-grained models (e.g.
+  // claude-opus-5) emit many small bursts per turn. The threshold is TWO: a
+  // single burst renders as exactly one row whether loose or wrapped (nothing
+  // to dedup), so wrapping it would only re-home it needlessly. `thinking` is
+  // deliberately NOT counted in hasWorkingSteps (it is a reasoning trace, not a
+  // working step that gates the "Worked through N steps" collapse), so this is
+  // a separate predicate. Empty placeholder bursts do not count (they render
+  // nothing, and mergeTurnThinking ignores them too).
+  const contentThinkingCount = (items: TurnItem[]) =>
+    items.reduce((n, t) => n + (isReasoningBurst(t) ? 1 : 0), 0)
   const flushTurn = (items: TurnItem[], complete: boolean) => {
-    if (hasWorkingSteps(items) && items.length > 2) {
+    if ((hasWorkingSteps(items) && items.length > 2) || contentThinkingCount(items) >= 2) {
       turns.push({ kind: 'turn', items, complete })
     } else {
       turns.push(...items)
@@ -128,6 +187,86 @@ export function groupDisplayItems(messages: ChatMessage[]): GroupedTurns {
     }
   }
   return { turns, trailingTurnIdx }
+}
+
+/** Two turn items describe the same rows: same kind, same underlying message
+ *  REFERENCES, same transcript indices. Reference equality on `msg` is the
+ *  load-bearing check — the store replaces a message object whenever its
+ *  content changes, so an unchanged reference means the row's input is
+ *  byte-identical. */
+// PURITY INVARIANT for the reconcile below: every field of a DisplayItem/
+// TurnItem must be a pure function of (its message references, their indices,
+// and `complete`). The equality helpers compare exactly those inputs, so a
+// future field derived from anything else will be silently frozen by the
+// substitution — such a field must be added to these comparisons.
+const sameTurnItem = (a: TurnItem, b: TurnItem): boolean => {
+  if (a.kind === 'single') return b.kind === 'single' && a.msg === b.msg && a.idx === b.idx
+  if (b.kind !== 'group') return false
+  if (a.startIdx !== b.startIdx || a.msgs.length !== b.msgs.length) return false
+  for (let i = 0; i < a.msgs.length; i++) if (a.msgs[i] !== b.msgs[i]) return false
+  return true
+}
+
+const sameDisplayItem = (a: DisplayItem, b: DisplayItem): boolean => {
+  if (a.kind === 'turn') {
+    if (b.kind !== 'turn') return false
+    if (a.complete !== b.complete || a.items.length !== b.items.length) return false
+    for (let i = 0; i < a.items.length; i++) if (!sameTurnItem(a.items[i], b.items[i])) return false
+    return true
+  }
+  if (b.kind === 'turn') return false
+  return sameTurnItem(a, b)
+}
+
+/**
+ * Identity-preserving wrapper around {@link groupDisplayItems}.
+ *
+ * The grouping is memoized on `messages` alone, but every streaming rAF flush
+ * replaces the messages array, so the memo re-runs and mints FRESH turn objects
+ * for every turn in the transcript — handing each mounted TurnBlock a new
+ * `turn` prop per flush and defeating all downstream memoization
+ * (memo(TurnBlock), mergeTurnThinking's [turn.items] memo, the disclosure
+ * machinery). This factory reconciles each fresh result against the previous
+ * one and substitutes the PRIOR object wherever the new element describes the
+ * same underlying message references — so a flush that only grew the trailing
+ * message returns the identical settled-turn objects and only the trailing
+ * turn carries a new identity.
+ *
+ * Cache shape and why it cannot leak: the closure holds exactly ONE
+ * (messages, result) pair — the last call's — and both slots are overwritten
+ * on every call, so the previous messages array is released as soon as the
+ * next one arrives. Each caller creates its own grouper (one per mounted
+ * ChatPage via useMemo), so two transcripts never thrash a shared slot and the
+ * whole cache dies with the component. `applyRunningState` stays downstream
+ * and untouched: it already applies the running flag in O(1) on top of
+ * whatever this returns.
+ */
+export function createTurnGrouper(): (messages: ChatMessage[]) => GroupedTurns {
+  let prevMessages: ChatMessage[] | null = null
+  let prevResult: GroupedTurns | null = null
+  return (messages: ChatMessage[]): GroupedTurns => {
+    if (prevMessages === messages && prevResult) return prevResult
+    const next = groupDisplayItems(messages)
+    if (prevResult) {
+      const prevTurns = prevResult.turns
+      let allReused = next.turns.length === prevTurns.length &&
+        next.trailingTurnIdx === prevResult.trailingTurnIdx
+      for (let i = 0; i < next.turns.length; i++) {
+        const p = prevTurns[i]
+        if (p && sameDisplayItem(next.turns[i], p)) next.turns[i] = p
+        else allReused = false
+      }
+      // Every element (and the trailing index) survived: keep the previous
+      // top-level object too, so the [groupedTurns] memos downstream also hit.
+      if (allReused) {
+        prevMessages = messages
+        return prevResult
+      }
+    }
+    prevMessages = messages
+    prevResult = next
+    return next
+  }
 }
 
 /**

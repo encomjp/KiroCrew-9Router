@@ -12,6 +12,7 @@ import Modal from '../components/Modal'
 import Clickable from '../components/Clickable'
 import { useNavigate } from 'react-router-dom'
 import { useDocumentImeLatch } from '../hooks/useImeGuard'
+import { handleMenuKeydown } from '../hooks/useMenuKeyboard'
 import { useAppDispatch } from '../store'
 import { addNotification } from '../store/notificationsSlice'
 import { setPendingInput } from '../store/chatSlice'
@@ -24,7 +25,7 @@ import * as api from './devFleetApi'
 import { ApiError } from '../api/client'
 
 import { i18nT } from '../i18n/t'
-import { compareText } from '../i18n/format'
+import { compareText, fmtBytes, fmtPercent } from '../i18n/format'
 /* ─── Notification helper (replaces useNotify) ─── */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _dispatch: any = null
@@ -58,6 +59,9 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 // stalls in one band, then jumps. An indeterminate spinner plus the step name
 // and elapsed time is the honest signal.
 const STEP_MARKER_RE = /^::step::(\d+)::(.+)$/
+// The failure diagnosis arrives on the run as `cause`, derived by the gateway
+// from the exit code -- never parsed out of this stream, which also carries
+// worktree-controlled build output. So the log needs no marker handling.
 
 function filterStepMarkers(lines: string[]): string[] {
   return lines.filter((l) => !STEP_MARKER_RE.test(l))
@@ -193,6 +197,10 @@ export function mergeLogWindow(buffer: string[], window: string[]): string[] {
 export function pruneVerdictLabel(code?: string): string {
   switch (code) {
     case 'merged': return i18nT('pages.devFleetPage.pr_merged')
+    case 'closed': return i18nT('pages.devFleetPage.pr_closed_not_on_main')
+    case 'closed_dirty': return i18nT('pages.devFleetPage.pr_closed_uncommitted_changes')
+    case 'closed_new_commits': return i18nT('pages.devFleetPage.pr_closed_but_branch_has_newer_commits')
+    case 'closed_unverified': return i18nT('pages.devFleetPage.pr_closed_but_verification_unavailable_retry')
     case 'empty': return i18nT('pages.devFleetPage.no_commits_stale')
     case 'merged_dirty': return i18nT('pages.devFleetPage.pr_merged_uncommitted_changes')
     case 'fresh': return i18nT('pages.devFleetPage.created_recently')
@@ -277,6 +285,73 @@ function iconLabel(icon: ReactNode, label: string) {
   return <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 } as CSSProperties}>{icon}{label}</span>
 }
 
+// Colour for the memory readout as the pod approaches its cgroup MemoryMax.
+// Crossing MemoryMax is an OOM kill, so the readout shifts warn -> danger as
+// the ratio climbs. No ceiling (mem_max absent) -> neutral, since there is
+// nothing to be close to.
+function memColor(current: number | null | undefined, max: number | null | undefined): string {
+  if (current == null || max == null || max <= 0) return 'var(--muted)'
+  const ratio = current / max
+  if (ratio >= 0.9) return 'var(--danger)'
+  if (ratio >= 0.75) return 'var(--warn)'
+  return 'var(--muted)'
+}
+
+interface PodResources {
+  mem_current?: number | null
+  mem_max?: number | null
+  cpu_pct?: number | null
+  tasks?: number | null
+  home_bytes?: number | null
+}
+
+interface FleetTotals {
+  pod_home_bytes?: number | null
+  orphan_pods?: number | null
+}
+
+// Compact inline readout for a running pod: memory against its ceiling, CPU%,
+// task count. Each field is rendered ONLY when present — an absent field
+// (probe failed, off Linux, accounting off, or first CPU sample) contributes
+// nothing, so a blank never reads as a measured 0. Returns null when there is
+// nothing at all to show.
+function PodReadout({ r }: { r?: PodResources | null }) {
+  if (!r) return null
+  const parts: ReactNode[] = []
+  const chip: CSSProperties = { fontVariantNumeric: 'tabular-nums', fontFamily: 'ui-monospace, SF Mono, Menlo, monospace' }
+  if (r.mem_current != null) {
+    const label = r.mem_max != null
+      ? fmtBytes(r.mem_current) + ' / ' + fmtBytes(r.mem_max)
+      : fmtBytes(r.mem_current)
+    parts.push(
+      <span key="mem" style={{ ...chip, color: memColor(r.mem_current, r.mem_max) }}
+        title={i18nT('pages.devFleetPage.pod_memory_of_ceiling')}>{label}</span>,
+    )
+  }
+  if (r.cpu_pct != null) {
+    parts.push(<span key="cpu" style={chip} title={i18nT('pages.devFleetPage.pod_cpu_usage')}>{fmtPercent(r.cpu_pct / 100, { maximumFractionDigits: 1 })}</span>)
+  }
+  if (r.tasks != null) {
+    parts.push(<span key="tasks" style={chip} title={i18nT('pages.devFleetPage.pod_task_count')}>{r.tasks} {i18nT('pages.devFleetPage.pod_tasks_label')}</span>)
+  }
+  if (parts.length === 0) return null
+  return (
+    // The readout must never squeeze the worktree NAME out of the row: `flexShrink: 0`
+    // made it demand its full intrinsic width, so at a narrow viewport the metrics
+    // ran past the cell and the name lost its space. It now shrinks and clips
+    // instead, capped so the name always keeps the larger share. The chips are
+    // ordered memory -> CPU -> tasks, so what disappears first when space runs out
+    // is the least decision-critical figure; memory, the OOM signal, is kept.
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 11, color: 'var(--muted)', flexShrink: 1, minWidth: 0, maxWidth: 'min(340px, 45%)', overflow: 'hidden', whiteSpace: 'nowrap' } as CSSProperties}>
+      {parts.map((p, i) => (
+        <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+          {i > 0 ? <span style={{ opacity: 0.4 }}>{'\u00b7'}</span> : null}{p}
+        </span>
+      ))}
+    </span>
+  )
+}
+
 /* ─── Sub-components ─── */
 interface MenuItemDef { label: string; icon?: ReactNode; onClick: () => void; disabled?: boolean; danger?: boolean; title?: string }
 // Row-actions dropdown geometry. The menu is portaled to <body> so a row's
@@ -291,22 +366,73 @@ function MenuBtn({ items }: { items: (MenuItemDef | null)[] }) {
   const [rect, setRect] = useState<DOMRect | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
+  // One ref per VISIBLE item (index-aligned with `visible`, not `items`), so
+  // focus-entry and Tab containment below can skip disabled rows without
+  // reasoning about the gaps a filtered/disabled mix would otherwise leave.
+  const itemRefs = useRef<(HTMLDivElement | null)[]>([])
   const visible = items.filter(Boolean) as MenuItemDef[]
+  // Composition latch shared with the sibling ConfirmBtn trap: a Tab or
+  // Escape the IME owns is choosing/cancelling a candidate, not navigating
+  // the menu (native-event contract in useImeGuard.ts). Menu items are
+  // non-editable today, so no composition can start on them — the latch pins
+  // that this stays safe if the menu ever grows a focusable text field.
+  const imeLatch = useDocumentImeLatch(open)
+
+  // Explicit dismissal (Escape, an item click) restores focus to the trigger.
+  // Outside-click closes WITHOUT moving focus, deliberately: the browser
+  // routes focus per the click target after the handler, so the user's focus
+  // is already elsewhere by their own action (#2533). Scroll/resize closes
+  // restore focus only when it would otherwise be orphaned — see
+  // onScrollOrResize below.
+  const close = useCallback(() => { setOpen(false); triggerRef.current?.focus() }, [])
+
+  // Enabled item elements, index-aligned filter over itemRefs/visible.
+  const focusableItems = useCallback(
+    () => itemRefs.current.filter((el, i) => !visible[i]?.disabled && el) as HTMLDivElement[],
+    [visible],
+  )
 
   useEffect(() => {
     if (!open) return
+    // role="menu" tells assistive technology that focus is managed here —
+    // move it onto the first enabled item so a keyboard user lands inside
+    // the menu they were just told is open, not still on the trigger.
+    focusableItems()[0]?.focus()
     // The menu is portaled to <body>, so it is not a DOM descendant of
     // the trigger — the outside-click guard must exclude BOTH the trigger and
     // the menu (a plain trigger.contains() check would close on every menu
-    // click). Escape closes and returns focus to the trigger.
+    // click).
     const onDown = (e: MouseEvent) => {
       const t = e.target as Node
       if (!triggerRef.current?.contains(t) && !menuRef.current?.contains(t)) setOpen(false)
     }
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { setOpen(false); triggerRef.current?.focus() } }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        // An Escape the IME owns is cancelling a candidate, not the menu —
+        // and close() also yanks focus back to the trigger. Same claim, same
+        // reason as the sibling ConfirmBtn trap.
+        if (!imeLatch.claimKey(e)) return
+        close()
+        return
+      }
+      // Arrow/Home/End navigation and Tab containment live in the shared
+      // menu contract (useMenuKeyboard.ts) — extracted from here (#6231) so
+      // the sibling role="menu" surfaces honour the same keyboard promise
+      // without another inline spelling. Escape stays local: what "close"
+      // means (restore focus to the trigger) is this host's own semantics.
+      handleMenuKeydown(e, focusableItems, imeLatch)
+    }
     // position:fixed desyncs from any scrolling ancestor — close on scroll
-    // (capture phase catches nested scrollers) and on resize.
-    const onScrollOrResize = () => setOpen(false)
+    // (capture phase catches nested scrollers) and on resize. A wheel scroll
+    // moves no DOM focus, so with focus-entry above the unmount would orphan
+    // focus to <body> — restore it to the trigger, but only when focus is
+    // still inside the menu, and without scrolling: a default focus() would
+    // yank the viewport back to the trigger, hijacking the very scroll that
+    // dismissed the menu.
+    const onScrollOrResize = () => {
+      if (menuRef.current?.contains(document.activeElement)) triggerRef.current?.focus({ preventScroll: true })
+      setOpen(false)
+    }
     document.addEventListener('mousedown', onDown)
     document.addEventListener('keydown', onKey)
     window.addEventListener('scroll', onScrollOrResize, true)
@@ -317,7 +443,13 @@ function MenuBtn({ items }: { items: (MenuItemDef | null)[] }) {
       window.removeEventListener('scroll', onScrollOrResize, true)
       window.removeEventListener('resize', onScrollOrResize)
     }
-  }, [open])
+    // `focusableItems` is a new function identity every render (it closes
+    // over `visible`, itself a new array every render); including it would
+    // re-run this effect (and re-steal focus onto the first item) on every
+    // unrelated parent re-render while the menu is open, not just on
+    // open/close.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, close, imeLatch])
 
   const toggle = () => {
     if (!open && triggerRef.current) setRect(triggerRef.current.getBoundingClientRect())
@@ -361,7 +493,8 @@ function MenuBtn({ items }: { items: (MenuItemDef | null)[] }) {
           {visible.map((item, i) => (
             <Clickable
               key={'mi' + i}
-              onClick={() => { setOpen(false); item.onClick() }}
+              ref={(el) => { itemRefs.current[i] = el }}
+              onClick={() => { close(); item.onClick() }}
               disabled={!!item.disabled}
               style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%', textAlign: 'left' as const, background: 'none', border: 'none', borderRadius: 7, padding: '7px 10px', fontSize: 12, color: item.danger ? 'var(--danger)' : 'var(--text)', cursor: item.disabled ? 'default' : 'pointer', opacity: item.disabled ? 0.5 : 1 } as CSSProperties}
             >
@@ -514,15 +647,24 @@ interface Worktree {
   pr?: PrInfo | null; shipped?: boolean
   issues?: IssueRef[]; tickets?: TicketRef[]; summary?: string | null
   own_commits?: number; real_dirty?: boolean; is_live?: boolean; is_staged?: boolean; legacy?: boolean
+  // Breakdown of what makes the tree dirty, from the detail payload. A tree
+  // whose only dirt is untracked files (dirty_tracked === false) is removable
+  // by discarding them; one with modified tracked files is not.
+  dirty_tracked?: boolean | null; dirty_untracked?: number; dirty_untracked_paths?: string[]
   path?: string
   provision_run_id?: string | null
+  // Per-pod system resources (running pods on Linux only); absent otherwise.
+  pod_resources?: PodResources | null
 }
-interface FleetData { worktrees: Worktree[]; error?: string; needs_setup?: boolean; main_repo?: string; main_repo_inferred?: boolean; base_branch?: string; sync_run_id?: string; build_pending?: boolean; gateway_service_active?: boolean; gateway_service_reason?: string | null; pods_available?: boolean; pods_unavailable_reason?: string | null; serving_install_reason?: string | null; staged_target?: string | null; staged_cancel_available?: boolean; manual_restart?: string }
-interface SyncRun { rid: string; status: 'running' | 'done' | 'error'; lines: string[]; startedAt: number; exit?: number | null; last?: string; stepLabel?: string }
+interface FleetData { worktrees: Worktree[]; error?: string; needs_setup?: boolean; main_repo?: string; main_repo_inferred?: boolean; base_branch?: string; sync_run_id?: string; build_pending?: boolean; gateway_service_active?: boolean; gateway_service_reason?: string | null; pods_available?: boolean; pods_unavailable_reason?: string | null; serving_install_reason?: string | null; staged_target?: string | null; staged_cancel_available?: boolean; manual_restart?: string; fleet_totals?: FleetTotals }
+// `lastIsCause` distinguishes the two things `last` can hold. A gateway-composed
+// diagnosis is decision-critical prose ending in the action to take, so it must
+// not render in the muted 11.5px monospace the raw log tail uses.
+interface SyncRun { rid: string; status: 'running' | 'done' | 'error'; lines: string[]; startedAt: number; exit?: number | null; last?: string; lastIsCause?: boolean; stepLabel?: string }
 // Provision run state: the FULL output is kept (not just the last
 // line) so the expandable log panel can show everything, and a failed run
 // persists (failed=true) until the user dismisses it rather than vanishing.
-interface ProvRun { status: 'starting' | 'running' | 'done' | 'failed'; lines: string[]; startedAt: number; exit?: number | null; failed?: boolean; done?: boolean }
+interface ProvRun { rid?: string; status: 'starting' | 'running' | 'done' | 'failed'; lines: string[]; startedAt: number; exit?: number | null; failed?: boolean; done?: boolean }
 interface RebaseResult { kind: 'ok' | 'conflict' | 'error'; text: string }
 
 /* ─── Detail Panel (expanded row) ─── */
@@ -593,6 +735,31 @@ function DetailPanel({ w, d, busy, onRemove, onLoadLogs, logs, logsLoading }: { 
       {d.pod_running ? (
         <div style={mutedSm}>
           {i18nT('pages.devFleetPage.pod_running_on')}{d.pod_port || '?'}
+        </div>
+      ) : null}
+      {/* Full per-pod resource breakdown for a running pod. Each line renders
+          only when its field is present — an absent field (probe failed, off
+          Linux, accounting off) shows nothing rather than a measured-looking 0. */}
+      {w.pod_resources ? (
+        <div style={{ ...mutedSm, display: 'flex', flexDirection: 'column', gap: 2 }}>
+          {w.pod_resources.mem_current != null ? (
+            <div style={{ ...mono, color: memColor(w.pod_resources.mem_current, w.pod_resources.mem_max) }}>
+              {i18nT('pages.devFleetPage.pod_memory', {
+                value: w.pod_resources.mem_max != null
+                  ? fmtBytes(w.pod_resources.mem_current) + ' / ' + fmtBytes(w.pod_resources.mem_max)
+                  : fmtBytes(w.pod_resources.mem_current),
+              })}
+            </div>
+          ) : null}
+          {w.pod_resources.cpu_pct != null ? (
+            <div style={{ ...mono, color: 'var(--text)' }}>{i18nT('pages.devFleetPage.pod_cpu', { value: fmtPercent(w.pod_resources.cpu_pct / 100, { maximumFractionDigits: 1 }) })}</div>
+          ) : null}
+          {w.pod_resources.tasks != null ? (
+            <div style={{ ...mono, color: 'var(--text)' }}>{i18nT('pages.devFleetPage.pod_tasks', { value: w.pod_resources.tasks })}</div>
+          ) : null}
+          {w.pod_resources.home_bytes != null ? (
+            <div style={{ ...mono, color: 'var(--text)' }}>{i18nT('pages.devFleetPage.pod_home_size', { value: fmtBytes(w.pod_resources.home_bytes) })}</div>
+          ) : null}
         </div>
       ) : null}
       <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
@@ -726,9 +893,28 @@ export default function DevFleetPage() {
     if (rid) cancelledRunsRef.current.add(rid)
     setSyncRun(null); setSyncLogOpen(false)
   }
-  function dismissProv(name: string) {
+  async function dismissProv(name: string) {
+    const rid = prov[name]?.rid
+    if (rid) {
+      try {
+        await api.post('/pod/provision/dismiss', { name, run_id: rid })
+      } catch (e: unknown) {
+        notify((e as Error)?.message || String(e), { type: 'error' })
+        return
+      }
+    }
+    // The POST above is awaited, so a REPLACEMENT provision can fail and
+    // reattach to this worktree while the dismiss is in flight. Clear only the
+    // strip the user actually dismissed: if `rid` moved underneath us a newer
+    // failure is on screen, and deleting it would hide that run (and its log)
+    // until the next reload.
+    let stale = false
+    setProv((p) => {
+      if (p[name]?.rid !== rid) { stale = true; return p }
+      const n = { ...p }; delete n[name]; return n
+    })
+    if (stale) return
     clearTimeout(provDoneTimersRef.current[name])
-    setProv((p) => { const n = { ...p }; delete n[name]; return n })
     setProvLogOpen((o) => { const n = { ...o }; delete n[name]; return n })
     invalidateFleet()
   }
@@ -764,7 +950,7 @@ export default function DevFleetPage() {
   // checkout, so the restart confirm must say so — that hazard does not
   // depend on whether the pointer-only cancel is available.
   const pendingStage = (fleet?.worktrees || []).find((x) => x.is_staged && !x.is_live) || null
-  const [pruneDialog, setPruneDialog] = useState<{ candidates: { name: string; code?: string }[]; kept: { name: string; code?: string; dirty?: boolean }[]; scanned: number } | null>(null)
+  const [pruneDialog, setPruneDialog] = useState<{ candidates: { name: string; code?: string; unmerged_commits?: boolean }[]; kept: { name: string; code?: string; dirty?: boolean; dirty_tracked?: boolean | null; dirty_untracked?: number; dirty_untracked_paths?: string[] }[]; scanned: number } | null>(null)
   const [pruneSelected, setPruneSelected] = useState<Set<string>>(new Set())
   const [pruneForceSelected, setPruneForceSelected] = useState<Set<string>>(new Set())
   const [pruneProgress, setPruneProgress] = useState<{ names: string[]; items: Record<string, { status: string; error?: string | null }>; done: number; total: number; running: boolean } | null>(null)
@@ -786,19 +972,25 @@ export default function DevFleetPage() {
     if (syncRun?.rid === fleet.sync_run_id) return // already tracking this run
     syncAttachedRef.current = true
     const rid = fleet.sync_run_id
-    api.get<{ status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string }>('/run?id=' + rid)
+    api.get<{ status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string; cause?: string }>('/run?id=' + rid)
       .then((run) => {
         if (!run) return
         const t0 = run.started ? run.started * 1000 : Date.now()
         const out = run.output || []
-        const last = [...out].reverse().find((l) => l?.trim() && !STEP_MARKER_RE.test(l)) || ''
+        // Same preference as the two poll paths: a reported cause outranks the
+        // last output line, which for npm is its log-file pointer. Missing it
+        // here meant a page RELOAD after a failed build showed the uninformative
+        // line even though the diagnosis was stored on the run.
+        const last = run.cause
+          || [...out].reverse().find((l) => l?.trim() && !STEP_MARKER_RE.test(l))
+          || ''
         if (run.status === 'running') {
           setSyncRun({ rid, status: 'running', lines: out, startedAt: t0, stepLabel: run.step_label })
           pollSyncRun(rid, t0)
         } else if (run.status === 'done' || run.status === 'timeout') {
           // Show the completed/failed result so user sees it on revisit
           const okRun = run.exit_code === 0
-          setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last })
+          setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last, lastIsCause: Boolean(run.cause) })
         }
       })
       .catch(() => { /* run endpoint unreachable — nothing to reattach */ })
@@ -825,12 +1017,12 @@ export default function DevFleetPage() {
           const t0 = run.started ? run.started * 1000 : Date.now()
           const lines = run.output || []
           if (run.status === 'running') {
-            setProv((p) => ({ ...p, [name]: { status: 'running', lines, startedAt: t0 } }))
+            setProv((p) => ({ ...p, [name]: { rid, status: 'running', lines, startedAt: t0 } }))
             void pollProvisionRun(name, rid, t0, lines)
           } else if (run.exit_code !== 0) {
             // Only unsuccessful runs are exposed by the backend, but guard
             // anyway: a successful run has nothing to reattach.
-            setProv((p) => ({ ...p, [name]: { status: 'failed', failed: true, lines, startedAt: t0, exit: run.exit_code ?? null } }))
+            setProv((p) => ({ ...p, [name]: { rid, status: 'failed', failed: true, lines, startedAt: t0, exit: run.exit_code ?? null } }))
             setProvLogOpen((o) => ({ ...o, [name]: true }))
           }
         })
@@ -879,18 +1071,20 @@ export default function DevFleetPage() {
       await sleep(2000)
       if (!pollAliveRef.current) return
       if (cancelledRunsRef.current.has(rid)) return
-      let run: { status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string } | null = null
+      let run: { status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string; cause?: string } | null = null
       try { run = await api.get('/run?id=' + rid) } catch { continue }
       if (!run) continue
       const t0 = run.started ? run.started * 1000 : startedAt
       const out = run.output || []
-      const last = [...out].reverse().find((l: string) => l?.trim() && !STEP_MARKER_RE.test(l)) || ''
+      const last = run.cause
+        || [...out].reverse().find((l: string) => l?.trim() && !STEP_MARKER_RE.test(l))
+        || ''
       if (run.status === 'done' || run.status === 'timeout') {
         const okRun = run.exit_code === 0
-        setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last })
+        setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last, lastIsCause: Boolean(run.cause) })
         return
       }
-      setSyncRun({ rid, status: 'running', lines: out, startedAt: t0, last, stepLabel: run.step_label })
+      setSyncRun({ rid, status: 'running', lines: out, startedAt: t0, last, lastIsCause: Boolean(run.cause), stepLabel: run.step_label })
     }
   }
 
@@ -904,7 +1098,7 @@ export default function DevFleetPage() {
       // keep polling and still issue the restart after unmount; the React state
       // setters below are safe no-ops once the component is gone.
       if (cancelledRunsRef.current.has(rid)) return
-      let run: { status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string } | null = null
+      let run: { status?: string; output?: string[]; exit_code?: number; started?: number; step_label?: string; cause?: string } | null = null
       let gone = false
       try { run = await api.get('/run?id=' + rid) } catch (e) {
         // 404 = the gateway restarted and dropped the run registry — the run
@@ -923,10 +1117,16 @@ export default function DevFleetPage() {
       }
       const out = run.output || []
       const t0 = run.started ? run.started * 1000 : startedAt
-      const last = [...out].reverse().find((l) => l?.trim() && !STEP_MARKER_RE.test(l)) || ''
+      // Prefer the cause a step reported over the last output line. npm prints
+      // its diagnosis FIRST and its "a complete log of this run can be found
+      // in ..." pointer LAST, so the last line is the least informative one it
+      // produces — which is what this used to surface on every failed build.
+      const last = run.cause
+        || [...out].reverse().find((l) => l?.trim() && !STEP_MARKER_RE.test(l))
+        || ''
       if (run.status === 'done' || run.status === 'timeout') {
         const okRun = run.exit_code === 0
-        setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last })
+        setSyncRun({ rid, status: okRun ? 'done' : 'error', lines: out, startedAt: t0, exit: run.exit_code, last, lastIsCause: Boolean(run.cause) })
         setFlag('__syncmain', false)
         if (okRun) {
           // Auto-restart the gateway when the service is drivable — the build
@@ -961,11 +1161,17 @@ export default function DevFleetPage() {
             notify(i18nT('pages.devFleetPage.synced_restart_gateway_to_apply_the_new_build'), { type: 'success' })
           }
         }
+        // With a named cause the detail is already a self-sufficient sentence
+        // ending in the action to take, so prefixing it with "(exit 41)" adds a
+        // reserved code that means nothing outside this codebase. Only the raw
+        // log-tail fallback still carries the code, where it is the only
+        // machine-readable thing the toast has.
+        else if (run.cause) notify(`${i18nT('pages.devFleetPage.pull_build_failed')}: ${run.cause}`, { type: 'error' })
         else notify(i18nT('pages.devFleetPage.pull_build_failed_exit_code_detail', { code: run.exit_code, detail: last }), { type: 'error' })
         invalidateFleet()
         return
       }
-      setSyncRun({ rid, status: 'running', lines: out, startedAt: t0, last, stepLabel: run.step_label })
+      setSyncRun({ rid, status: 'running', lines: out, startedAt: t0, last, lastIsCause: Boolean(run.cause), stepLabel: run.step_label })
     }
     setSyncRun((s) => (s && s.rid === rid ? { ...s, status: 'error', last: 'timed out after 30 min' } : s))
     setFlag('__syncmain', false)
@@ -1037,7 +1243,7 @@ export default function DevFleetPage() {
         if (ok) {
           // Flash a brief green "Provisioned", then clear. The
           // fleet refetch flips the row to its built state in the meantime.
-          setProv((p) => ({ ...p, [name]: { status: 'done', done: true, lines, startedAt, exit: 0 } }))
+          setProv((p) => ({ ...p, [name]: { rid, status: 'done', done: true, lines, startedAt, exit: 0 } }))
           invalidateFleet()
           provDoneTimersRef.current[name] = setTimeout(() => {
             setProv((p) => { const n = { ...p }; delete n[name]; return n })
@@ -1047,7 +1253,7 @@ export default function DevFleetPage() {
           // FAILURE PERSISTENCE: keep the run, auto-expand the log, hold until
           // the user dismisses it — a multi-minute failed provision must not
           // vanish into an empty row.
-          setProv((p) => ({ ...p, [name]: { status: 'failed', failed: true, lines, startedAt, exit: run.exit_code } }))
+          setProv((p) => ({ ...p, [name]: { rid, status: 'failed', failed: true, lines, startedAt, exit: run.exit_code } }))
           setProvLogOpen((o) => ({ ...o, [name]: true }))
           invalidateFleet()
         }
@@ -1055,17 +1261,17 @@ export default function DevFleetPage() {
       }
       if (run.status !== 'running') {
         notify(run.status === 'timeout' ? i18nT('pages.devFleetPage.provision_timed_out') : i18nT('pages.devFleetPage.provision_failed_status', { status: run.status }), { type: 'error' })
-        setProv((p) => ({ ...p, [name]: { status: 'failed', failed: true, lines: lines.length ? lines : ['Provision ' + run.status], startedAt, exit: run.exit_code ?? null } }))
+        setProv((p) => ({ ...p, [name]: { rid, status: 'failed', failed: true, lines: lines.length ? lines : ['Provision ' + run.status], startedAt, exit: run.exit_code ?? null } }))
         setProvLogOpen((o) => ({ ...o, [name]: true }))
         invalidateFleet()
         return
       }
-      setProv((p) => ({ ...p, [name]: { status: 'running', lines, startedAt } }))
+      setProv((p) => ({ ...p, [name]: { rid, status: 'running', lines, startedAt } }))
     }
     // Poll budget exhausted (e.g. run id lost across a gateway restart): keep
     // the failed marker + accumulated log so the user has something to act on.
     notify(i18nT('pages.devFleetPage.provision_polling_timed_out_check_pod_logs'), { type: 'error' })
-    setProv((p) => ({ ...p, [name]: { status: 'failed', failed: true, lines: acc.length ? acc : ['Provision polling timed out \u2014 check pod logs'], startedAt, exit: null } }))
+    setProv((p) => ({ ...p, [name]: { rid, status: 'failed', failed: true, lines: acc.length ? acc : ['Provision polling timed out \u2014 check pod logs'], startedAt, exit: null } }))
     setProvLogOpen((o) => ({ ...o, [name]: true }))
     invalidateFleet()
   }
@@ -1123,11 +1329,33 @@ export default function DevFleetPage() {
   async function removeWorktree(name: string, d: Worktree) {
     if (d?.is_main) { notify(i18nT('pages.devFleetPage.cannot_remove_the_main_worktree'), { type: 'error' }); return }
     const shipped = !!d?.shipped; const empty = d && d.own_commits === 0 && d.real_dirty === false
-    const desc = shipped ? i18nT('pages.devFleetPage.pr_merged_safe_to_remove_runs_git_worktree_remov') : empty ? i18nT('pages.devFleetPage.empty_worktree_cannot_be_undone') : i18nT('pages.devFleetPage.has_unmerged_work_removing_deletes_permanently')
+    // Dirt that is ONLY untracked files is session scratch (probe scripts,
+    // capture harnesses, notes). The backend refuses both plain and forced
+    // removal while any dirt remains, so without naming those files and asking
+    // to discard them the row is a dead end. Tracked modifications never take
+    // this path — they are unfinished work and stay protected.
+    //
+    // The paths list is capped by the server, so a discard is only offered when
+    // it is COMPLETE: consent has to cover the whole set, and the server rejects
+    // a partial one. Offering it on a truncated list would promise something the
+    // backend refuses.
+    const paths = d?.dirty_untracked_paths ?? []
+    const untrackedOnly = d?.dirty_tracked === false && (d?.dirty_untracked ?? 0) > 0
+      && paths.length === d?.dirty_untracked
+    const files = paths.join(', ')
+    // The discard line is ADDITIVE, never a replacement. A worktree can carry
+    // unmerged commits AND a stray probe script at the same time, and this
+    // removal still sends force — so telling the user only about the scratch
+    // would describe a permanent branch deletion as harmless cleanup. The
+    // stake-naming warning stays; the discard sentence is appended to it.
+    const base = shipped ? i18nT('pages.devFleetPage.pr_merged_safe_to_remove_runs_git_worktree_remov') : empty ? i18nT('pages.devFleetPage.empty_worktree_cannot_be_undone') : i18nT('pages.devFleetPage.has_unmerged_work_removing_deletes_permanently')
+    const desc = untrackedOnly
+      ? base + ' ' + i18nT('pages.devFleetPage.discard_untracked_files', { count: d?.dirty_untracked ?? 0, files })
+      : base
     const ok = await askConfirm(i18nT('pages.devFleetPage.remove_name', { name }), desc, { confirmLabel: shipped || empty ? i18nT('pages.devFleetPage.remove') : i18nT('pages.devFleetPage.delete_anyway'), danger: true })
     if (!ok) return
     setFlag(name + ':remove', true)
-    try { const r = await api.post<{ ok?: boolean; error?: string }>('/worktree/remove', { name, force: !shipped && !empty }); if (r?.ok) { notify(i18nT('pages.devFleetPage.removed_name', { name }), { type: 'success' }); invalidateAll() } else notify(r?.error || i18nT('pages.devFleetPage.failed'), { type: 'error' }) }
+    try { const r = await api.post<{ ok?: boolean; error?: string }>('/worktree/remove', { name, force: !shipped && !empty, discard_untracked_paths: untrackedOnly ? paths : undefined }); if (r?.ok) { notify(i18nT('pages.devFleetPage.removed_name', { name }), { type: 'success' }); invalidateAll() } else notify(r?.error || i18nT('pages.devFleetPage.failed'), { type: 'error' }) }
     catch (e: unknown) { notify((e as Error)?.message || String(e), { type: 'error' }) }
     finally { setFlag(name + ':remove', false) }
   }
@@ -1185,7 +1413,7 @@ export default function DevFleetPage() {
   async function pruneShipped() {
     setFlag('__prune', true)
     try {
-      const r = await api.get<{ ok?: boolean; candidates?: { name: string; code?: string }[]; kept?: { name: string; code?: string }[]; scanned?: number; error?: string }>('/prune-candidates')
+      const r = await api.get<{ ok?: boolean; candidates?: { name: string; code?: string; unmerged_commits?: boolean }[]; kept?: { name: string; code?: string; dirty?: boolean; dirty_tracked?: boolean | null; dirty_untracked?: number; dirty_untracked_paths?: string[] }[]; scanned?: number; error?: string }>('/prune-candidates')
       if (!r || r.ok === false) { notify(r?.error || i18nT('pages.devFleetPage.prune_preview_failed'), { type: 'error' }); return }
       const cands = r.candidates || []
       const kept = r.kept || []
@@ -1197,13 +1425,19 @@ export default function DevFleetPage() {
     finally { setFlag('__prune', false) }
   }
 
-  async function pruneExecute(rawNames: string[], rawForceNames: string[] = []) {
+  async function pruneExecute(rawNames: string[], rawForceNames: string[] = [], discardPaths: Record<string, string[]> = {}) {
     // Mirror the backend's order-preserving dedup: a duplicate would render
     // duplicate checklist rows and inflate the total for a batch the server
     // processes once.
     const names = Array.from(new Set(rawNames))
     const forceNames = Array.from(new Set(rawForceNames))
-    const allNames = Array.from(new Set([...names, ...forceNames]))
+    // Rows whose only dirt is untracked scratch, each carrying the exact file
+    // list that was displayed. Sent as its own field rather than folded into
+    // force: it authorizes discarding those specific files and nothing more,
+    // the server re-checks that the set is unchanged, and it refuses outright
+    // if a tracked file is modified.
+    const discardNames = Object.keys(discardPaths)
+    const allNames = Array.from(new Set([...names, ...forceNames, ...discardNames]))
     if (!allNames.length) { notify(i18nT('pages.devFleetPage.nothing_selected'), { type: 'info' }); return }
     setPruneDialog(null)
     const seed: Record<string, { status: string; error?: string | null }> =
@@ -1213,7 +1447,7 @@ export default function DevFleetPage() {
       // A rejected run ("prune already running") comes back ok:false with
       // HTTP 200 — starting the poll loop anyway would track the OTHER run's
       // items and render every row as a misleading "Pending".
-      const start = await api.post<{ ok?: boolean; error?: string }>('/prune-run', { names, force_names: forceNames })
+      const start = await api.post<{ ok?: boolean; error?: string }>('/prune-run', { names, force_names: forceNames, discard_untracked_paths: discardPaths })
       if (!start || start.ok === false) {
         notify(start?.error || i18nT('pages.devFleetPage.prune_failed_to_start'), { type: 'error' })
         setPruneProgress(null)
@@ -1621,9 +1855,41 @@ export default function DevFleetPage() {
     }
     // error
     return (
-      <div style={{ gridColumn: '4 / -1', display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 } as CSSProperties}>
-        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--danger)' }}>{i18nT('pages.devFleetPage.pull_build_failed')}</span>
-        <span style={{ ...mono, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } as CSSProperties} title={syncRun.last}>{syncRun.last}</span>
+      <div style={{ gridColumn: '4 / -1', display: 'flex', alignItems: 'flex-start', gap: 8, minWidth: 0 } as CSSProperties}>
+        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--danger)', whiteSpace: 'nowrap' }}>{i18nT('pages.devFleetPage.pull_build_failed')}</span>
+        {/* A gateway-composed diagnosis is rendered as PROSE -- body colour, not
+            monospace -- because it is the one line the user has to act on, and
+            the muted 11.5px log styling was burying the remedy in the noise it
+            exists to replace. It also wraps in full rather than ellipsizing: a
+            cause can end with the action to take, and `title`-only overflow puts
+            that action out of reach of keyboard and touch users.
+
+            The raw log tail gets the opposite treatment: it is clamped to two
+            lines, because an uncapped npm line would otherwise stretch this
+            header several lines tall for text whose full form already lives one
+            click away in the Log panel. */}
+        <span
+          style={{
+            ...(syncRun.lastIsCause
+              ? {
+                  color: 'var(--text)',
+                  fontSize: 12.5,
+                  whiteSpace: 'pre-wrap',
+                  overflowWrap: 'anywhere',
+                }
+              : {
+                  ...mono,
+                  display: '-webkit-box',
+                  WebkitLineClamp: 2,
+                  WebkitBoxOrient: 'vertical',
+                  overflow: 'hidden',
+                  overflowWrap: 'anywhere',
+                }),
+            minWidth: 0,
+            flex: 1,
+          } as CSSProperties}
+          title={syncRun.lastIsCause ? undefined : syncRun.last}
+        >{syncRun.last}</span>
         <Clickable aria-label={i18nT('pages.devFleetPage.toggle_log')} onClick={() => setSyncLogOpen((o) => !o)} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 11, padding: 2 } as CSSProperties}>{syncLogOpen ? i18nT('pages.devFleetPage.log') : i18nT('pages.devFleetPage.log_2')}</Clickable>
         <Clickable aria-label={i18nT('pages.devFleetPage.dismiss_sync_status')} onClick={() => dismissSync(syncRun?.rid)} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 14, padding: 2 } as CSSProperties}>{"\u00d7"}</Clickable>
       </div>
@@ -1645,7 +1911,7 @@ export default function DevFleetPage() {
           <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--danger)', flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 4 }}><X size={12} className="lucide-inline" />{pr.exit != null ? i18nT('pages.devFleetPage.provision_failed_exit_code', { code: pr.exit }) : i18nT('pages.devFleetPage.provision_failed')}</span>
           <span style={{ ...mono, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } as CSSProperties} title={lastLine(pr.lines)}>{lastLine(pr.lines)}</span>
           {logToggle}
-          <Clickable aria-label={i18nT('pages.devFleetPage.dismiss_provision_status')} onClick={() => dismissProv(w.name)} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 14, padding: 2 } as CSSProperties}>{"\u00d7"}</Clickable>
+          <Clickable aria-label={i18nT('pages.devFleetPage.dismiss_provision_status')} onClick={() => { void dismissProv(w.name) }} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 14, padding: 2 } as CSSProperties}>{"\u00d7"}</Clickable>
         </div>
       )
     }
@@ -1713,6 +1979,11 @@ export default function DevFleetPage() {
               ? i18nT('pages.devFleetPage.cutover_staged_run_cmd_to_finish_or_cancel', { cmd: fleet?.manual_restart || 'kirocrew restart' })
               : i18nT('pages.devFleetPage.cutover_staged_run_the_restart_command_to_finish', { cmd: fleet?.manual_restart || 'kirocrew restart' })}>{i18nT('pages.devFleetPage.restart_pending')}</Badge> : null}
             {w.summary ? <span title={w.summary} style={{ fontSize: 11.5, color: 'var(--muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, flex: '0 1 auto' } as CSSProperties}>{w.summary}</span> : null}
+            {/* Inline system readout for a running pod: memory vs ceiling
+                (colour-shifting near MemoryMax), CPU%, task count. Absent
+                fields render nothing, so a pod the host cannot measure shows
+                no readout rather than a fake 0. */}
+            {w.running && !w.is_main ? <PodReadout r={w.pod_resources} /> : null}
           </div>
           {isMainWithStepper ? renderSyncStepper() : provActive ? renderProvStepper(w) : (
             <>
@@ -1779,9 +2050,29 @@ export default function DevFleetPage() {
       return !!(wt?.is_main || wt?.is_live || wt?.is_staged || (liveWt && liveWt.name === name))
     }
     const hasForceSelected = pruneForceSelected.size > 0
+    // A kept row is blocked by scratch alone when the backend classified its
+    // dirt as untracked-only AND handed back the COMPLETE file list (the server
+    // caps it, and it refuses a consent that does not cover the whole set).
+    // Ticking such a row means "remove it, discarding exactly these files" —
+    // the paths travel with the request so the server can verify the set has
+    // not changed since it was shown, and it still refuses if a tracked file
+    // turns out to be modified.
+    const scratchPaths = (name: string): string[] | null => {
+      const k = pruneDialog.kept.find((r) => r.name === name)
+      if (!k || k.dirty_tracked !== false) return null
+      const paths = k.dirty_untracked_paths ?? []
+      if (!paths.length || paths.length !== k.dirty_untracked) return null
+      return paths
+    }
+    const untrackedOnly = (name: string) => scratchPaths(name) !== null
     const handleRemove = async () => {
       const regularNames = pruneDialog.candidates.filter((c) => pruneSelected.has(c.name)).map((c) => c.name)
       const forceNames = Array.from(pruneForceSelected)
+      const discardPaths: Record<string, string[]> = {}
+      for (const n of forceNames) {
+        const p = scratchPaths(n)
+        if (p) discardPaths[n] = p
+      }
       if (forceNames.length > 0) {
         const confirmed = await askConfirm(
           i18nT('pages.devFleetPage.force_remove_confirm_title'),
@@ -1790,19 +2081,45 @@ export default function DevFleetPage() {
         )
         if (!confirmed) return
       }
-      pruneExecute(regularNames, forceNames)
+      pruneExecute(regularNames, forceNames, discardPaths)
     }
     return (
       <Modal open={true} onClose={() => setPruneDialog(null)} title={i18nT('pages.devFleetPage.prune_worktrees')} maxWidth={480} footer={<><Btn onClick={() => setPruneDialog(null)}>{i18nT('pages.devFleetPage.cancel')}</Btn><Btn danger onClick={handleRemove}>{i18nT('pages.devFleetPage.remove_selected')}</Btn></>}>
         <div style={{ maxHeight: 360, overflowY: 'auto' }}>
-          {pruneDialog.candidates.length > 0 && (
+          {pruneDialog.candidates.filter((c) => c.code !== 'closed').length > 0 && (
             <div style={{ marginBottom: 10 }}>
               <div style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--muted)', textTransform: 'uppercase', borderBottom: '1px solid var(--border)', paddingBottom: 3, marginBottom: 4 }}>{i18nT('pages.devFleetPage.remove')}</div>
-              {pruneDialog.candidates.map((c) => (
+              {pruneDialog.candidates.filter((c) => c.code !== 'closed').map((c) => (
+                // eslint-disable-next-line jsx-a11y/label-has-for -- deprecated rule; the control is nested in the label and carries an aria-label, so it is properly associated.
                 <label key={c.name} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0', cursor: 'pointer' }}>
                   <Checkbox checked={pruneSelected.has(c.name)} onChange={(e) => setPruneSelected((prev) => { const next = new Set(prev); if (e.target.checked) next.add(c.name); else next.delete(c.name); return next })} aria-label={i18nT('pages.devFleetPage.select', { name: c.name })} />
-                  <span style={{ fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{c.name}</span>
-                  <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--muted)', whiteSpace: 'nowrap' }}>{pruneVerdictLabel(c.code)}</span>
+                  <span style={{ fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }}>{c.name}</span>
+                  <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--muted)', whiteSpace: 'nowrap', flex: '0 1 auto', minWidth: 0, maxWidth: 'min(200px, 55%)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{pruneVerdictLabel(c.code)}</span>
+                </label>
+              ))}
+            </div>
+          )}
+          {/* Closed-PR worktrees are a DISTINCT group with its own header and
+              warning copy, never folded into the merged "Remove" list — a
+              merged tree's content is on main by definition, a closed one's is
+              not, so the operator must never mistake one for the other. Rows
+              whose branch is ahead of main carry an extra per-row alarm. */}
+          {pruneDialog.candidates.filter((c) => c.code === 'closed').length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--warn)', textTransform: 'uppercase', borderBottom: '1px solid var(--border)', paddingBottom: 3, marginBottom: 4 }}>{i18nT('pages.devFleetPage.remove_closed_pr')}</div>
+              <p style={{ fontSize: 11, color: 'var(--muted)', margin: '0 0 6px' }}>{i18nT('pages.devFleetPage.closed_pr_not_on_main_hint')}</p>
+              {pruneDialog.candidates.filter((c) => c.code === 'closed').map((c) => (
+                // eslint-disable-next-line jsx-a11y/label-has-for -- deprecated rule; the control is nested in the label and carries an aria-label, so it is properly associated.
+                <label key={c.name} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0', cursor: 'pointer' }}>
+                  <Checkbox checked={pruneSelected.has(c.name)} onChange={(e) => setPruneSelected((prev) => { const next = new Set(prev); if (e.target.checked) next.add(c.name); else next.delete(c.name); return next })} aria-label={i18nT('pages.devFleetPage.select', { name: c.name })} />
+                  <span style={{ fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }}>{c.name}</span>
+                  {/* The status must never starve the NAME: this row selects a
+                      worktree for permanent deletion, so the operator has to be
+                      able to read which one. A nowrap status with no shrink
+                      basis takes its full intrinsic width -- and a long
+                      localized string in a 320px modal then collapses the
+                      flexible name to an ellipsis. */}
+                  <span style={{ marginLeft: 'auto', fontSize: 11, color: c.unmerged_commits ? 'var(--danger)' : 'var(--muted)', whiteSpace: 'nowrap', flex: '0 1 auto', minWidth: 0, maxWidth: 'min(200px, 55%)', overflow: 'hidden', textOverflow: 'ellipsis' }}>{c.unmerged_commits ? i18nT('pages.devFleetPage.closed_has_unmerged_commits') : pruneVerdictLabel(c.code)}</span>
                 </label>
               ))}
             </div>
@@ -1811,24 +2128,43 @@ export default function DevFleetPage() {
             <div style={{ marginBottom: 10 }}>
               <div style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--muted)', textTransform: 'uppercase', borderBottom: '1px solid var(--border)', paddingBottom: 3, marginBottom: 4 }}>{i18nT('pages.devFleetPage.kept')}</div>
               {pruneDialog.kept.some((k) => !isGuarded(k.name) && !k.dirty && k.code !== 'dirty_check_failed') && <p style={{ fontSize: 11, color: 'var(--muted)', margin: '0 0 6px' }}>{i18nT('pages.devFleetPage.kept_force_hint')}</p>}
+              {pruneDialog.kept.some((k) => !isGuarded(k.name) && untrackedOnly(k.name)) && <p style={{ fontSize: 11, color: 'var(--muted)', margin: '0 0 6px' }}>{i18nT('pages.devFleetPage.kept_discard_untracked_hint')}</p>}
               {pruneDialog.kept.map((k) => {
                 const guarded = isGuarded(k.name)
-                // Disable force-checkbox for worktrees the backend refuses
-                // force=True on: dirty=True (uncommitted changes) OR
-                // code=dirty_check_failed (git status failed / unverifiable).
-                const cannotForce = !!k.dirty || k.code === 'dirty_check_failed'
+                // Disable the override only where the backend really refuses it:
+                // an unverifiable tree (git status failed), or dirt that includes
+                // a MODIFIED TRACKED file — unfinished work the override must not
+                // destroy. Dirt that is only untracked scratch stays checkable,
+                // because ticking it sends a discard for exactly those files;
+                // blanket-disabling on `dirty` was what left such rows with no
+                // way forward at all.
+                const scratchOnly = untrackedOnly(k.name)
+                const cannotForce = k.code === 'dirty_check_failed' || (!!k.dirty && !scratchOnly)
                 const disabled = guarded || cannotForce
                 const checked = pruneForceSelected.has(k.name)
                 return (
+                  // eslint-disable-next-line jsx-a11y/label-has-for -- deprecated rule; the control is nested in the label and carries an aria-label, so it is properly associated.
                   <label key={k.name} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0', cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.6 : 1 }}>
                     {guarded
                       ? <span style={{ width: 13, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}><ShieldAlert size={13} style={{ color: 'var(--muted)' }} /></span>
                       : <Checkbox checked={checked} disabled={cannotForce} onChange={(e) => setPruneForceSelected((prev) => { const next = new Set(prev); if (e.target.checked) next.add(k.name); else next.delete(k.name); return next })} aria-label={i18nT('pages.devFleetPage.force_remove', { name: k.name })} />
                     }
-                    <span style={{ fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', fontSize: 12, color: checked ? 'var(--danger)' : guarded ? 'var(--muted)' : 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{k.name}</span>
-                    <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--muted)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 200 }} title={pruneVerdictLabel(k.code)}>
+                    <span style={{ fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', fontSize: 12, color: checked ? 'var(--danger)' : guarded ? 'var(--muted)' : 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }}>{k.name}</span>
+                    {/* `min(200px, 55%)` rather than a flat 200px: a fixed cap
+                        does not scale down, so in a 320px modal the status took
+                        200px of it and the flexible name collapsed to nothing --
+                        leaving a consequence with no visible subject. The px arm
+                        keeps the roomier desktop reading. */}
+                    <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--muted)', whiteSpace: 'nowrap', flex: '0 1 auto', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', maxWidth: 'min(200px, 55%)' }} title={scratchOnly ? (k.dirty_untracked_paths ?? []).join(', ') : pruneVerdictLabel(k.code)}>
                       {guarded && i18nT('pages.devFleetPage.protected_worktree')}
-                      {!guarded && pruneVerdictLabel(k.code)}
+                      {/* A scratch-only row shows the FILENAMES it would
+                          discard, not the verdict label. Two rows can carry the
+                          same checkbox meaning very different destruction --
+                          "force-delete unmerged work" vs "throw away a probe
+                          script" -- and a hover title is the one disclosure a
+                          keyboard or touch user never reaches. The filenames are
+                          data, so they need no translation. */}
+                      {!guarded && (scratchOnly ? (k.dirty_untracked_paths ?? []).join(', ') : pruneVerdictLabel(k.code))}
                     </span>
                   </label>
                 )
@@ -1915,6 +2251,35 @@ export default function DevFleetPage() {
               <span className="text-text-strong">{i18nT('pages.devFleetPage.prune')}</span> {i18nT('pages.devFleetPage.safely_removes_worktrees_whose_pr_has_already_me')}
             </p>
             )}
+            {/* Fleet-level totals: worktree disk, pod-home disk, and orphan
+                count — so "this needs cleaning" is legible where the operator
+                already is. Each figure renders only when the host could
+                measure it; the whole strip is hidden when none are present. */}
+            {!noFleet && fleet?.fleet_totals && (
+              fleet.fleet_totals.pod_home_bytes != null ||
+              (fleet.fleet_totals.orphan_pods != null && fleet.fleet_totals.orphan_pods > 0)
+            ) ? (
+              <div
+                data-testid="fleet-totals"
+                className="flex flex-wrap items-center gap-x-4 gap-y-1 mt-2 text-[12px] leading-relaxed text-muted"
+                style={{ fontVariantNumeric: 'tabular-nums' } as CSSProperties}
+              >
+                {/* Worktree disk is intentionally absent here: the stat cards
+                    below already show it, sourced from the async `/disk`
+                    endpoint. Repeating it from a second measurement would give
+                    one label two numbers. */}
+                {fleet.fleet_totals.pod_home_bytes != null ? (
+                  <span title={i18nT('pages.devFleetPage.total_disk_used_by_running_pod_homes')}>
+                    <Server size={12} className="lucide-inline" /> <span className="text-text-strong">{i18nT('pages.devFleetPage.pod_home_disk', { value: fmtBytes(fleet.fleet_totals.pod_home_bytes) })}</span>
+                  </span>
+                ) : null}
+                {fleet.fleet_totals.orphan_pods != null && fleet.fleet_totals.orphan_pods > 0 ? (
+                  <span title={i18nT('pages.devFleetPage.pod_homes_left_on_disk_with_no_live_pod')} style={{ color: 'var(--warn)' } as CSSProperties}>
+                    <AlertTriangle size={12} className="lucide-inline" /> {i18nT('pages.devFleetPage.orphan_pods_label', { value: fleet.fleet_totals.orphan_pods })}
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
             {!noFleet && fleet?.main_repo_inferred && fleet.main_repo && (
               <div
                 role="note"

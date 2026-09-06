@@ -7,8 +7,10 @@ import { basenamePatchHeaders } from '../utils/diffUtils'
 import { PierrePatch } from '../pierre'
 import { PIERRE_COMPACT_HEADER_CSS, PIERRE_WRAP_NO_HSCROLL_CSS, PIERRE_SEPARATOR_BG_CSS } from '../pierre/config'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
+import { usePersistedBool } from '../hooks/usePersistedBool'
 
 import { i18nT } from '../i18n/t'
+import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 
 /** Extract the target file path from unified-diff header lines.
  *
@@ -90,8 +92,12 @@ export function extractFilePath(code: string): { path: string; prefixStripped: b
 const ROOTLESS_ABS_RE = /^(home|Users|tmp|var|opt|workplace)\//
 
 export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint, streaming, onFold }: { code: string; complete: boolean; onFileOpen?: (path: string) => void; pathHint?: string; streaming?: boolean; onFold?: () => void }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [copied, setCopied] = useState(false)
-  const [sideBySide, setSideBySide] = useState(false)
+  // Shares the app-wide `mc-diff-split` preference with the side panel and
+  // markdown panel (#6024): the choice made on any diff surface sticks and
+  // seeds the next block, instead of every fence resetting to unified.
+  const [sideBySide, setSideBySide] = usePersistedBool('mc-diff-split', true)
   // Resolve the file path: prefer headers inside the diff, fall back to the
   // pathHint extracted from the surrounding chat text by MarkdownRenderer
   // (helps when a tool emits "Created /path/to/file:" before a
@@ -152,9 +158,10 @@ export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint, s
     return () => ac.abort()
   }, [headerPath, probePath])
 
-  // Diff layout is a per-block toggle over the centrally-configured defaults;
-  // wrap because chat/side-panel columns are width-constrained. Pierre's own
-  // file header is the block's title row (file icon, name, +/- counts).
+  // Diff layout follows the shared, persisted split preference (toggled from
+  // this block's own header); wrap because chat/side-panel columns are
+  // width-constrained. Pierre's own file header is the block's title row
+  // (file icon, name, +/- counts).
   const options = useMemo(
     () => ({
       diffStyle: (sideBySide ? 'split' : 'unified') as 'split' | 'unified',

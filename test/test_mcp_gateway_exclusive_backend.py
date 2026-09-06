@@ -406,6 +406,10 @@ class _RecordingPool:
 
     def __init__(self) -> None:
         self.unreserved: list[Any] = []
+        #: Every kwargs dict the handler passed to ``_acquire_backend``. The
+        #: retreat is only observable here: it changes which backend the handler
+        #: ASKS for, and the fake acquire below is what the real pool would see.
+        self.acquire_kwargs: list[dict[str, Any]] = []
 
     def unreserve(self, key: Any) -> None:
         self.unreserved.append(key)
@@ -428,7 +432,10 @@ async def _drive_handler(monkeypatch: pytest.MonkeyPatch, *, poolable: bool) -> 
         def log_api_access(self, **kwargs: Any) -> None:
             pass
 
+    pool = _RecordingPool()
+
     async def _fake_acquire(_pool: Any, _key: Any, _resolver: Any, **_kw: Any):
+        pool.acquire_kwargs.append(dict(_kw))
         return _HandlerBackend(), True
 
     async def _fake_drain(_inbox: Any, _writer: Any, _stub_uuid: str = "") -> None:
@@ -438,7 +445,6 @@ async def _drive_handler(monkeypatch: pytest.MonkeyPatch, *, poolable: bool) -> 
     monkeypatch.setattr(gw, "_acquire_backend", _fake_acquire)
     monkeypatch.setattr(gw, "_drain_inbox_to_stub", _fake_drain)
 
-    pool = _RecordingPool()
     await asyncio.wait_for(
         gw._handle_connection(
             _FrameReader([_register_frame(poolable=poolable), _TOOL_CALL]),
@@ -477,3 +483,119 @@ async def test_handler_still_releases_for_a_pooled_connection(
     the life of the process."""
     pool = await _drive_handler(monkeypatch, poolable=True)
     assert len(pool.unreserved) == 1
+
+
+def _install_hazard_sink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    command_args_hash: str = "0" * 64,
+    env_hash: str = "1" * 64,
+    binary_version: str = "deadbeef",
+) -> None:
+    """Bind a hazard sink carrying one observation for ``echo-mcp``.
+
+    The defaults are exactly the launch fields ``_register_frame`` reports, so a
+    caller that overrides one is describing a DIFFERENT program -- which is the
+    whole point of the identity-checked read.
+    """
+    from kiro_crew.mcp_gateway import hazards
+
+    ledger = hazards.HazardLedger(tmp_path / hazards.HAZARDS_FILENAME)
+    ledger.record(
+        "echo-mcp",
+        hazards.HAZARD_UNROUTABLE_SERVER_REQUEST,
+        hazards.launch_identity(command_args_hash, env_hash, binary_version),
+    )
+    monkeypatch.setattr(hazards, "_sink", ledger)
+
+
+@pytest.mark.asyncio
+async def test_an_observed_hazard_retreats_a_poolable_connection_to_private(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The consuming half of the ledger: an observation reaches the routing decision.
+
+    Before this wiring, recording a hazard changed a label on the MCP page and
+    nothing else -- the stub still registered ``poolable`` and still landed on a
+    shared backend, so "share by default, retreat when observed" had no retreat.
+    """
+    _install_hazard_sink(monkeypatch, tmp_path)
+    pool = await _drive_handler(monkeypatch, poolable=True)
+    assert pool.acquire_kwargs, "handler never reached the acquire"
+    assert pool.acquire_kwargs[0]["exclusive_stub_uuid"] == "ex-stub-0001"
+
+
+@pytest.mark.asyncio
+async def test_a_retreated_connection_releases_no_reservation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A retreat must not decrement a reservation it never took.
+
+    ``pool.get_or_create`` is what reserves; ``pool.acquire_exclusive`` does not.
+    A retreated connection asked to pool but resolved down the exclusive path, so
+    it reserved nothing -- and because the refcount is per DIGEST while
+    ``poolable`` is not a PoolKey dimension, releasing here would decrement a
+    CONCURRENT pooled connection's reservation on the same key and drop its
+    eviction protection before its stub attaches.
+    """
+    _install_hazard_sink(monkeypatch, tmp_path)
+    pool = await _drive_handler(monkeypatch, poolable=True)
+    assert pool.acquire_kwargs[0]["exclusive_stub_uuid"] == "ex-stub-0001"
+    assert pool.unreserved == [], "retreat released a reservation it never took"
+
+
+@pytest.mark.asyncio
+async def test_a_hazard_from_another_launch_identity_does_not_retreat(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An upgrade or a config edit re-earns pooling.
+
+    The evidence described the program that was replaced, so answering with it
+    would strand a server for ever on behaviour its current build never showed.
+    """
+    _install_hazard_sink(monkeypatch, tmp_path, binary_version="a-different-build")
+    pool = await _drive_handler(monkeypatch, poolable=True)
+    assert pool.acquire_kwargs[0]["exclusive_stub_uuid"] == ""
+
+
+@pytest.mark.asyncio
+async def test_clearing_the_record_lets_the_server_pool_again(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The retreat is undoable, which is what makes it safe to switch on.
+
+    One cause of a record is a defect on OUR side -- a frame the gateway
+    misattributed -- and the identity check cannot clear that, because fixing our
+    own bug does not change the server's launch identity. Without an undo the
+    evidence would stand for ever against a server that never misbehaved. This
+    pins the whole round trip: retreat, clear, pool again.
+
+    The clear itself is ``hazards.clear_observed`` plus a flush, which is what an
+    operator reaches through offline (stop the daemon, delete the record from
+    ``observed-hazards.json``, start). An online socket verb for it was descoped
+    from this change -- see the PR discussion.
+    """
+    from kiro_crew.mcp_gateway import hazards
+
+    _install_hazard_sink(monkeypatch, tmp_path)
+
+    retreated = await _drive_handler(monkeypatch, poolable=True)
+    assert retreated.acquire_kwargs[0]["exclusive_stub_uuid"] == "ex-stub-0001"
+
+    assert hazards.clear_observed("echo-mcp") is True
+
+    restored = await _drive_handler(monkeypatch, poolable=True)
+    assert restored.acquire_kwargs[0]["exclusive_stub_uuid"] == ""
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_server_with_nothing_recorded_reports_no_change(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """False is the honest answer, not an error: there was nothing to forget."""
+    from kiro_crew.mcp_gateway import hazards
+
+    _install_hazard_sink(monkeypatch, tmp_path)
+
+    assert hazards.clear_observed("some-other-mcp") is False

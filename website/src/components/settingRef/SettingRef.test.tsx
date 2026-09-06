@@ -49,12 +49,11 @@ function openPopover(container: HTMLElement): string {
 
 describe('SettingRef component', () => {
   describe('mode: ui (registry hit)', () => {
-    it('renders a Link to /settings with tab and highlight=key:<configKey> params', () => {
+    it('renders a Link to the /settings/<tab> path with highlight=key:<configKey>', () => {
       const { container } = renderRef({ configKey: 'chat.default_model' })
       const link = container.querySelector('a')
       expect(link).not.toBeNull()
-      expect(link!.getAttribute('href')).toContain('/settings')
-      expect(link!.getAttribute('href')).toContain('tab=chat')
+      expect(link!.getAttribute('href')).toContain('/settings/chat')
       // highlight uses key:<configKey> format (URL-encoded colon)
       expect(link!.getAttribute('href')).toMatch(/highlight=key(%3A|:)chat\.default_model/)
     })

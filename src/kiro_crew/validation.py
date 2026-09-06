@@ -32,7 +32,7 @@ from typing import Any
 # no native library is loaded on any platform. Aliased so the schema block below
 # reads as "the computer-use vocabulary" rather than bare names.
 from kiro_crew.computer_use import types as _cu_types
-from kiro_crew.constants import WINDOWS_DEVICE_STEMS
+from kiro_crew.constants import AWS_PROFILE_NAME_RE, WINDOWS_DEVICE_STEMS
 
 # Reasoning-effort vocabulary: ``effort.py`` is the single source of truth for
 # the valid levels; EFFORT_VALUES additionally admits ``""`` ("unset — defer to
@@ -1175,17 +1175,23 @@ _ASK_MAX_DESC_LEN = 500
 # transcript, so an oversized custom answer would consume model context.
 _ASK_MAX_ANSWER_LEN = 2000
 
-# ask_question renders the dashboard question card and blocks the tool call
-# until the user answers. `questions` is only shape-checked here (a bounded
-# list); the per-question/per-option limits are enforced server-side by
-# validate_ask_user_question, which is the single source of truth for the card
-# payload. timeout bounds mirror DashboardState._QUESTION_TIMEOUT_MAX.
+# ask_question requests a NON-BLOCKING dashboard question card: the MCP tool
+# returns a session directive and the agent ends its turn, so no tool call is
+# held open (see mcp_tools.control.ask_question). `questions` is only
+# shape-checked here (a bounded list); the per-question/per-option limits are
+# enforced server-side by validate_ask_user_question, which is the single
+# source of truth for the card payload.
 ASK_QUESTION_SCHEMA = ToolSchema(
     tool_name="ask_question",
     fields=[
         FieldSpec("questions", list, required=True, max_items=_ASK_MAX_QUESTIONS),
-        # 540 not 1800: the ACP tool-stall watchdog (600s) kills the turn
-        # first, and an answer arriving after that has no turn to return to.
+        # Accepted but IGNORED: the directive the tool returns carries only
+        # `questions`, so nothing downstream reads a timeout. The bound still
+        # mirrors DashboardState._QUESTION_TIMEOUT_MAX, which governs the legacy
+        # blocking POST /api/ask-question path. Kept lenient rather than removed
+        # so a caller still passing it gets its card instead of a validation
+        # error, while the tool's inputSchema no longer advertises it — a knob
+        # with no effect should not be offered to a model.
         FieldSpec("timeout_secs", int, min_val=15, max_val=540),
     ],
 )
@@ -1418,10 +1424,17 @@ WORKFLOW_RUN_SCHEMA = ToolSchema(
         # Either an authored Python script (source) or a NL intent to author one.
         FieldSpec("source", str, max_len=MAX_LONG_STRING),
         FieldSpec("intent", str, max_len=MAX_MEDIUM_STRING),
+        FieldSpec("workflow", str, max_len=MAX_SHORT_STRING, pattern=_WF_RUN_ID_RE),
+        FieldSpec("input", str, max_len=MAX_MEDIUM_STRING),
         FieldSpec("name", str, max_len=MAX_SHORT_STRING),
         FieldSpec("args", dict),
         FieldSpec("budget_total", int, min_val=0, max_val=100_000_000),
     ],
+)
+
+WORKFLOW_LIBRARY_LIST_SCHEMA = ToolSchema(
+    tool_name="workflow_library_list",
+    fields=[FieldSpec("search", str, max_len=MAX_MEDIUM_STRING)],
 )
 
 WORKFLOW_RUN_ID_SCHEMA = ToolSchema(
@@ -1479,7 +1492,13 @@ def _validate_artifact_save(cleaned: dict) -> None:
 
 # Shared slug pattern (matches _ARTIFACT_SLUG_RE + deploy slug validation).
 _WM_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-_WM_PROFILE_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+# constants.AWS_PROFILE_NAME_RE — the single source of truth (#6063): '+'
+# admitted for IAM Identity Center derived profiles
+# ("<account>+<permission-set>", #6051); first char excludes '-' so a stored
+# profile is never option-shaped when it later reaches `--profile <value>`
+# argv. \Z is load-bearing here: this path matches the raw value WITHOUT a
+# strip, so the old $ anchor let a trailing-newline value through.
+_WM_PROFILE_RE = AWS_PROFILE_NAME_RE
 _WM_URL_RE = re.compile(r"^https?://.{1,2048}$")
 _WM_LIFECYCLE_STATUSES = {"draft", "deploying", "live", "error", "expired"}
 _WM_LIST_CAP = 50
@@ -2665,6 +2684,14 @@ SESSION_STOP_SCHEMA = ToolSchema(
     ],
 )
 
+SESSION_SEND_SCHEMA = ToolSchema(
+    tool_name="session_send",
+    fields=[
+        FieldSpec("target", str, required=True, max_len=MAX_SHORT_STRING),
+        FieldSpec("message", str, required=True, max_len=MAX_LONG_STRING),
+    ],
+)
+
 SESSION_READ_MESSAGE_SCHEMA = ToolSchema(
     tool_name="session_read_message",
     fields=[
@@ -2740,6 +2767,7 @@ MCP_CORE_SCHEMAS: dict[str, ToolSchema] = {
     "workflow_result": WORKFLOW_RUN_ID_SCHEMA,
     "workflow_cancel": WORKFLOW_RUN_ID_SCHEMA,
     "workflow_rerun_subtree": WORKFLOW_RERUN_SCHEMA,
+    "workflow_library_list": WORKFLOW_LIBRARY_LIST_SCHEMA,
     "deploy_artifact": DEPLOY_ARTIFACT_SCHEMA,
     "issue_radar_record_investigation": ISSUE_RADAR_RECORD_INVESTIGATION_SCHEMA,
     "ops_mission_control_api": OPS_MISSION_CONTROL_API_SCHEMA,
@@ -2889,6 +2917,7 @@ def _cu_coord_field(name: str, *, required: bool = False) -> FieldSpec:
 MCP_DASHBOARD_SCHEMAS: dict[str, ToolSchema] = {
     "session_create": SESSION_CREATE_SCHEMA,
     "session_stop": SESSION_STOP_SCHEMA,
+    "session_send": SESSION_SEND_SCHEMA,
     "session_read_message": SESSION_READ_MESSAGE_SCHEMA,
     "chat_folder_tree": CHAT_FOLDER_TREE_SCHEMA,
     "chat_folder_create": CHAT_FOLDER_CREATE_SCHEMA,

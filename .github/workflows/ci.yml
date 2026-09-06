@@ -65,6 +65,8 @@ jobs:
       linux_packaging: ${{ steps.filter.outputs.linux_packaging }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
@@ -143,6 +145,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -175,6 +179,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         # Full history is fetched lazily by the script only for the (skipped)
         # history scan; the working-tree gate needs just the checkout.
+        with:
+          persist-credentials: false
       - name: Scan working tree for internal markers
         # Blocking gate: fails the build on any Amazon-internal marker in the
         # public tree (internal domains/hosts, ticket ids, aliases, credential
@@ -193,6 +199,8 @@ jobs:
     # always-on job cannot be dodged by a path-filter edge case.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Verify _vendor tree against the committed sha256 manifest
         # Blocking gate: fails on any modified, missing, or added file under
@@ -208,6 +216,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # persist-credentials retained: brand-lint/Check the product name on the lines this change adds runs `git fetch origin`
+      # against the same remote, through the shared diff-base resolver script.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check the product name on the lines this change adds
@@ -237,6 +247,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # persist-credentials retained: focus-cue-lint/Check the focus cues on the elements this change touches runs `git fetch origin`
+      # against the same remote, through the shared diff-base resolver script.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check the focus cues on the elements this change touches
@@ -264,6 +276,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # persist-credentials retained: changelog-history/Check that shipped changelog sections survived this change runs `git fetch origin`
+      # against the same remote, through the shared diff-base resolver script.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check that shipped changelog sections survived this change
@@ -304,6 +318,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Check for bare module-global asyncio primitives
         # An asyncio.Lock/Event/Queue created at module scope binds to the
@@ -321,11 +337,35 @@ jobs:
           python3 scripts/check_loop_bound_locks.py --test
           python3 scripts/check_loop_bound_locks.py
 
+  testpaths-coverage:
+    name: Testpaths Coverage Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check that every pytest test file sits under a collected root
+        # setup.cfg pins `testpaths`, so a test_*.py file created outside those
+        # roots is silently never run — green by omission — and rots against
+        # the code it claims to cover (#6577: twelve files sat uncollected in a
+        # root-level tests/ dir). Whole-tree, not diff-scoped: the backlog is
+        # zero after #6577's move, so there is nothing to charge to whoever
+        # pushes next. Nested distributions with their own pyproject/setup.cfg
+        # and marker-exempted manual scripts are excluded; see the script
+        # docstring.
+        run: |
+          # Self-test first: it plants one probe per rule family, so a rule
+          # that silently stops matching fails here instead of shipping green.
+          python3 scripts/check_testpaths_coverage.py --test
+          python3 scripts/check_testpaths_coverage.py
+
   harness-parity:
     name: Harness Parity Gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # persist-credentials retained: harness-parity/Check harness identity tests on the lines this change adds runs `git fetch origin`
+      # against the same remote, through the shared diff-base resolver script.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Check harness identity tests on the lines this change adds
@@ -360,6 +400,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Verify the linter's own checks still fire
         # Self-test first: a gate that has silently stopped detecting anything is
@@ -392,6 +434,7 @@ jobs:
       # so a regression here is visible in the log instead of silent.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -482,6 +525,8 @@ jobs:
       SHARD_COUNT: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -614,6 +659,8 @@ jobs:
       MDNB_GIT_TIMEOUT_SEC: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -726,6 +773,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -804,6 +853,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -859,6 +910,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -1056,6 +1109,8 @@ jobs:
       # downloads because actions/checkout cleans the workspace by default and
       # would otherwise delete them.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The gate parses the Cobertura reports through defusedxml rather than the
       # stdlib parser, which resolves external entities -- and on a fork PR the
@@ -1163,6 +1218,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # persist-credentials retained: frontend-lint/Check for new hardcoded UI strings runs `git fetch origin`
+      # against the same remote, through the shared diff-base resolver script.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -1193,7 +1250,7 @@ jobs:
         # The ceiling must EQUAL the measured count, not sit above it: slack is
         # silent admission, and a warning that lands inside it never surfaces
         # again. Re-measure with `cd website && npx eslint src/` when burning down.
-        run: npx eslint src/ --max-warnings 664
+        run: npx eslint src/ --max-warnings 659
 
       - name: Copy/paste detection
         working-directory: website
@@ -1227,7 +1284,7 @@ jobs:
         # unrecognised flag makes those scripts refuse to run rather than fall through to
         # their destructive conversion path.
         #
-        # ONLY TWO KINDS OF CHECK CAN FAIL THIS STEP.
+        # ONLY THREE KINDS OF CHECK CAN FAIL THIS STEP.
         #
         #   DIFF-SCOPED, zero tolerance — a finding on a line you wrote is yours and there
         #   is no number to raise:
@@ -1243,8 +1300,16 @@ jobs:
         #                       reference and its catalog entry are edited independently, so
         #                       a catalog-only rename dangles references in files the PR
         #                       never opens. Needs no base ref, so it cannot skip itself.
-        #     [plurals]         a `{n} {t('item')}s` concatenation.
+        #     [plurals]         an i18nT-adjacent `{n} {t('item')}s` concatenation.
         #     [pseudolocale]    `en-XA.json` stale against its generator.
+        #
+        #   WHOLE-REPO CEILING — fails only when the class GROWS:
+        #     [plurals-hardcoded] the same plural-glue defect with NO i18nT in it, e.g.
+        #                       a fully hardcoded aria-label gluing `?'s':''` onto a
+        #                       noun. The frozen sites are pinned at HARDCODED_CEILING
+        #                       in i18n-plural-codemod.mjs and ratchet DOWN as they are
+        #                       converted; a failure lists every site with file:line so
+        #                       the added one is findable.
         #
         # EVERYTHING ELSE IS REPORT ONLY — [untranslated], [allcaps], [extractable] and
         # [dynamic-keys]. Each is a stored whole-repo total, written by whichever branch
@@ -1278,12 +1343,97 @@ jobs:
           export I18N_BASE_REF
           npm run i18n:check
 
+      - name: Check the color utilities this change touches name real tokens
+        # A Tailwind utility naming a token the theme never declared is not an
+        # error anywhere: the class is simply not emitted, the element renders
+        # with no color, and the build, tsc and eslint all stay silent. Diff-
+        # scoped for the same reason as the focus-cue gate above: the tree
+        # carried a backlog of these, so a whole-tree gate would charge it to
+        # whoever pushed next. Literals a change touched are complete for
+        # regression, and the whole-tree count is printed as a non-failing
+        # report either way.
+        working-directory: website
+        env:
+          PHANTOM_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          # Absolute path: this step's working-directory is `website`.
+          PHANTOM_BASE_REF="$(bash "$GITHUB_WORKSPACE/.github/scripts/resolve-i18n-base.sh" \
+            "$PHANTOM_BASE_REF" 'the phantom-classes gate')" || exit 1
+          export PHANTOM_BASE_REF
+          # Self-test first: it plants one probe per rule family, so a change
+          # that breaks the lexer or promotes a non-class string to a class
+          # fails here instead of shipping a gate that passes everything.
+          npm run lint:phantom-classes -- --test
+          npm run lint:phantom-classes
+
+  # Prove `npm ci` still works on the OLDEST Node the frontend claims to support.
+  # Every other job here runs the .nvmrc toolchain (Node 24 / npm 11), and npm 11
+  # and npm 10 (Node 22) build different ideal trees for an OPTIONAL PEER
+  # dependency: npm 10 wants a nested entry for it, npm 11 does not install it at
+  # all. A lockfile regenerated under npm 11 therefore drops what npm 10 demands,
+  # and `npm ci` dies with EUSAGE ("Missing: <pkg> from lock file") for everyone
+  # on the declared floor while all of CI stays green. That happened twice to the
+  # same dependency, the second time as a side effect of a change about something
+  # else entirely.
+  #
+  # The specific divergence is gone -- an `overrides` entry now makes both majors
+  # resolve that dependency identically, so neither can drop anything. This job
+  # exists because that is a property of today's dependency tree, not a guarantee:
+  # the next package with an unsatisfiable optional peer reintroduces the whole
+  # class, and without a job on the floor nothing would notice.
+  lockfile-engines-floor:
+    name: Lockfile Installs On Declared Node Floor
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Pinned to the floor, NOT to `engines.node` via node-version-file: that
+      # input resolves a range like ">=22" to the NEWEST matching release, which
+      # would quietly re-test Node 24 and make this job vacuous. The literal is
+      # held to engines.node statically instead, by
+      # test_the_engines_floor_job_pins_the_declared_floor -- one derivation of
+      # the floor, in the file that already governs every other node pin.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: npm ci on the engines floor
+        working-directory: website
+        # A real install, not `--dry-run`: dry-run still fires the postinstall
+        # patch script but leaves no node_modules for it to patch, so it fails
+        # for a reason that has nothing to do with the lockfile. Installing for
+        # real also makes the gate mean what its name says -- `npm ci` works on
+        # the declared floor -- rather than only that resolution succeeded.
+        #
+        # The failure hint matters because this job is the ONLY one on the floor:
+        # whoever trips it is on Node 24 and cannot reproduce the red locally, so
+        # naming the reproduction turns an opaque failure into a self-servicing
+        # one.
+        run: |
+          npm ci --no-audit --no-fund || {
+            echo "::error::npm ci failed on Node $(node -v), the engines.node floor." \
+              "Every other job runs the .nvmrc toolchain (Node 24 / npm 11), so this can" \
+              "fail while they pass: the two npm majors resolve optional peer dependencies" \
+              "differently. Reproduce without installing Node 22:" \
+              "cd website && npx -y npm@10 ci. If it is a lockfile disagreement, prefer" \
+              "removing the divergence (an overrides entry both majors resolve the same way)" \
+              "over hand-adding whichever entry one major happens to want."
+            exit 1
+          }
+
   cfn-lint:
     name: CloudFormation Lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -1311,6 +1461,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -1355,6 +1507,8 @@ jobs:
     env:
       SHARD_COUNT: 4
     steps:
+      # persist-credentials retained: frontend-test/Run the diff-scoped vitest gates runs `git fetch origin`
+      # against the same remote, through the shared diff-base resolver script.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -1479,6 +1633,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -1547,6 +1703,8 @@ jobs:
     if: needs.changes.outputs.only_backend != 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -1579,6 +1737,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
+      # persist-credentials retained: e2e/Scan the rendered dashboard runs `git fetch origin`
+      # against the same remote, through the shared diff-base resolver script.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

@@ -353,6 +353,64 @@ skills/crons/MCP registration overwrite in place.
 
 Writer: `apps/bridges.py::reconcile_enabled_app_resources`.
 
+### 7.1 A hung startup lifecycle hook is bounded at the dispatch boundary
+
+`LifecycleDispatcher` invokes startup hooks **serially** in lexicographic app-name
+order, so one hook that never returns would stall the whole loop and keep the
+gateway from ever reaching readiness. An awaited startup coroutine is therefore
+bounded by a per-hook deadline (`lifecycle._HOOK_TIMEOUT_SEC`, 30s). The task
+is registered in the dispatcher-owned map keyed by app immediately when it is
+created, before the dispatcher first awaits it, so parent cancellation cannot
+orphan live work during the pre-deadline window. A completion observer retrieves
+its result and removes proven-terminal ownership. On deadline expiry the same
+owned task remains tracked while startup continues; the dispatcher does not wait
+indefinitely for it to settle and does not cancel it. Cancelling an asyncio task
+awaiting `asyncio.to_thread` makes the wrapper terminal while its worker thread
+still executes app code, so any observed child cancellation records a
+process-lifetime residual marker before releasing the task reference. The timeout
+is treated as a hook failure (the app is marked degraded and the event is
+SEL-recorded with `outcome="timeout"`), and startup **continues with the remaining
+apps**. The deadline is a safety net against a hang, not a performance budget,
+which is why it is generous.
+
+The per-app ownership is also a teardown contract. Dashboard disable, local or
+registry install, update, uninstall, and registry replacement perform a bounded
+ownership preflight and return a retryable refusal without mutating app state when
+retained startup execution cannot be proven stopped. Trust withdrawal also remains
+bounded, but if the hook continues executing, teardown fails and revocation leaves
+the trust grant in place for a retry rather than claiming the app stopped while its
+code remains live. In that failure case an app-declared `on_shutdown` is skipped:
+it is unbounded third-party code and must not overlap the still-running startup
+hook against partially initialized state.
+
+Normal recovery is to retry after retained startup execution exits. If a startup
+hook is permanently wedged, the operator must **stop the gateway completely**,
+run `kirocrew app disable <name>` while no gateway process can execute app code,
+and then restart the gateway. The CLI command only writes `enabled=false` to
+installed-app metadata; it is not runtime teardown and must not be run against a
+live gateway as evidence that old app code stopped. The disabled app is skipped
+on the next startup, allowing the operator to repair or remove it without
+re-entering the wedged hook.
+
+Graceful gateway shutdown sweeps retained startup ownership for **every enabled
+app**, including apps with no `on_shutdown` declaration. All ownership checks
+start concurrently and are non-blocking: ownership that is already terminal
+permits that app's shutdown hook, while active or residual startup work skips only
+the affected hook fail-closed. The sweep consumes none of the gateway's remaining
+10-second cooperative shutdown window, preserving time for unaffected app hooks
+after the existing bounded slot-history save; the service manager's separate
+10-second signal margin is not hook-execution time. An app's `on_shutdown` is
+invoked in reverse lexicographic order only after that app's startup ownership
+settled; otherwise the hook is skipped rather than running concurrently against
+partially initialized state. Once an `on_shutdown` hook is invoked, it is
+intentionally not detached at the deadline: the task still owns its `AppContext`
+capabilities, so teardown awaits it to completion. The startup deadline governs
+**async hooks only**: a synchronous hook returns before the
+`asyncio.iscoroutine` check and runs to completion outside the timeout; a
+successful async startup hook that returns within the deadline is unaffected.
+
+Writer: `apps/lifecycle.py::LifecycleDispatcher._invoke`.
+
 ## 8. An app's EventBus only exists with a real broadcast function
 
 `build_app_context` returns `events=None` when `broadcast_fn` is None, and
@@ -475,6 +533,49 @@ persisted at first registration and never routes through `enable_app`, so the
 governance `apps` activation allowlist is re-applied at that write: a
 governance-denied app registers disabled.
 
+`defaultEnabled` is read on FIRST registration only — every later start preserves
+the user's own state — so ADDING a name to the exemption reaches new installs
+alone. An install that registered the app while it was still default-off keeps
+`enabled: false` through every restart, update and version bump, because the
+record lives in the user's data home and a code update does not touch it. For a
+builtin that replaces a host surface that is terminal rather than inconvenient:
+it has no page, so it is absent from the launcher's own app list, and it is
+absent from Discover unless the published catalog carries a row, which leaves a
+disabled row in Library as the only trace of an app the user never heard of.
+
+`manager.backfill_default_on_builtins()` closes that gap, invoked from
+`agent.run_first_run_setup()`. It reads a SECOND set, `_DEFAULT_ON_BACKFILL`, and
+the separation is load-bearing rather than bookkeeping: `_DEFAULT_ON_BUILTINS`
+answers "what does a fresh install enable", while this one answers "which
+promotion has not yet reached installs that predate it". Reading the first for the
+second question reverses deliberate opt-outs — `projects` has shipped
+`defaultEnabled: true` since it was aligned with the other builtins, long before
+the allowlist existed, so it has been enabled and visible in the sidebar on every
+existing install and a disabled record for it is a user who found it and turned it
+off. A name qualifies only when a fresh install enables it AND existing installs
+were never in a position to choose; a ratchet test pins both halves.
+
+The backfill is ONE-SHOT, and the record of that is
+`InstalledApp.defaultOnBackfilled`, written in the SAME atomic record write that
+flips `enabled`. One document deliberately: a separate marker file has no correct
+ordering, because whichever of the two writes goes first leaves a window the other
+one owns — marker-last loses the record of an enable that happened, so every later
+start re-applies the promotion and reverses the user's own disable forever;
+marker-first can outlive a flip that failed, so the app is skipped forever and the
+promotion is never delivered. Both are real failures; neither is reachable when the
+flag and the state it guards land or fail together. A record created under the
+promoted default is born `True`, because a first registration with `defaultEnabled`
+IS the promotion being received — without that, "install, disable the app in the
+same session, restart" would re-enable it, and no write ordering can fix that since
+on a fresh install the record may not exist yet when first-run setup runs.
+Disabling the app must survive, since it is the only thing that gives a replaced
+host surface back. Both the `_builtin_owns_install` boundary (a user's own install
+under the same name is never touched) and the governance activation gate are
+re-applied, and a governance-denied app is deliberately left unflagged so the
+promotion is still delivered if policy later permits. The activation is recorded in
+the SEL, because it moves an app from inactive to active with no user request
+behind it.
+
 `hidden: true` on a builtin manifest removes it from the Discover catalog while
 leaving its code and routes fully intact. It stays installable and enablable by
 name from the CLI, and remains visible in the Library once enabled. **Channels**
@@ -497,7 +598,8 @@ deterministic order (hero art, then verified publishers, then name), so the
 surface is never empty and never arbitrary.
 
 Writers: `apps/manager.py` (`_BUILTIN_APPS`, `_DEFAULT_ON_BUILTINS`,
-`register_builtin_apps`), `apps/discovery.py::discover_builtin_apps`,
+`_DEFAULT_ON_BACKFILL`, `register_builtin_apps`, `backfill_default_on_builtins`),
+`agent.py::run_first_run_setup`, `apps/discovery.py::discover_builtin_apps`,
 `apps/registry.py::_apply_trust_fields`;
 consumers: `website/src/pages/AppsPage.tsx` (`pickFeatured`),
 `website/src/components/appstore/types.ts` (`isVerified`, `sourceLabel`).
@@ -709,6 +811,53 @@ independently load-bearing:
   collision keeps the seed, so a republished document cannot silently re-home
   an app to a new repository under a familiar name.
 
+**Execution consent is repository-bound for new grants.** Registry and installed
+app responses carry a server-overwritten `trustRepository`: the normalized clone
+target the grant handler itself would resolve, never an index/manifest assertion.
+This field is deliberately separate from the legacy/display `repo` alias because
+an entry may legitimately carry a different `gitUrl`, and `_entry_git_url`
+prefers `gitUrl` for the actual clone. The trust dialog displays
+`trustRepository` and posts it back as consent proof.
+`POST /api/security/trusted-apps/{name}` freshly resolves the target and requires
+the normalized proof to match before it records that target in
+`agent.apps_trusted_repositories` beside the name in `agent.apps_trusted`.
+Missing or stale proof for a repository-backed app is refused. A local installed
+app with no repository remains grantable with no proof and records its grant kind
+in `agent.apps_trusted_local`; this prevents a pre-binding name-only grant from
+silently becoming local consent after a same-name takeover. The stored repository
+uses the same normalization as catalog supersession (scheme/host case-folded,
+trailing slash and `.git` removed, path case preserved). HTTP(S) userinfo is
+removed in full. Username-only SSH/git+ssh userinfo and scp-style
+`user@host:path` are retained because they select transport routing. Git passes
+colon-bearing SSH userinfo to OpenSSH as the complete username rather than
+treating the suffix as a password, so executable and governance paths reject it
+instead of rewriting it to a different identity. SCP likewise has no password
+field: in a no-scheme target whose first colon precedes `@`, Git treats the text
+before that colon as the host and everything after it as the path. Such an
+ambiguous target is rejected rather than rewritten to a different host. URI
+query and fragment components are omitted from the durable/API identity because
+free-form sources can carry provider tokens there. A registry clone target with
+either suffix or an ambiguous SSH/SCP identity is rejected before trust
+comparison or fetch: displaying one identity while transporting another would
+allow repository rebinding and trusted-host bypass. Legacy installed provenance,
+catalog fallback,
+or stored bindings containing any of these unsupported forms are inert: they
+cannot produce consent proof, compare equal, or pass the runtime gate and require
+revoke plus fresh consent. Clone-host trust parses bracketed IPv6 literals in URI
+and scp forms as validated canonical full addresses; malformed brackets/non-IPv6
+contents fail closed, and sharing a first hextet never grants host equivalence.
+`install_from_registry` compares its freshly resolved row against that value
+before manifest fetch, credential selection, clone, build, or setup code. A bound
+mismatch returns `app_trust_repository_mismatch` and requires revoke plus fresh
+consent without returning either repository coordinate. A legacy name grant with
+no binding is inactive for every repository-backed source — including the same
+repository it historically used — and returns `app_execution_denied` so the
+normal consent dialog can create the missing binding. A still-installed app with
+positively local provenance retains migration compatibility; an unknown/fresh
+same-name local source does not inherit that old grant. The commit is deliberately
+not bound: a new pin in the same repository is the ordinary catalog update path
+and does not warrant a new consent prompt.
+
 A name is a filesystem path on install, so `inventory()` and
 `list_catalog_rows` drop any entry whose name fails the manifest name contract
 (`app_name_error` / `KEBAB_RE`), and the catalog fetch runs off the event loop
@@ -718,7 +867,9 @@ Writers: `apps/official_catalog.py` (`list_catalog_rows`, `inventory`,
 `fetch_inventory_entries`, `inventory_for_install`), `apps/registry.py`
 (`list_catalog_apps`, `_resolve_registry_row`, `_git_fetch_commit`,
 `_append_external_registry_apps`, `_detect_installed_probe`),
-`apps/routes.py` (`handle_registry`).
+`dashboard/handlers/security.py` (`api_trusted_app_grant`),
+`apps/routes.py` (`handle_registry`, `handle_list_apps`, `handle_get_app`), and
+`website/src/components/appstore/TrustAppModal.tsx`.
 
 ## 15. A registry's credential posture follows its index's change control
 
@@ -857,3 +1008,511 @@ Writers: `apps/registry.py` (`_effective_registries`, `_pinned_registries`,
 `anonymous_git_env`), `platform/interfaces.py`
 (`AppsLoader.default_registries`), `config/loader.py`
 (`ExternalRegistryConfig.trust`), `apps/routes.py` (`handle_registries`).
+
+## 16. Store guidance and product screenshots are manifest-owned
+
+An App detail page carries three different kinds of information and does not
+substitute one for another:
+
+- `highlights` describes capabilities;
+- `useCases` says when an operator should reach for the App;
+- `configuration` says how to make it usable, including prerequisites that live
+  outside the page (provider CLIs, credentials, desktop shell, or another App).
+
+All three remain English in `app.json` so catalog-less consumers such as the CLI
+print meaningful copy. Builtins resolve them through the frontend catalogs; the
+manifest/catalog sync gate derives `use_case_N` and `configuration_N` keys and
+requires the English values to stay byte-identical. External apps fall back to
+their manifest copy because a third-party app id is not first-party provenance.
+
+Store artwork and proof are likewise distinct. `heroImage*` is illustrative
+banner art, while `screenshots*` must be a capture of the real App UI. The detail
+page prefers the wide `heroImageDetail*` banner when present and renders the
+screenshot gallery independently. Registry manifests project `useCases` and
+`configuration` as display metadata and rewrite repo-relative screenshot and
+hero paths through the same-origin blob proxy.
+
+**An INSTALLED app's art is served from its own install directory, not the blob
+proxy.** `GET /apps/{name}/art/{path}` (`handle_app_art_file`) reads the bytes
+the install itself wrote, and the four surfaces that render an installed app's
+art — the left rail and command palette (`appNav`), the Library card, the Updates
+worklist, and the detail page — resolve through `installedArt` /
+`installedArtList`.
+
+The proxy reaches those same bytes by a **git clone gated by an SSRF allowlist**,
+which is the wrong mechanism for a file already on local disk and had a visible
+failure mode: the allowlist is warmed by a network fetch a page render can
+outrun — the Library card list gates only on the installed-apps query while the
+catalog fetch rides the separate store listing — and an `<img>` does not retry a
+403, so a catalog-listed app's art vanished for that paint. Reading the file has
+no ordering, needs no network, survives a CDN outage, and names no host. It also
+takes the repo identifier off the art path: an app with no registry row, no
+manifest `repo` and no recorded `sourceUrl` now renders its real icon where
+before it fell back to the generic box.
+
+Two narrowings against `handle_app_ui_file`, whose shape this follows:
+
+- **Images only** — `_ART_IMAGE_EXTENSIONS`, which is deliberately NOT
+  `_ALLOWED_EXTENSIONS`: that set (the UI-bundle route's) admits `.json`, so
+  reusing it on a route rooted at the install directory would also serve
+  `installed.json` and `app.json`, a widening paid to show an icon. The blob
+  proxy screens on the same set, and that parity is load-bearing rather than
+  incidental — this route REPLACES the proxy per surface, so a file one serves
+  and the other refuses would make the same app's art render or 403 depending
+  only on whether it happens to be installed. One set, pinned by
+  `test_both_art_paths_screen_on_the_SAME_extension_set`, which asserts on
+  MEMBERS so a duplicate under any new name fails.
+- **Declared paths only** — the path must equal one the manifest names
+  (`iconPath`, `heroImage`, `heroImageDetail`, `screenshots`, and their `Dark`
+  variants, with a leading `./` normalized off). The manifest, not the request,
+  chooses the file, which is what lets the route carry no traversal reasoning of
+  its own. Containment is still checked, because a manifest is the app's own
+  untrusted content and a declared value is not evidence the file lands inside
+  the directory. Undeclared, escaping and missing all answer one 404, so a probe
+  cannot map a manifest's declarations by status.
+
+The containment check catches `OSError`, `RuntimeError` and `ValueError`, not
+`ValueError` alone. `Path.resolve()` raises `RuntimeError` — not an `OSError` —
+on a symlink loop, so a declared self-referential link (or a mutual pair) would
+otherwise leave the handler as a 500 on a route whose every other refusal is a
+clean status; the app that plants the link is the one whose art this serves, so
+that input is exactly what the endpoint reads. None of the three is a different
+ANSWER: all mean the path is not servable, which is the same 404 as undeclared
+and missing. The publisher's `EditorialAssets.add` in KiroCrewApps documents the
+same `RuntimeError` trap from the other side of the same operation.
+
+**The route serves BYTES read under a pinned descriptor, not a path.** Validating
+a path and handing it to `web.FileResponse` opens it a SECOND time, so the app that
+owns the install directory can swap a declared name for a symlink between the check
+and that open and have the gateway read the target instead — and the gateway is not
+sandboxed, so that launders a read the app's own code can be refused. Checking a
+path and then acting on a re-resolution of it is worse than not checking, because
+it reports success.
+
+So `_read_declared_art` does one open through `pinned_fs.open_in_pinned_parent`
+(one `openat` per component, each carrying `O_NOFOLLOW`), validates the
+**descriptor** with `fstat`, reads from it, and the handler serves those bytes.
+Three consequences worth stating:
+
+- A symlink at the declared final name is refused **even when its target is a
+  legitimate file inside the root**. It is the indirection that is refused, not the
+  destination, because only the indirection is swappable.
+- Containment on the resolved parent is still required and is not redundant with the
+  pinned walk. `pin_parent`'s contract is explicit that a component swapped BEFORE
+  the parent was resolved is followed by that resolution, so an ANCESTOR that is
+  already a link is refused by the containment check alone.
+- The bytes are held rather than streamed, so `_ART_MAX_BYTES` caps what one
+  declared file can make the gateway buffer, and the `ETag` is derived from the
+  descriptor that was read rather than from a second stat of the path. `no-cache`
+  means the browser revalidates on every load and the rail renders on every load, so
+  without that validator each load would be a full 200 instead of a 304.
+
+On Windows the pinned walk is unavailable (no `O_NOFOLLOW`, no descriptor-relative
+open), so the route refuses any reparse point between the root and the target and
+then opens by path. That narrows the window rather than closing it, and it narrows
+it against what the platform actually permits: creating a FILE symlink there needs
+elevation (the reason `platform_compat.symlink_or_junction` exists), so the
+reachable swap is a junction on an ancestor, which the reparse-point probe covers.
+
+**Every guard tuple around a path operation carries `ValueError`, and that is not
+redundant with `OSError`.** `os.open` raises `ValueError` — never an `OSError` — for
+a name the OS layer cannot encode, and there are two reachable classes: an embedded
+NUL (`ValueError`) and a lone surrogate (`UnicodeEncodeError`, a `ValueError`
+subclass). Such a name survives every earlier check, which is what makes it
+reachable: the extension allowlist reads the suffix AFTER the bad byte
+(`bad\x00.png` → `.png`), and containment resolves the PARENT, which is clean when
+the bad byte sits in the final component. So the open is the first thing that
+touches it, and uncaught that is a 500 on a route whose every other refusal is a
+clean status.
+
+The guard is on the EXCEPTION, not on the character, and the surrogates are why:
+screening NUL at the door would admit every one of them. Three sites need it — both
+opens and the `realpath` on the parent — and each is pinned separately, because a
+mutation on one reddens only its own cases. The Windows branch needs a test that
+forces `supports_pinned_walk()` False, since on a POSIX runner that branch never
+executes and its guard was untested until one existed.
+
+**The descriptor check is `S_ISREG` AND `st_nlink == 1` AND the size cap**, and the
+nlink half is the only one that can see a HARDLINK. An alias shares its target's
+inode, so every path-based guard is blind to it: `is_symlink()` is False, `realpath`
+yields the alias's own name so containment passes, and `O_NOFOLLOW` has no link to
+refuse. Measured before it was added: a declared `assets/icon.webp` hardlinked to a
+file outside the install directory opened cleanly, reported `S_ISREG`, sat under the
+cap, and its bytes were served with a 200 — laundering, through an unsandboxed
+gateway, a read the app's own sandboxed code can be refused. Every other
+descriptor-validated read in the tree applies the same gate (`hooks.py`, `memory.py`,
+`spec_builder`, `onboarding_import.py`, `pinned_fs.copy_file_pinned`), so this route
+was the outlier rather than a new rule.
+
+Spelled inline rather than through `pinned_fs.refuse_hardlink_alias`, which is the
+same check behind an exception: that helper CLOSES the descriptor before raising and
+this function closes in a `finally`, so routing through it would double-close — and a
+reused descriptor number makes that worse than the bug it fixes. The sibling sites
+spell it inline for the same reason: their refusal is a return value, not a raise.
+
+**The response carries its own `Content-Security-Policy` and `nosniff`, and the CSP is
+load-bearing rather than decoration.** `.svg` is in the allowlist because an SVG in an
+`<img>` is script-inert — but a TOP-LEVEL NAVIGATION to an art URL makes the response a
+DOCUMENT on the dashboard's own origin, and the dashboard's `_BASE_CSP` is deliberately
+permissive there (`script-src 'self' 'unsafe-inline'`, so widget and MCP-app iframes can
+run inline script). It would therefore NOT stop a scripted SVG an app declared as its
+art, and same-origin script reaches the authenticated dashboard API with the viewer's
+session.
+
+So the handler answers with `default-src 'none'; sandbox`: `sandbox` with no tokens
+gives the document an opaque origin and no script, and `default-src 'none'` stops it
+fetching anything. A response CSP does not apply when the bytes are consumed as an
+`<img>` subresource, so the store's own rendering is unaffected. `nosniff` is part of
+it because the `Content-Type` is derived from the EXTENSION, not the bytes — without it,
+art named `.png` whose content is markup could still be sniffed into a document.
+
+Set on the response rather than in the middleware because
+`dashboard/server.py`'s security-header middleware uses `setdefault` precisely so a
+handler can tighten its own answer. Applied to EVERY art response, not only `.svg`: a
+per-extension shortcut is one `if` away from a gap, and a mutation that narrows it to
+`.svg` is one of the cases pinned.
+
+The same exposure exists on `/api/apps/blob` and `handle_app_ui_file`, which also serve
+`.svg` from this origin with no per-response policy. Both are pre-existing and tracked
+rather than widened from here.
+
+**The deferral against `handle_app_ui_file` is wider than the CSP, and stating only the
+CSP half would understate it.** That route serves the same app-owned tree by
+`resolve()` + `relative_to` and then RE-OPENS by path through `web.FileResponse`, so it
+carries the identical check-then-reopen window this function exists to close — with no
+pinned open, no `st_nlink` gate, and a wider extension set (`.js`/`.json`/`.mjs`/`.css`).
+It is therefore weaker on EVERY platform, not only where the pinned walk is unavailable.
+Both halves — the missing response policy and the TOCTOU/hardlink exposure — are
+deliberately left to that route rather than fixed from here, because it is not a route
+this function's change otherwise touches. Anyone hardening it should read the invariant
+list above as the checklist, and should not copy `default-src 'none'` onto it without
+first confirming nothing loads a UI asset as a document rather than a subresource.
+
+**`O_NONBLOCK` is in the open flags because it is what makes those checks
+reachable.** Opening a FIFO blocks until a writer appears, and the handler runs inside
+`asyncio.to_thread` — so an app declaring a FIFO as its icon path parks a thread-pool
+worker forever, and enough such requests starve every other blocking call in the
+gateway. The descriptor checks cannot help, because the block happens BEFORE `fstat`.
+Measured: the open hangs indefinitely without the flag and returns immediately with
+it, after which `S_ISREG` refuses the FIFO; on an ordinary file the flag changes
+nothing. Its guard test bounds itself with `asyncio.wait_for`, so a regression fails
+the suite instead of hanging it.
+
+**`iconUrl` is not an art path, and the frontend must not treat it as one.**
+`_ART_MANIFEST_FIELDS` carries `iconPath`/`iconPathDark`, never
+`iconUrl`/`iconUrlDark` — because for a FETCHED app `iconUrl` is ignored by design,
+so a publisher cannot name a host the client would load. A surface that built
+`/apps/<name>/art/<relative iconUrl>` would therefore produce a URL this route
+refuses by construction: a guaranteed 404 dressed as a fallback, and an internal
+contract disagreement where the frontend asks for what the backend cannot answer.
+
+So `useHeroArt` exposes two resolvers and the caller picks by what the field MEANS,
+not by which happens to be imported:
+
+| helper | reads | relative value | absolute same-origin value |
+|---|---|---|---|
+| `installedArt(path, name)` | `iconPath`, `heroImage*`, `screenshots*` | `/apps/<name>/art/<path>` | passed through |
+| `clientLocalArt(path)` | `iconUrl`, `iconUrlDark` | **refused** | passed through |
+| `installedIcon(path, url, name)` | both icon fields, in that ORDER | — | — |
+
+Both route through the one `classifyManifestArt`, so the cross-origin refusal rules
+cannot drift between them. `clientLocalArt` refusing a relative value is what keeps a
+builtin's absolute `/app-assets/…` working (its primary path) without inventing an
+art URL for a field the backend never declared.
+
+`installedIcon` exists because the two-term icon rule is needed at eight call sites
+(rail, command palette, Library card, Updates list, detail page — light and dark each)
+and spelling it out at each one is not stable: four of them resolved `iconPath` first
+and four resolved `iconUrl` first, so a manifest declaring BOTH wore one icon in the
+rail and a different one on its own Library card. Nothing went red, because the order
+is observable ONLY for a manifest that declares both. `iconPath` wins, being the field
+that addresses a file inside the install directory; `iconUrl` is the fallback. The
+order now exists in exactly one place, and a mutation flipping it reddens one test
+rather than needing a test per surface.
+
+The handler's own `..` guard is load-bearing rather than belt-and-braces:
+measured against the real router, `../x` and `%2e%2e/x` are normalized away
+before matching, but `assets/..%2fx.webp` reaches the handler with
+`match_info['path'] == 'assets/../x.webp'` because the encoded slash stops that
+normalization. The whole decision runs in one `asyncio.to_thread` hop — manifest
+read, declaration check and containment are each a blocking syscall, and the
+gateway runs everything on one loop (`no-blocking-call-on-event-loop`).
+
+The route's verb must also appear in `token_auth._APPS_SPA_EXCLUDED_RE`, which
+enumerates the `/apps/` sub-namespaces that have real handlers. A verb missing
+from it is classified as a React Router navigation, so the middleware answers the
+SPA shell and an `<img>` receives HTML with a 200 and renders nothing — silent,
+because the handler is never the thing that fails. The pre-existing drift guard
+cannot catch this (it scans `server.py` only, and its `"{" in p` escape hatch
+treats any pattern route as a real handler without consulting the regex), so
+`test_apps_routes_get_paths_are_matched_by_the_apps_spa_regex` instantiates each
+`/apps/` route literal in `apps/routes.py` and matches the concrete path.
+
+The blob proxy keeps serving a **not-installed** external-registry row, which
+genuinely has no local copy; that half of `known_registry_repos` is untouched.
+
+Writers: builtin `app.json` manifests, `apps/registry.py` (`_merge_manifest`),
+`apps/routes.py` (`handle_app_art_file`),
+`website/src/components/appstore/appManifest.ts`,
+`website/src/components/appstore/useHeroArt.ts`,
+`website/src/pages/AppDetailPage.tsx`, and
+`website/scripts/check-app-manifest-sync.mjs`.
+
+## 17. A backend's health is a standing observation, not a startup verdict
+
+`healthy` on the `AppProcess` record is what the reverse proxy gates on
+(`get_app_backend_port` returns the port ONLY while the flag is set) and what
+`/api/apps` reports. Establishing it once at startup would make it a write-once
+cache: a backend that died an hour later would keep collecting proxied requests
+into a dead port, and the dashboard would keep calling it healthy, with no
+transition anywhere in the tree able to say otherwise.
+
+So the per-backend daemon thread that waits for the backend to come up does not
+exit when it does — it keeps watching, at the much coarser
+`_HEALTH_WATCH_INTERVAL`, for as long as the record stays tracked. The two phases
+are `_health_check_loop` (bounded startup poll) and `_watch_backend_health`
+(unbounded watch), joined by `_supervise_backend_health`.
+
+- **Liveness is cheapest-first, and only a dead process is decisive.** A backend
+  we spawned is judged first by `Popen.poll()`, which answers from an
+  already-reaped exit status without touching the app. An exited process cannot
+  recover on its own, so one observation demotes it and the watch stops. An
+  **adopted** backend has no `Popen` handle — it belongs to another supervisor —
+  and is judged by its health endpoint alone.
+- **An HTTP failure from a live process is not decisive.** A backend can be
+  briefly busy, so demotion needs `_HEALTH_WATCH_FAILURES` consecutive misses;
+  demoting on a single miss would let one slow response take a working app
+  offline.
+- **Demotion is reversible.** The watch keeps running after it demotes and
+  re-promotes on the next successful probe, which is what lets a backend that
+  wedged briefly heal with no operator action.
+- **Both directions move the MCP entry**, through the same
+  `_gate_mcp_registration` branches the startup phase uses: a demotion scrubs the
+  app's HTTP MCP url so kiro-cli does not dial a dead port on every session, and a
+  recovery re-registers it. The scrub goes through the **no-live-port registration**
+  path, not a blanket deregister: an app's stdio/command servers are launched by kiro-cli
+  itself and have no port to be dead, so removing them because an HTTP backend died would
+  take working tools away for a reason unrelated to them. That path pops each HTTP entry
+  and keeps the rest, and its port lookup is health-gated, so it cannot resurrect the
+  port it is removing. It calls `_register_mcp_servers` DIRECTLY rather than
+  `reregister_app_mcp_servers`, because the latter also re-materializes the app's agents
+  — an ungated write that would land before the caller's enablement check and make a
+  disabled app's agents dispatchable in the gap. The scrub owns the mcp.json half only;
+  the agent refresh belongs to the caller, which gates it. The admission gate is applied
+  explicitly here so a denied app still gets a FULL removal rather than the selective
+  keep-stdio treatment. It falls back to removing EVERY entry for the app when the
+  manifest cannot be resolved or declares no servers: that case cannot tell a
+  backend-dependent server from an independent one, and the dead url must not survive on
+  the strength of not knowing. The fallback **never deletes the app's materialized
+  agents**. Deleting them is unrecoverable — it takes the user-owned fields
+  `_preserve_user_agent_edits` carries across every refresh — whereas what it would
+  prevent, an agent naming a server that is gone, costs failed tool calls until the next
+  refresh with a readable manifest rewrites it. An unreadable manifest is frequently
+  TRANSIENT, so destroying data over it trades a temporary fault for a permanent one.
+  `deregister_app` is the path that legitimately owns removing those files.
+
+**An adopted backend registers through the serialized transition BEFORE its watch is
+armed.** Registering afterwards — from a caller that returns and leaves the work queued —
+lets the watch demote and scrub in between, after which the queued write restores the
+dead url and, having bypassed `_set_backend_health`, leaves `mcp_healthy` agreeing with a
+state that is no longer on disk, so nothing retries. **The scrub also re-materializes the app's agents**, because
+  an agent JSON COPIES the server's launch spec and the agent config is what kiro-cli
+  loads — clearing the global map alone leaves the dead url one file over. Registration
+  already refreshes agents for this reason; the scrub mirrors it by calling the SAME
+  `refresh_app_agents`, which carries the two guards this path must honour: an app with
+  `resources="app"` publishes its own agents and the gateway must not duplicate them, and
+  a denied app's agents are scrubbed rather than rewritten back into dispatchable
+  existence. Both return an empty list, which is "nothing to do" rather than a failure.
+  **Registration owes the same guarantee**: it writes the same agent JSONs, so an agent
+  write that failed there leaves the app's agent without the MCP tools the registration
+  was supposed to make reachable. Both directions collect I/O failures and report the
+  reconcile unlanded, so the watch retries either way. A FAILED refresh makes
+  the whole reconcile unlanded, so the watch retries it. Registration treats its own
+  refresh as non-fatal, but that path has no retry behind it — there, non-fatal means
+  "do not fail the registration". Here a re-scrub is idempotent and cheap, and the
+  alternative is a dead url left permanently in the file kiro-cli actually reads. An app
+  with no resolvable manifest has nothing materialized to correct and counts as
+  reconciled, since retrying that would never converge. The same distinction applies
+  WITHIN the refresh: `_register_agents` skips a failing agent and continues, so it
+  reports the agents it could not read or write for **I/O** reasons and only those make
+  the reconcile unlanded. Its other skips — a path escaping the app root, an unsafe agent
+  name, malformed JSON, an unresolved placeholder — are permanent refusals, and treating
+  "declared minus registered" as the retry signal would spin forever on an app that can
+  never converge.
+- **The probe treats a malformed HTTP response as a failed probe, not an error.**
+  `http.client.HTTPException` is NOT an `OSError` or `URLError` subclass (only
+  `RemoteDisconnected` is, via `ConnectionResetError`), and `urllib` re-raises
+  `getresponse()` failures unwrapped — so a `BadStatusLine` from a port answering with a
+  non-HTTP first line escapes a socket-errors-only catch. An app backend is arbitrary
+  third-party code, including `exec` backends and adopted processes, so that is a real
+  condition rather than a hypothetical one. Both probes catch it. The watch additionally
+  survives an unexpected fault in any single sweep, because the failure MODE is the bug
+  itself: a dead watch thread freezes `healthy` at its last value and silently restores
+  the write-once behaviour, with the proxy still routing to a port nothing serves.
+- **Every health verdict uses the same loopback-only probe boundary.** Adoption,
+  startup polling, and the standing watch pass the manifest's app-authored
+  `healthCheck` through `_health_probe_url`: the port must be valid and the value must
+  be an absolute path whose restricted character set cannot move the URL authority or
+  be silently normalized by the parser. Rejected paths fail closed as unhealthy and
+  warn once per distinct value. The shared `_health_probe` opens accepted URLs through
+  `loopback_urlopen`, which ignores HTTP proxy environment variables and rejects
+  redirects, so a probe cannot be redirected or proxied away from `127.0.0.1`.
+- **Every writer of an app's MCP and agent state shares one serialization.** Two
+  independent families write it: the lifecycle paths in `apps/bridges.py` (enable,
+  update, boot reconcile) and the backend's health watch. Unserialized they interleave
+  their DECISIONS — each performing a correct read-modify-write, with the stale one
+  landing last — so `_register_mcp_servers`, `_deregister_mcp_servers` and
+  `_register_agents` all acquire `health_reconcile_lock()`. It is an **RLock**, because
+  the health path already holds it before calling into those writers; a plain Lock
+  deadlocks the watch thread there. Agent materialization holds it across the READ as
+  well as the write, since an agent copies the ambient server spec and a read taken
+  before a scrub could otherwise be written after it. The order is always this lock
+  first, then `_lock` or `_mcp_lock` — never the reverse — which is what keeps the two
+  families from deadlocking against each other.
+- **A promotion requires a positively confirmed ENABLED app; a demotion never does.**
+  `kirocrew app disable` runs in its own process: it deregisters the app's resources and
+  never touches the gateway's tracking table, so the record survives and a later health
+  recovery would re-register the MCP servers and agents the operator just removed. The
+  check fails CLOSED — an unreadable enabled-state refuses the promotion rather than
+  guessing, because guessing wrong makes a disabled app dispatchable again. Demotion is
+  deliberately ungated: refusing a scrub because enablement could not be read would
+  strand the dead url this whole mechanism exists to remove.
+
+  The flag has to be flipped BEFORE the resources come down, or the check reads a stale
+  `enabled` while they are already gone. The gateway's own disable path has no such
+  window — `teardown_app_runtime` stops the backend first, which pops the record and ends
+  the watch — but `kirocrew app disable` runs in ANOTHER process and cannot pop it, so it
+  closes the window by ordering: `disable_app` then `deregister_app`.
+
+  Ordering closes one interleave; it cannot close the other, where the check passes and
+  the disable completes before the write lands. There is no lock to share across
+  processes, so the promotion is **verified after the write** and undone through
+  `deregister_app` when the app turns out to have been disabled meanwhile. Check-act-
+  verify is the convergence available here, and the undo is idempotent with the CLI's own
+  deregistration. `deregister_app` reports most problems SOFTLY, in
+  `RegistrationResult.errors` rather than by raising, so the undo reads that list and
+  moves `mcp_healthy` to False only on a complete removal — otherwise a failed cleanup
+  would read as done and a disabled app would stay dispatchable with nothing left to
+  retry. The refused-promotion path retries an unlanded undo on every sweep, because
+  nothing else revisits a disabled app.
+
+  A demotion's **scrub** is never gated or verified, for the same reason: removing a
+  disabled app's entry is the desired outcome, not something to roll back. Its **agent
+  refresh is**, and the distinction is the point — the scrub REMOVES, while the refresh
+  RE-MATERIALIZES, so for a disabled app it writes back the very files a concurrent
+  `deregister_app` just removed. That refresh is checked before and after and undone if
+  the disable wins, and the cleanup's OWN result is the reconcile's result, since
+  `deregister_app` reports softly and discarding it would record a removal that never
+  happened.
+
+  The identity guard runs BEFORE the enablement check, because the undo deregisters by
+  app NAME: an unreadable enabled state is exactly what would otherwise send a retired
+  watcher into deleting the SUCCESSOR's resources.
+
+  Enablement is **tri-state** — enabled, disabled, or unreadable — read through
+  `manager.app_enabled_state`, NOT `is_app_enabled`. That distinction is the whole
+  mechanism: `_read_installed` returns None for both a missing file and a caught read
+  error, so `is_app_enabled` collapses "unreadable" into False WITHOUT raising. Building
+  the tri-state on it left the unknown branch unreachable for precisely the transient
+  fault it exists to catch. The two callers want opposite defaults on that third state. Refusing to ADD when it is unknown is
+  safe: the app stays as it is. DELETING when it is unknown is not, since the cleanup
+  unlinks materialized agents and `installed.json` can fail to read transiently, so
+  collapsing "unknown" into "disabled" would destroy user edits over a temporary fault.
+  Unknown therefore refuses a promotion AND refuses a deletion, reporting unlanded so the
+  watch retries. That applies at **every** deletion site — the demotion path and both
+  undo calls in `_set_backend_health` — since all three reach the same
+  `deregister_app` → `_deregister_agents` → unlink. A demotion does not even read the
+  state: it is a file access with no bearing on a scrub.
+
+  A **transition always reconciles**, even when `healthy` and `mcp_healthy` agree. That
+  flag can be stale in the other direction after a partial reconcile — an MCP write that
+  landed followed by an agent write that did not leaves it unmoved while the entry is on
+  disk — so matching it across a flip would skip the scrub and strand the dead url. The
+  short-circuit is valid only when the verdict did not change, which is what keeps a
+  settled backend from rewriting `mcp.json` every sweep.
+
+  An **unreadable manifest leaves the scrub unlanded.** Keeping the agents there is
+  right, but it leaves them naming the server just removed, and `refresh_app_agents`
+  gives up on the same condition — so nothing else revisits those files. Reporting it
+  unlanded makes the watch retry until the manifest is readable and the refresh can
+  correct them, instead of recording a job that was only half done.
+- **Teardown participates in the same serialization.** `stop_app_backend` takes
+  `_health_reconcile_lock` across its pop, so it and a reconcile are mutually exclusive:
+  either the reconcile finishes and the pop follows it (the caller's subsequent
+  `deregister_app` then wins), or the pop lands first and the reconcile's identity check
+  fails. Without that, a watcher already past its identity check could still be inside
+  the MCP write when the caller scrubbed, and its write would land after — restoring the
+  dead url this gate exists to keep out of `mcp.json`.
+- **An ADOPTED recovery re-binds ownership before it promotes.** `adopted_pids` is what
+  `stop_app_backend` signals and what uninstall acts behind, and it was captured at
+  adoption. A recovery means the EXTERNAL supervisor put something back, possibly a
+  different process — so the owner set is re-captured through the same consistency
+  sandwich adoption uses, and the promotion is REFUSED when ownership cannot be
+  confirmed. Unhealthy-but-serving is recoverable on the next sweep; a record that claims
+  freshly-valid ownership of a process that is gone is not, because stop would then
+  signal the wrong PIDs while the live replacement keeps running.
+- **The watch is bound to the RECORD, not the app name.** A stop/start installs a
+  new `AppProcess` under the same name with its own watch, so every transition is
+  guarded by `_processes.get(name) is ap`. Resolving by name instead would let a
+  retiring watch demote a successor it never observed. The same guard is how the
+  watch terminates — `stop_app_backend` pops the record — so it needs no separate
+  teardown, and a stale watcher exits before it can probe a port some other
+  backend has since taken.
+- **A reconcile that did not land is retried, not stranded.** The health flag moves
+  whether or not the mcp.json write succeeded, so gating the reconcile on the health
+  *transition* alone would leave a transient failure uncorrected until the next
+  transition — which for a backend that then stays put never arrives, leaving either a
+  dead URL kiro-cli dials every session or a live backend with no MCP entry.
+  `AppProcess.mcp_healthy` records the value last SUCCESSFULLY written — **tri-state**,
+  where `None` means *unknown* (no write has been confirmed) and only `False` means
+  confirmed-scrubbed, so it must never be read as a plain boolean. Each sweep
+  reconciles when the verdict changed **or** when that record is behind the verdict.
+  The terminal exited-process path consults it too, and does not return until the entry
+  is reconciled or the record is dropped. That path is the one place where giving up is
+  permanent — nothing revisits an exited backend — so returning on an unlanded scrub
+  would strand the dead URL for kiro-cli to dial on every session.
+- **The startup poll belongs to ONE generation, bound at the spawn.** The supervisor is
+  handed the `AppProcess` itself and derives both name and port from it; every attempt
+  re-checks that the record is still the tracked one. A name plus a port are two
+  independent inputs that can DISAGREE — a restart landing between the record's insertion
+  and the supervisor thread's first statement would give a name lookup the successor
+  while the port argument still named the predecessor, and the poll would then act on a
+  backend whose port it never probed. Re-resolving by name — even per attempt — lets a stop/start inside the ~30s
+  startup window hand a later attempt the successor, which the poll would then promote,
+  or on exhaustion scrub, on evidence gathered entirely about its predecessor, having
+  never probed the successor's port. The exhaustion scrub is identity-guarded for the
+  same reason: it deregisters by app NAME, and because a bypassing scrub never touches
+  the successor's record, its `mcp_healthy` would still read True and the retry above
+  would never fire to put the entry back.
+- **That identity guard has to stay effective THROUGH the MCP reconcile**, which is
+  why every health transition goes through `_set_backend_health`. The MCP writers key
+  on the app NAME, not on the record — `_deregister_mcp_servers` removes every
+  `<app>:` entry — so checking identity only alongside the flag write would leave a
+  window in which a retiring watcher scrubs the SUCCESSOR's live servers, or
+  republishes its own dead port. `_lock` cannot just be held across the reconcile: it
+  does manifest and config file I/O, so the reverse proxy's `get_app_backend_port`
+  would block behind it on every request, and the `bridges ↔ backend` import cycle
+  makes it a deadlock risk. The ordering is established with a separate
+  `_health_reconcile_lock` that every health-driven reconcile takes, including the
+  startup registration. That is what makes it sufficient: passing the identity check
+  proves the successor is not yet in `_processes` and so has not registered, and its
+  own registration must then queue behind the retiring one — so the last write always
+  belongs to the live record.
+
+**Teardown stops the backend before scrubbing its resources.** `stop_app_backend` pops
+the tracking record, and that pop is what ends the watch's authority to reconcile MCP for
+the app — so it has to happen BEFORE `deregister_app`. Scrubbing first leaves a window in
+which a backend that recovers re-registers the OLD manifest's servers, and entries the
+update removed survive it. Uninstall and the disable rollback already ordered it this
+way; the two update paths in `apps/routes.py` now match them, and
+`test_update_stops_the_backend_before_deregistering_resources` pins it.
+
+`backend_status.running` on `/api/apps` is likewise read off the record
+(`AppProcess.is_running`) rather than asserted from the record merely existing.
+For an adopted backend, where we hold no handle to poll, "we still track it"
+is the only honest answer and `healthy` is the load-bearing signal.
+
+Writers: `apps/backend.py` (`_health_check_loop`, `_watch_backend_health`,
+`_demote`, `_promote`, `_supervise_backend_health`, `_start_health_supervisor`,
+`_start_adopted_health_watch`, `AppProcess.is_running`), `apps/routes.py`
+(`handle_list_apps`).

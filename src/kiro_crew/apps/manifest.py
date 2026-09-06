@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from kiro_crew.constants import WINDOWS_DEVICE_STEMS
+from kiro_crew.cron import is_valid_skip_date, is_valid_timezone
 
 # ---------------------------------------------------------------------------
 # Nested manifest types
@@ -36,6 +37,21 @@ SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+([+-]|$)")
 # reserved system channels (e.g. "system.approval"). Rejected at manifest
 # validation AND defense-in-depth at the push endpoint.
 RESERVED_APP_NAMES = frozenset({"system"})
+
+# Dashboard route segments under ``/apps/`` that resolve to a STATIC page
+# instead of the ``/apps/:name`` installed-app catch-all. An app carrying one
+# of these names would be unreachable: its exact URL (``/apps/library``) is
+# claimed by the page, which is registered before the catch-all. ``detail`` and
+# ``migrate`` need no entry here — their routes carry a mandatory second
+# segment (``/apps/detail/:name``), so a bare ``/apps/detail`` still resolves
+# to an app named "detail" via the catch-all.
+RESERVED_ROUTE_APP_NAMES = frozenset({"library"})
+
+#: Wire code for a reserved-name refusal. Callers that turn ``app_name_error``
+#: into a JSON error response set this as ``AppResult.error_code`` (serialized
+#: as ``code``) so the frontend can switch on the failure instead of parsing
+#: English prose (see ``test_error_code_contract.py``).
+RESERVED_APP_NAME_CODE = "reserved_app_name"
 
 # App names that are not safe portable filesystem identities. An app name becomes
 # a directory (``apps/<name>/``, plus ``apps/<name>/data`` at first startup), and
@@ -84,12 +100,27 @@ def app_name_error(name: str) -> str | None:
             f"app name {name!r} is reserved (would shadow the "
             f"{name}.* notification channel namespace)"
         )
+    if name in RESERVED_ROUTE_APP_NAMES:
+        return (
+            f"app name {name!r} is reserved (the dashboard /apps/{name} route is a "
+            f"static page, so the app's own page would be unreachable)"
+        )
     if name in UNPORTABLE_APP_NAMES:
         return (
             f"app name {name!r} is not portable: Windows reserves it as a device name, "
             f"so the app directory is not safe to create there"
         )
     return None
+
+
+def is_reserved_app_name(name: str) -> bool:
+    """Return True if *name* is refused solely because it is reserved.
+
+    Lets callers that translate ``app_name_error`` prose into a JSON error
+    attach the machine-readable ``RESERVED_APP_NAME_CODE`` for exactly the
+    reserved-name refusals, without re-deriving the reservation sets.
+    """
+    return name in RESERVED_APP_NAMES or name in RESERVED_ROUTE_APP_NAMES
 
 
 def _is_rooted_path(rel_path: str) -> bool:
@@ -154,6 +185,17 @@ def _path_escapes_app_root(rel_path: str, app_root: Path | None) -> bool:
     return False
 
 
+# Expected JSON type per CronEntry field that from_dict type-gates, used to turn
+# a recorded parse-time violation into a message an app author can act on.
+_CRON_FIELD_JSON_TYPES = {
+    "every": "a number of seconds",
+    "agent_sequence": "an array of agent names",
+    "env": "an object of string keys to string values",
+    "timezone": "a string IANA zone name",
+    "skip_dates": "an array of YYYY-MM-DD strings",
+}
+
+
 @dataclass
 class CronEntry:
     """A scheduled agent job declared by an app."""
@@ -170,6 +212,16 @@ class CronEntry:
     env: dict[str, str] = field(default_factory=dict)  # environment variables for the job
     persistent_session: bool = True  # whether to carry context between runs
     silent: bool = False  # suppress dashboard notifications
+    # IANA zone the schedule and skip_dates are evaluated in (e.g.
+    # "America/New_York"). Empty falls back to the gateway config's timezone and
+    # then to UTC, so a job whose hour is only meaningful in one zone -- market
+    # hours, a regional business-day digest -- must name it here. A per-USER zone
+    # is not manifest data: an app that schedules against its user's local time
+    # passes ``timezone`` to ``ctx.cron.add_job`` instead.
+    timezone: str = ""
+    # Calendar dates (YYYY-MM-DD, evaluated in ``timezone``) the job must not
+    # fire on -- e.g. a publisher's own holiday list.
+    skip_dates: list[str] = field(default_factory=list)
     # When False the cron is registered in a paused state (visible in the
     # dashboard Schedule view, resumable) instead of firing on install/enable.
     # Apps that need user configuration before their crons are useful ship
@@ -180,6 +232,14 @@ class CronEntry:
     # silently re-creating the fires-unconfigured bug). Reported as a
     # validation error; never serialized.
     enabled_type_invalid: bool = False
+    # Names of container/numeric fields whose manifest value was PRESENT and
+    # non-null but of the wrong JSON type. Parsing degrades them to the field's
+    # empty value so /api/apps/register cannot 500, and validate() reports each
+    # one -- erasing a wrong-typed value SILENTLY would be its own bug: an
+    # author who wrote "skip_dates": "2026-12-25" (a string, not an array) asked
+    # for a skip, and dropping it without a word lets the job fire on the
+    # excluded date. Same shape as enabled_type_invalid; never serialized.
+    type_invalid_fields: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"name": self.name}
@@ -199,6 +259,10 @@ class CronEntry:
             d["agent_sequence"] = self.agent_sequence
         if self.env:
             d["env"] = self.env
+        if self.timezone:
+            d["timezone"] = self.timezone
+        if self.skip_dates:
+            d["skip_dates"] = self.skip_dates
         if not self.persistent_session:
             d["persistent_session"] = False
         if self.silent:
@@ -212,16 +276,84 @@ class CronEntry:
         def _str_or_empty(v: Any) -> str:
             return v if isinstance(v, str) else ""
 
-        return cls(
+        # app.json is third-party, hand-editable input reached from
+        # /api/apps/register, so a wrong JSON TYPE must not raise:
+        # `data.get(key, [])` defends only the ABSENT key, and an explicit
+        # `"skip_dates": null` (or a scalar, or an object) returns that value,
+        # after which the comprehension raises TypeError / AttributeError out of
+        # from_dict and surfaces as an HTTP 500 rather than a validation error.
+        # Two distinct cases, deliberately treated differently:
+        #   * null == "not set" -> the empty value, no error (mirrors
+        #     _str_or_empty, and JSON null is how generators spell "absent").
+        #   * present, non-null, WRONG type -> the empty value AND a recorded
+        #     violation, because silently erasing it would drop a skip date the
+        #     author asked for and let the job fire on that date.
+        invalid: list[str] = []
+
+        def _list_or_empty(key: str, v: Any) -> list[Any]:
+            if isinstance(v, list):
+                return v
+            if v is not None:
+                invalid.append(key)
+            return []
+
+        def _dict_or_empty(key: str, v: Any) -> dict[Any, Any]:
+            if isinstance(v, dict):
+                return v
+            if v is not None:
+                invalid.append(key)
+            return {}
+
+        def _int_or_zero(key: str, v: Any) -> int:
+            # bool is an int subclass, so `"every": true` would pass isinstance
+            # and coerce to a 1-second interval; it is a type slip, not a
+            # schedule. 0 is already the "not set, use cron_expr" value.
+            if isinstance(v, bool):
+                invalid.append(key)
+                return 0
+            try:
+                return int(v)
+            except (TypeError, ValueError, OverflowError):
+                # OverflowError is the infinity case: json.loads accepts
+                # `"every": 1e1000000` and yields float('inf'), which int()
+                # refuses. NaN lands in ValueError. A merely ENORMOUS finite
+                # value is not caught here and does not need to be -- it is a
+                # valid int, and compute_next_run_ts already absorbs it into
+                # "next run unknown" rather than raising.
+                if v is not None:
+                    invalid.append(key)
+                return 0
+
+        def _str_or_flagged(key: str, v: Any) -> str:
+            # `timezone` gets the recording treatment that plain _str_or_empty
+            # does not, because discarding it silently reproduces the very bug
+            # this field exists to fix: validation would pass, the job would
+            # persist timezone="" and fire in the fallback zone (UTC on a fresh
+            # install), and the author would see a schedule running on the wrong
+            # calendar day with nothing anywhere saying why. A discarded `agent`
+            # or `message` degrades visibly; a discarded zone does not.
+            if isinstance(v, str):
+                return v
+            if v is not None:
+                invalid.append(key)
+            return ""
+
+        entry = cls(
             name=_str_or_empty(data.get("name")),
-            every=int(data.get("every", 0)),
+            every=_int_or_zero("every", data.get("every", 0)),
             cron_expr=_str_or_empty(data.get("cron_expr")),
             agent=_str_or_empty(data.get("agent")),
             message=_str_or_empty(data.get("message")),
             command=_str_or_empty(data.get("command")),
             script=_str_or_empty(data.get("script")),
-            agent_sequence=[str(a) for a in data.get("agent_sequence", [])],
-            env={str(k): str(v) for k, v in data.get("env", {}).items()},
+            agent_sequence=[
+                str(a) for a in _list_or_empty("agent_sequence", data.get("agent_sequence"))
+            ],
+            env={
+                str(k): str(v) for k, v in _dict_or_empty("env", data.get("env")).items()
+            },
+            timezone=_str_or_flagged("timezone", data.get("timezone")),
+            skip_dates=[str(d) for d in _list_or_empty("skip_dates", data.get("skip_dates"))],
             persistent_session=bool(data.get("persistent_session", True)),
             silent=bool(data.get("silent", False)),
             # STRICT boolean: "enabled" gates whether a cron fires at all, so a
@@ -232,6 +364,8 @@ class CronEntry:
             enabled=(data["enabled"] if isinstance(data.get("enabled"), bool) else True),
             enabled_type_invalid=("enabled" in data and not isinstance(data["enabled"], bool)),
         )
+        entry.type_invalid_fields = invalid
+        return entry
 
 
 @dataclass
@@ -1158,6 +1292,30 @@ class AppManifest:
                 errors.append(
                     f"cron entry {cron.name!r}: 'command' and 'script' are mutually exclusive"
                 )
+            # Calendar fields are validated HERE as well as at the persistence
+            # owner. register_app_crons_with_service catches a per-job
+            # ValueError, logs it and moves on, so a bad zone shipped in a
+            # manifest would otherwise register nothing and say so only in the
+            # gateway log -- the app author sees a cron that silently does not
+            # exist. Surfacing it as a manifest validation error reports it at
+            # install/validate time instead.
+            for _bad in cron.type_invalid_fields:
+                errors.append(
+                    f"cron entry {cron.name!r}: {_bad!r} has the wrong JSON type "
+                    f"(expected {_CRON_FIELD_JSON_TYPES.get(_bad, 'a different type')}); "
+                    f"the value was ignored"
+                )
+            if cron.timezone and not is_valid_timezone(cron.timezone):
+                errors.append(
+                    f"cron entry {cron.name!r}: unknown timezone: {cron.timezone!r} "
+                    f"(expected an IANA zone name such as 'America/New_York')"
+                )
+            for _skip in cron.skip_dates:
+                if not is_valid_skip_date(_skip):
+                    errors.append(
+                        f"cron entry {cron.name!r}: invalid skip_date: {_skip!r} "
+                        f"(expected zero-padded YYYY-MM-DD)"
+                    )
             if cron.enabled_type_invalid:
                 errors.append(
                     f"cron entry {cron.name!r}: 'enabled' must be a JSON boolean "

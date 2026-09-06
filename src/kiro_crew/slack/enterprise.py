@@ -35,6 +35,15 @@ logger = logging.getLogger(__name__)
 _validated_team_id: str = ""
 _validated_enterprise_id: str = ""
 
+# The gateway's OWN bot_id, from the same startup ``auth.test`` response.
+# Consulted by the trusted-bot admission in ``events.py`` so an operator who
+# mistakenly lists this gateway's own bot id in ``slack.trusted_bot_ids``
+# cannot make the gateway reply to itself in a loop.  Empty when auth.test
+# was unavailable — the admission then fails CLOSED (trusts nobody), because
+# a trust feature without verifiable self identity cannot apply its
+# self-exclusion.
+_validated_self_bot_id: str = ""
+
 # Set of team_ids accepted by check_message_origin().  Contains the
 # validated team_id plus any workspace IDs explicitly listed in
 # ``slack.allowed_enterprise_ids`` config — populated once during
@@ -323,13 +332,14 @@ def validate_enterprise(
     another edition implements against a different allowlist source.
     """
     global _validated_team_id, _validated_enterprise_id, _allowed_team_ids
-    global _allowlist_configured
+    global _allowlist_configured, _validated_self_bot_id
 
     # Clear stale state before re-validating.
     _validated_team_id = ""
     _validated_enterprise_id = ""
     _allowed_team_ids = set()
     _allowlist_configured = False
+    _validated_self_bot_id = ""
 
     extra = extra_ids or set()
 
@@ -436,6 +446,11 @@ def validate_enterprise(
     # slack.allowed_enterprise_ids config).
     _validated_team_id = team_id
     _validated_enterprise_id = enterprise_id
+    # auth.test on a bot token also names the bot's OWN bot_id; cache it so
+    # the trusted-bot admission can refuse the gateway's own id (self-reply
+    # loop guard). str() defends against a non-string field in a degraded
+    # response.
+    _validated_self_bot_id = str(resp.get("bot_id") or "")
     degraded = _load_allowed_team_ids()
     if extra and degraded:
         # The config read REFUSED, and ``extra`` is the caller's own
@@ -537,6 +552,20 @@ def validate_enterprise(
         resources=f"enterprise_id={enterprise_id} team={team} team_id={team_id}",
     )
     return True
+
+
+def validated_self_bot_id() -> str:
+    """The gateway's own bot_id from startup ``auth.test`` ("" when unavailable).
+
+    Zero-cost in-memory read.  Consulted by the trusted-bot admission so the
+    gateway's own id is never trusted even when an operator mistakenly lists
+    it in ``slack.trusted_bot_ids`` (a self-reply loop otherwise).  Empty when
+    auth.test failed or has not run — the admission then FAILS CLOSED and
+    trusts nobody: a trust feature is configured but the identity needed to
+    apply its self-exclusion cannot be verified, the same posture enterprise
+    validation takes for an allowlist with unverifiable workspace identity.
+    """
+    return _validated_self_bot_id
 
 
 def check_message_origin(event_team_id: str) -> bool:

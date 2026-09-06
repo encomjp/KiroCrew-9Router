@@ -771,7 +771,7 @@ def test_env_sidecar_directory_goes_through_make_owner_only_dir(
 def test_failed_sidecar_protection_leaves_no_readable_credentials(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """An icacls failure must not leave the credentials on disk.
+    """A lockdown failure must not leave the credentials on disk.
 
     The previous order wrote the sidecar first (with a mode argument that is
     inert on Windows) and applied the DACL afterwards, catching the failure with
@@ -803,7 +803,7 @@ def test_failed_sidecar_protection_leaves_no_readable_credentials(
         test would stop short of the behaviour under test.
         """
         if Path(path).parent.name == "env":
-            raise OSError("icacls: access denied")
+            raise OSError("SetNamedSecurityInfoW: access denied")
 
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_POSIX", False)
     monkeypatch.setattr("kiro_crew.mcp_gateway.rewriter.platform_compat.IS_WINDOWS", True)

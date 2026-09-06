@@ -37,8 +37,8 @@ describe('SessionArchive empty state', () => {
       const link = container.querySelector('a')
       expect(link, 'expected the settingRef chip to render as an anchor (ui mode)').not.toBeNull()
       const href = link!.getAttribute('href') ?? ''
-      expect(href).toContain('/settings')
-      expect(href).toContain('tab=chat')
+      // Deep links mint the PATH form now (/settings/<tab>), not ?tab=.
+      expect(href).toContain('/settings/chat')
       expect(href).toMatch(/highlight=key(%3A|:)session\.autocompact_pct/)
       expect(link!.textContent).toContain('session.autocompact_pct')
     })

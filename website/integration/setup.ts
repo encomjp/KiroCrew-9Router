@@ -3,43 +3,6 @@ import '@testing-library/jest-dom'
 import { server } from './mocks/server'
 import { initI18n, i18next } from '../src/i18n'
 
-// --- happy-dom teardown AbortError guard -------------------------------------
-// happy-dom navigates a live `<iframe src>` by scheduling an async fetch task on
-// DOM insertion. When a fork worker tears the window down between files, vitest's
-// teardownWindow calls AsyncTaskManager.abortAll(), which rejects any still
-// in-flight iframe/sub-resource Fetch with `DOMException [AbortError]`. The test
-// that mounted the iframe has already finished, so nothing awaits that rejection:
-// it surfaces as a run-level unhandled rejection and fails the whole shard with
-// zero failing tests — a teardown-timing race whose exposure shifts with worker
-// and file count. The blob-iframe path is closed by stubbing createObjectURL
-// (below), but a direct `<iframe src="http://host/...">` (e.g. InstancesViewport,
-// InstanceTabBar) still schedules a real fetch task. Swallow ONLY happy-dom's
-// teardown abort — every other unhandled rejection still propagates and fails
-// the run as it should.
-process.on('unhandledRejection', (reason) => {
-  const isTeardownAbort =
-    reason instanceof Error &&
-    reason.name === 'AbortError' &&
-    typeof reason.stack === 'string' &&
-    reason.stack.includes('onAsyncTaskManagerAbort')
-  if (isTeardownAbort) return  // orphaned iframe fetch aborted during window teardown
-
-  // ECONNREFUSED from a stale happy-dom async fetch that fires AFTER msw's
-  // server.close() — the request escapes interception, dials the real TCP stack,
-  // and gets refused because no gateway is listening on the test-document origin
-  // (localhost:6776). Same teardown-timing race, different symptom: AggregateError
-  // wrapping ECONNREFUSED from node:net instead of AbortError from happy-dom.
-  // Scoped to port 6776 (the test document origin pinned in vite.config.ts) so a
-  // genuine test dial to an unexpected port still fails the run.
-  const isPostMswDial =
-    reason instanceof Error &&
-    (reason as NodeJS.ErrnoException).code === 'ECONNREFUSED' &&
-    String(reason).includes('6776')
-  if (isPostMswDial) return  // orphaned fetch hit real TCP after msw closed
-
-  throw reason  // re-raise anything else so the run still fails on a real leak
-})
-
 // lottie-web registers a module-scoped `setInterval(checkReady, 100)` purely by
 // being IMPORTED (`readyStateCheckInterval` in the prebuilt player bundles). That
 // interval belongs to no AnimationItem, so neither `anim.destroy()` nor RTL
@@ -188,14 +151,6 @@ export function beginTimerTeardown(): number {
   timersTearingDown = true
   return clearLeakedTimers()
 }
-
-// Registered FIRST on purpose: vitest runs after-hooks in reverse registration
-// order, so this executes after the msw `server.close()` below -- immediately
-// before environment teardown, when anything still pending is by definition a
-// leak about to fire into a torn-down document.
-afterAll(() => {
-  beginTimerTeardown()
-})
 
 // Initialize i18n for EVERY test file, pinned to English.
 //
@@ -532,3 +487,27 @@ afterEach(() => {
 
 // Clean up after all tests are done
 afterAll(() => server.close())
+
+/**
+ * Stop late Node-timer registrations, then let happy-dom finish every task it
+ * already owns while MSW is still listening.  This fixes the lifecycle rather
+ * than hiding AbortError/ECONNREFUSED after the responsible test has finished.
+ *
+ * The API is passed in so the ordering contract has a deterministic unit test;
+ * production passes `window.happyDOM` below.
+ */
+export async function settleDOMTasksBeforeMockShutdown(
+  happyDOM: { waitUntilComplete: () => Promise<void> } | undefined,
+): Promise<void> {
+  beginTimerTeardown()
+  // A handful of suites opt into jsdom and still load this shared setup. They
+  // have no happy-dom task queue to drain, but timer teardown remains required.
+  if (happyDOM) await happyDOM.waitUntilComplete()
+}
+
+// Vitest runs after-hooks in reverse registration order. Register this AFTER
+// server.close() so the task drain completes first and no deferred iframe or
+// resource fetch can escape interception and dial localhost during teardown.
+afterAll(async () => {
+  await settleDOMTasksBeforeMockShutdown(window.happyDOM)
+})

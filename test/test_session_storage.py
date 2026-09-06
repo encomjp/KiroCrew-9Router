@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -764,6 +765,40 @@ class TestManifestPersistenceFailure:
         assert (crew_home / "sessions" / "dashboard_chat-1.jsonl").is_file()
         assert session_storage.list_trash() == []
 
+    def test_rewrite_fsyncs_before_publishing_manifest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A crash after publish must not expose manifest bytes still only in cache."""
+        from kiro_crew import atomic_write as atomic_write_module
+
+        batch = tmp_path / "batch"
+        batch.mkdir()
+        events: list[str] = []
+        real_fsync = atomic_write_module.os.fsync
+        real_replace = atomic_write_module.replace_with_retry
+
+        def tracking_fsync(fd: int) -> None:
+            events.append("fsync")
+            real_fsync(fd)
+
+        def tracking_replace(src: str | Path, dst: str | Path) -> None:
+            events.append("replace")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(atomic_write_module.os, "fsync", tracking_fsync)
+        monkeypatch.setattr(atomic_write_module, "replace_with_retry", tracking_replace)
+        header = {"schema": session_storage.MANIFEST_SCHEMA, "batch_id": "batch"}
+        entries = [{"uid": "aaaa1111", "files": []}]
+
+        session_storage._rewrite_manifest(batch, header, entries)
+
+        assert events.index("fsync") < events.index("replace")
+        manifest = batch / session_storage.MANIFEST_NAME
+        assert [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()] == [
+            header,
+            *entries,
+        ]
+
 
 class TestBatchIdentityIsTheDirectory:
     def test_a_header_naming_another_batch_is_not_offered(self, stores: tuple[Path, Path]) -> None:
@@ -800,6 +835,407 @@ class TestBatchIdentityIsTheDirectory:
 
         assert [b.batch_id for b in listed] == [batch.batch_id]
         assert (session_storage.trash_root() / listed[0].batch_id).is_dir()
+
+
+class TestTrashBatchNamesAreLogSafe:
+    """A batch directory name is agent-controlled and can embed a newline; every
+    ``list_trash`` log line that carries it must escape it, or one record forges
+    additional records (refs #6315, the #6281 log-forgery class).
+    """
+
+    _FORGED = "20240101T000000-deadbeef\nWARNING forged: batch cleared by operator"
+
+    @staticmethod
+    def _make_forged_dir(name: str) -> Path:
+        forged = session_storage.trash_root() / name
+        try:
+            forged.mkdir(parents=True)
+        except OSError:
+            pytest.skip("this filesystem refuses a newline in a directory name")
+        return forged
+
+    def test_missing_manifest_log_escapes_the_batch_name(
+        self, stores: tuple[Path, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self._make_forged_dir(self._FORGED)
+
+        with caplog.at_level(logging.DEBUG, logger="kiro_crew.session_storage"):
+            assert session_storage.list_trash() == []
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if "no readable manifest" in record.getMessage()
+        ]
+        assert messages, "the missing-manifest site did not log at all"
+        # The rendered record stays one line: the name appears repr'd, and the
+        # injected second line never starts a record of its own.
+        assert all("\n" not in message for message in messages)
+        assert any(repr(self._FORGED) in message for message in messages)
+
+    def test_batch_id_disagreement_log_escapes_the_batch_name(
+        self, stores: tuple[Path, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"], reason="manual", index=_index(), now=_NOW
+        )
+        # Renaming the directory makes its manifest header disagree with it,
+        # which is exactly the warning path under test.
+        original = session_storage.trash_root() / batch.batch_id
+        try:
+            original.rename(session_storage.trash_root() / self._FORGED)
+        except OSError:
+            pytest.skip("this filesystem refuses a newline in a directory name")
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            assert session_storage.list_trash() == []
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if "claiming batch id" in record.getMessage()
+        ]
+        assert messages, "the batch-id-disagreement site did not log at all"
+        assert all("\n" not in message for message in messages)
+        assert any(repr(self._FORGED) in message for message in messages)
+
+    def test_both_sites_escape_without_touching_the_filesystem(
+        self,
+        stores: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Windows refuses a newline in a real directory name, which would skip
+        the two filesystem tests above on those shards. Injecting the forged
+        name at the manifest-read seam pins both log sites on every platform.
+        """
+        session_storage.trash_root().mkdir(parents=True)
+
+        class _ForgedDir:
+            name = self._FORGED
+
+            @staticmethod
+            def is_dir() -> bool:
+                return True
+
+        # Shaped for `_summarize_manifest` — (header, sessions, staged_bytes) —
+        # because that is the seam `list_trash` reads since #6312. Patching
+        # `_read_manifest` instead lets the real `_summarize_manifest` run, and it
+        # does `batch / MANIFEST_NAME`, which a name-only double cannot support.
+        manifests: dict[str, tuple[dict[str, object], int, int] | None] = {
+            "missing": None,
+            "disagreeing": ({"batch_id": "someone-else", "created_at": _NOW}, 0, 0),
+        }
+
+        # Forge ONLY the trash root's own enumeration, via a Path subclass whose
+        # `iterdir` yields the double. Patching `session_storage.Path.iterdir`
+        # (i.e. `pathlib.Path.iterdir`) globally leaks across the xdist worker:
+        # a sibling test in the same process that legitimately iterates a real
+        # directory then reaches the unpatched `_summarize_manifest`, which does
+        # `<_ForgedDir> / MANIFEST_NAME` and raises TypeError (refs #6425).
+        class _ForgedRoot(type(session_storage.trash_root())):
+            def iterdir(self):  # type: ignore[override]
+                return iter([_ForgedDir()])
+
+        forged_root = _ForgedRoot(session_storage.trash_root())
+
+        for label, parsed in manifests.items():
+            caplog.clear()
+            monkeypatch.setattr(session_storage, "trash_root", lambda: forged_root)
+            monkeypatch.setattr(
+                session_storage.platform_compat, "is_link_or_junction", lambda p: False
+            )
+            monkeypatch.setattr(
+                session_storage, "_summarize_manifest", lambda batch, parsed=parsed: parsed
+            )
+
+            with caplog.at_level(logging.DEBUG, logger="kiro_crew.session_storage"):
+                assert session_storage.list_trash() == []
+
+            rendered = [record.getMessage() for record in caplog.records]
+            carrying = [message for message in rendered if repr(self._FORGED) in message]
+            assert carrying, f"the {label}-manifest site did not log the name repr'd"
+            assert all("\n" not in message for message in rendered)
+
+
+class TestUntrustedNamesAreLogSafeOutsideListTrash:
+    """The forgery primitive of :class:`TestTrashBatchNamesAreLogSafe`, at the
+    sibling sites outside ``list_trash`` (refs #6344, the #6281 class).
+
+    Two operands carry it, and they are not equally reachable. A manifest-supplied
+    ``uid`` is read off disk with no validation, so its sites take a forged value
+    end to end. A batch DIRECTORY name reaches its sites only through
+    :func:`_batch_dir`, whose id pattern rejects a newline, so those conversions
+    are defence in depth and are pinned at the seam each helper already offers —
+    which is also what keeps them covered on Windows shards, where a hostile
+    directory name cannot be created at all.
+    """
+
+    _FORGED_UID = "aaaa1111\nWARNING forged: session restored by operator"
+    _FORGED_NAME = "20240101T000000-deadbeef\nWARNING forged: batch cleared by operator"
+
+    @staticmethod
+    def _staged(kiro_home: Path) -> tuple[str, Path]:
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["aaaa1111"], reason="manual", index=_index(), now=_NOW
+        )
+        return batch.batch_id, session_storage.trash_root() / batch.batch_id
+
+    @classmethod
+    def _forge_uid(cls, batch: Path, *, files: object | None = None) -> None:
+        """Rewrite the batch's one manifest entry under a forged uid.
+
+        The uid is JSON-escaped on the way to disk, so the manifest itself stays
+        one line — the forgery only materializes if a log renders the value raw.
+        """
+        manifest = batch / session_storage.MANIFEST_NAME
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+        entry = json.loads(lines[1])
+        entry["uid"] = cls._FORGED_UID
+        if files is not None:
+            entry["files"] = files
+        manifest.write_text(f"{lines[0]}\n{json.dumps(entry)}\n", encoding="utf-8")
+
+    @staticmethod
+    def _carrying(caplog: pytest.LogCaptureFixture, needle: str) -> list[str]:
+        return [record.getMessage() for record in caplog.records if needle in record.getMessage()]
+
+    def _assert_escaped(self, messages: list[str], value: str, site: str) -> None:
+        assert messages, f"the {site} site did not log at all"
+        # One record stays one record: the value appears repr'd, so the injected
+        # second line never starts a record of its own.
+        assert all("\n" not in message for message in messages)
+        assert any(repr(value) in message for message in messages)
+
+    def test_a_forged_uid_is_escaped_when_a_manifest_record_is_not_an_object(
+        self, stores: tuple[Path, Path], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _, kiro_home = stores
+        batch_id, batch = self._staged(kiro_home)
+        self._forge_uid(batch, files=["not-an-object"])
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            assert session_storage.restore(batch_id) == 0
+
+        self._assert_escaped(
+            self._carrying(caplog, "is not an object"), self._FORGED_UID, "unreadable-record"
+        )
+
+    def test_a_forged_uid_is_escaped_when_the_session_was_recreated(
+        self,
+        stores: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _, kiro_home = stores
+        batch_id, batch = self._staged(kiro_home)
+        self._forge_uid(batch)
+        # The occupant-wins branch: the session came back between the preflight
+        # and the move, so the batch keeps its entry.
+        monkeypatch.setattr(session_storage, "_move_file_exclusive", lambda src, dst: False)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            assert session_storage.restore(batch_id) == 0
+
+        self._assert_escaped(
+            self._carrying(caplog, "was recreated while being restored"),
+            self._FORGED_UID,
+            "lost-race",
+        )
+
+    def test_a_forged_uid_is_escaped_when_the_restore_cannot_finish(
+        self,
+        stores: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        _, kiro_home = stores
+        batch_id, batch = self._staged(kiro_home)
+        self._forge_uid(batch)
+
+        def _refuse(src: Path, dst: Path) -> bool:
+            raise OSError("the store is read-only")
+
+        monkeypatch.setattr(session_storage, "_move_file_exclusive", _refuse)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            assert session_storage.restore(batch_id) == 0
+
+        self._assert_escaped(
+            self._carrying(caplog, "could not fully restore session"),
+            self._FORGED_UID,
+            "restore-failed",
+        )
+
+    def test_the_manifest_rollback_site_escapes_the_session_id(
+        self,
+        stores: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """This uid comes from the caller's validated list, so the conversion is
+        defence in depth; the test pins it rather than claiming reachability.
+        """
+        _, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+
+        def _refuse(handle: object, entry: dict[str, object]) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(session_storage, "_append_entry", _refuse)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            with pytest.raises(SessionStorageError):
+                session_storage.move_to_trash(
+                    ["aaaa1111"], reason="manual", index=_index(), now=_NOW
+                )
+
+        self._assert_escaped(
+            self._carrying(caplog, "could not record session"), "aaaa1111", "manifest-rollback"
+        )
+
+    def test_the_discard_and_incomplete_sites_escape_the_batch_name(
+        self,
+        stores: tuple[Path, Path],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Both keep-the-batch branches and the still-on-disk branch, at the
+        ``_unlisted_files`` seam — no hostile directory has to exist on disk.
+        """
+        forged = session_storage.trash_root() / self._FORGED_NAME
+        # Neither branch may write: the point under test is the log line.
+        monkeypatch.setattr(session_storage, "_rewrite_manifest", lambda *a, **k: None)
+
+        def _refuse(batch: Path) -> list[Path]:
+            raise SessionStorageError(f"could not read all of {batch.name!r}")
+
+        monkeypatch.setattr(session_storage, "_unlisted_files", _refuse)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            session_storage._discard_restored_batch(forged, {})
+        self._assert_escaped(
+            self._carrying(caplog, "keeping trash batch"), self._FORGED_NAME, "unreadable-scan"
+        )
+
+        caplog.clear()
+        monkeypatch.setattr(
+            session_storage, "_unlisted_files", lambda batch: [forged / "orphan.jsonl"]
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            session_storage._discard_restored_batch(forged, {})
+        self._assert_escaped(
+            self._carrying(caplog, "keeping trash batch"), self._FORGED_NAME, "leftover-files"
+        )
+
+        caplog.clear()
+
+        class _ForgedBatch:
+            name = self._FORGED_NAME
+
+            @staticmethod
+            def exists() -> bool:
+                return True
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            assert (
+                session_storage._incomplete_if_present(_ForgedBatch())
+                == session_storage.SKIP_INCOMPLETE
+            )
+        self._assert_escaped(
+            self._carrying(caplog, "did not remove it"), self._FORGED_NAME, "still-present"
+        )
+
+    def test_the_empty_trash_sites_escape_what_they_name(
+        self,
+        stores: tuple[Path, Path],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The three refusals in the sweep, at the ``_batch_dir`` seam."""
+        session_storage.trash_root().mkdir(parents=True, exist_ok=True)
+        forged = session_storage.trash_root() / self._FORGED_NAME
+
+        class _Batch:
+            batch_id = "20240101T000000-deadbeef"
+
+        monkeypatch.setattr(session_storage, "list_trash", lambda: [_Batch()])
+        monkeypatch.setattr(session_storage, "_batch_dir", lambda batch_id: forged)
+
+        def _refuse(batch: Path) -> list[Path]:
+            raise SessionStorageError("could not read all of it")
+
+        monkeypatch.setattr(session_storage, "_unlisted_files", _refuse)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            assert session_storage.empty_trash() == 0
+        self._assert_escaped(
+            self._carrying(caplog, "refusing to empty"), self._FORGED_NAME, "unreadable-batch"
+        )
+
+        caplog.clear()
+        monkeypatch.setattr(
+            session_storage, "_unlisted_files", lambda batch: [forged / "orphan.jsonl"]
+        )
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            assert session_storage.empty_trash() == 0
+        self._assert_escaped(
+            self._carrying(caplog, "refusing to empty"), self._FORGED_NAME, "leftover-files"
+        )
+
+        # The outside-the-root refusal names the PATH, so its repr is the Path's.
+        caplog.clear()
+        outside = tmp_path / self._FORGED_NAME
+        monkeypatch.setattr(session_storage, "_batch_dir", lambda batch_id: outside)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            assert session_storage.empty_trash() == 0
+        messages = self._carrying(caplog, "outside the trash root")
+        assert messages, "the outside-the-root site did not log at all"
+        assert all("\n" not in message for message in messages)
+        assert any(repr(outside) in message for message in messages)
+
+    def test_the_unreadable_scan_error_escapes_the_batch_name(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The two refusal sites render this exception with ``%s``, so the name has
+        to be escaped where the exception is BUILT or the escape at the log site is
+        undone by the text it carries.
+        """
+        forged = session_storage.trash_root() / self._FORGED_NAME
+
+        # The error carries a hostile .filename, which is the half the batch-name
+        # escape does not cover: its string form is interpolated into the same
+        # message.
+        planted = OSError(13, "Permission denied", str(forged / self._FORGED_NAME))
+
+        # ``session_storage.os`` is the global module, so this patch is also seen
+        # by ``shutil.rmtree`` during fixture teardown (which passes ``topdown=``
+        # on Windows).  Accept the real signature and divert only the walk of the
+        # forged batch, delegating every other call to the genuine ``os.walk``.
+        real_walk = os.walk
+
+        def _walk(top, *args, onerror=None, **kwargs):  # type: ignore[no-untyped-def]
+            if Path(top) == forged:
+                assert callable(onerror)
+                onerror(planted)
+                return iter(())
+            return real_walk(top, *args, onerror=onerror, **kwargs)
+
+        monkeypatch.setattr(session_storage.os, "walk", _walk)
+        monkeypatch.setattr(session_storage, "_manifest_rels", lambda batch: [])
+
+        with pytest.raises(SessionStorageError) as raised:
+            session_storage._unlisted_files(forged)
+
+        # Both halves of the message are newline-free: the name because this call
+        # site reprs it, and the interpolated OSError because ``OSError.__str__``
+        # reprs its own ``.filename``. The second half is why the error operand is
+        # correctly left as %s at the sites that render it.
+        assert "\n" not in str(raised.value)
+        assert repr(self._FORGED_NAME) in str(raised.value)
+        assert "Permission denied" in str(raised.value)
 
 
 class TestScanCache:
@@ -924,6 +1360,351 @@ class TestScanCache:
         session_storage.move_to_trash(["aaaa1111"], reason="manual", index=_index(), now=_NOW)
 
         assert session_storage.list_units(_index()) == []
+
+    def test_a_hit_is_served_for_an_equal_but_distinct_pairing_dict(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The key compares the pairing by value, so a fresh dict of equal
+        contents must reuse the pass — callers rebuild the mapping per call."""
+        crew_home, kiro_home = stores
+        stem1 = transcript_stem("dashboard:chat-1")
+        stem2 = transcript_stem("dashboard:chat-2")
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=32, age_days=40)
+        _transcript(crew_home, stem1, size=64, age_days=40)
+        _transcript(crew_home, stem2, size=64, age_days=40)
+
+        session_storage.list_units(_multi_index({stem1: "aaaa1111", stem2: "bbbb2222"}))  # prime
+
+        calls = 0
+        real = session_storage._scan_raw_uncached
+
+        def counted(sid_for_stem):
+            nonlocal calls
+            calls += 1
+            return real(sid_for_stem)
+
+        monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
+        # A distinct dict object with equal contents built in the opposite
+        # insertion order, so an order-sensitive comparison would also miss.
+        session_storage.list_units(_multi_index({stem2: "bbbb2222", stem1: "aaaa1111"}))
+
+        assert calls == 0, "an equal-by-value pairing must be served from the cached pass"
+
+    def test_a_repointed_stem_with_unchanged_length_is_a_miss(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One stem repointed to a different sid, same mapping length, must
+        re-enumerate.
+
+        This is the behavioural pin for the failure an ``id()``/``len()``
+        memoisation of the pairing would permit: a length-preserving repoint
+        served from a pass built under the old pairing. The deterministic
+        key-level half lives in
+        :meth:`test_scan_key_distinguishes_same_length_mappings` — this test
+        alone cannot force CPython to recycle the first dict's ``id()``.
+        """
+        crew_home, kiro_home = stores
+        stem1 = transcript_stem("dashboard:chat-1")
+        stem2 = transcript_stem("dashboard:chat-2")
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=32, age_days=40)
+        _transcript(crew_home, stem1, size=64, age_days=40)
+        _transcript(crew_home, stem2, size=64, age_days=40)
+
+        session_storage.list_units(_multi_index({stem1: "aaaa1111", stem2: "bbbb2222"}))  # prime
+
+        calls = 0
+        real = session_storage._scan_raw_uncached
+
+        def counted(sid_for_stem):
+            nonlocal calls
+            calls += 1
+            return real(sid_for_stem)
+
+        monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
+        # Same keys, same length — only one value repointed.
+        session_storage.list_units(_multi_index({stem1: "aaaa1111", stem2: "aaaa1111"}))
+
+        assert calls == 1, "a repointed pairing must not be answered from the old pass"
+
+    def test_a_callers_in_place_edit_after_priming_is_a_miss(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The stored key must be a snapshot, not an alias of the caller's dict.
+
+        ``dict(sid_for_stem)`` is the only thing making it one — passing the
+        mapping straight through still satisfies the type annotation. Aliased,
+        a caller's in-place repoint would mutate the stored key in lockstep,
+        so the stale pass would compare EQUAL to the new pairing and be served
+        as a hit — the exact failure the key exists to prevent.
+        """
+        crew_home, kiro_home = stores
+        stem1 = transcript_stem("dashboard:chat-1")
+        stem2 = transcript_stem("dashboard:chat-2")
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=32, age_days=40)
+        _transcript(crew_home, stem1, size=64, age_days=40)
+        _transcript(crew_home, stem2, size=64, age_days=40)
+
+        pairing = {stem1: "aaaa1111", stem2: "bbbb2222"}
+        session_storage.list_units(SessionIndex(stem_to_sid=pairing))  # prime
+
+        calls = 0
+        real = session_storage._scan_raw_uncached
+
+        def counted(sid_for_stem):
+            nonlocal calls
+            calls += 1
+            return real(sid_for_stem)
+
+        monkeypatch.setattr(session_storage, "_scan_raw_uncached", counted)
+        pairing[stem2] = "aaaa1111"  # the caller's own dict, edited in place
+        session_storage.list_units(SessionIndex(stem_to_sid=pairing))
+
+        assert calls == 1, "an in-place repoint must miss; the stored key may not alias it"
+
+    def test_scan_key_distinguishes_same_length_mappings(self) -> None:
+        """Deterministic key-level guard against a length-based pairing key.
+
+        The pairing element must compare unequal for same-length mappings that
+        differ in one value — this is what rules out memoising on
+        ``id()``+``len()`` (CPython reuses ``id()`` after garbage collection,
+        so identity plus length cannot stand in for contents).
+        """
+        a = session_storage._scan_key({"s1": "aaaa", "s2": "bbbb"})
+        b = session_storage._scan_key({"s1": "aaaa", "s2": "aaaa"})
+        assert a[2] != b[2], "same-length repointed mappings must produce unequal keys"
+
+    def test_scan_key_is_unhashable_so_it_can_never_be_a_hash_key(self) -> None:
+        """The docstring's "never hashed" is enforced by the interpreter.
+
+        A future refactor that hashes the key (a dict-keyed cache, a set of
+        keys) must fail loudly at runtime, not silently collide.
+        """
+        with pytest.raises(TypeError):
+            hash(session_storage._scan_key({"a": "1"}))
+
+    def test_scan_key_pairing_equality_matches_the_sorted_tuple_form(self) -> None:
+        """``dict(a) == dict(b)`` iff ``tuple(sorted(a.items())) == tuple(sorted(b.items()))``.
+
+        This pins the equivalence the key relies on: the dict snapshot answers the
+        equality question identically to the sorted-tuple form it replaced, across
+        empty, single-entry, reordered, repointed and disjoint mappings. Compares
+        the pairing element directly so the assertion is about the pairing alone —
+        a store-path difference cannot mask a pairing disagreement.
+        """
+        mappings: list[dict[str, str]] = [
+            {},
+            {"a": "1"},
+            {"b": "1"},  # key differs, value identical
+            {"a": "1", "b": "2"},
+            {"b": "2", "a": "1"},  # same contents, different insertion order
+            {"a": "1", "b": "3"},  # one value repointed, same length
+            {"a": "2", "b": "1"},  # values swapped
+            {"c": "9"},
+        ]
+        for a in mappings:
+            for b in mappings:
+                expected = tuple(sorted(a.items())) == tuple(sorted(b.items()))
+                got = session_storage._scan_key(a)[2] == session_storage._scan_key(b)[2]
+                assert got == expected, f"disagreement on {a!r} vs {b!r}"
+
+
+class TestCotenantCache:
+    """The co-tenant lookup follows the scan cache's rules: reads may reuse, mutations never.
+
+    :func:`_scan_units` is the single funnel for four public entry points, and its
+    co-tenant dependency used to bypass the 30s cache entirely — every read paid a
+    pod-root enumeration plus a map read per leftover pod even on a scan-cache hit.
+    The cache is OPT-IN per call site because the same value gates destructive
+    paths; the safety tests below are what stop a later refactor from making it
+    global.
+
+    One uncached pass deliberately remains on a default install: ``measure``
+    populates ``reclaim_blocked_reason`` via :func:`reclaim_block_reason`, whose
+    co-tenant read must never opt in (it derives a refusal). The isolated *stores*
+    fixture short-circuits that path, which is why the reuse test below counts 1;
+    the default-home test pins that the gate really does re-read.
+    """
+
+    @staticmethod
+    def _count_pod_scans(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+        """Count full passes over the pod root without changing their answer."""
+        calls = {"n": 0}
+        real = session_storage._replay_store_cotenants
+
+        def counted() -> list[str]:
+            calls["n"] += 1
+            return real()
+
+        monkeypatch.setattr(session_storage, "_replay_store_cotenants", counted)
+        return calls
+
+    def test_a_read_inside_the_ttl_does_not_rescan_the_pod_root(
+        self, stores: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A scan-cache hit must not still pay for the co-tenant half."""
+        _, kiro_home = stores
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        calls = self._count_pod_scans(monkeypatch)
+
+        index = _index()
+        session_storage.list_units(index)
+        session_storage.measure(index, now=_NOW)
+        session_storage.list_units(index)
+
+        assert calls["n"] == 1, "reads within the TTL must enumerate the pod root once"
+
+    def test_select_reclaimable_rereads_cotenants_on_every_call(
+        self, stores: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reclaim selection derives refusals from this value: never from a snapshot."""
+        _, kiro_home = stores
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        _cli_half(kiro_home, "aaaa1111", log_bytes=32, age_days=40)
+        session_storage.list_units(_index())  # prime both caches
+        calls = self._count_pod_scans(monkeypatch)
+
+        session_storage.select_reclaimable(_index(), 30.0, now=_NOW)
+        session_storage.select_reclaimable(_index(), 30.0, now=_NOW)
+
+        assert calls["n"] == 2, "a mutation-path selection must re-read co-tenants every call"
+
+    def test_move_to_trash_rereads_cotenants_on_every_call(
+        self, stores: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both the scan inside the move and the pre-move authority check must be live.
+
+        The pre-move re-read exists precisely because the view taken during the
+        scan is seconds stale by the time anything moves; a primed cache must not
+        be allowed to answer it.
+        """
+        _, kiro_home = stores
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        _cli_half(kiro_home, "aaaa1111", log_bytes=64, age_days=40)
+        session_storage.list_units(_index())  # prime both caches
+        calls = self._count_pod_scans(monkeypatch)
+
+        session_storage.move_to_trash(["aaaa1111"], reason="manual", index=_index(), now=_NOW)
+
+        assert calls["n"] == 2, "the move's scan and its authority re-read must each hit disk"
+
+    def test_invalidate_scan_cache_drops_the_cotenant_pass_too(
+        self, stores: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The mutation hooks clear one thing; both caches must go with it."""
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        calls = self._count_pod_scans(monkeypatch)
+
+        session_storage.list_units(_index())
+        session_storage.invalidate_scan_cache()
+        session_storage.list_units(_index())
+
+        assert calls["n"] == 2, "invalidation must force a fresh co-tenant pass"
+
+    def test_a_different_pod_root_is_not_answered_from_an_older_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``KIROCREW_POD_ROOT`` resolves per call, so the root keys the cache.
+
+        Same reasoning as the store locations in the scan key: keyed without the
+        location, the second root would be answered with the first's pass.
+        """
+        first = tmp_path / "pods-a"
+        pod = first / "wt-old"
+        pod.mkdir(parents=True)
+        # Own replay store: its sids are recorded but it constrains nothing.
+        (pod / "kiro").mkdir()
+        (pod / "session_map.json").write_text(
+            json.dumps({"dashboard:chat-1": {"sid": "podsid01"}}), encoding="utf-8"
+        )
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(first))
+        protected, refusals = session_storage.cotenant_sids(cached=True)
+        assert protected == frozenset({"podsid01"})
+        assert refusals == ()
+
+        second = tmp_path / "pods-b"
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(second))
+        assert session_storage.cotenant_sids(cached=True) == (
+            frozenset(),
+            (),
+        ), "an empty pod root must read as empty, not as the first root's pass"
+
+    def test_a_different_crew_home_is_not_answered_from_an_older_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``KIROCREW_HOME`` alone keys the cache.
+
+        Each map is read through ``hooks.safe_read_file``, whose sensitive-path
+        READ gate re-anchors on the raw ``KIROCREW_HOME`` — the same symlinked
+        map can be refused under one anchoring and readable under another, so a
+        pass taken under one must not answer for the other. Varied ALONE so the
+        term is ratcheted independently, not only as part of a pair.
+        """
+        pod_root = tmp_path / "pods"
+        (pod_root / "wt-x").mkdir(parents=True)
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / "home-a" / "kiro"))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home-a"))
+        calls = self._count_pod_scans(monkeypatch)
+        session_storage.cotenant_sids(cached=True)
+
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home-b"))
+        session_storage.cotenant_sids(cached=True)
+
+        assert calls["n"] == 2, "a changed KIROCREW_HOME must not be served the old pass"
+
+    def test_a_different_kiro_home_is_not_answered_from_an_older_pass(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``KIRO_HOME`` alone keys the cache — defensive over-keying, ratcheted.
+
+        Today the read tier re-anchors on ``KIROCREW_HOME`` only, but the gate's
+        anchor set is keyed on both raw values; keeping ``KIRO_HOME`` in this key
+        means a future read-tier anchor cannot silently start serving stale
+        answers. A spurious miss costs a re-scan; a spurious hit would cost a
+        wrong answer.
+        """
+        pod_root = tmp_path / "pods"
+        (pod_root / "wt-x").mkdir(parents=True)
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home-a"))
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / "home-a" / "kiro"))
+        calls = self._count_pod_scans(monkeypatch)
+        session_storage.cotenant_sids(cached=True)
+
+        monkeypatch.setenv("KIRO_HOME", str(tmp_path / "home-b" / "kiro"))
+        session_storage.cotenant_sids(cached=True)
+
+        assert calls["n"] == 2, "a changed KIRO_HOME must not be served the old pass"
+
+    def test_reclaim_block_reason_rereads_cotenants_despite_a_primed_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The hard reclaim gate must never opt in — and nothing else covered it.
+
+        The isolated *stores* fixture short-circuits :func:`reclaim_block_reason`
+        before its co-tenant read, so the other safety tests never execute that
+        call. This pins the DEFAULT-home posture, where the read actually runs,
+        and asserts a primed cache does not answer it — the ratchet that stops a
+        future perf change from threading ``cached=`` through the gate.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        # Pin the default home rather than clearing the memo; see
+        # TestSharedStoreRefusal for why re-resolving on a real machine is unsafe.
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+
+        session_storage.cotenant_sids(cached=True)  # prime
+        calls = self._count_pod_scans(monkeypatch)
+        session_storage.reclaim_block_reason()
+        session_storage.reclaim_block_reason()
+
+        assert calls["n"] == 2, "the reclaim gate must re-enumerate the pod root on every call"
 
 
 class TestSharedStoreRefusal:
@@ -1190,7 +1971,9 @@ class TestSharedStoreRefusal:
 
         calls = {"n": 0}
 
-        def claimed_late() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
+        def claimed_late(
+            *, cached: bool = False
+        ) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
             calls["n"] += 1
             # Empty while the scan runs; owned by the time the move is authorized.
             return (frozenset() if calls["n"] == 1 else frozenset({"adopted001"})), ()
@@ -1210,7 +1993,9 @@ class TestSharedStoreRefusal:
 
         calls = {"n": 0}
 
-        def unreadable_late() -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
+        def unreadable_late(
+            *, cached: bool = False
+        ) -> tuple[frozenset[str], tuple[tuple[str, str], ...]]:
             calls["n"] += 1
             return frozenset(), (() if calls["n"] == 1 else (("wt-corrupt", "unreadable map"),))
 
@@ -1314,7 +2099,11 @@ class TestSharedStoreRefusal:
         """
         _, kiro_home = stores
         _cli_half(kiro_home, "podsid01", log_bytes=64, age_days=40)
-        monkeypatch.setattr(session_storage, "cotenant_sids", lambda: (frozenset({"podsid01"}), ()))
+        monkeypatch.setattr(
+            session_storage,
+            "cotenant_sids",
+            lambda *, cached=False: (frozenset({"podsid01"}), ()),
+        )
 
         with pytest.raises(SessionStorageError, match="still in use"):
             session_storage.move_to_trash(["podsid01"], reason="manual", index=_index(), now=_NOW)
@@ -1596,6 +2385,190 @@ class TestSharedStoreRefusal:
         report = session_storage.measure(_index(), now=_NOW)
 
         assert "sits outside it" in report.reclaim_blocked_reason
+
+
+class TestCotenantNamesAreLogSafe:
+    """A co-tenant directory name is agent-influenced and can embed a newline;
+    both ``cotenant_sids`` log sites that carry it must escape it, or one record
+    forges additional records (refs #6371, the #6281/#6315 log-forgery class).
+    """
+
+    _FORGED = "wt-evil\nWARNING forged: reclaim authorized by operator"
+
+    def _pod_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        pod_root = tmp_path / "pods"
+        pod_root.mkdir()
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(pod_root))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        return pod_root
+
+    def _make_forged_pod(self, pod_root: Path) -> Path:
+        pod = pod_root / self._FORGED
+        try:
+            pod.mkdir()
+        except OSError:
+            pytest.skip("this filesystem refuses a newline in a directory name")
+        return pod
+
+    @staticmethod
+    def _carrying(caplog: pytest.LogCaptureFixture, marker: str) -> list[str]:
+        return [record.getMessage() for record in caplog.records if marker in record.getMessage()]
+
+    def test_malformed_map_log_escapes_the_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pod = self._make_forged_pod(self._pod_root(tmp_path, monkeypatch))
+        (pod / "session_map.json").write_text("not json{", encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            _protected, refusals = session_storage.cotenant_sids()
+
+        assert [name for name, _why in refusals] == [self._FORGED]
+        messages = self._carrying(caplog, "malformed session map")
+        assert messages, "the malformed-map site did not log at all"
+        # The rendered record stays one line: the name appears repr'd, and the
+        # injected second line never starts a record of its own.
+        assert all("\n" not in message for message in messages)
+        assert any(repr(self._FORGED) in message for message in messages)
+
+    def test_unreadable_map_log_escapes_the_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pod = self._make_forged_pod(self._pod_root(tmp_path, monkeypatch))
+        # Invalid UTF-8 makes ``safe_read_file`` raise ``UnicodeDecodeError``,
+        # which is exactly the unreadable-map warning path under test.
+        (pod / "session_map.json").write_bytes(b"\xff\xfe\xfa")
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            _protected, refusals = session_storage.cotenant_sids()
+
+        assert [name for name, _why in refusals] == [self._FORGED]
+        messages = self._carrying(caplog, "unreadable session map")
+        assert messages, "the unreadable-map site did not log at all"
+        assert all("\n" not in message for message in messages)
+        assert any(repr(self._FORGED) in message for message in messages)
+
+    def test_exc_info_rendering_does_not_carry_a_raw_newline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The unreadable-map site logs with ``exc_info=True``, and
+        ``safe_read_file``'s refusal messages embed the resolved path — which
+        keeps a newline-bearing directory name. The FULL rendered record
+        (message plus exception text) must stay forge-free, not just the
+        ``getMessage()`` line the other tests pin.
+        """
+        pod = self._make_forged_pod(self._pod_root(tmp_path, monkeypatch))
+        (pod / "session_map.json").write_text("{}", encoding="utf-8")
+        # Force the refusal arm so the raised PermissionError carries the real
+        # resolved path (newline included) into the traceback rendering.
+        monkeypatch.setattr(session_storage.hooks, "is_sensitive_path", lambda p: True)
+
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+            _protected, refusals = session_storage.cotenant_sids()
+
+        assert [name for name, _why in refusals] == [self._FORGED]
+        assert "unreadable session map" in caplog.text
+        # The injected payload never lands at the start of a rendered line,
+        # which is what a forged record would need.
+        assert not [line for line in caplog.text.splitlines() if line.startswith("WARNING forged")]
+
+    def test_both_sites_escape_without_touching_the_filesystem(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Windows refuses a newline in a real directory name, which would skip
+        the two filesystem tests above on those shards. Injecting the forged
+        name at the candidate-list seam pins both log sites on every platform.
+        """
+        self._pod_root(tmp_path, monkeypatch)
+        monkeypatch.setattr(session_storage, "_replay_store_cotenants", lambda: [self._FORGED])
+
+        reads: dict[str, object] = {
+            "unreadable": PermissionError("refused"),
+            "malformed": "not json{",
+        }
+        for label, outcome in reads.items():
+
+            def _read(path: str, outcome: object = outcome) -> str:
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return str(outcome)
+
+            caplog.clear()
+            monkeypatch.setattr(session_storage.hooks, "safe_read_file", _read)
+
+            with caplog.at_level(logging.WARNING, logger="kiro_crew.session_storage"):
+                _protected, refusals = session_storage.cotenant_sids()
+
+            assert [name for name, _why in refusals] == [self._FORGED]
+            rendered = [record.getMessage() for record in caplog.records]
+            carrying = [message for message in rendered if repr(self._FORGED) in message]
+            assert carrying, f"the {label}-map site did not log the name repr'd"
+            assert all("\n" not in message for message in rendered)
+
+
+class TestCotenantRefusalTextIsForgeSafe:
+    """The raw co-tenant name also exits ``cotenant_sids`` inside the refusals
+    tuples and is interpolated into two downstream refusal-text surfaces. Neither
+    is a log line today, but one caller-side ``logger.warning(str(exc))`` away
+    from re-opening the #6281/#6371 forgery class — so both must carry the name
+    repr'd, exactly like the log sites ``TestCotenantNamesAreLogSafe`` pins
+    (refs #6430).
+    """
+
+    _FORGED = "wt-evil\nWARNING forged: reclaim authorized by operator\x1b[31m"
+    _REFUSALS = ((_FORGED, "its session map could not be parsed"),)
+
+    def test_reclaim_block_reason_escapes_the_name(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The listed refusals in the block reason render one-line and escaped.
+
+        Injected at the ``cotenant_sids`` seam rather than through the pod root:
+        Windows refuses a newline in a real directory name, and what is under
+        test is the CONSUMER's rendering, not discovery.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        monkeypatch.delenv("KIROCREW_HOME", raising=False)
+        monkeypatch.delenv("KIRO_HOME", raising=False)
+        monkeypatch.setattr(paths, "_resolved_home", paths._default_home())
+        monkeypatch.setattr(paths, "_config_dir_memo", None)
+        monkeypatch.setattr(
+            session_storage, "cotenant_sids", lambda *, cached=False: (frozenset(), self._REFUSALS)
+        )
+
+        reason = session_storage.reclaim_block_reason()
+
+        assert "make reclaiming unsafe" in reason
+        assert repr(self._FORGED) in reason
+        # One line, no raw control bytes: the injected second record and the
+        # ANSI payload both survive only inside the repr's escapes.
+        assert "\n" not in reason
+        assert "\x1b" not in reason
+
+    def test_move_to_trash_refusal_error_escapes_the_name(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The ``SessionStorageError`` raised at the move renders one-line and
+        escaped, so a caller logging ``str(exc)`` cannot be used to forge a
+        second record.
+        """
+        _, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=64, age_days=40)
+        monkeypatch.setattr(
+            session_storage, "cotenant_sids", lambda *, cached=False: (frozenset(), self._REFUSALS)
+        )
+
+        with pytest.raises(SessionStorageError, match="make reclaiming unsafe") as excinfo:
+            session_storage.move_to_trash(["aaaa1111"], reason="manual", index=_index(), now=_NOW)
+
+        text = str(excinfo.value)
+        assert repr(self._FORGED) in text
+        assert "\n" not in text
+        assert "\x1b" not in text
+        assert (kiro_home / "sessions" / "cli" / "aaaa1111.jsonl").is_file()
 
 
 class TestBuckets:
@@ -2147,3 +3120,493 @@ class TestTrashLocation:
     ) -> None:
         report = session_storage.measure(_index(), now=_NOW)
         assert report.trash_same_filesystem is True
+
+
+class TestSingleTrashPass:
+    """Each payload build reads each trash manifest exactly once.
+
+    ``list_trash`` is uncached and reads every batch manifest per call, so a
+    payload builder that calls it once for the totals (inside ``measure``) and
+    again for the wire array pays double I/O — and could ship totals that
+    contradict the array beside them if a stage/empty lands between the calls.
+    Both builders thread one list through ``measure(batches=...)`` instead,
+    mirroring the ``units=`` parameter and the counting test above.
+    """
+
+    @staticmethod
+    def _two_batches(kiro_home: Path) -> None:
+        """Two batches with DISTINCT created_at stamps, so an ordering assertion
+        on the payload array is falsifiable rather than satisfied by any order."""
+        _cli_half(kiro_home, "aaaa1111", log_bytes=64, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=64, age_days=40)
+        session_storage.move_to_trash(["aaaa1111"], reason="manual", index=_index(), now=_NOW - 60)
+        session_storage.move_to_trash(["bbbb2222"], reason="manual", index=_index(), now=_NOW)
+
+    @staticmethod
+    def _counted_manifest_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+        """Count via ``_summarize_manifest``: since #6281 it is ``list_trash``'s
+        per-batch cost (the count-only streamed pass), and it is hit through the
+        module global, so it sees every ``list_trash`` pass no matter which
+        module's imported name made the call."""
+        reads: list[Path] = []
+        real = session_storage._summarize_manifest
+
+        def counted(batch: Path):
+            reads.append(batch)
+            return real(batch)
+
+        monkeypatch.setattr(session_storage, "_summarize_manifest", counted)
+        return reads
+
+    def test_report_payload_reads_each_manifest_exactly_once(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.dashboard.handlers import session_storage as handler
+
+        _, kiro_home = stores
+        self._two_batches(kiro_home)
+        reads = self._counted_manifest_reads(monkeypatch)
+
+        payload = handler._report_payload()
+
+        assert len(reads) == 2, "one payload build must read each batch manifest once"
+        assert len(set(reads)) == 2
+        # Newest first is list_trash's own contract; asserting it on the wire
+        # array proves the hoisted list reaches the payload unreordered. The
+        # helper gives the batches distinct stamps so this can actually fail.
+        assert [b["created_at"] for b in payload["trash"]["batches"]] == [_NOW, _NOW - 60]
+        assert len(payload["trash"]["batches"]) == 2
+        assert payload["trash"]["bytes"] == sum(b["bytes"] for b in payload["trash"]["batches"])
+
+    def test_inventory_payload_reads_each_manifest_exactly_once(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from kiro_crew.dashboard.handlers import session_storage as handler
+
+        _, kiro_home = stores
+        self._two_batches(kiro_home)
+        reads = self._counted_manifest_reads(monkeypatch)
+
+        # Explicit empty stubs, not a MagicMock: a bare mock answers
+        # running_session_keys() and list_sessions() via magic-method defaults,
+        # which silently weakens the test if either callee grows a real check.
+        state = SimpleNamespace(
+            running_session_keys=lambda: frozenset(),
+            conversation_log=SimpleNamespace(list_sessions=lambda: []),
+        )
+        payload = handler._inventory_payload(state)
+
+        assert len(reads) == 2, "one payload build must read each batch manifest once"
+        assert len(set(reads)) == 2
+        assert len(payload["trash"]["batches"]) == 2
+        assert payload["trash"]["bytes"] == sum(b["bytes"] for b in payload["trash"]["batches"])
+
+    def test_measure_without_batches_still_enumerates_the_trash(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The default path is load-bearing: every existing ``measure(index)``
+        caller relies on it enumerating the trash itself."""
+        _, kiro_home = stores
+        self._two_batches(kiro_home)
+        reads = self._counted_manifest_reads(monkeypatch)
+
+        report = session_storage.measure(_index(), now=_NOW)
+
+        assert report.trash_batches == 2
+        assert report.trash_bytes > 0
+        assert len(reads) == 2, "measure() with no batches= must do its own pass"
+
+    def test_measure_uses_the_handed_over_batches_without_a_second_pass(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, kiro_home = stores
+        self._two_batches(kiro_home)
+        batches = session_storage.list_trash()
+        reads = self._counted_manifest_reads(monkeypatch)
+
+        report = session_storage.measure(_index(), now=_NOW, batches=batches)
+
+        assert report.trash_batches == 2
+        assert report.trash_bytes == sum(b.bytes for b in batches)
+        assert reads == [], "a handed-over list must not trigger another manifest pass"
+
+
+class TestManifestReaders:
+    """`_read_manifest` streams; `_summarize_manifest` aggregates without a list.
+
+    The core invariant: on every manifest the summary's (header, sessions, bytes)
+    are byte-identical to what the full read derives — same skipped-line
+    tolerance, same schema rejection, same ``None`` on an unreadable file.
+    """
+
+    _BATCH_ID = "20240101T000000-cafe0001"
+
+    def _batch(self, tmp_path: Path, lines: list[str], *, terminated: bool = True) -> Path:
+        batch = tmp_path / self._BATCH_ID
+        batch.mkdir(parents=True, exist_ok=True)
+        (batch / session_storage.MANIFEST_NAME).write_text(
+            "\n".join(lines) + ("\n" if terminated else ""), encoding="utf-8"
+        )
+        return batch
+
+    def _header(self, **overrides: object) -> dict[str, object]:
+        header: dict[str, object] = {
+            "schema": session_storage.MANIFEST_SCHEMA,
+            "batch_id": self._BATCH_ID,
+            "created_at": _NOW,
+            "reason": "manual",
+        }
+        header.update(overrides)
+        return header
+
+    def _entry(self, uid: str, sizes: list[int]) -> dict[str, object]:
+        return {
+            "uid": uid,
+            "files": [
+                {"rel": f"cli/{uid}-{i}.jsonl", "origin": f"/x/{uid}-{i}", "bytes": size}
+                for i, size in enumerate(sizes)
+            ],
+        }
+
+    def test_summary_is_byte_identical_to_the_full_read(self, tmp_path: Path) -> None:
+        """Header, count and byte total agree with the entry list on a manifest
+        that exercises every tolerated irregularity at once: blank lines, a
+        malformed line, a non-dict line, and a truncated final line."""
+        entries = [
+            self._entry("aaaa1111", [10, 20]),
+            self._entry("bbbb2222", [5]),
+            self._entry("cccc3333", []),
+        ]
+        lines = [json.dumps(self._header())]
+        lines.append("")
+        lines.append(json.dumps(entries[0]))
+        lines.append("not json at all {")
+        lines.append(json.dumps(entries[1]))
+        lines.append(json.dumps([1, 2, 3]))
+        lines.append(json.dumps(entries[2]))
+        lines.append('{"uid": "dddd444')  # crash mid-append: NO trailing newline
+        batch = self._batch(tmp_path, lines, terminated=False)
+
+        parsed = session_storage._read_manifest(batch)
+        summary = session_storage._summarize_manifest(batch)
+
+        assert parsed is not None and summary is not None
+        header, read_entries = parsed
+        assert summary == (
+            header,
+            len(read_entries),
+            sum(session_storage._entry_bytes(e) for e in read_entries),
+        )
+        # Pin the absolute values too, so both readers cannot be wrong together.
+        assert summary[1] == 3
+        assert summary[2] == 35
+
+    def test_header_only_manifest_summarizes_to_zero(self, tmp_path: Path) -> None:
+        batch = self._batch(tmp_path, [json.dumps(self._header())])
+        summary = session_storage._summarize_manifest(batch)
+        assert summary is not None
+        assert (summary[1], summary[2]) == (0, 0)
+
+    def test_wrong_schema_is_rejected_by_both_readers(self, tmp_path: Path) -> None:
+        lines = [json.dumps(self._header(schema=99)), json.dumps(self._entry("aaaa1111", [8]))]
+        batch = self._batch(tmp_path, lines)
+        assert session_storage._read_manifest(batch) is None
+        assert session_storage._summarize_manifest(batch) is None
+
+    def test_unreadable_manifest_returns_none_from_both_readers(self, tmp_path: Path) -> None:
+        batch = tmp_path / self._BATCH_ID
+        # A directory where the file should be: open() raises an OSError subclass,
+        # the same contract read_text() had.
+        (batch / session_storage.MANIFEST_NAME).mkdir(parents=True)
+        assert session_storage._read_manifest(batch) is None
+        assert session_storage._summarize_manifest(batch) is None
+
+    def test_batch_id_disagreement_is_tolerated_by_the_reader(self, tmp_path: Path) -> None:
+        """The reader returns the header untouched; refusing a disagreeing batch id
+        is list_trash's decision, exercised by TestTrashIsolation."""
+        lines = [json.dumps(self._header(batch_id="somebody-else"))]
+        batch = self._batch(tmp_path, lines)
+        summary = session_storage._summarize_manifest(batch)
+        assert summary is not None
+        assert summary[0]["batch_id"] == "somebody-else"
+
+    def test_corrupt_lines_are_counted_and_logged_once(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#6292 item 3: mid-file corruption is no longer silent — one aggregated
+        warning per read, counting only genuinely corrupt lines."""
+        lines = [
+            json.dumps(self._header()),
+            "garbage {",
+            json.dumps(self._entry("aaaa1111", [4])),
+            "more garbage {",
+        ]
+        batch = self._batch(tmp_path, lines)
+        with caplog.at_level("WARNING", logger="kiro_crew.session_storage"):
+            summary = session_storage._summarize_manifest(batch)
+        assert summary is not None and summary[1] == 1
+        warnings = [r for r in caplog.records if "unparseable" in r.getMessage()]
+        assert len(warnings) == 1
+        assert "skipped 2 unparseable" in warnings[0].getMessage()
+
+    def test_a_trailing_partial_line_does_not_warn(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A crash mid-append is EXPECTED and tolerated; warning for it on every
+        storage-screen open would be recurring noise about a normal state."""
+        lines = [
+            json.dumps(self._header()),
+            json.dumps(self._entry("aaaa1111", [4])),
+            '{"uid": "trunc',
+        ]
+        batch = self._batch(tmp_path, lines, terminated=False)
+        with caplog.at_level("WARNING", logger="kiro_crew.session_storage"):
+            summary = session_storage._summarize_manifest(batch)
+        assert summary is not None and summary[1] == 1
+        assert not [r for r in caplog.records if "unparseable" in r.getMessage()]
+
+    def test_unicode_line_boundaries_split_records_like_splitlines_did(
+        self, tmp_path: Path
+    ) -> None:
+        """The old reader split on str.splitlines boundaries (\\u2028, \\x1c, ...).
+        Two records separated by one must still parse as two records, not be
+        rejected as one malformed line."""
+        entry = self._entry("aaaa1111", [7])
+        blob = (
+            json.dumps(self._header())
+            + "\u2028"
+            + json.dumps(entry)
+            + "\x1c"
+            + json.dumps(self._entry("bbbb2222", [3]))
+        )
+        batch = self._batch(tmp_path, [blob])
+        summary = session_storage._summarize_manifest(batch)
+        assert summary is not None
+        assert (summary[1], summary[2]) == (2, 10)
+
+    def test_an_oversized_record_aborts_the_batch_not_materialised(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The manifest lives in an agent-writable tree: one multi-GB line with no
+        newline must not be read whole. Past the cap the batch is treated as
+        having no readable manifest — a crafted tail sitting exactly past a
+        cap boundary cannot be smuggled in as its own forged record."""
+        monkeypatch.setattr(session_storage, "_MANIFEST_RECORD_CAP", 256)
+        forged_tail = json.dumps(
+            {"uid": "evil0000", "files": [{"rel": "r", "origin": "o", "bytes": 999}]}
+        )
+        # 256 filler chars put the forged record exactly after the first
+        # cap-sized read of this single (newline-free) oversized line.
+        giant = "x" * 256 + forged_tail
+        lines = [
+            json.dumps(self._header()),
+            giant,
+            json.dumps(self._entry("aaaa1111", [5])),
+        ]
+        batch = self._batch(tmp_path, lines)
+        assert session_storage._summarize_manifest(batch) is None
+        assert session_storage._read_manifest(batch) is None
+
+    def test_undecodable_bytes_still_propagate(self, tmp_path: Path) -> None:
+        """read_text raised UnicodeDecodeError on corrupt bytes and the streaming
+        readers must keep that contract rather than silently absorbing it."""
+        batch = tmp_path / self._BATCH_ID
+        batch.mkdir(parents=True)
+        (batch / session_storage.MANIFEST_NAME).write_bytes(b'{"schema": 1}\n\xff\xfe garbage\n')
+        with pytest.raises(UnicodeDecodeError):
+            session_storage._read_manifest(batch)
+        with pytest.raises(UnicodeDecodeError):
+            session_storage._summarize_manifest(batch)
+
+    def test_an_oserror_mid_iteration_returns_none(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """read_text failed as one whole-file operation; the streaming readers must
+        map a read error DURING iteration to the same None, not leak it."""
+        batch = self._batch(tmp_path, [json.dumps(self._header())])
+
+        class _FailsMidRead:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def readline(self, _cap: int) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    return json.dumps({"schema": session_storage.MANIFEST_SCHEMA}) + "\n"
+                raise OSError("device gone")
+
+            def __enter__(self) -> "_FailsMidRead":
+                return self
+
+            def __exit__(self, *exc: object) -> None:
+                return None
+
+        monkeypatch.setattr(Path, "open", lambda *a, **k: _FailsMidRead())
+        assert session_storage._read_manifest(batch) is None
+        assert session_storage._summarize_manifest(batch) is None
+
+    def test_list_trash_never_materialises_the_entry_list(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The memory fix itself: the listing must go through the count-only
+        reader. Reverting it to _read_manifest would pass every aggregate check,
+        so pin the path by making the full reader unreachable from list_trash."""
+        _, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=64, age_days=40)
+        session_storage.move_to_trash(["aaaa1111"], reason="manual", index=_index(), now=_NOW)
+
+        def _forbidden(batch: Path) -> None:
+            raise AssertionError("list_trash must not materialise manifest entries")
+
+        monkeypatch.setattr(session_storage, "_read_manifest", _forbidden)
+        listed = session_storage.list_trash()
+        assert len(listed) == 1 and listed[0].sessions == 1
+
+    def test_a_cap_boundary_read_does_not_destroy_a_record_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GPT round-2 finding 1: a cap-sized read that cuts a physical line
+        mid-way must not condemn the bounded, individually valid records inside
+        it. A 255-char record + \\u2028 + another record on one physical line,
+        with the cap at 256, must yield both records."""
+        monkeypatch.setattr(session_storage, "_MANIFEST_RECORD_CAP", 256)
+        pad = "p" * (255 - len('{"uid": "aaaa1111", "files": [], "": ""}'))
+        first = '{"uid": "aaaa1111", "files": [], "' + pad + '": ""}'
+        assert len(first) == 255
+        second = json.dumps(self._entry("bbbb2222", [9]))
+        lines = [json.dumps(self._header()), first + "\u2028" + second]
+        batch = self._batch(tmp_path, lines)
+        summary = session_storage._summarize_manifest(batch)
+        assert summary is not None
+        assert (summary[1], summary[2]) == (2, 9)
+
+    def test_a_final_line_ended_by_a_unicode_boundary_is_complete_corruption(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """GPT round-2 finding 2: 'garbage\\u2028' at EOF IS terminated under
+        splitlines semantics — a complete corrupt record that must warn, not a
+        crash-partial that hides at debug."""
+        blob = json.dumps(self._header()) + "\n" + "garbage {\u2028"
+        batch = tmp_path / self._BATCH_ID
+        batch.mkdir(parents=True, exist_ok=True)
+        (batch / session_storage.MANIFEST_NAME).write_text(blob, encoding="utf-8")
+        with caplog.at_level("WARNING", logger="kiro_crew.session_storage"):
+            summary = session_storage._summarize_manifest(batch)
+        assert summary is not None and summary[1] == 0
+        assert [r for r in caplog.records if "unparseable" in r.getMessage()]
+
+    def test_a_record_spanning_many_cap_reads_aborts_without_materialising(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A record several multiples of the cap long aborts the read (the batch
+        is unreadable) without its bytes ever being concatenated whole."""
+        monkeypatch.setattr(session_storage, "_MANIFEST_RECORD_CAP", 256)
+        lines = [
+            json.dumps(self._header()),
+            '{"uid": "' + "x" * 1500 + '"}',
+            json.dumps(self._entry("aaaa1111", [5])),
+        ]
+        batch = self._batch(tmp_path, lines)
+        assert session_storage._summarize_manifest(batch) is None
+        assert session_storage._read_manifest(batch) is None
+
+    def test_even_a_valid_record_longer_than_the_cap_aborts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cap is a contract on parsed record size: a syntactically VALID
+        record between cap and 2x cap (reachable because the carry-over buffer
+        admits up to two cap-sized reads) must abort the read, NOT be silently
+        skipped — restore() rewrites the manifest from parsed records, so a
+        skipped record's staged files would be orphaned."""
+        monkeypatch.setattr(session_storage, "_MANIFEST_RECORD_CAP", 256)
+        valid_oversized = '{"uid": "bbbb2222", "pad": "' + "y" * 380 + '", "files": []}'
+        assert 256 < len(valid_oversized) < 512
+        lines = [
+            json.dumps(self._header()),
+            valid_oversized,
+            json.dumps(self._entry("aaaa1111", [5])),
+        ]
+        batch = self._batch(tmp_path, lines)
+        assert session_storage._summarize_manifest(batch) is None
+        assert session_storage._read_manifest(batch) is None
+
+    def test_an_oversized_record_makes_restore_refuse_not_orphan(
+        self, stores: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The blocked data-loss seam, end to end: a manifest with an oversized
+        record must make restore() refuse loudly. Skipping the record instead
+        would let a partial restore REWRITE the manifest without it, permanently
+        orphaning its staged files. The manifest must also be left untouched."""
+        _, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=8, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=8, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["aaaa1111", "bbbb2222"], reason="manual", index=_index(), now=_NOW
+        )
+        manifest = session_storage.trash_root() / batch.batch_id / session_storage.MANIFEST_NAME
+        lines = manifest.read_text(encoding="utf-8").splitlines()
+        entry = json.loads(lines[1])
+        inflated_uid = entry["uid"]
+        intact_uid = "bbbb2222" if inflated_uid == "aaaa1111" else "aaaa1111"
+        entry["pad"] = "y" * 600
+        lines[1] = json.dumps(entry)
+        manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        before = manifest.read_bytes()
+        monkeypatch.setattr(session_storage, "_MANIFEST_RECORD_CAP", 256)
+
+        # Restoring the INTACT session is the dangerous path: with the oversized
+        # record merely skipped, this would succeed and rewrite the manifest from
+        # the parsed records only — erasing the skipped record's metadata.
+        with pytest.raises(SessionStorageError):
+            session_storage.restore(batch.batch_id, [intact_uid])
+
+        assert manifest.read_bytes() == before
+
+    def test_an_unterminated_oversized_record_at_eof_still_aborts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An over-cap record with NO final newline must abort like any other
+        oversized record, not degrade into a silently dropped 'trailing partial'
+        — silent dropping is the exact shape that lets a restore rewrite orphan
+        staged files."""
+        monkeypatch.setattr(session_storage, "_MANIFEST_RECORD_CAP", 256)
+        valid_oversized = '{"uid": "bbbb2222", "pad": "' + "y" * 560 + '", "files": []}'
+        lines = [json.dumps(self._header()), valid_oversized]
+        batch = self._batch(tmp_path, lines, terminated=False)
+        assert session_storage._summarize_manifest(batch) is None
+        assert session_storage._read_manifest(batch) is None
+
+    def test_an_oversized_sibling_aborts_even_across_a_unicode_boundary(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """'x'*cap + \\u2028 + valid record on one physical line: the oversized
+        piece aborts the whole batch (fail-closed) — the record past the boundary
+        is NOT salvaged, because salvaging some records while dropping others is
+        exactly the shape that lets a partial restore orphan staged files."""
+        monkeypatch.setattr(session_storage, "_MANIFEST_RECORD_CAP", 256)
+        lines = [
+            json.dumps(self._header()),
+            "x" * 300 + "\u2028" + json.dumps(self._entry("aaaa1111", [6])),
+        ]
+        batch = self._batch(tmp_path, lines)
+        assert session_storage._summarize_manifest(batch) is None
+        assert session_storage._read_manifest(batch) is None
+
+    def test_list_trash_aggregates_match_the_staged_batch(self, stores: tuple[Path, Path]) -> None:
+        """End-to-end proof that the count-only path reports the same numbers the
+        entry-list path did: the listing agrees with the batch returned by the move."""
+        _, kiro_home = stores
+        _cli_half(kiro_home, "aaaa1111", log_bytes=100, age_days=40)
+        _cli_half(kiro_home, "bbbb2222", log_bytes=300, age_days=40)
+        batch = session_storage.move_to_trash(
+            ["aaaa1111", "bbbb2222"], reason="manual", index=_index(), now=_NOW
+        )
+
+        listed = session_storage.list_trash()
+
+        assert len(listed) == 1
+        assert listed[0].sessions == batch.sessions == 2
+        assert listed[0].bytes == batch.bytes
+        assert listed[0].bytes > 0

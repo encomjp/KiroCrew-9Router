@@ -161,6 +161,15 @@ describe('presetForKind', () => {
     expect(presetForKind('turn', { ...base, perCategory: { ...base.perCategory, turn: 'blip' } })).toBe('blip')
     expect(presetForKind('turn', { ...base, perCategory: { ...base.perCategory, turn: 'none' } })).toBe('none')
   })
+
+  it('resolves the agent category with override and fallback', () => {
+    // 'agent' is the kind on Agent Message feed notifications (system.agent
+    // channel) — it must resolve its own override, not fall through as an
+    // unknown kind, so "silent default + audible agent messages" works.
+    expect(presetForKind('agent', base)).toBe('chime') // no override -> all
+    expect(presetForKind('agent', { ...base, perCategory: { ...base.perCategory, agent: 'ding' } })).toBe('ding')
+    expect(presetForKind('agent', { ...base, perCategory: { ...base.perCategory, all: 'none', agent: 'ding' } })).toBe('ding')
+  })
 })
 
 // -- playPreset ---------------------------------------------------------------

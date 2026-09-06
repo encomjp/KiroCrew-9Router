@@ -93,7 +93,7 @@ jobs:
         # override-able. The always()-run steps below still post a leak-safe
         # comment and log the outcome regardless.
         if: github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
-        uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
+        uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
         with:
           # Inference via Amazon Bedrock (region from the AWS creds step above).
           use_bedrock: "true"
@@ -347,6 +347,7 @@ jobs:
           HUMAN_OVERRIDE: ${{ steps.human_override.outputs.active }}
           OVERRIDE_ACTOR: ${{ steps.human_override.outputs.actor }}
           ACTOR: ${{ github.actor }}
+          REVIEW_OUTCOME: ${{ steps.review.outcome }}
         run: |
           if [ "$HUMAN_OVERRIDE" = "true" ]; then
             OV_MARKER="<!-- design-review -->"
@@ -390,6 +391,19 @@ jobs:
           # Machine-parse the verdict header the prompt requires (case-insensitive).
           verdict="$(printf '%s\n' "$summary" | grep -iE '^Design-Verdict:' | head -n1 | sed -E 's/^[^:]*:[[:space:]]*//' | tr -d '\r' | tr '[:lower:]' '[:upper:]')"
           [ -z "$verdict" ] && verdict="UNKNOWN"
+          # Require the CURRENT-HEAD proof marker before honouring that verdict.
+          # The prompt emits `[DESIGN-REVIEWED] <sha>`, but parsing the
+          # `Design-Verdict:` header alone made the marker decorative: a reply
+          # carrying a stale or rewritten marker still scored as a verdict for
+          # THIS revision, so a design verdict earned on older code could be
+          # presented as current. Absent or mismatched -> fall through to the
+          # existing non-blocking "could not complete" path rather than
+          # inventing a verdict. Here-string, not `printf | grep`, so a long
+          # summary cannot manufacture a SIGPIPE status under `pipefail`.
+          if ! grep -qF "[DESIGN-REVIEWED] $HEAD" <<< "$summary"; then
+            echo "verdict header present but no [DESIGN-REVIEWED] $HEAD marker; treating as UNKNOWN"
+            verdict="UNKNOWN"
+          fi
           echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
           MARKER="<!-- design-review -->"
           case "$verdict" in
@@ -413,11 +427,23 @@ jobs:
             # NOT post the raw model/error text: it can carry internal detail
             # (AWS account ids, ARNs, endpoints, stack traces) into a public
             # comment. Post a generic, leak-safe notice; humans read the job logs.
+            # Name the cause from the model step's OWN outcome instead of
+            # asserting one: this branch is reached both when the model ran and
+            # returned nothing usable and when the model was never called at all,
+            # and "the model call errored" sent contributors to debug a call that
+            # had not happened.
+            case "${REVIEW_OUTCOME:-}" in
+              skipped) why="the review step never ran, because an earlier step in this job failed — no model call was made" ;;
+              failure) why="the review step failed" ;;
+              cancelled) why="the review step was cancelled" ;;
+              success) why="the review step completed but returned no verdict header" ;;
+              *)       why="the review step reported no outcome" ;;
+            esac
             {
               echo "$MARKER"
               echo "## Design Review (Fable 5) — ⚠️ could not complete"
               echo
-              echo "_The design review did not produce a verdict for \`$HEAD\` (the model call errored or returned no verdict header). See the Design Review job logs. Advisory — does not block merge._"
+              echo "_The design review did not produce a verdict for \`$HEAD\` ($why). See the Design Review job logs. Advisory — does not block merge._"
             } > /tmp/design-comment.md
           fi
           # Defense-in-depth: scrub credential shapes AND AWS account ids / ARNs

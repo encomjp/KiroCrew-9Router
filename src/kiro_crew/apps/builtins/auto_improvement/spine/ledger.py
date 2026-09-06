@@ -26,6 +26,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .ledger_lock import LEDGER_WRITE_LOCK
+
 # The outcome statuses a finding can land on. Mirrors the source ledger so the
 # morning-collection step (``grep '"status": "filed"'``) is unchanged (M5).
 STATUS_SEEN = "seen"
@@ -279,7 +281,14 @@ class Ledger:
     def record(self, entry: LedgerEntry) -> None:
         if entry.ts == 0.0:
             entry.ts = time.time()
-        with self._lock:
+        # The process-wide ledger write lock, NOT this instance's own lock: the same
+        # file is written by the operator's forget / purge / manual-filed / commit
+        # paths in `backend.ledger_admin`, which hold `LEDGER_WRITE_LOCK` across their
+        # read → decide → append. Sharing one lock makes this append atomic against a
+        # concurrent `forget`'s read → decide → `purged`, so a just-filed row can no
+        # longer be superseded by a stale purge (#6716). `self._lock` still guards the
+        # in-memory `_seen` map for readers on this instance.
+        with LEDGER_WRITE_LOCK, self._lock:
             self._seen[entry.fp] = entry
             with self.path.open("a") as f:
                 f.write(json.dumps(asdict(entry)) + "\n")

@@ -74,7 +74,7 @@ def test_restrict_to_owner_runs_before_any_content_is_written(tmp_path, monkeypa
     events: list[str] = []
     real_restrict = platform_compat.restrict_to_owner
 
-    def _spy(path):
+    def _spy(path, **_kw):
         events.append("restrict")
         return real_restrict(path)
 
@@ -128,7 +128,7 @@ def test_a_wider_mode_alongside_restrict_to_owner_is_rejected(tmp_path):
 def test_a_failing_lockdown_leaves_no_temp_and_no_target(tmp_path, monkeypatch):
     """Fail-loud: a secret we cannot protect must not be written at all."""
 
-    def _boom(path):
+    def _boom(path, **_kw):
         raise OSError("cannot set DACL")
 
     monkeypatch.setattr(platform_compat, "restrict_to_owner", _boom)
@@ -144,7 +144,7 @@ def test_a_failing_lockdown_leaves_no_temp_and_no_target(tmp_path, monkeypatch):
 def _failing_restrict(monkeypatch):
     """Make the owner-only lockdown fail the way a read-only FS or icacls would."""
 
-    def _boom(path):
+    def _boom(path, **_kw):
         raise OSError("cannot set DACL")
 
     monkeypatch.setattr(platform_compat, "restrict_to_owner", _boom)

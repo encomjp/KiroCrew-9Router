@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -50,7 +51,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from kiro_crew import hooks, platform_compat
+from kiro_crew import hooks, identity_stores, platform_compat
 from kiro_crew._sqlite_compat import sqlite3
 from kiro_crew.agent_files import AGENT_FILENAME
 from kiro_crew.atomic_write import atomic_write
@@ -64,6 +65,7 @@ from kiro_crew.sandbox import (
     SandboxUnavailableError,
     resource_limit_supervisor_argv,
     sandboxed_spawn_argv,
+    shielded_prepare_off_loop,
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
@@ -193,7 +195,7 @@ _AUTH_STORE_READ_ERROR = "Kiro identity file could not be read safely"
 # "no such table: history" on first use. Copying every table's DDL (and indexes)
 # while withholding non-identity ROWS keeps the CLI's queries valid and still
 # hands the sandboxed process no transcript content.
-_AUTH_SQLITE_DB = "data.sqlite3"
+_AUTH_SQLITE_DB = identity_stores.AUTH_SQLITE_DB
 _AUTH_IDENTITY_TABLES = ("auth_kv", "migrations")
 # `state` is a mixed key/value table: a few rows describe WHICH identity is signed
 # in (Identity Center region + start URL, CodeWhisperer profile) and the rest is
@@ -448,6 +450,17 @@ class _AuthStoreMapping:
     source: Path
     staged_relative: Path
     filenames: tuple[str, ...]
+    # Mappings sharing a group are ALTERNATE locations of ONE store, only one of
+    # which a given host uses. Staging must abort when a matched store cannot be
+    # read, because a staged home with no identity looks signed-out -- but that
+    # rule is right per LOCATION and wrong across alternates, where a stale
+    # leftover in the root this host abandoned would abort staging from the root
+    # it actually uses. Within a group the abort is therefore deferred: it fires
+    # only when NO alternate yielded an identity. ``None`` means "not an
+    # alternate of anything" and keeps the strict per-location rule -- the AWS
+    # SSO cache is a single location holding several token files, and losing any
+    # one of those must still abort.
+    group: str | None = None
 
 
 @dataclass(frozen=True)
@@ -801,8 +814,9 @@ def kiro_identity_store_path(
     different product's credential, so it cannot answer "which account is this
     CLI signed in as".
 
-    Every platform resolves to a FIXED, home-anchored location, matching the
-    trusted live-store list in ``dashboard/handlers/kiro_usage_api.py``. No
+    Every platform resolves among FIXED, home-anchored locations, drawn from the
+    same set as the trusted live-store list in
+    ``dashboard/handlers/kiro_usage_api.py`` (``_CLI_SQLITE_DBS``). No
     environment variable is consulted -- not ``XDG_DATA_HOME`` on Linux, not
     ``APPDATA`` or ``LOCALAPPDATA`` on Windows -- because the fence that makes
     this store unwritable by agent file tools (``_SENSITIVE_HOME_DIRS``) is
@@ -812,6 +826,17 @@ def kiro_identity_store_path(
     the children signed in as the previous account would never be retired. A
     fixed anchor cannot be pointed at something the agent may write.
 
+    On Windows current kiro-cli writes its store under the local app-data
+    directory (``AppData/Local/kiro-cli``); older layouts used the roaming one
+    (``AppData/Roaming/kiro-cli``). When only one store exists it is chosen;
+    when both exist the most recently written one wins, so a leftover from
+    the other layout never masks the live store's account (the WAL-aware
+    mtime tie-break lives in :func:`identity_stores.selected_store`). Both
+    anchors sit inside the
+    ``_SENSITIVE_HOME_DIRS`` fence, so neither choice widens what an agent
+    can forge. This branch stats the filesystem, so callers on the event loop
+    should resolve the path inside the same worker thread as the read itself.
+
     The cost is that a host which relocates its data home is read as having no
     identity, so the change is reported as "absent" -- which errs toward retiring
     children, never toward trusting them. ``environ`` is kept in the signature so
@@ -819,11 +844,7 @@ def kiro_identity_store_path(
     that genuinely requires it does not change every call site.
     """
 
-    if platform_name == "darwin":
-        return home / "Library" / "Application Support" / "kiro-cli" / _AUTH_SQLITE_DB
-    if platform_name == "win32":
-        return home / "AppData" / "Roaming" / "kiro-cli" / _AUTH_SQLITE_DB
-    return home / ".local" / "share" / "kiro-cli" / _AUTH_SQLITE_DB
+    return identity_stores.selected_store(platform_name, home)
 
 
 def identity_store_is_relocated(
@@ -846,23 +867,48 @@ def identity_store_is_relocated(
     absent: no read, no false confidence, and the absent path already means "never
     reconciled, re-sweep every turn".
 
-    Only variables that actually move the store count. ``LOCALAPPDATA`` is not
-    consulted: the identity lives under Roaming. A variable set to exactly the
-    default location is not a relocation.
+    Both variables count, unconditionally. The live store's directory is
+    resolved by the CLI from ``LOCALAPPDATA`` (current layout) or ``APPDATA``
+    (legacy layout), and which generation is writing cannot be observed --
+    so once EITHER variable is redirected, a database at a fixed anchor
+    cannot be attributed to a live writer: it may be the live store of the
+    other generation, or a leftover of either, and reading a leftover yields
+    a confident fingerprint of an account nobody is signed into. Refusing to
+    guess errs toward absent, the module's safe side. The cost is that a
+    host with Group-Policy folder redirection (which targets Roaming)
+    reports absent even when a current-layout Local store is healthy -- the
+    same answer such hosts got when the anchor lived under Roaming, so the
+    posture is status quo there, and the once-per-service log in
+    :meth:`KiroPrerequisiteService.current_identity_fingerprint` makes it
+    diagnosable. A variable set to exactly the default location is not a
+    relocation.
+
+    The (variable, default root) pairs are PROJECTED from
+    :data:`identity_stores.IDENTITY_STORE_ROOTS` -- each kiro-cli row's
+    ``env_var`` against the parent of its home-relative directory -- so this
+    check learns about a new or relocated store row the same way the fence,
+    staging, and state-db discovery do. macOS falls out naturally: its rows
+    carry no ``env_var`` (no standard variable relocates
+    ``~/Library/Application Support``), so no pair is checked there.
     """
 
-    if platform_name == "win32":
-        configured = environ.get("APPDATA", "").strip()
-        if not configured:
-            return False
-        return Path(configured) != home / "AppData" / "Roaming"
-    if platform_name == "darwin":
-        # No standard variable relocates ~/Library/Application Support.
-        return False
-    configured = environ.get("XDG_DATA_HOME", "").strip()
-    if not configured:
-        return False
-    return Path(configured) != home / ".local" / "share"
+    plat = (
+        identity_stores.Platform(platform_name)
+        if platform_name in ("darwin", "win32")
+        else identity_stores.Platform.POSIX
+    )
+    for root in identity_stores.IDENTITY_STORE_ROOTS:
+        if (
+            root.platform is not plat
+            or root.product is not identity_stores.Product.KIRO_CLI
+            or root.env_var is None
+        ):
+            continue
+        default = home.joinpath(*root.home_relative_dir.split("/")).parent
+        configured = environ.get(root.env_var, "").strip()
+        if configured and Path(configured) != default:
+            return True
+    return False
 
 
 def identity_fingerprint(path: Path) -> str:
@@ -999,7 +1045,17 @@ def _auth_store_mappings(
     home: Path,
     environ: MutableMapping[str, str],
 ) -> tuple[_AuthStoreMapping, ...]:
-    """Return only Kiro identity stores, never the surrounding credential dirs."""
+    """Return only Kiro identity stores, never the surrounding credential dirs.
+
+    Built over the canonical :func:`identity_stores.store_mappings` projection so
+    the source directories, the env-var source-side honouring
+    (``LOCALAPPDATA`` / ``APPDATA`` / ``XDG_DATA_HOME``), the fixed staged side,
+    and the Local-before-Roaming ordering all come from the single table. This
+    wrapper keeps staging's own concerns: the ``.aws/sso/cache`` token mapping
+    (not an identity store, so not in the table), the ``_AuthStoreMapping`` shape
+    with ``filenames=_AUTH_SQLITE_FILES``, and the ``win32:{app}`` group that
+    defers the abort across a product's two alternate AppData roots.
+    """
 
     mappings = [
         _AuthStoreMapping(
@@ -1008,36 +1064,25 @@ def _auth_store_mappings(
             filenames=("kiro-auth-token*.json",),
         )
     ]
-    app_names = ("kiro-cli", "amazon-q")
-    if platform_name == "darwin":
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=home / "Library" / "Application Support" / app_name,
-                    staged_relative=Path("Library") / "Application Support" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
+    for row in identity_stores.store_mappings(platform_name, home, environ):
+        # Both AppData roots of one Windows product are alternates: only one is
+        # this host's live store, so a stale leftover in the unused root must
+        # not abort staging from the used one. A shared group defers the abort
+        # across them; distinct ``staged_relative`` values (from the table) keep
+        # them from overwriting each other. macOS/Linux have a single location
+        # per product, so no group. (The env-var source-side honouring and the
+        # fixed staged side are already applied by ``store_mappings``.)
+        group = (
+            f"win32:{row.product.value}" if platform_name == "win32" else None
+        )
+        mappings.append(
+            _AuthStoreMapping(
+                source=row.source,
+                staged_relative=row.staged_relative,
+                filenames=_AUTH_SQLITE_FILES,
+                group=group,
             )
-    elif platform_name == "win32":
-        local_app_data = Path(environ.get("LOCALAPPDATA") or home / "AppData" / "Local")
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=local_app_data / app_name,
-                    staged_relative=Path("AppData") / "Local" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
-            )
-    else:
-        data_home = Path(environ.get("XDG_DATA_HOME") or home / ".local" / "share")
-        for app_name in app_names:
-            mappings.append(
-                _AuthStoreMapping(
-                    source=data_home / app_name,
-                    staged_relative=Path(".local") / "share" / app_name,
-                    filenames=_AUTH_SQLITE_FILES,
-                )
-            )
+        )
     return tuple(mappings)
 
 
@@ -1091,7 +1136,13 @@ def _prepare_auth_workspace(
             platform_compat.chmod_safe(str(root), 0o700)
         else:
             platform_compat.restrict_dir_to_owner(str(root))
+        # Deferred aborts, keyed by group: a group records its failure and is
+        # judged only after every alternate has been attempted.
+        group_staged: dict[str, bool] = {}
+        group_failed: dict[str, str] = {}
         for mapping in _auth_store_mappings(platform_name, home, environ):
+            if mapping.group is not None:
+                group_staged.setdefault(mapping.group, False)
             for pattern in mapping.filenames:
                 for source in mapping.source.glob(pattern):
                     staged_path = root / mapping.staged_relative / source.name
@@ -1099,14 +1150,34 @@ def _prepare_auth_workspace(
                     # every other identity file is a small JSON token copied
                     # under the bounded byte rules. Both abort staging on
                     # failure — never omit a matched store as though absent.
+                    # For a mapping in a GROUP the abort is deferred to the
+                    # group verdict below, because the alternates of one store
+                    # are not each independently required.
                     if source.name == _AUTH_SQLITE_DB:
                         if not _project_identity_database(source, staged_path):
-                            raise OSError(_AUTH_STORE_READ_ERROR)
+                            if mapping.group is None:
+                                raise OSError(_AUTH_STORE_READ_ERROR)
+                            group_failed[mapping.group] = _AUTH_STORE_READ_ERROR
+                            continue
+                        if mapping.group is not None:
+                            group_staged[mapping.group] = True
                         continue
                     content = _read_bounded_regular_file(source)
                     if content is None:
-                        raise OSError(_AUTH_STORE_READ_ERROR)
+                        if mapping.group is None:
+                            raise OSError(_AUTH_STORE_READ_ERROR)
+                        group_failed[mapping.group] = _AUTH_STORE_READ_ERROR
+                        continue
                     _atomic_write_secret_bytes(staged_path, content)
+                    if mapping.group is not None:
+                        group_staged[mapping.group] = True
+
+        # A group that had a readable store in ANY of its alternates is staged.
+        # A group whose every matched store failed is the signed-out-looking
+        # case the strict rule exists for, so it still aborts.
+        for group, message in group_failed.items():
+            if not group_staged.get(group, False):
+                raise OSError(message)
 
         env = dict(base_env)
         env.update(
@@ -1402,12 +1473,14 @@ async def _prepare_sandboxed_spawn(
 ) -> tuple[list[str], dict[str, str], str | None]:
     """Prepare filesystem-heavy sandbox state on a worker thread.
 
-    Cancellation waits for preparation to settle so a launcher/profile created
-    by the worker is still removed instead of becoming an untracked temp file.
+    Delegates to the shared :func:`shielded_prepare_off_loop`, which owns the
+    shield-and-recover pattern (including the repeat-cancellation semantics of
+    #5841) for every async caller of the chokepoint.  The chokepoint call itself
+    stays in this module so the ``mode``/``strip_python_env`` policy — and this
+    module's own seam over ``sandboxed_spawn_argv`` — remain local.
     """
-
-    task = asyncio.create_task(
-        asyncio.to_thread(
+    return await shielded_prepare_off_loop(
+        functools.partial(
             sandboxed_spawn_argv,
             argv,
             mode=mode,
@@ -1417,14 +1490,6 @@ async def _prepare_sandboxed_spawn(
             extra_visible_dirs=extra_visible_dirs,
         )
     )
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        cleanup_path: str | None = None
-        with contextlib.suppress(Exception):
-            _, _, cleanup_path = await task
-        await _unlink_off_loop(cleanup_path)
-        raise
 
 
 async def _run_process(
@@ -1913,6 +1978,10 @@ class KiroPrerequisiteService:
         # Real-time cache bounding the store reads and their SEL audit events.
         self._identity_cache = _AUTH_FINGERPRINT_ABSENT
         self._identity_cache_at = 0.0
+        # Whether the relocation refusal has been logged. The relocated arm runs
+        # on every identity poll, so the diagnostic logs once per service rather
+        # than flooding; see current_identity_fingerprint.
+        self._relocation_logged = False
 
     @property
     def initial_setup_complete(self) -> bool:
@@ -2258,18 +2327,35 @@ class KiroPrerequisiteService:
             and now - self._identity_cache_at < _AUTH_FINGERPRINT_CACHE_SECS
         ):
             return self._identity_cache
-        if identity_store_is_relocated(self._platform, self._home, self._environ):
-            # Do not read the default path: with the CLI pointed elsewhere, a
-            # leftover database there would fingerprint an account nobody is signed
-            # into, and a logout in the real store would change nothing we can see.
-            # Absent is never reconciled, so this re-sweeps every turn instead of
-            # trusting a stale file.
-            self._identity_cache = _AUTH_FINGERPRINT_ABSENT
-            self._identity_cache_at = now
-            return _AUTH_FINGERPRINT_ABSENT
-        path = kiro_identity_store_path(self._platform, self._home, self._environ)
+
+        def _read() -> str:
+            # Both the relocation guard and the win32 path resolver stat the
+            # filesystem, so the whole resolve-and-read runs in this worker
+            # thread and stats stay off the event loop.
+            if identity_store_is_relocated(self._platform, self._home, self._environ):
+                # Do not read the default path: with the CLI pointed elsewhere, a
+                # leftover database there would fingerprint an account nobody is
+                # signed into, and a logout in the real store would change nothing
+                # we can see. Absent is never reconciled, so this re-sweeps every
+                # turn instead of trusting a stale file.
+                if not self._relocation_logged:
+                    # Once per service: this arm runs on every poll, and without
+                    # the log an absent-because-relocated host is indistinguishable
+                    # from a signed-out user -- the silence that made the identity
+                    # probe's failures undiagnosable without reading source.
+                    self._relocation_logged = True
+                    logger.info(
+                        "Kiro identity store is env-relocated on %s; reporting the "
+                        "identity as absent instead of reading the fixed anchor",
+                        self._platform,
+                    )
+                return _AUTH_FINGERPRINT_ABSENT
+            return identity_fingerprint(
+                kiro_identity_store_path(self._platform, self._home, self._environ)
+            )
+
         try:
-            fingerprint = await asyncio.to_thread(identity_fingerprint, path)
+            fingerprint = await asyncio.to_thread(_read)
         except Exception:
             # An unreadable store reports "no identity", matching
             # identity_fingerprint's own contract, rather than "unchanged" --

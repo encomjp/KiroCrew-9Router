@@ -7,6 +7,7 @@ import { copySessionLink } from '../../utils/shareUrl'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../../utils/touchActions'
 import Clickable from '../../components/Clickable'
 import type { ChatPin } from '../../api/pins'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 
 interface PinnedMessagesPanelProps {
   pins: ChatPin[]
@@ -46,6 +47,7 @@ function relativeTime(iso: string, now: number): string {
 const PinnedMessagesPanel = memo(function PinnedMessagesPanel({
   pins, loading, slotKey, slotTitle, mode, onJumpToMessage, onUnpin,
 }: PinnedMessagesPanelProps) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -71,7 +73,7 @@ const PinnedMessagesPanel = memo(function PinnedMessagesPanel({
         {!loading && pins.map(pin => (
           <Clickable
             key={pin.id}
-            className="group/pin flex flex-col gap-1 px-3 py-2.5 rounded-md hover:bg-hover cursor-pointer transition-colors mb-1"
+            className="group/pin flex flex-col gap-1 px-3 py-2.5 rounded-md hover:bg-bg-hover cursor-pointer transition-colors mb-1"
             onClick={() => onJumpToMessage(pin.message_ts, pin.mid)}
             data-testid="pin-entry"
             aria-label={i18nT('pages.chat.pins.jump_to_message')}

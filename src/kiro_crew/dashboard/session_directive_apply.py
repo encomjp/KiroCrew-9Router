@@ -56,31 +56,15 @@ from kiro_crew.session_surface import has_dashboard_surface
 
 logger = logging.getLogger(__name__)
 
-# Directives whose effect targets a DASHBOARD chat slot (its follow-up card,
-# its question card). The HTTP endpoints they replaced were dashboard-scoped,
-# so the applier keeps that boundary; the monitor trio is intentionally NOT
-# here because it binds by session and supports Slack/Discord. ``set_project``
-# is also not here — it renders no card, so any USER-FACING surface (dashboard,
-# Slack, Telegram, Discord, ...) may retarget its own session's CWD — but it is
-# gated below on the same positive predicate, so headless callers (cron,
-# subagent, hook, taskrunner, background, empty key) are still refused.
+# Card directives require a connected dashboard surface. ``set_project`` is
+# admitted by the user-surface provenance gate below, then separately requires
+# the current turn to own the slot it would mutate.
 _DASHBOARD_ONLY_DIRECTIVES = frozenset({"suggest_followup", "ask_question"})
-
-# Directives allowed from any USER-FACING surface but refused for headless
-# callers. A cron turn can run ON A USER'S DASHBOARD SLOT (cron
-# ``session="origin"`` injection), and a sub-agent inherits its parent's slot —
-# letting those retarget ``slot.project`` would silently repoint the user's own
-# session out from under them. The gate is POSITIVE (dashboard surface or a
-# known channel namespace), so a key minted by any other subsystem (``hook:``,
-# ``secretary:``, ``wf-pool:``, an empty key, ...) fails closed instead of
-# silently qualifying.
 _USER_SURFACE_DIRECTIVES = frozenset({"set_project"})
 
 
 def _has_user_surface(session_key: str) -> bool:
-    """True when *session_key* names a user-facing conversation surface: a
-    dashboard slot (open tab or dashboard-born key) or a messaging-channel
-    session (Slack, Telegram, Discord, ...)."""
+    """Return whether *session_key* names a user-facing conversation."""
     return has_dashboard_surface(session_key) or is_channel_session_key(session_key)
 
 
@@ -119,6 +103,8 @@ async def apply_session_directive(
     session_key: str,
     kind: str,
     args: dict[str, Any],
+    *,
+    producer_is_user_facing: bool = False,
 ) -> str:
     """Apply directive *kind* with *args* to *slot*/*session_key*; return a
     confirmation string for the model. Fail-soft: any error is returned as a
@@ -143,32 +129,31 @@ async def apply_session_directive(
             f"Error: {kind} only works from a dashboard chat session "
             f"(this turn is {session_key!r}). Nothing was changed."
         )
-    if kind in _USER_SURFACE_DIRECTIVES and not _has_user_surface(session_key):
-        # set_project needs no dashboard tab (it renders no card), but it DOES
-        # need a user-facing conversation: a cron turn injected into a user's
-        # slot or a sub-agent sharing its parent's slot must not repoint that
-        # slot's project/CWD out from under the user. Positive predicate — an
-        # unrecognized key shape fails closed.
-        _audit(session_key, kind, "denied")
-        return (
-            f"Error: {kind} only works from a user-facing session (dashboard "
-            f"or a messaging channel); headless callers such as cron jobs and "
-            f"sub-agents are refused (this turn is {session_key!r}). "
-            "Nothing was changed."
-        )
     if kind in _USER_SURFACE_DIRECTIVES and slot is None:
         # set_project mutates the SLOT (its project and session CWD). A
         # slot-less caller — a channel transport's TurnDriver — holds no slot
         # for the effect to land on, so refuse it as a decision here: letting
         # it fall through would crash `_set_project` on the missing slot and
         # the fail-soft wrapper would audit "error" for what is a permission
-        # boundary. Slot-BEARING channel sessions pass — the user-surface gate
-        # above already vetted the surface, and the applier can deliver the
-        # effect to a real slot.
+        # boundary. Slot-bearing callers continue to the provenance and
+        # user-surface gate below.
         _audit(session_key, kind, "denied")
         return (
             f"Error: {kind} targets this turn's chat slot, and this turn "
             f"holds none (this turn is {session_key!r}). Nothing was changed."
+        )
+    if kind in _USER_SURFACE_DIRECTIVES and (
+        not producer_is_user_facing or not _has_user_surface(session_key)
+    ):
+        # A cron turn can run on a user's slot and a sub-agent can share its
+        # parent's slot. Positive admission prevents either from silently
+        # retargeting the user's project/CWD.
+        _audit(session_key, kind, "denied")
+        return (
+            f"Error: {kind} only works from a user-facing session (dashboard "
+            f"or a messaging channel); headless callers such as cron jobs and "
+            f"sub-agents are refused (this turn is {session_key!r}). "
+            "Nothing was changed."
         )
     try:
         if kind == "monitor_start":
@@ -370,13 +355,42 @@ async def _monitor_update(session_key: str, args: dict[str, Any]) -> str:
     )
 
 
+def _no_loop_message(svc: Any, binding: str) -> str:
+    """The result for ``autonudge_stop`` when this session resolves no loop.
+
+    ``get_by_slot`` resolves only the loop bound to the CALLING session's
+    binding key, so its miss covers two states that a caller cannot otherwise
+    tell apart: no loop exists anywhere (an idempotent success — the goal
+    already holds), or a loop is running under a different slot key and is
+    simply unreachable from here (nothing was stopped). Counting the service's
+    active loops separates them.
+
+    Reports a COUNT and never a loop id or slot key. The stop tool exposes no
+    loop-id parameter precisely so a session cannot target another session's
+    loop; naming other sessions' loops here would hand the model the
+    identifiers that schema withholds. Cross-session enumeration stays on the
+    token-authed dashboard API. A count is all this branch needs, because the
+    caller's question is whether ITS OWN stop took effect.
+    """
+    active = [lp for lp in svc.list_all() if getattr(lp, "active", True)]
+    if not active:
+        return "No active auto-nudge loop on this session — nothing to stop."
+    return (
+        "NOTHING WAS STOPPED. No auto-nudge loop is bound to this session "
+        f"(binding: {binding}), but {len(active)} auto-nudge loop(s) are running on "
+        "other sessions. A loop can only be stopped from the session it is bound "
+        "to, so this call could not reach them."
+    )
+
+
 async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> str:
     from kiro_crew.autonudge import get_instance
 
     svc = get_instance()
     # "Nothing to stop" is an IDEMPOTENT success — the goal (no loop running on
     # this session) already holds — so the disabled-service and no-loop paths
-    # keep returning. The unsupported-session path is a refusal like its
+    # keep returning; a binding miss that is NOT that state is separated in
+    # ``_no_loop_message``. The unsupported-session path is a refusal like its
     # siblings: the caller asked for an effect this session can never carry.
     if svc is None:
         return "No auto-nudge loop to stop (auto-nudge is disabled on this host)."
@@ -385,7 +399,7 @@ async def _autonudge_stop(slot: Any, session_key: str, args: dict[str, Any]) -> 
         raise _DirectiveDenied("autonudge_stop is not supported from this session type.")
     loop = svc.get_by_slot(binding)
     if not loop:
-        return "No active auto-nudge loop on this session — nothing to stop."
+        return _no_loop_message(svc, binding)
     loop_id = loop.id
     reason = str(args.get("reason") or "").strip()
     # Research Lab consumes a persisted stop record to distinguish deliberate

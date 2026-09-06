@@ -2317,14 +2317,14 @@ window list.
 ### `call` is a harness, not an eleventh tool
 
 `call` runs the existing tools through `tools.dispatch_tool` — **the same ordered
-chokepoint an agent call traverses**. The primary enable, the fail-closed
-`gate.require_computer_use`, the app denylist, index freshness, the secure-target
-refusals and the observation ceiling all apply, so `call` cannot see or do anything
-the agent could not. That is precisely what makes it a faithful reproduction tool
-rather than a debug backdoor, and it is why the implementation goes through
-`tools` rather than reaching into `service` (a test asserts that over the AST — a
-future "skip the overhead" edit would otherwise stay green while dropping
-governance on the floor).
+chokepoint an agent call traverses**. The fail-closed primary enable, the
+audit-only `gate.require_computer_use`, the app denylist, index freshness, the
+secure-target refusals and the observation ceiling all apply, so `call` cannot see
+or do anything the agent could not. That is precisely what makes it a faithful
+reproduction tool rather than a debug backdoor, and it is why the implementation
+goes through `tools` rather than reaching into `service` (a test asserts that over
+the AST — a future "skip the overhead" edit would otherwise stay green while
+dropping governance on the floor).
 
 One consequence, stated rather than left to be discovered: the session key is
 always the attended `cli_chat` surface (`sel._infer_source` → `cli`), used for the

@@ -4,6 +4,7 @@ import type { ChatMessage } from '../../types'
 
 import { i18nT } from '../../i18n/t'
 import { useRowDisclosure } from './rowDisclosure'
+import { useLanguageGeneration } from '../../i18n/useLanguageGeneration'
 /** Matches the `[auto-nudge cycle N]` prefix the gateway prepends to nudge turns. */
 const NUDGE_TAG_RE = /^\[auto-nudge cycle (\d+)\]\n?/
 
@@ -83,6 +84,7 @@ export default memo(function NudgeCard({
   onOpenLoop?: () => void
   disclosureKey?: string
 }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const [expanded, setExpanded] = useRowDisclosure(disclosureKey, false)
   const { cycle, body } = parseNudgeMessage(message)
   const firstLine = body.split('\n').find(l => l.trim().length > 0)?.trim() ?? ''
@@ -100,7 +102,7 @@ export default memo(function NudgeCard({
           onClick={() => setExpanded(v => !v)}
           aria-expanded={expanded}
           aria-label={expanded ? i18nT('pages.chat.nudgeCard.hide_nudge_instructions') : i18nT('pages.chat.nudgeCard.show_nudge_instructions')}
-          className="flex items-center gap-2 min-w-0 flex-1 text-left text-[13px] leading-5 hover:text-fg transition-colors"
+          className="flex items-center gap-2 min-w-0 flex-1 text-left text-[13px] leading-5 hover:text-text transition-colors"
           data-testid="nudge-card-toggle"
         >
           <ChevronRight
@@ -118,7 +120,7 @@ export default memo(function NudgeCard({
           <button
             type="button"
             onClick={onOpenLoop}
-            className="shrink-0 text-[11px] leading-4 px-1.5 py-0.5 rounded border border-border hover:text-fg transition-colors"
+            className="shrink-0 text-[11px] leading-4 px-1.5 py-0.5 rounded border border-border hover:text-text transition-colors"
             data-testid="nudge-card-open-loop"
           >
             {i18nT('pages.chat.nudgeCard.loop')}

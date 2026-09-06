@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeAll } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import AgentDropdownList, { DefaultAgentRow, ManageAgentsFooter } from '../components/AgentDropdownList'
 import type { AgentItem } from '../components/AgentDropdownList'
 
@@ -38,6 +40,54 @@ describe('AgentDropdownList', () => {
   it('shows description when present', () => {
     render(<AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={() => {}} />)
     expect(screen.getByText('Main agent')).toBeInTheDocument()
+  })
+
+  it('declares no scroll container of its own, leaving the host as the single scroll owner', () => {
+    // Both hosts (ChatPage and ChatPane) wrap this list in their own
+    // `overflow-y-auto max-h-[280px]` listbox. When the component also carried
+    // `overflow-y-auto max-h-[300px]`, the panel showed two nested scrollbars
+    // (#6375). Every option row's ancestor inside the component must stay
+    // overflow-free so exactly one scrollbar — the host's — appears. Checked
+    // via class AND inline style, so neither a Tailwind overflow utility nor
+    // a `style={{ overflowY: 'auto' }}` can reintroduce the nested scroller.
+    const { container } = render(
+      <AgentDropdownList agents={agents} activeAgent="" defaultAgent="" onSelect={() => {}} />
+    )
+    const option = screen.getAllByRole('option')[0]
+    let checked = 0
+    for (let el: HTMLElement | null = option.parentElement; el && container.contains(el); el = el.parentElement) {
+      checked++
+      expect(el.className).not.toMatch(/overflow-(y-)?(auto|scroll)/)
+      expect(el.style.overflowY).toMatch(/^(|visible)$/)
+      expect(el.style.overflow).toMatch(/^(|visible)$/)
+    }
+    // Guard against the loop passing vacuously (e.g. rows moved into a portal).
+    expect(checked).toBeGreaterThan(0)
+  })
+})
+
+describe('AgentDropdownList hosts own the scroll (#6375)', () => {
+  // The component deliberately declares no scroll container (see the test
+  // above), which moves the "exactly one scroll owner" invariant into the two
+  // hosts. Pin it structurally: each render site must wrap the list in a
+  // listbox that carries the overflow + max-height, or the pop-up grows
+  // unbounded with no failing test.
+  // vitest's cwd is website/ (the vitest config root), and import.meta.url is
+  // not file-scheme under its transform, so resolve from cwd instead.
+  const hosts = [
+    ['ChatPage', join(process.cwd(), 'src', 'pages', 'ChatPage.tsx')],
+    ['ChatPane', join(process.cwd(), 'src', 'components', 'ChatPane.tsx')],
+  ] as const
+
+  it.each(hosts)('%s wraps the list in a scroll-owning listbox', (_name, file) => {
+    const src = readFileSync(file, 'utf8')
+    const sites = [...src.matchAll(/<AgentDropdownList[\s>]/g)]
+    expect(sites.length).toBeGreaterThan(0)
+    for (const site of sites) {
+      // The wrapper opens within the few hundred chars above the render site.
+      const windowBefore = src.slice(Math.max(0, site.index! - 600), site.index!)
+      expect(windowBefore).toMatch(/role="listbox"[^>]*className="[^"]*overflow-y-auto[^"]*max-h-\[/)
+    }
   })
 })
 

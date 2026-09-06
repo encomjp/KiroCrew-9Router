@@ -2,7 +2,7 @@
  * <SettingRef> — clickable setting reference chip.
  *
  * Renders differently depending on where the setting lives:
- * - UI-editable: accent link chip navigating to /settings?tab=X&highlight=Y
+ * - UI-editable: accent link chip navigating to /settings/<tab>?highlight=key:<configKey>
  * - File-only: <code> with popover showing CLI command
  * - Env var (kind='env'): <code> with popover showing per-shell export lines
  * - Unknown/malicious key: plain <code>, NO link
@@ -14,6 +14,7 @@ import { resolveSettingRef } from './resolveSettingRef'
 import type { SchemaEntry } from './resolveSettingRef'
 import { useConfigSchema } from './useConfigSchema'
 import { i18nT } from '../../i18n/t'
+import { toPathSegment } from '../subNavParams'
 import { CopyCommandButton } from './CopyCommandButton'
 
 export interface SettingRefProps {
@@ -40,8 +41,14 @@ import type { EnvIntent } from './envShellCommands'
  * resolve directly via data-setting-key attribute, avoiding the label round-trip.
  */
 function buildSettingsRoute(tab: string, configKey: string): string | null {
-  const params = new URLSearchParams({ tab, highlight: `key:${configKey}` })
-  const route = ['/settings', params.toString()].join('?')
+  // Shared codec, not bare encodeURIComponent: toPathSegment additionally
+  // rejects the dot-only values ('.', '..') whose percent-forms the WHATWG
+  // URL parser still resolves as dot-segments — a crafted registry tab must
+  // not mint a route that normalizes outside /settings.
+  const seg = toPathSegment(tab)
+  if (!seg) return null
+  const params = new URLSearchParams({ highlight: `key:${configKey}` })
+  const route = `/settings/${seg}?${params.toString()}`
   // Final safety: must start with '/', must not be '//' or contain '://'
   if (!route.startsWith('/') || route.startsWith('//') || route.includes('://')) {
     return null

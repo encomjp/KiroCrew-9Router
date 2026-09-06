@@ -779,3 +779,132 @@ describe('ActivityViewer — panel behaviour', () => {
     await waitFor(() => expect(screen.getByTestId('path')).toHaveTextContent('/artifacts'))
   })
 })
+
+// ---------------------------------------------------------------------------
+// Live model-downgrade flag (#5326)
+// ---------------------------------------------------------------------------
+describe('ActivityViewer — live model downgrade flag (#5326)', () => {
+  it('shows normal accent chip when requested model matches resolved', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.8',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    // No amber classes when there is no downgrade.
+    expect(chip.className).not.toContain('text-warn')
+    expect(chip.className).toContain('text-accent')
+  })
+
+  it('renders amber chip when resolved model differs from requested', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.7',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.className).toContain('text-warn')
+    expect(chip.className).not.toContain('text-accent')
+  })
+
+  it('chip title contains requested and resolved when downgraded', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: 'claude-opus-4.7',
+            requestedModel: 'claude-opus-4.8',
+          }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.title).toContain('claude-opus-4.8')
+    expect(chip.title).toContain('claude-opus-4.7')
+  })
+
+  it('shows normal chip when requestedModel is absent', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'running', model: 'gpt-5.6' }) }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.className).toContain('text-accent')
+    expect(chip.className).not.toContain('text-warn')
+  })
+
+  it('shows a neutral muted chip when only requestedModel is set (no resolved yet)', () => {
+    // Unpinned spawn: backend sets requested_model="auto", resolved="" — the
+    // frontend should show a neutral chip (not accent, not amber) using requestedModel.
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', { status: 'running', model: undefined, requestedModel: 'auto' }),
+        }}
+      />,
+    )
+    const chip = screen.getByTestId('subagent-model')
+    expect(chip.textContent).toContain('auto')
+    expect(chip.className).not.toContain('text-accent')
+    expect(chip.className).not.toContain('text-warn')
+    expect(chip.className).toContain('text-muted')
+    // Tooltip uses model_effective ("backend selects the model") for the auto sentinel.
+    expect(chip.title).toContain('backend selects')
+  })
+
+  it('uses model_label tooltip for a concrete requested-only chip (pinned, pre-resolve)', () => {
+    // A pinned spawn before the session resolves: requestedModel is a concrete id,
+    // resolved is still "". No chip should render — showing an unconfirmed pin as
+    // fact is misleading. The chip appears once the model actually resolves.
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{
+          s1: mkAgent('s1', {
+            status: 'running',
+            model: undefined,
+            requestedModel: 'gpt-5.6-sol',
+          }),
+        }}
+      />,
+    )
+    // Concrete requested-only id must NOT render a chip.
+    expect(screen.queryByTestId('subagent-model')).toBeNull()
+  })
+
+  it('hides the chip when both model and requestedModel are absent', () => {
+    renderPanel(
+      <ActivityViewer
+        {...baseProps}
+        view="subagents"
+        subagents={{ s1: mkAgent('s1', { status: 'running' }) }}
+      />,
+    )
+    expect(screen.queryByTestId('subagent-model')).toBeNull()
+  })
+})

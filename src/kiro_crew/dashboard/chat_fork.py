@@ -8,7 +8,7 @@ import logging
 from aiohttp import web
 
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+from kiro_crew.dashboard.chat_persistence import save_slot_off_loop, session_was_deleted
 from kiro_crew.dashboard.chat_utils import (
     _sync_dashboard_slots,
     effective_session_key,
@@ -56,7 +56,7 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     request_app = request.get("app", "")
     if not slot:
-        return web.json_response({"error": "not found"}, status=404)
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
 
     # Rate/resource guard: reject if we're already at the cap. Counts slots still
     # under construction too (``live_slot_count``): the import path retracts a
@@ -64,62 +64,97 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     # cap would otherwise ignore.
     if state.live_slot_count() >= MAX_LIVE_SLOTS:
         sel().log_api_access(
-            caller=request_app or "dashboard", operation="chat.slot_fork",
-            outcome="denied", source="rate_limit",
+            caller=request_app or "dashboard",
+            operation="chat.slot_fork",
+            outcome="denied",
+            source="rate_limit",
             resources=f"slot={name},slot_count={state.live_slot_count()}",
             error="slot cap reached",
         )
         return web.json_response(
-            {"error": f"slot cap reached ({MAX_LIVE_SLOTS})"}, status=429,
+            {
+                "error": f"slot cap reached ({MAX_LIVE_SLOTS})",
+                "code": "slot_cap_reached",
+            },
+            status=429,
         )
 
     # App ownership check (App Kit §5.2)
     if request_app:
         if not slot._app:
             sel().log_api_access(
-                caller=request_app, operation="chat.slot_fork", outcome="denied",
-                source="app_isolation", resources=f"slot={name}",
+                caller=request_app,
+                operation="chat.slot_fork",
+                outcome="denied",
+                source="app_isolation",
+                resources=f"slot={name}",
                 error="app cannot fork unscoped slots",
             )
-            return web.json_response({"error": "not found"}, status=404)
+            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
         if slot._app != request_app:
             sel().log_api_access(
-                caller=request_app, operation="chat.slot_fork", outcome="denied",
-                source="app_isolation", resources=f"slot={name}",
+                caller=request_app,
+                operation="chat.slot_fork",
+                outcome="denied",
+                source="app_isolation",
+                resources=f"slot={name}",
                 error="app does not own this slot",
             )
             # Return 404 (not 403) so a slot owned by another app / an unscoped
             # slot is indistinguishable from a non-existent one — prevents an
             # app-scoped caller enumerating slots across the isolation boundary
             # (CWE-204). The true reason is recorded server-side via SEL above.
-            return web.json_response({"error": "not found"}, status=404)
+            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
 
     if slot.memory_mode != "persistent":
         sel().log_api_access(
-            caller=request_app or "dashboard", operation="chat.slot_fork",
-            outcome="denied", source="dashboard",
+            caller=request_app or "dashboard",
+            operation="chat.slot_fork",
+            outcome="denied",
+            source="dashboard",
             resources=f"slot={name},memory_mode={slot.memory_mode}",
             error="non-persistent slot",
         )
-        return web.json_response({"error": "cannot fork a non-persistent session"}, status=400)
+        return web.json_response(
+            {
+                "error": "cannot fork a non-persistent session",
+                "code": "slot_not_persistent",
+            },
+            status=400,
+        )
     if request.body_exists:
         try:
             body = await request.json()
         except Exception:
-            return web.json_response({"error": "invalid JSON body"}, status=400)
+            return web.json_response(
+                {"error": "invalid JSON body", "code": "invalid_json"}, status=400
+            )
         if not isinstance(body, dict):
-            return web.json_response({"error": "body must be a JSON object"}, status=400)
+            return web.json_response(
+                {"error": "body must be a JSON object", "code": "body_not_object"},
+                status=400,
+            )
     else:
         body = {}
     at_index = body.get("at_message_index")
     prompt = body.get("prompt")
     mode_override = body.get("mode")
     if mode_override is not None and mode_override not in ("", "orchestrator", "crew"):
-        return web.json_response({"error": "mode must be '', 'orchestrator' or 'crew'"}, status=400)
+        return web.json_response(
+            {
+                "error": "mode must be '', 'orchestrator' or 'crew'",
+                "code": "invalid_mode",
+            },
+            status=400,
+        )
     direction = body.get("direction", _FORK_DIRECTION_HEAD)
     if direction not in _FORK_DIRECTIONS:
         return web.json_response(
-            {"error": f"direction must be one of {list(_FORK_DIRECTIONS)}"}, status=400,
+            {
+                "error": f"direction must be one of {list(_FORK_DIRECTIONS)}",
+                "code": "invalid_direction",
+            },
+            status=400,
         )
     if direction == _FORK_DIRECTION_TAIL and not KiroCrewConfig.load().dashboard.tail_fork_enabled:
         # Server-side gate: tail-fork requested but disabled in config —
@@ -128,18 +163,27 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
         # head-fork instead of the requested tail-fork; "denied" would misleadingly
         # suggest the fork itself was rejected.
         sel().log_api_access(
-            caller=request_app or "dashboard", operation="chat.slot_fork",
-            outcome="allowed", source="dashboard",
+            caller=request_app or "dashboard",
+            operation="chat.slot_fork",
+            outcome="allowed",
+            source="dashboard",
             resources=f"slot={name},direction=tail",
             error="tail_fork_enabled is False; falling back to head-fork",
         )
         direction = _FORK_DIRECTION_HEAD
     if prompt is not None and not isinstance(prompt, str):
-        return web.json_response({"error": "prompt must be a string"}, status=400)
+        return web.json_response(
+            {"error": "prompt must be a string", "code": "invalid_field_type"},
+            status=400,
+        )
     prompt = (prompt or "").strip()
     if len(prompt) > 32_768:
         return web.json_response(
-            {"error": "prompt too long (max 32768 chars)"}, status=400,
+            {
+                "error": "prompt too long (max 32768 chars)",
+                "code": "prompt_too_long",
+            },
+            status=400,
         )
 
     # Read disk FIRST (full history). Use chained read so the index space
@@ -242,7 +286,7 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                         # (``test_a_first_entry_pending_rewrite_save_archives_as_
                         # before`` pins that). Stating it here removes the dependence
                         # on that promotion, which is the thing that silently failed.
-                        await save_slot_off_loop(
+                        saved = await save_slot_off_loop(
                             state, slot, rewrite=True, best_effort=False
                         )
                     except Exception:
@@ -250,15 +294,33 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                             "chat_fork: could not persist the pending rewrite for "
                             "slot=%s; refusing the fork rather than copying the "
                             "discarded turns still on disk",
-                            slot.key, exc_info=True,
+                            slot.key,
+                            exc_info=True,
                         )
                         return web.json_response(
                             {
-                                "error": "the source session is being written to; "
-                                         "please retry",
+                                "error": "the source session is being written to; " "please retry",
                                 "code": "fork_snapshot_unstable",
                             },
                             status=503,
+                        )
+                    if not saved:
+                        # Delete-won: the source session was permanently deleted
+                        # while this flush awaited the lock. Do not fork — the
+                        # copy would republish the destroyed conversation under
+                        # a fresh key (see the identical check at the plain
+                        # flush site below).
+                        logger.warning(
+                            "chat_fork: source slot=%s was permanently deleted "
+                            "during the pending-rewrite flush; aborting fork",
+                            slot.key,
+                        )
+                        return web.json_response(
+                            {
+                                "error": "the source session was permanently deleted",
+                                "code": "fork_source_deleted",
+                            },
+                            status=409,
                         )
                     # A moved generation means a genuine re-dirty landed across the
                     # await -- i.e. a rewind, whose ``_pending_rewrite`` this save
@@ -329,7 +391,7 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                     # read has supplied the only authoritative discriminator: the
                     # true on-disk length.
                     tail = None
-                    capped_tail = list(slot.messages[slot._resumed_count:])
+                    capped_tail = list(slot.messages[slot._resumed_count :])
                 else:
                     tail = []
                 all_messages = await asyncio.to_thread(
@@ -409,12 +471,12 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                     logger.warning(
                         "chat_fork: could not persist slot=%s to re-sync the "
                         "persisted boundary; refusing the fork",
-                        slot.key, exc_info=True,
+                        slot.key,
+                        exc_info=True,
                     )
                     return web.json_response(
                         {
-                            "error": "the source session is being written to; "
-                                     "please retry",
+                            "error": "the source session is being written to; " "please retry",
                             "code": "fork_snapshot_unstable",
                         },
                         status=503,
@@ -427,7 +489,8 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                 # not, and this handler already uses that shape below.
                 logger.warning(
                     "chat_fork: slot=%s did not settle in %d attempts; refusing the fork",
-                    slot.key, _SNAPSHOT_ATTEMPTS,
+                    slot.key,
+                    _SNAPSHOT_ATTEMPTS,
                 )
                 return web.json_response(
                     {
@@ -480,7 +543,9 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                 "chat_fork: slot=%s has %d frozen-prefix rows for a %d-message "
                 "window but disk holds more; skipping the durable save so it "
                 "cannot truncate the persisted history",
-                slot.key, slot._disk_older_count, len(slot.messages),
+                slot.key,
+                slot._disk_older_count,
+                len(slot.messages),
             )
         elif slot._dirty:
             # Persist with best_effort=False so a lock timeout / I/O failure
@@ -494,34 +559,87 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             # abort the fork (leaving ``_dirty`` set) rather than fork from a
             # partially-persisted source.
             try:
-                await save_slot_off_loop(state, slot, best_effort=False)
+                saved = await save_slot_off_loop(state, slot, best_effort=False)
             except Exception:
                 logger.warning(
                     "chat_fork: durable save of source slot=%s failed; "
                     "aborting fork to avoid losing unwritten messages",
-                    slot.key, exc_info=True,
+                    slot.key,
+                    exc_info=True,
                 )
                 return web.json_response(
-                    {"error": "could not persist source session before fork; "
-                              "please retry"},
+                    {
+                        "error": "could not persist source session before fork; " "please retry",
+                        "code": "source_save_failed",
+                    },
                     status=503,
+                )
+            if not saved:
+                # The delete-won guard skipped the write: the source session was
+                # permanently deleted while the flush awaited the lock. Forking
+                # now would republish the destroyed conversation under a fresh
+                # key (a brand-new slot carries no delete evidence, so ITS save
+                # would proceed) — the exact resurrection the guard exists to
+                # prevent, laundered through a copy. Abort instead; the delete's
+                # reported success stands.
+                logger.warning(
+                    "chat_fork: source slot=%s was permanently deleted during "
+                    "the pre-fork flush; aborting fork",
+                    slot.key,
+                )
+                return web.json_response(
+                    {
+                        "error": "the source session was permanently deleted",
+                        "code": "fork_source_deleted",
+                    },
+                    status=409,
                 )
             slot._resumed_count = len(slot.messages)
             slot._dirty = False
         if not all_messages:
             all_messages = list(slot.messages)
+        # Direct delete check, independent of the flush arms above: if the
+        # periodic 5s flush hit the delete-won guard first, it cleared
+        # ``_dirty`` and this handler's own flush arms never ran — the disk
+        # read came back empty and ``all_messages`` just fell back to the
+        # in-memory window of a permanently deleted conversation. The two
+        # ``saved``-checks above only cover a delete observed by THIS
+        # handler's flush; this probe answers regardless of who consumed the
+        # signal.
+        if session_was_deleted(state, slot):
+            logger.warning(
+                "chat_fork: source slot=%s belongs to a permanently deleted "
+                "session; refusing to fork it",
+                slot.key,
+            )
+            return web.json_response(
+                {
+                    "error": "the source session was permanently deleted",
+                    "code": "fork_source_deleted",
+                },
+                status=409,
+            )
     visible = [m for m in all_messages if m.get("role") in ("user", "assistant")]
     if not visible:
-        return web.json_response({"error": "no messages to fork"}, status=400)
+        return web.json_response(
+            {"error": "no messages to fork", "code": "no_messages_to_fork"},
+            status=400,
+        )
     if at_index is not None:
         if isinstance(at_index, bool) or not isinstance(at_index, int) or at_index < 0:
             return web.json_response(
-                {"error": "at_message_index must be a non-negative integer"},
+                {
+                    "error": "at_message_index must be a non-negative integer",
+                    "code": "invalid_field_type",
+                },
                 status=400,
             )
         if at_index >= len(visible):
             return web.json_response(
-                {"error": f"at_message_index {at_index} out of range (have {len(visible)} visible messages)"},
+                {
+                    "error": f"at_message_index {at_index} out of range (have {len(visible)} visible messages)",
+                    "code": "value_out_of_range",
+                },
                 status=400,
             )
 
@@ -529,22 +647,45 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     if direction == _FORK_DIRECTION_TAIL:
         if at_index is None:
             return web.json_response(
-                {"error": "at_message_index is required for a tail fork"}, status=400,
+                {
+                    "error": "at_message_index is required for a tail fork",
+                    "code": "at_message_index_required",
+                },
+                status=400,
             )
         head_messages = visible[: at_index + 1]
-        visible = visible[at_index + 1:]
+        visible = visible[at_index + 1 :]
         if not visible:
             return web.json_response(
-                {"error": "no messages after the fork point"}, status=400,
+                {
+                    "error": "no messages after the fork point",
+                    "code": "no_messages_after_fork_point",
+                },
+                status=400,
             )
     elif at_index is not None:
         visible = visible[: at_index + 1]
 
     new_slot = state.get_or_create_slot(
-        name=None, agent=slot.agent, workspace=slot.workspace, model=slot.model,
-        mode=mode_override if mode_override is not None else slot.mode,
+        name=None,
+        agent=slot.agent,
+        workspace=slot.workspace,
+        model=slot.model,
+        # A fork of a member DM thread is an ordinary chat, never a second
+        # "member" slot: the fork mints a chat-* key, so member mode would make
+        # it invisible everywhere (excluded from Sessions by surface mode, and
+        # absent from the roster, whose threads live only on member-<slug>
+        # keys). The override allowlist deliberately cannot name "member".
+        mode=(
+            mode_override
+            if mode_override is not None
+            else ("" if slot.mode == "member" else slot.mode)
+        ),
         app=request_app,
         origin=request_slot_origin(request_app),
+        # Human request-layer path: a person forking a conversation. The
+        # origin conjunct in state.py still excludes app-token callers.
+        count_user_session=True,
     )
     new_slot.forked_from = effective_session_key(slot)
     new_slot.reasoning_effort = slot.reasoning_effort
@@ -574,7 +715,9 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                 content, _ = redact_exfiltration_urls(content)
                 content, _ = redact_credentials(content)
             cls = "msg msg-u" if role == "user" else "msg msg-a"
-            new_slot.append(role, content, cls, ts=m.get("ts", ""), meta=m.get("meta"), broadcast=False)
+            new_slot.append(
+                role, content, cls, ts=m.get("ts", ""), meta=m.get("meta"), broadcast=False
+            )
             # A fork copies the parent's messages into a new session. Origin is
             # a property of the message, not of the file, so a copied inbound
             # channel turn keeps the origin it actually had.
@@ -593,6 +736,85 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             error="fork finalisation failed",
         )
         raise
+    # Acknowledgment boundary. The destination save above is the last await
+    # before this fork is answered, and it takes the DESTINATION's history lock
+    # -- nothing in it serialises against the SOURCE's permanent delete. So a
+    # delete that began after the pre-copy probe passed can commit inside that
+    # await, and the copy now on disk is a conversation the user has since
+    # destroyed. ``build_transfer_bundle_async`` already closes its equivalent
+    # window by re-probing after bundle assembly and before the peer send is
+    # acknowledged; this is the same rule at the same boundary, for the copy
+    # this handler makes.
+    #
+    # A delete that commits AFTER this point is deliberately out of scope: a
+    # fork acknowledged while its source was alive is its own session and
+    # survives the source, the way a repo fork outlives what it came from.
+    # Acknowledgment is the only boundary a handler owns, so it is the line
+    # drawn here.
+    if session_was_deleted(state, slot):
+        # Roll the destination back. It has been neither acknowledged nor
+        # broadcast (``push_slots_update`` is below, and every ``append`` above
+        # passed ``broadcast=False``), so nothing outside this handler has seen
+        # it: removing it leaves no trace of the deleted conversation instead of
+        # a fresh key holding a full copy. Removing the destination cannot harm
+        # the source -- different key, different lock -- so a false positive
+        # here (``session_was_deleted`` fails CLOSED when a stat or metadata
+        # read is unverifiable) costs a retryable 409 against a still-live
+        # source, not data.
+        removed = False
+        if state.conversation_log is not None:
+            try:
+                removed = bool(
+                    await asyncio.to_thread(
+                        state.conversation_log.delete_session,
+                        slot_history_key(new_slot),
+                    )
+                )
+            except Exception:
+                removed = False
+                logger.warning(
+                    "chat_fork: removing the unacknowledged fork transcript for %s raised",
+                    new_slot.key,
+                    exc_info=True,
+                )
+        state._slots.pop(new_slot.key, None)
+        if removed:
+            logger.warning(
+                "chat_fork: source slot=%s was permanently deleted during the "
+                "destination save; removed the unacknowledged fork %s",
+                slot.key,
+                new_slot.key,
+            )
+        else:
+            # The copy is still on disk and WILL be listed in Older Sessions.
+            # Loud, because this is the resurrection the guard exists to
+            # prevent and it now needs a human -- but still a 409: reporting
+            # success would additionally hide it.
+            logger.error(
+                "chat_fork: source slot=%s was permanently deleted during the "
+                "destination save, but the fork transcript for %s could not be "
+                "removed; a copy of the deleted conversation remains on disk",
+                slot.key,
+                new_slot.key,
+            )
+        sel().log_api_access(
+            caller=request_app or "dashboard",
+            operation="chat.slot_fork",
+            outcome="denied",
+            source="dashboard",
+            resources=(
+                f"from={slot.key},to={new_slot.key},"
+                f"rollback={'removed' if removed else 'failed'}"
+            ),
+            error="source session permanently deleted during the destination save",
+        )
+        return web.json_response(
+            {
+                "error": "the source session was permanently deleted",
+                "code": "fork_source_deleted",
+            },
+            status=409,
+        )
     sel().log_api_access(
         caller=request_app or "dashboard",
         operation="chat.slot_fork",
@@ -609,8 +831,13 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     _sync_dashboard_slots(state)
     state.push_slots_update()
     return web.json_response(
-        {"ok": True, "key": new_slot.key, "title": new_slot.title,
-         "messages": len(visible), "prompt": prompt,
-         "folder_id": new_slot.folder_id or None,
-         "direction": direction}
+        {
+            "ok": True,
+            "key": new_slot.key,
+            "title": new_slot.title,
+            "messages": len(visible),
+            "prompt": prompt,
+            "folder_id": new_slot.folder_id or None,
+            "direction": direction,
+        }
     )

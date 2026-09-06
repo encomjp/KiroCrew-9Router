@@ -215,7 +215,10 @@ async def test_run_bridge_installs_write_lock() -> None:
     stdin = asyncio.StreamReader()
     stdin.feed_eof()
     await asyncio.wait_for(
-        stub_mod.run_bridge(reader, w, stop, stdin=stdin, stdout_writer=w),
+        stub_mod.run_bridge(
+            reader, w, stop, stdin=stdin, stdout_writer=w,
+            session=stub_mod.StubSession(),
+        ),
         timeout=2.0,
     )
     assert getattr(w, "_mc_write_lock", None) is not None

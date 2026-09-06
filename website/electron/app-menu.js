@@ -19,7 +19,7 @@ function buildMenuTemplate(deps) {
     isMac,
     appName,
     openSettings, // navigate dashboard to /settings
-    openAbout, // navigate dashboard to /settings?tab=about (version + updates)
+    openAbout, // navigate dashboard to /settings/about (version + updates)
     reload,
     forceReload,
     toggleDevTools,
@@ -28,6 +28,7 @@ function buildMenuTemplate(deps) {
     zoomOut,
     alwaysOnTop, // initial checked state for Keep on Top (restored preference)
     toggleAlwaysOnTop,
+    openNewSessionWindow,
     openNewConnectionWindow,
     renameCurrentWindow,
     promptRemoteHost,
@@ -110,6 +111,12 @@ function buildMenuTemplate(deps) {
       id: "connection-menu",
       label: "Connection",
       submenu: [
+        ...(isMac
+          ? [
+              { label: "New Window", accelerator: "Cmd+Shift+N", click: openNewSessionWindow },
+              { type: "separator" },
+            ]
+          : []),
         { label: "New Connection Window…", accelerator: "CmdOrCtrl+N", click: openNewConnectionWindow },
         // No accelerator: Cmd+Shift+R is Force Reload (platform standard).
         { label: "Rename Window…", click: renameCurrentWindow },

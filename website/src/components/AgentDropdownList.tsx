@@ -142,7 +142,7 @@ export function ManageAgentsFooter({ onManage, error }: { onManage: () => void; 
   )
 }
 
-/** Shared agent list used in dropdown portals across ChatPage and AgentsPage */
+/** Shared agent list used in dropdown portals across ChatPage and ChatPane */
 export default function AgentDropdownList({ agents, activeAgent, defaultAgent, onSelect, filter }: {
   agents: AgentItem[]
   activeAgent: string
@@ -160,7 +160,14 @@ export default function AgentDropdownList({ agents, activeAgent, defaultAgent, o
   }
 
   return (
-    <div className="overflow-y-auto flex flex-col max-h-[300px]">
+    // Plain flex column: scrolling is owned by the host's listbox wrapper
+    // (ChatPage / ChatPane render this inside `overflow-y-auto max-h-[280px]`).
+    // A second overflow container here nests two scrollbars (#6375), and
+    // `scrollIntoView` on the active row scrolls the nearest scrollable
+    // ancestor, so the host-owned scroller keeps that behavior intact.
+    // role="presentation" keeps this layout div out of the listbox's
+    // owned-children chain (hosts put role="listbox" on their wrapper).
+    <div role="presentation" className="flex flex-col">
       {agents.map(a => {
         const active = activeAgent === a.name
         return <AgentButton key={a.name} a={a} active={active} isDefault={a.name === defaultAgent} activeRef={activeRef} onSelect={onSelect} filter={filter} />

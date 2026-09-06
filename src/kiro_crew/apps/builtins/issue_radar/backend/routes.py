@@ -68,7 +68,13 @@ from functools import partial, wraps
 
 from aiohttp import web
 
-from kiro_crew.apps.builtins.issue_radar.backend import github_client, provider, store, watch
+from kiro_crew.apps.builtins.issue_radar.backend import (
+    github_client,
+    pipeline_routes,
+    provider,
+    store,
+    watch,
+)
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.context import ui_language_tag
@@ -4443,6 +4449,13 @@ def _pr_action_error(op: str, target: str, exc: Exception) -> web.Response:
     the client could fix is 400, and anything else upstream is 502 — the same
     taxonomy the label/state routes use, so one action behaving differently is not
     something a caller has to discover.
+
+    The 502 relays ``str(exc)`` rather than a fixed string, unlike the read routes.
+    A PR action fails for a reason the caller can usually FIX — "Allow auto-merge is
+    off for this repository", "the base branch is protected" — and that reason lives
+    only in the provider's own text. Withholding it here would leave the operator
+    retrying a button that can never work. The read routes carry no such actionable
+    text, so they sanitize (see ``_handle_pull_runs``).
     """
     if isinstance(exc, GhPermissionError):
         _audit(op, target, "denied", error=str(exc))
@@ -5075,7 +5088,12 @@ async def _handle_pull_runs(request: web.Request) -> web.Response:
             )
         )
     except GhCliError as exc:
-        return web.json_response({"error": str(exc), "code": "provider_error"}, status=502)
+        # Fixed string, not `str(exc)`: the message is gh's stderr tail (command,
+        # exit code, upstream body). Logged for us, withheld from the caller.
+        logger.warning("issue-radar list_pr_workflow_runs provider error: %s", exc)
+        return web.json_response(
+            {"error": "upstream provider error", "code": "provider_error"}, status=502
+        )
     return web.json_response({**_identity(key), "number": number, "runs": runs})
 
 
@@ -5320,6 +5338,13 @@ def register_routes(app: web.Application) -> None:
     from . import crew_routes
 
     crew_routes.register_crew_routes(app)
+
+    # The pipeline dashboard's routes, same arrangement and for the same reason:
+    # its own module, registered HERE so this function stays the one place that
+    # lists this app's routes. Unlike crew_routes this import is NOT circular --
+    # pipeline_routes depends only on its fold and on `store` for the app name --
+    # so it is imported at module scope with the rest.
+    pipeline_routes.register_routes(app)
 
     # Background new-issue watcher: a single in-process asyncio loop (NOT a cron
     # job) that polls opted-in repos every ~60s and pushes a KiroCrew

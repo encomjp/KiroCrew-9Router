@@ -39,6 +39,10 @@ class TestAttachBackendValidation:
         """Known-good inputs should not raise."""
         self.mod._validate_args("my-profile", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
 
+    def test_sso_plus_profile_passes(self):
+        """IAM Identity Center derived names contain '+' (#6055)."""
+        self.mod._validate_args("AdminAccess+dev", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
+
     def test_empty_profile_allowed(self):
         """Empty profile (default) should pass."""
         self.mod._validate_args("", "us-east-1", "ABCDEFGHIJKLM", "demo-app")
@@ -81,6 +85,10 @@ class TestDetachBackendValidation:
 
     def test_valid_args_pass(self):
         self.mod._validate_args("my-profile", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
+
+    def test_sso_plus_profile_passes(self):
+        """IAM Identity Center derived names contain '+' (#6055)."""
+        self.mod._validate_args("AdminAccess+dev", "us-west-2", "E1A2B3C4D5E6F7", "my-app")
 
     def test_empty_profile_allowed(self):
         self.mod._validate_args("", "ap-southeast-2", "ABCDEFGHIJKLM", "demo")

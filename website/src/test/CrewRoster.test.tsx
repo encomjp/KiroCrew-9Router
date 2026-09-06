@@ -587,6 +587,7 @@ describe('crew editor — create', () => {
         workspace: 'default',
         memory_store: 'default',
         triggers: '',
+        session_color: '',
       }),
     )
   })
@@ -610,6 +611,7 @@ describe('crew editor — save', () => {
       memory_store: 'oncall-mem',
       triggers: 'pager',
       model: 'claude-opus-5',
+      session_color: '',
     })
   })
 

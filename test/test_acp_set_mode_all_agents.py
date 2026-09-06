@@ -23,7 +23,7 @@ def _make_client(agent: str, tmp_path) -> AcpClient:
     return c
 
 
-async def _fake_wait(rid, timeout=None):
+async def _fake_wait(rid, timeout=None, *, method="", expected_mcp=None):
     """Return minimal valid responses for each init step."""
     return {"protocolVersion": "1.0", "sessionId": "sess-123"}
 
@@ -37,24 +37,22 @@ async def test_set_mode_called_for_all_agents(agent, tmp_path):
     client._wait_for_response = AsyncMock(side_effect=_fake_wait)
     client._drain_notifications = AsyncMock()
 
-    with patch("pathlib.Path.exists", return_value=False), \
-         patch("pathlib.Path.stat"):
+    with patch("pathlib.Path.exists", return_value=False), patch("pathlib.Path.stat"):
         await client._initialize_session()
 
     set_mode_calls = [
-        c for c in client._send_request.call_args_list
-        if c.args[0] == METHOD_SET_MODE
+        c for c in client._send_request.call_args_list if c.args[0] == METHOD_SET_MODE
     ]
-    assert len(set_mode_calls) == 1, (
-        f"set_mode not called for agent={agent!r}; calls: {client._send_request.call_args_list}"
-    )
+    assert (
+        len(set_mode_calls) == 1
+    ), f"set_mode not called for agent={agent!r}; calls: {client._send_request.call_args_list}"
     assert set_mode_calls[0].args[1]["modeId"] == agent
 
 
 async def _wait_with_modes(mode_ids):
     """Init-step response factory that advertises a `modes` payload."""
 
-    async def _fake(rid, timeout=None):
+    async def _fake(rid, timeout=None, *, method="", expected_mcp=None):
         return {
             "protocolVersion": "1.0",
             "sessionId": "sess-123",

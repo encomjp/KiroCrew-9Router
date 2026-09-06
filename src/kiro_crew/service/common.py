@@ -152,6 +152,10 @@ def service_environment(home: str) -> "dict[str, str]":
         "PATH": service_path(home),
         "LANG": utf8_locale,
         "LC_ALL": utf8_locale,
+        # Cross-platform marker for runtime policies that differ in a managed
+        # background service. Older definitions without it are diagnosed by
+        # ``kirocrew doctor`` and regenerated with ``kirocrew service install``.
+        "KIROCREW_SERVICE_MANAGED": "1",
     }
     kiro_bin = os.environ.get("KIROCREW_KIRO_BIN", "").strip()
     if kiro_bin:

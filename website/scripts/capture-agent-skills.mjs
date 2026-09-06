@@ -18,6 +18,7 @@ import { mkdirSync, readFileSync, existsSync, statSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { join, extname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { json, logPageProblems, stubDashboardApi } from './lib/stub-dashboard-api.mjs'
 
 const OUT = process.argv[2] || '/tmp/agent-skills-shots'
 // fileURLToPath, not URL.pathname: on Windows .pathname yields "/C:/…", which
@@ -102,9 +103,6 @@ function installed() {
   }))
 }
 
-const json = (route, body) =>
-  route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) })
-
 const { srv, base } = await serveDist()
 const browser = await chromium.launch()
 const context = await browser.newContext({
@@ -114,11 +112,8 @@ const context = await browser.newContext({
 })
 const page = await context.newPage()
 
-await page.routeWebSocket(/\/api\/ws/, () => {})
-
-await page.route('**/api/**', async route => {
-  const url = new URL(route.request().url())
-  const path = url.pathname
+// Feature fixtures only; boot-path endpoints come from the shared stub.
+const extra = async (path, route) => {
   const method = route.request().method()
 
   if (path.startsWith('/api/agents/detail/')) {
@@ -126,61 +121,36 @@ await page.route('**/api/**', async route => {
     if (method === 'PATCH') {
       const body = JSON.parse(route.request().postData() || '{}')
       if (Array.isArray(body.skills)) mapping[name] = body.skills
-      return json(route, { ok: true, model: DETAIL[name]?.model || '', skills: mapping[name] })
+      await json(route, { ok: true, model: DETAIL[name]?.model || '', skills: mapping[name] })
+      return true
     }
-    return json(route, {
+    await json(route, {
       ...(DETAIL[name] || { name }),
       skills: mapping[name] || [],
       unmanaged_skills: UNMANAGED[name] || [],
     })
+    return true
   }
-  if (path === '/api/agents/installed') return json(route, installed())
-  if (path === '/api/skills') return json(route, SKILLS)
-  if (path === '/api/config/default-agent') return json(route, { default_agent: 'kirocrew' })
-  if (path.startsWith('/api/agent-metadata/')) return json(route, { content: '' })
-  if (path === '/api/mcp/probe') return json(route, [])
-  if (path === '/api/spawn') return json(route, { agents: [] })
-  if (path === '/api/sessions/context') return json(route, { sessions: [] })
-  if (path === '/api/sessions/usage') return json(route, { usage: null })
+  if (path === '/api/agents/installed') { await json(route, installed()); return true }
+  if (path === '/api/skills') { await json(route, SKILLS); return true }
+  if (path === '/api/config/default-agent') { await json(route, { default_agent: 'kirocrew' }); return true }
+  if (path.startsWith('/api/agent-metadata/')) { await json(route, { content: '' }); return true }
+  if (path === '/api/mcp/probe') { await json(route, []); return true }
+  if (path === '/api/spawn') { await json(route, { agents: [] }); return true }
+  if (path === '/api/sessions/context') { await json(route, { sessions: [] }); return true }
+  if (path === '/api/sessions/usage') { await json(route, { usage: null }); return true }
   if (path === '/api/models') {
-    return json(route, [
+    await json(route, [
       { model_name: 'auto', description: 'Let Kiro choose' },
       { model_name: 'claude-opus-4.8', description: 'Most capable' },
       { model_name: 'claude-sonnet-4.5', description: 'Balanced' },
     ])
+    return true
   }
-  // The app shell mounts behind this gate and reads status.operation.status —
-  // a generic object stub crashes it, blanking the whole page.
-  if (path === '/api/kiro-prerequisite') {
-    return json(route, {
-      platform: 'linux', installed: true, authenticated: true, ready: true,
-      initial_setup_complete: true, can_auto_install: false, can_login: false,
-      repair_required: false, docs_url: '', setup_allowed: false,
-      operation: { kind: '', status: 'idle', message: '', detail: '', url: '', error: '' },
-    })
-  }
-  if (path === '/api/chat/slots') return json(route, [])
-  if (path.startsWith('/api/instances')) return json(route, { instances: [], active: '' })
-  if (path === '/api/status') return json(route, { sessions: 1, crons: 0, lessons: 0, subagents: 0, uptime: 120, version: 'dev' })
-  if (path === '/api/notifications') return json(route, { notifications: [], unread: 0 })
-  if (path === '/api/auth/me') return json(route, { user: 'owner', app: '' })
-  if (path === '/api/themes') return json(route, { themes: [], installed: [] })
-  if (path === '/api/theme/boot') return json(route, { mode: 'dark', theme: '' })
-  if (path === '/api/dashboard/branding') return json(route, { bot_name: 'Kiro', avatar: '' })
-  if (path === '/api/recent-projects') return json(route, { dirs: [] })
-  if (path === '/api/dashboard/config') return json(route, { restore_sessions: false, restore_window_minutes: 30, merge_queued_messages: false, widget_density: 'more' })
-  const objectish = /(config|tips|voice|autonudge|branding|status|usage-summary)/.test(path)
-  return json(route, objectish ? {} : [])
-})
-
-page.on('pageerror', err => console.log('PAGEERROR:', String(err).slice(0, 300)))
-page.on('console', msg => { if (msg.type() === 'error') console.log('CONSOLE:', msg.text().slice(0, 300)) })
-
-await page.addInitScript(() => {
-  localStorage.clear()
-  localStorage.setItem('mc-theme', 'dark')
-  localStorage.setItem('mc-onboarded', '1')
-})
+  return false
+}
+logPageProblems(page)
+await stubDashboardApi(page, { extra })
 
 async function load() {
   await page.goto(base + '/capabilities?tab=templates', { waitUntil: 'domcontentloaded' })

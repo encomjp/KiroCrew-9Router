@@ -27,8 +27,14 @@
  * so it must stay LAST in this file.
  */
 import { describe, it, expect, vi } from 'vitest'
-import { setTimeout as sleep } from 'node:timers/promises'
-import { clearLeakedTimers, beginTimerTeardown } from '../../integration/setup'
+import {
+  setImmediate as nextImmediate,
+  setTimeout as nextTimer,
+} from 'node:timers/promises'
+import {
+  clearLeakedTimers,
+  settleDOMTasksBeforeMockShutdown,
+} from '../../integration/setup'
 
 describe('lottie-web import-time timer neutralization', () => {
   it('serves the setup mock for BOTH runtime specifiers, so the real bundle never registers its interval', async () => {
@@ -45,13 +51,14 @@ describe('lottie-web import-time timer neutralization', () => {
     // dereferences `document` on each tick. No await between registration and
     // the sweep, so the tick cannot run first -- the assertion is deterministic.
     const tick = vi.fn(() => document.readyState)
-    setInterval(tick, 100)
+    setInterval(tick, 0)
     expect(clearLeakedTimers()).toBeGreaterThan(0)
 
-    // Wait past the interval period on a raw Node timer imported directly from
-    // node:timers/promises (independent of the wrapped globals). If the sweep
-    // failed, the tick fires within 100ms and this catches it.
-    await sleep(250)
+    // A raw Node timer registered after the interval is an event-loop barrier:
+    // without the sweep, the earlier zero-delay interval fires before it. This
+    // proves cancellation without a wall-clock allowance that can flake on a
+    // loaded worker.
+    await nextTimer(0)
     expect(tick).not.toHaveBeenCalled()
   })
 
@@ -59,34 +66,37 @@ describe('lottie-web import-time timer neutralization', () => {
     const soon = vi.fn(() => document.readyState)
     setImmediate(soon)
     clearLeakedTimers()
-    await sleep(20)
+    // Registered after `soon`, so this raw immediate runs later in the same
+    // check phase unless the wrapped immediate was cancelled.
+    await nextImmediate()
     expect(soon).not.toHaveBeenCalled()
   })
 
   it('clearTimeout/clearInterval through the wrappers stay functional', async () => {
     const late = vi.fn()
-    const handle = setTimeout(late, 100)
+    const handle = setTimeout(late, 0)
     clearTimeout(handle)
-    await sleep(150)
+    await nextTimer(0)
     expect(late).not.toHaveBeenCalled()
   })
 
   it('a fired one-shot self-evicts from the ledger (the Set tracks live timers, not total creations)', async () => {
     clearLeakedTimers() // drain anything earlier tests or React left pending
     const ran = vi.fn()
-    setTimeout(ran, 1)
-    await sleep(30)
+    setTimeout(ran, 0)
+    // FIFO within the timers phase: the wrapped callback was registered first,
+    // so it fires and self-evicts before this raw timer resolves.
+    await nextTimer(0)
     expect(ran).toHaveBeenCalledTimes(1)
     // The fired handle must be gone from the ledger; only timers created by
     // OTHER code between the drain and here could remain, and none were.
     expect(clearLeakedTimers()).toBe(0)
   })
 
-  it('setup.ts wires the sweep into an afterAll (structural pin)', async () => {
-    // The behavioral tests above exercise the sweep directly; this pins that it
-    // is actually REGISTERED to run at file teardown. A refactor that keeps the
-    // function but drops the hook re-opens the race silently -- the leak only
-    // fires under specific worker/file-count timing.
+  it('setup.ts drains happy-dom before closing MSW (structural pin)', async () => {
+    // The behavioral tests exercise the drain directly; this pins reverse hook
+    // registration order. Moving server.close() below the drain would close the
+    // interceptor first and restore the deferred localhost dial.
     const { readFile } = await import('node:fs/promises')
     const { resolve } = await import('node:path')
     // Resolved from cwd (vitest runs with cwd at the website root, where
@@ -94,16 +104,31 @@ describe('lottie-web import-time timer neutralization', () => {
     // suite's happy-dom environment it carries the environment's http URL,
     // not a file: URL, so fileURLToPath throws.
     const source = await readFile(resolve(process.cwd(), 'integration/setup.ts'), 'utf8')
-    expect(source).toMatch(/afterAll\([\s\S]{0,120}?beginTimerTeardown\(/)
+    const closeHook = source.indexOf('afterAll(() => server.close())')
+    const drainHook = source.indexOf(
+      'afterAll(async () => {\n  await settleDOMTasksBeforeMockShutdown(window.happyDOM)',
+    )
+    expect(closeHook).toBeGreaterThan(-1)
+    expect(drainHook).toBeGreaterThan(closeHook)
+    expect(source).not.toContain("process.on('unhandledRejection'")
   })
 
-  it('after teardown begins, a late registration is cancelled on the spot (MUST BE LAST)', async () => {
-    beginTimerTeardown()
+  it('drains owned DOM tasks before teardown and cancels late timers (MUST BE LAST)', async () => {
+    const order: string[] = []
+    await settleDOMTasksBeforeMockShutdown({
+      waitUntilComplete: async () => { order.push('dom-drained') },
+    })
+    expect(order).toEqual(['dom-drained'])
+    // Shared setup also runs in explicit jsdom suites, where window.happyDOM is
+    // absent. That environment still arms timer teardown and must not fail.
+    await expect(settleDOMTasksBeforeMockShutdown(undefined)).resolves.toBeUndefined()
+
     const straggler = vi.fn(() => document.readyState)
-    setTimeout(straggler, 1)
-    setInterval(straggler, 10)
-    await sleep(80)
+    setTimeout(straggler, 0)
+    setInterval(straggler, 0)
+    await nextTimer(0)
     expect(straggler).not.toHaveBeenCalled()
-    // The file's own afterAll calls beginTimerTeardown() again -- idempotent.
+    // The file's own afterAll calls the drain again -- both operations are
+    // idempotent, and the real happy-dom queue is already empty here.
   })
 })

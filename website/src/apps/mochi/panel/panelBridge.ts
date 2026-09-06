@@ -353,8 +353,8 @@ export function isRenderableChatRole(role: unknown): boolean {
  * (`/api/approvals/{id}` scans slot futures and broadcasts `approval_resolved`).
  *
  * `full_command` / `base_command` are carried through as well. The gateway
- * pre-computes them for the dashboard's scoped Trust menu (see chat_runner's
- * `_extract_full_command` / `_extract_base_command`), and they arrive on this
+ * pre-computes them for the dashboard's scoped Trust menu (see the shared
+ * `kiro_crew.trust_patterns` module), and they arrive on this
  * frame already redacted. Dropping them is what limited the pet to the single
  * BROADEST grant ("trust all tools") while the dashboard could scope a grant to
  * one command — a security-relevant gap, since the pet's one button silently did
@@ -390,6 +390,7 @@ export function permissionApprovalFromFrame(
   toolInput?: string
   fullCommand?: string
   baseCommand?: string
+  trustGrantable?: boolean
   purpose?: string
 } | null {
   let meta: unknown
@@ -411,6 +412,7 @@ export function permissionApprovalFromFrame(
     toolInput?: string
     fullCommand?: string
     baseCommand?: string
+    trustGrantable?: boolean
     purpose?: string
   } = { id, tool }
   if (typeof m.tool_input === 'string' && m.tool_input) {
@@ -420,6 +422,9 @@ export function permissionApprovalFromFrame(
   }
   if (typeof m.full_command === 'string' && m.full_command) req.fullCommand = m.full_command
   if (typeof m.base_command === 'string' && m.base_command) req.baseCommand = m.base_command
+  // Proof is server-authored on the pending card. Scope strings are display
+  // values and their absence must never make the pet fall back to broad Trust.
+  if (m.trust_grantable === '1') req.trustGrantable = true
   return req
 }
 
@@ -808,7 +813,7 @@ export async function ensureSlot(): Promise<void> {
   // with that foreign agent, and sending the pet's turn into it would hijack and
   // corrupt that session. Verify the returned binding and refuse otherwise; the
   // throw aborts the send (ChatPanel restores the message and shows the error).
-  let bound: { agent?: unknown } = {}
+  let bound: { agent?: unknown; effective_agent?: unknown } = {}
   try {
     bound = await resp.json()
   } catch {
@@ -818,6 +823,24 @@ export async function ensureSlot(): Promise<void> {
     throw new Error(
       `mochi slot "${MOCHI_SLOT}" is bound to another agent ` +
         `(${String(bound.agent) || 'none'}); refusing to send`,
+    )
+  }
+  // Second gate: the slot asks for `mochi` but something else answers it — the
+  // app agent was removed, or its registration has not landed. The first gate
+  // cannot see this, because `agent` is stored VERBATIM by design, so it keeps
+  // reading `mochi` while the default agent takes the turn. Sending anyway would
+  // put the pet's conversation into an agent that has none of its tools and is
+  // very likely the user's own main agent.
+  //
+  // Absent/"" is "no news", NOT a mismatch: the backend reports "" whenever
+  // resolution is unsettled (a cold snapshot during boot), and every caller
+  // predating the field sends nothing at all. Treating that as a mismatch would
+  // refuse every send on a healthy install.
+  const effective = bound.effective_agent
+  if (typeof effective === 'string' && effective !== '' && effective !== MOCHI_AGENT) {
+    throw new Error(
+      `mochi slot "${MOCHI_SLOT}" resolves to a different agent ` +
+        `(${effective}); refusing to send`,
     )
   }
   slotEnsured = true
@@ -1268,14 +1291,27 @@ export async function getPendingApprovals(): Promise<Record<string, unknown>[]> 
  * `pattern` scopes a trust grant (`trust_command` / `trust_base`) to one command
  * or one command family; the slot endpoint reads it as `pattern`. Omitted for
  * `approve` / `reject` and for the unscoped `trust` (trust every tool), which
- * carry no pattern.
+ * carry no pattern. `trustGrantable` is the gateway proof carried by this exact
+ * pending card; every durable trust route fails locally without it, while the
+ * server independently verifies the card again before changing policy.
  */
 export async function respondApproval(
   id: string,
   action: string,
   pattern?: string,
+  trustGrantable = false,
 ): Promise<{ ok: boolean; error?: string; staleOwnerSession?: boolean }> {
   const route = approvalRoute(action)
+  if (
+    route.kind === 'slot'
+    && ['trust', 'trust_command', 'trust_base'].includes(route.action)
+    && !trustGrantable
+  ) {
+    // Defense-in-depth for stale/custom renderers: without the gateway proof,
+    // this card may still allow/reject once but cannot manufacture a durable
+    // slot grant through the bridge.
+    return { ok: false, error: 'durable trust is unavailable for this approval' }
+  }
   try {
     const res =
       route.kind === 'approval'
@@ -1382,10 +1418,26 @@ export async function getSlotModel(): Promise<string> {
 }
 
 /**
+ * Result of a slot-model switch. `ok: false` alone is a generic failure;
+ * `code` carries the gateway's machine-readable refusal when the body names
+ * one (`turn_in_flight`: a turn is running mid-switch, retry after it ends).
+ *
+ * This deliberately widens the original preload's bare-boolean signature: the
+ * gateway refuses a mid-turn switch with a 409 whose only useful content is
+ * the structured code, and a bare `false` collapsed that into "failed for no
+ * stated reason". Truthiness call sites keep working (`{ ok: true }` vs
+ * `{ ok: false }` is what the one caller reads).
+ */
+export interface SetModelResult {
+  ok: boolean
+  code?: string
+}
+
+/**
  * Switch the pet slot's model. Slot-scoped, so it cannot disturb the dashboard's
  * own conversations. An empty string hands the slot back to the gateway default.
  */
-export async function setModel(model: string): Promise<boolean> {
+export async function setModel(model: string): Promise<SetModelResult> {
   try {
     const res = await fetch(`/api/chat/slots/${MOCHI_SLOT}/model`, {
       method: 'POST',
@@ -1393,9 +1445,20 @@ export async function setModel(model: string): Promise<boolean> {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model }),
     })
-    return res.ok
+    if (res.ok) return { ok: true }
+    // Refusals carry {"error": ..., "code": ...}; surface the code so the
+    // caller can tell "a turn is in flight — retry later" apart from a hard
+    // failure. A non-JSON or code-less body stays a generic failure.
+    try {
+      const body = await res.json()
+      const code = (body as { code?: unknown } | null)?.code
+      if (typeof code === 'string' && code) return { ok: false, code }
+    } catch {
+      // fall through — body was not JSON
+    }
+    return { ok: false }
   } catch {
-    return false
+    return { ok: false }
   }
 }
 
@@ -1525,19 +1588,6 @@ export async function getSttConfig(): Promise<SttConfig | undefined> {
   } catch {
     return undefined
   }
-}
-
-export async function installStt(): Promise<{ ok: boolean; error?: string }> {
-  const res = await fetch('/api/stt/install', {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-    body: '{}',
-  })
-  // The settings UI shows the failure reason, so the status text is carried
-  // through rather than collapsed into a bare boolean.
-  if (res.ok) return { ok: true }
-  return { ok: false, error: `install failed (${res.status})` }
 }
 
 /** Transcribe one recorded clip. `audio` is a base64 payload, as core expects. */

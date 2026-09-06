@@ -27,6 +27,7 @@ import { wakesCrew, crewWakeQueryKey, crewWebhooksQueryKey, webhookBoundToCrew, 
 import type { CronJob } from '../types'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import { SourceBadge } from '../components/SourceBadge'
+import { errMessage } from '../utils/thunkError'
 
 import { i18nT } from '../i18n/t'
 import ErrorNotice from '../components/ErrorNotice'
@@ -43,6 +44,7 @@ interface CreatePayload {
   workspace: string
   memory_store: string
   triggers: string
+  session_color: string
 }
 
 /** Editable fields sent when updating an existing agent binding. */
@@ -54,6 +56,8 @@ interface AgentUpdatePayload {
   triggers: string
   /** '' = inherit (the kiro template's pin, then the global fallback). */
   model: string
+  /** Default session color (#rrggbb hex) for new sessions. '' = no default. */
+  session_color: string
 }
 
 /** The stored spelling for "no per-agent pin, inherit the next tier down". The
@@ -367,6 +371,59 @@ export function TriggersField({ value, onChange }: { value: string; onChange: (v
   )
 }
 
+/** Session color picker for agent configuration. Sets the default session
+ *  tint color for new sessions created with this agent. */
+export function SessionColorField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const HEX_RE = /^#[0-9a-f]{6}$/i
+  const [draft, setDraft] = useState(value || '')
+  // Re-sync the draft when the committed value changes from outside (e.g. the
+  // swatch, Clear, or opening the editor on a different crew).
+  useEffect(() => { setDraft(value || '') }, [value])
+  const commit = (raw: string) => {
+    const v = raw.trim().toLowerCase()
+    if (v === '') { onChange(''); setDraft('') }
+    else if (HEX_RE.test(v)) { onChange(v); setDraft(v) }
+    else { setDraft(value || '') } // invalid on blur → revert to committed
+  }
+  return (
+    <Field label={i18nT('pages.kiroCrewAgentsPage.session_color')} hint={i18nT('pages.kiroCrewAgentsPage.session_color_hint')}>
+      <div className="flex items-center gap-2">
+        <Input
+          type="color"
+          value={value || '#6366f1'}
+          onChange={e => onChange(e.target.value.toLowerCase())}
+          className="h-8 w-8 flex-none cursor-pointer p-0.5"
+          aria-label={i18nT('pages.kiroCrewAgentsPage.session_color')}
+        />
+        <Input
+          placeholder="#rrggbb"
+          value={draft}
+          onChange={e => {
+            const v = e.target.value.trim().toLowerCase()
+            setDraft(v)
+            // Live-commit only when the draft is a complete hex or cleared;
+            // partial values stay local so typing is never swallowed.
+            if (v === '' || HEX_RE.test(v)) onChange(v)
+          }}
+          onBlur={e => commit(e.target.value)}
+          className="flex-1 font-mono text-[13px]"
+          aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_hex')}
+        />
+        {value && (
+          <Btn
+            type="button"
+            onClick={() => onChange('')}
+            className="text-[11px]"
+            aria-label={i18nT('pages.kiroCrewAgentsPage.session_color_clear')}
+          >
+            {i18nT('pages.kiroCrewAgentsPage.session_color_clear')}
+          </Btn>
+        )}
+      </div>
+    </Field>
+  )
+}
+
 /** The create form's binding block. */
 function BindingFields({
   templateLabel, kiroAgentOptions, kiroAgent, setKiroAgent,
@@ -412,6 +469,7 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
       className={`group flex flex-col gap-3 rounded-lg border bg-card p-3.5 transition-all
                   hover:border-border-strong hover:shadow-md focus-ring
                   ${isDefault ? 'border-accent-subtle' : 'border-border'}`}
+      style={agent.session_color ? { borderLeftColor: agent.session_color, borderLeftWidth: '3px' } : undefined}
     >
       <div className="flex items-center gap-3">
         <CrewAvatar seed={agent.name} size={38} />
@@ -603,6 +661,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const [workspace, setWorkspace] = useState('default')
   const [memoryStore, setMemoryStore] = useState('default')
   const [triggers, setTriggers] = useState('')
+  const [sessionColor, setSessionColor] = useState('')
   const [editModel, setEditModel] = useState(INHERIT_MODEL)
   const [confirmDelete, setConfirmDelete] = useState(false)
   /** The armed confirm row, scrolled into view when it appears: the danger zone
@@ -639,6 +698,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     setConfirmDelete(false)
     setName(''); setKiroAgent(''); setWorkspace('default'); setMemoryStore('default')
     setTriggers('')
+    setSessionColor('')
     setSheet({ mode: 'create' })
   }, [])
 
@@ -648,6 +708,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     setConfirmDelete(false)
     setKiroAgent(a.kiro_agent); setWorkspace(a.workspace); setMemoryStore(a.memory_store)
     setTriggers(a.triggers || '')
+    setSessionColor(a.session_color || '')
     setEditModel(a.model || INHERIT_MODEL)
     setSheet({ mode: 'edit', name: a.name })
   }, [defaultAgent])
@@ -716,7 +777,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     // 'kirocrew' default: that default is what silently turns a new crew into an
     // alias for the DEFAULT agent (#1684).
     if (!kiroAgent) { setError(i18nT('pages.kiroCrewAgentsPage.agent_template_is_required')); return }
-    createMut.mutate({ name: n, kiro_agent: kiroAgent, workspace, memory_store: memoryStore, triggers, epoch: sheetEpoch.current })
+    createMut.mutate({ name: n, kiro_agent: kiroAgent, workspace, memory_store: memoryStore, triggers, session_color: sessionColor, epoch: sheetEpoch.current })
   }
 
   const saveEdit = () => {
@@ -733,6 +794,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
         // INHERIT_MODEL is normalized to '' server-side; send it verbatim so
         // clearing a pin is a real write rather than a skipped field.
         model: editModel,
+        session_color: sessionColor,
       },
     })
   }
@@ -748,8 +810,10 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     } catch (e) {
       // `unwrap()` rethrows Redux Toolkit's SERIALIZED error, which is a plain
       // object carrying `message` rather than a real Error — an `instanceof`
-      // check alone renders it as "[object Object]".
-      const msg = e instanceof Error ? e.message : (e as { message?: string })?.message
+      // check alone renders it as "[object Object]". `errMessage` owns that
+      // extraction for every thunk-boundary reader, so this site cannot drift
+      // from the classifier in `utils/thunkError` that depends on the same fact.
+      const msg = errMessage(e)
       settleFor(epoch, msg || i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent'))
       return
     }
@@ -889,8 +953,9 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     }
     if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add('model')
     if (triggers !== (editingAgent.triggers || '')) out.add('routing')
+    if (sessionColor !== (editingAgent.session_color || '')) out.add('routing')
     return out
-  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers])
+  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers, sessionColor])
 
   const sections = useCrewEditorSections({
     templateLabel: provider.labels.agentTemplateField,
@@ -1120,6 +1185,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 <section className="flex flex-col gap-3">
                   <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">{i18nT('pages.kiroCrewAgentsPage.routing')}</h3>
                   <TriggersField value={triggers} onChange={setTriggers} />
+                  <SessionColorField value={sessionColor} onChange={setSessionColor} />
                 </section>
                 <section className="flex flex-col gap-3">
                   <h3 className="text-[12px] font-semibold uppercase tracking-wider text-muted">{i18nT('pages.kiroCrewAgentsPage.runtime_binding')}</h3>
@@ -1226,7 +1292,12 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
                   {pane === 'webhook' && <CrewWebhookSection crew={editing} />}
 
-                  {pane === 'routing' && <TriggersField value={triggers} onChange={setTriggers} />}
+                  {pane === 'routing' && (
+                    <>
+                      <TriggersField value={triggers} onChange={setTriggers} />
+                      <SessionColorField value={sessionColor} onChange={setSessionColor} />
+                    </>
+                  )}
 
                   {pane === 'danger' && (
                     <div className="flex flex-col gap-3 rounded-md border border-danger-subtle bg-danger-subtle p-3">

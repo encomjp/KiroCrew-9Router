@@ -21,14 +21,33 @@ import { cn } from '../../lib/utils'
  * NOT ported from shadcn: `NativeSelectOptGroup`. Nothing here has grouped
  * options, and an unused export is API to maintain for no caller.
  */
-const NativeSelect = React.forwardRef<HTMLSelectElement, React.ComponentPropsWithoutRef<'select'>>(
+interface NativeSelectProps extends React.ComponentPropsWithoutRef<'select'> {
+  /** Class names for the positioning wrapper (the layout box), not the control. */
+  wrapperClassName?: string
+  /** Inline style for the positioning wrapper — where a caller's sizing belongs. */
+  wrapperStyle?: React.CSSProperties
+}
+
+/**
+ * Right padding the control reserves for the chevron overlay: the arrow is 14px
+ * wide and pinned at `right-3` (12px), so 36px clears it with the same breathing
+ * room the old `pr-9` class gave. Exported so a test can assert the reservation
+ * without restating the number.
+ */
+export const CHEVRON_GUTTER = '2.25rem'
+
+const NativeSelect = React.forwardRef<HTMLSelectElement, NativeSelectProps>(
   // Named function expression rather than an arrow plus `NativeSelect.displayName = '…'`:
   // React infers the devtools name from the function, and the assignment form would
   // add a bare string literal that the i18n gate counts (eslint-rules/i18n-strict.js
   // re-surfaces literals the upstream rule exempts).
-  function NativeSelect({ className, children, ...props }, ref) {
+  function NativeSelect({ className, wrapperClassName, wrapperStyle, children, ...props }, ref) {
     return (
-      <div className="relative">
+      // The wrapper is the layout box: it owns the chevron's positioning context,
+      // so a caller's sizing (a flex basis, a min-width) has to land HERE to have
+      // any effect — on the `<select>` itself, which is `w-full` inside this div,
+      // a flex rule is inert.
+      <div className={cn('relative', wrapperClassName)} style={wrapperStyle}>
         <select
           ref={ref}
           // Mirrors ui/select.tsx's SelectTrigger so the two paths are the same
@@ -39,11 +58,21 @@ const NativeSelect = React.forwardRef<HTMLSelectElement, React.ComponentPropsWit
           // zooms the page when a form control under 16px takes focus, the same
           // reason the composer bumps to 16px on coarse pointers.
           className={cn(
-            'flex items-center justify-between w-full pl-3 pr-9 py-2 rounded-md text-base border border-border bg-bg-elevated text-text truncate',
+            'flex items-center justify-between w-full pl-3 py-2 rounded-md text-base border border-border bg-bg-elevated text-text truncate',
             'hover:border-border-strong transition-all cursor-pointer outline-none appearance-none',
             'focus-visible:border-accent disabled:opacity-40 disabled:pointer-events-none',
             className
           )}
+          // The gutter the chevron below sits in. It is a constant of THIS
+          // component (the arrow is always `right-3` and always 14px), not a
+          // caller's choice — and it is inline rather than a `pr-9` class because
+          // `cn` is tailwind-merge, which cannot split a caller's `px-*`
+          // shorthand: the two classes would both survive and which one won would
+          // depend on Tailwind's stylesheet order. A caller passing `px-1.5` is
+          // how the arrow came to paint over the text on the phone sidebar's
+          // recency-unit picker. `style` is the wrapper's on this component, so
+          // nothing of the caller's is being overwritten here.
+          style={{ paddingInlineEnd: CHEVRON_GUTTER }}
           {...props}
         >
           {children}

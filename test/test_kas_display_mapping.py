@@ -288,6 +288,60 @@ def test_summarization_failed_emits_failed_and_does_not_reset() -> None:
     assert handle.last_prompt_stats.context_tokens_from_usage is True
 
 
+def test_summarization_failed_arms_the_post_failure_budget() -> None:
+    # KAS is a third producer of a failed compaction status on the SAME dispatch
+    # loop, so it must arm the bounded post-failure wait — otherwise a KAS turn
+    # abandoned after failed summarization still drains to the turn ceiling
+    # (issue #3583).
+    handle = _handle(ACP_BACKEND_KAS)
+    assert handle._compaction_failed_at is None
+    _update(
+        handle,
+        {"sessionUpdate": "session_info_update", "_meta": {"kiro": {"kind": "summarization_failed"}}},
+    )
+    assert handle._compaction_failed_at is not None
+
+
+def test_summarization_completed_disarms_the_post_failure_budget() -> None:
+    handle = _handle(ACP_BACKEND_KAS)
+    _update(
+        handle,
+        {"sessionUpdate": "session_info_update", "_meta": {"kiro": {"kind": "summarization_failed"}}},
+    )
+    _update(
+        handle,
+        {
+            "sessionUpdate": "session_info_update",
+            "_meta": {"kiro": {"kind": "summarization_completed", "conversationSummary": "ok"}},
+        },
+    )
+    assert handle._compaction_failed_at is None
+
+
+def test_summarization_failed_notice_carries_the_reason() -> None:
+    # conversationSummary is empty on failure, so the dashboard notice would read
+    # "unknown error" — KAS's own reason rides the title instead.
+    handle = _handle(ACP_BACKEND_KAS)
+    events = _update(
+        handle,
+        {
+            "sessionUpdate": "session_info_update",
+            "_meta": {"kiro": {"kind": "summarization_failed", "reason": "transcript too long"}},
+        },
+    )
+    assert events[0].title == "transcript too long"
+
+
+def test_summarization_failed_notice_falls_back_to_the_raw_shape() -> None:
+    handle = _handle(ACP_BACKEND_KAS)
+    events = _update(
+        handle,
+        {"sessionUpdate": "session_info_update", "_meta": {"kiro": {"kind": "summarization_failed"}}},
+    )
+    assert "no reason reported" in events[0].title
+    assert "summarization_failed" in events[0].title
+
+
 def test_session_info_missing_or_malformed_meta_is_safe() -> None:
     handle = _handle(ACP_BACKEND_KAS)
     assert _update(handle, {"sessionUpdate": "session_info_update"}) == []
