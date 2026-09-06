@@ -111,7 +111,7 @@ describe('productName interpolation variable', () => {
       for (const k of EXCEPTIONS) {
         const v = flat[k]
         if (v === undefined) continue
-        expect(v, `${lang}:${k} must keep the literal product name`).toMatch(/Kiro[ -]?Crew/) // brand-ok
+        expect(v, `${lang}:${k} must keep the literal product name`).toMatch(/Kiro[ -]?Crew|kirocrew-customapi/) // brand-ok (fork rebrand)
         expect(v, `${lang}:${k} must not interpolate the product name`).not.toContain('{{productName}}')
       }
     }

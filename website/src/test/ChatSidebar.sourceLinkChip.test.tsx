@@ -62,6 +62,8 @@ import type { ChatSlot } from '../types'
 import type { RootState } from '../store'
 
 const PR_URL = 'https://github.com/encomjp/kirocrew-customapi/pull/634'
+const ACTIVE_PR_URL = 'https://github.com/encomjp/kirocrew-customapi/pull/12'
+const ISSUE_URL = 'https://github.com/encomjp/kirocrew-customapi/issues/701'
 
 const slots = [
   {

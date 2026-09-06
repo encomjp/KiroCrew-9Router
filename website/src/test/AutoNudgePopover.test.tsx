@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, fireEvent, act } from '@testing-library/react'
+import { waitFor, render, screen, fireEvent, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import AutoNudgePopover, { type AutoNudgeLoop } from '../components/AutoNudgePopover'
 import { __resetForTests, loadGoalDraft, saveGoalDraft } from '../utils/goalDrafts'
@@ -273,8 +273,11 @@ describe('AutoNudgePopover — zero-token watches armed on this slot', () => {
     // popover showed "Set a goal" and nothing else while a watch was polling --
     // the one surface a user opens to confirm something is running.
     stubCrons([cron()])
-    await act(async () => { renderPopover(null) })
-    expect(screen.getByText(/Zero-token watches/i)).toBeTruthy()
+    renderPopover(null)
+    // waitFor, not a single act() flush: the cron read is an async query, and a
+    // prior test's in-flight fetch can land between mount and assertion, so the
+    // section may not be present at the first flush. Poll until the query settles.
+    await waitFor(() => expect(screen.getByText(/Zero-token watches/i)).toBeTruthy())
     expect(screen.getByText('pr watch #6234')).toBeTruthy()
   })
 

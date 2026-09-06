@@ -417,10 +417,7 @@ async def api_theme_config(request: web.Request) -> web.Response:
         return web.json_response(_theme_payload(cfg))
 
     # PUT
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body = await request.json()
     if not isinstance(body, dict):
         raise web.HTTPBadRequest(text="request body must be an object")
     from kiro_crew.dashboard.handlers.agents import _get_config_lock
@@ -1545,7 +1542,6 @@ _EDITABLE_CONFIG: dict[str, dict] = {
             "pattern": r"^(?!.*\.\.)[A-Za-z0-9._\-/:@+\[\]]*$",
         },
     },
-    "agent.provider": {"type": "enum", "values": ["acp"]},
     # Which ACP agent drives a session: "" = kiro-cli, "kas" = kiro-agent.
     # ``values_fn`` rather than a literal, because the set WIDENS after this module
     # is imported: an edition registers a backend from

@@ -2089,7 +2089,7 @@
       "state_draft": "Draft",
       "state_merged": "Merged",
       "state_open": "Open",
-      "owner_not_configured_guidance": "This action needs a configured owner, which Kiro Crew identifies by Slack member ID. Set \"Owner Slack member ID\" in Settings → Channels → Slack, restart the gateway, then sign in again.",
+      "owner_not_configured_guidance": "This action needs a configured owner, which {{productName}} identifies by Slack member ID. Set \"Owner Slack member ID\" in Settings → Channels → Slack, restart the gateway, then sign in again.",
       "open_slack_settings": "Open Slack settings"
     },
     "registryManager": {
@@ -4572,7 +4572,22 @@
         "fallback_auto_hint": "Auto (default) lets the backend route to an available model. A fallback swap is announced in chat and sticks until your model recovers. Disabled turns fallback off.",
         "fallback_disabled": "Disabled",
         "fallback_auto": "Auto (recommended)",
-        "failed_to_save_fallback_model": "Failed to save fallback model"
+        "failed_to_save_fallback_model": "Failed to save fallback model",
+        "provider": "Provider",
+        "provider_managed_by_kiro_cli": "Managed by kiro-cli — the kiro-native (acp) backend configures its own router.",
+        "provider_save": "Save provider",
+        "provider_preset": "Preset",
+        "provider_url": "Base URL",
+        "provider_api_key": "API key",
+        "provider_api_key_saved": "Key saved — leave blank to keep the saved key",
+        "provider_test": "Test connection",
+        "provider_test_ok": "Connection OK",
+        "provider_test_failed": "Connection failed",
+        "provider_models": "Models",
+        "failed_to_save_provider": "Failed to save provider settings",
+        "failed_to_save_vision_mode": "Failed to save image input mode",
+        "failed_to_save_vision_redirect": "Failed to save image redirect setting",
+        "failed_to_save_vision_fallback": "Failed to save vision fallback model"
       },
       "displayPanel": {
         "color": "Color {{n}}",
@@ -4887,7 +4902,8 @@
         "unavailable_import_failed": "The speech recogniser is installed but could not be loaded on this machine.",
         "unavailable_model_missing": "The speech model is not on this machine yet. Download it below.",
         "unavailable_apple_unsupported": "Apple Speech needs macOS 26 or newer. Choose the local provider instead.",
-        "unavailable_apple_needs_toolchain": "Apple Speech needs the Xcode command line tools. Install them, then reload this page."
+        "unavailable_apple_needs_toolchain": "Apple Speech needs the Xcode command line tools. Install them, then reload this page.",
+        "the_bundled_audio_decoder_is_missing_or_damaged": "The bundled audio decoder is missing or damaged. Reinstall the {{productName}} desktop app; do not install FFmpeg separately."
       },
       "teamsPanel": {
         "active": "Active",

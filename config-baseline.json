@@ -22,9 +22,25 @@
         "fallback_model": "auto",
         "reasoning_effort": "",
         "provider": "acp",
+        "safe_mode": false,
+        "use_shim": false,
+        "shim_openai_base_url": "http://127.0.0.1:11434/v1",
+        "shim_openai_api_key": "",
+        "provider_base_url": "",
+        "provider_api_key": "",
         "mcp_registry_mode": false,
         "mcp_quarantine_after_failures": 3,
         "acp_backend": "",
+        "provider_api_format": "",
+        "model_whitelist": [],
+        "image_redirect": "subagent",
+        "vision_fallback_model": "cmc/mimo-v2.5",
+        "vision_providers": [],
+        "text_only_models": [
+          "oc/deepseek-v4-flash",
+          "ol/deepseek-v4-flash:0731"
+        ],
+        "image_input_mode": "auto",
         "default_agent": "",
         "sweep_agents_backups": false,
         "sandbox": "auto",
@@ -223,10 +239,12 @@
       "sensitive": false,
       "tags": [],
       "label": "Provider",
-      "help": "LLM provider backend (KiroACP / kiro-cli).",
+      "help": "LLM provider backend. 'acp' drives kiro-cli; 'claude_code' drives claude-agent-acp (Claude Code over ACP, pointing at any ANTHROPIC_BASE_URL — e.g. a local router).",
       "hasChildren": false,
       "enumValues": [
-        "acp"
+        "acp",
+        "claude_code",
+        "opencode"
       ],
       "defaultValue": "acp"
     },
@@ -351,7 +369,7 @@
       "sensitive": false,
       "tags": [],
       "label": "ACP Backend",
-      "help": "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent. KAS runs chat but has no native subagent progress reporting yet.",
+      "help": "Which ACP agent to drive: '' = kiro-cli (default), 'kas' = kiro-agent, 'opencode' = OpenCode ACP (fork). KAS runs chat but has no native subagent progress reporting yet.",
       "hasChildren": false,
       "enumValues": null,
       "defaultValue": ""

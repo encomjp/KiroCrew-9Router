@@ -1266,6 +1266,7 @@ async def test_set_model_falls_back_to_auto_when_unadvertised():
     handle = _make_handle()
     handle.available_models = [{"modelId": "auto"}, {"modelId": "deepseek-3.2"}]
     handle.set_model = AsyncMock()
+    handle.refresh_available_models = AsyncMock(return_value=[{"modelId": "auto"}, {"modelId": "deepseek-3.2"}])
     provider = AcpSessionProvider(handle, _make_runtime())
 
     await provider.set_model("deepseek-v4-flash:0731")
@@ -1281,6 +1282,7 @@ async def test_set_model_raises_only_when_auto_also_unusable():
     handle = _make_handle()
     handle.available_models = [{"modelId": "deepseek-3.2"}]
     handle.set_model = AsyncMock()
+    handle.refresh_available_models = AsyncMock(return_value=[{"modelId": "deepseek-3.2"}])
     provider = AcpSessionProvider(handle, _make_runtime())
 
     with pytest.raises(AcpModelUnavailable):

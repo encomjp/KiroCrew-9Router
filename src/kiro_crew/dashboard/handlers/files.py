@@ -1696,6 +1696,9 @@ async def api_workspaces_update(request: web.Request) -> web.Response:
     """PUT /api/workspaces/{name} — update a workspace."""
 
     name = request.match_info["name"]
+    cfg = KiroCrewConfig.load()
+    if name not in cfg.workspaces:
+        return web.json_response({"error": f"Workspace '{name}' not found"}, status=404)
     try:
         body = await request.json()
     except Exception:
@@ -1971,7 +1974,7 @@ async def api_file_read(request: web.Request) -> web.Response:
                 _sel().log_tool_invocation(
                     session_key="dashboard", tool_name="file_read", outcome="denied", resources=path, error="symlink_rejected"
                 )
-                return web.json_response({"error": "symlinks not allowed"}, status=403)
+                return web.json_response({"error": "symlinks not allowed", "code": "symlink_refused"}, status=403)
             raise
         with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
             content = f.read(read_cap + 1)

@@ -33,7 +33,7 @@ from contextlib import aclosing
 from pathlib import Path
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Sequence, TypeVar
 
-from kiro_crew import model_registry, platform_compat
+from kiro_crew import agent_scratch, model_registry, platform_compat
 from kiro_crew.acp._dispatch import (
     _kiro_mcp_server_name,
     _kiro_tool_name,
@@ -6397,7 +6397,10 @@ class AcpClient:
                 # the true window, so prefer it over the SDK's fallback — a
                 # 200K reading for a 1M model makes the context meter lie
                 # ("96K / 200K") and can force premature compaction.
-                resolved = self._resolved_model_id or self._model or ""
+                # getattr: minimal (__new__) constructions (tests, embedders)
+                # carry no model state — without a model id there is nothing
+                # to consult the registry with, so the SDK size stands.
+                resolved = getattr(self, "_resolved_model_id", None) or getattr(self, "_model", "") or ""
                 if (
                     size <= 200_000
                     and model_registry.has_known_window(resolved)

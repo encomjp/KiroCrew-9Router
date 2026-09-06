@@ -3436,7 +3436,12 @@ async def api_mcp_gateway_set_poolable(request: web.Request) -> web.Response:
     the gateway is enabled).  Returns ``{ok, name, poolable, ...}``.
     """
     from kiro_crew.config.loader import config_path  # noqa: F811
+    from kiro_crew.dashboard.handlers._shared import require_owner_dashboard_request
     from kiro_crew.dashboard.handlers.agents import _get_config_lock  # circular: agents imports mcp
+
+    denied = await require_owner_dashboard_request(request, "mcp_gateway.set_poolable")
+    if denied is not None:
+        return denied
 
     try:
         body = await request.json()

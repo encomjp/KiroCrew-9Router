@@ -23,6 +23,8 @@ def test_opencode_bin_resolution_path() -> None:
 
 def test_write_opencode_provider_config(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Windows expanduser("~") reads USERPROFILE, not HOME.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     client = object.__new__(acp.AcpClient)
     client._extra_env = {
         "ANTHROPIC_BASE_URL": "http://localhost:8317",
@@ -48,6 +50,8 @@ def test_write_opencode_provider_config(tmp_path, monkeypatch) -> None:
 
 def test_write_opencode_provider_config_normalizes_ollama_cloud_url(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Windows expanduser("~") reads USERPROFILE, not HOME.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     client = object.__new__(acp.AcpClient)
     client._extra_env = {
         "ANTHROPIC_BASE_URL": "https://ollama.com/v1",
@@ -68,6 +72,8 @@ def test_write_opencode_provider_config_normalizes_ollama_cloud_url(tmp_path, mo
 def test_write_opencode_provider_config_is_isolated(tmp_path, monkeypatch) -> None:
     """The isolated config must not inherit user plugins or MCP servers."""
     monkeypatch.setenv("HOME", str(tmp_path))
+    # Windows expanduser("~") reads USERPROFILE, not HOME.
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     client = object.__new__(acp.AcpClient)
     client._extra_env = {"ANTHROPIC_BASE_URL": "http://localhost:8317", "OPENCODE_API_FORMAT": "anthropic"}
     client._write_opencode_provider_config()

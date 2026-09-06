@@ -196,7 +196,8 @@ class TestEndToEnd:
                     "--out", str(out), "--name", "e2e", "--size", "640x480",
                     "--settle-ms", "200", "--tail-ms", "200",
                 ],
-                capture_output=True, text=True, timeout=300,
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=300,
             )
             if p.returncode != 0 and "Executable doesn't exist" in p.stderr:
                 pytest.skip("playwright package present but chromium binaries not installed")
