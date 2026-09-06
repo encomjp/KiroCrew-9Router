@@ -192,6 +192,12 @@ def _no_real_checkout(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, str]]
     return seen
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_clone_isolated(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+    monkeypatch.setattr(clone_setup, "_push_disabled", lambda _clone: True)
+
+
 @pytest.fixture()
 def sup() -> Any:
     """A fresh supervisor whose worker thread is always joined."""
@@ -629,7 +635,10 @@ class TestBuildDriver:
             self._locked(sup, config, _profile(tmp_path / "clone"))
         assert "scopeDiffBase would resolve against the wrong HEAD" in str(excinfo.value)
 
-    def test_refuses_when_push_is_not_disabled(self, sup: Any, tmp_path: Path) -> None:
+    def test_refuses_when_push_is_not_disabled(
+        self, sup: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(clone_setup, "_push_disabled", lambda _clone: False)
         profile = _profile(tmp_path / "clone", push_disabled=False)
         with pytest.raises(PermissionError) as excinfo:
             self._locked(sup, self._config(tmp_path), profile)

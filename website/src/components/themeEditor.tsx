@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef } from 'react'
 import { useTheme, type CustomThemeData, CUSTOM_THEMES_CHANGED_EVENT } from '../hooks/useTheme'
 import { Input, Btn } from './ui'
 import { api } from '../api/client'
@@ -95,6 +95,7 @@ export function getCurrentThemeVars(): Record<string, string> {
     '--diff-add', '--diff-add-text', '--diff-del', '--diff-del-text',
     '--diff-hunk', '--diff-hunk-text', '--diff-meta-text',
     '--shadow-sm', '--shadow-md', '--shadow-lg',
+    '--term-magenta', '--term-cyan',
   ]
   for (const k of extras) result[k] = computed.getPropertyValue(k).trim()
   return result
@@ -136,24 +137,56 @@ export function useThemeEditor() {
 
   const isEditing = editingSlug !== null
 
+  /**
+   * Fingerprint of everything the editor collects, key-order independent so a
+   * re-keyed var map does not read as an edit.
+   */
+  const fingerprint = (
+    name: string, emoji: string,
+    dark: Record<string, string>, light: Record<string, string>, json: string,
+  ) => {
+    const stable = (o: Record<string, string>) =>
+      Object.keys(o).sort().map(k => `${k}=${o[k]}`).join('\u0000')
+    return [name, emoji, stable(dark), stable(light), json].join('\u0001')
+  }
+
+  /**
+   * What the editor held when it opened. A dialog rendering this editor refuses
+   * the ACCIDENTAL dismissals (Escape, backdrop click) once the fingerprint has
+   * moved, so one habitual keystroke cannot discard a part-filled theme — the
+   * explicit exits (the header close button, Cancel) still close. Held in a ref
+   * because it is only ever compared against, never rendered.
+   */
+  const openedWith = useRef('')
+  const isDirty = useMemo(
+    () => editorOpen && fingerprint(themeName, themeEmoji, darkVars, lightVars, jsonText) !== openedWith.current,
+    [editorOpen, themeName, themeEmoji, darkVars, lightVars, jsonText],
+  )
+
   const openNewTheme = () => {
     const current = getCurrentThemeVars()
     setDarkVars({ ...current }); setLightVars({ ...current })
     setThemeName(''); setThemeEmoji('✨'); setJsonText(''); setError('')
     setEditingSlug(null); setEditorOpen(true); setCreatorMode('picker')
+    openedWith.current = fingerprint('', '✨', current, current, '')
   }
 
   const openEditTheme = async (slug: string) => {
     setError('')
     try {
       const data = await api.themeDetail(slug)
+      const json = JSON.stringify(data, null, 2)
       setThemeName(data.name || ''); setThemeEmoji(data.emoji || '🎨')
       setDarkVars(data.dark || {}); setLightVars(data.light || {})
-      setJsonText(JSON.stringify(data, null, 2))
+      setJsonText(json)
       setEditingSlug(slug); setEditorOpen(true); setCreatorMode('picker')
+      openedWith.current = fingerprint(data.name || '', data.emoji || '🎨', data.dark || {}, data.light || {}, json)
     } catch {
       setError(i18nT('components.themeEditor.failed_to_load_theme_for_editing'))
       setEditorOpen(true)
+      // Nothing was written before the throw (the fetch is awaited first), so
+      // the values still on screen ARE what this failed open shows.
+      openedWith.current = fingerprint(themeName, themeEmoji, darkVars, lightVars, jsonText)
     }
   }
 
@@ -217,7 +250,7 @@ export function useThemeEditor() {
   const updateLightVar = (key: string, val: string) => setLightVars(prev => ({ ...prev, [key]: val }))
 
   return {
-    editorOpen, isEditing, editingSlug, creatorMode, setCreatorMode,
+    editorOpen, isEditing, editingSlug, creatorMode, setCreatorMode, isDirty,
     themeName, setThemeName, themeEmoji, setThemeEmoji,
     darkVars, lightVars, updateDarkVar, updateLightVar,
     jsonText, setJsonText, saving, error,
@@ -318,14 +351,12 @@ export function ThemeEditorPanel({ editor }: { editor: ReturnType<typeof useThem
               {/* Control is the custom <Input> (a forwardRef <input>) nested here
                   and linked via htmlFor+id; the deprecated label-has-for rule can't
                   see through the component wrapper, so scope-disable it. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="theme-editor-name">
                 <span className="text-[12px] text-muted uppercase tracking-[.04em] mb-1 block">{i18nT('components.themeEditor.theme_name')}</span>
                 <Input id="theme-editor-name" value={themeName} onChange={e => setThemeName(e.target.value)} placeholder={i18nT('components.themeEditor.my_custom_theme')} />
               </label>
             </div>
             <div className="w-16 shrink-0">
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="theme-editor-emoji">
                 <span className="text-[12px] text-muted uppercase tracking-[.04em] mb-1 block">{i18nT('components.themeEditor.emoji')}</span>
                 <Input id="theme-editor-emoji" value={themeEmoji} onChange={e => setThemeEmoji(e.target.value)} placeholder="✨" className="text-center !flex-none w-full" />

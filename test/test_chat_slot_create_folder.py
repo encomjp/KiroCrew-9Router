@@ -29,10 +29,22 @@ from aiohttp.test_utils import TestClient, TestServer
 # resolves to the stdlib `test` and fails with ModuleNotFoundError on CI.
 from chat_test_helpers import _make_ready_kiro_prerequisite
 
+from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.state import _SLOTS_BROADCAST_INTERVAL_S, DashboardState
 from kiro_crew.history import ConversationLog
 
 FOLDER_ID = "f-design"
+
+
+def _raise_on_slots(payload):
+    """A ``_broadcast`` double that fails the way the evidenced defect does.
+
+    The exception TYPE is incidental — ``json.dumps`` on a non-serializable slot
+    value is the shape #6522 hit — so these tests pin the ordering instead: any
+    raise out of the flush must not unwind past the durable write.
+    """
+    if payload.get("_type") == "slots":
+        raise TypeError("Object of type object is not JSON serializable")
 
 
 def _make_state(tmp_path):
@@ -300,3 +312,229 @@ class TestCreateAppIsolation:
             )
             assert again.status == 200
         assert state._slots["s1"].folder_id == FOLDER_ID
+
+
+class TestFolderTagInheritance:
+    """Folder tags copied onto NEW chats filed into the folder (issue #5419).
+
+    Creation-only: re-opening an existing session inside the folder must not
+    re-stamp tags, and moving an existing session into a tagged folder via the
+    folder PATCH must not retro-tag. Direct folder only.
+    """
+
+    @staticmethod
+    def _tagged_state(tmp_path, folder_tags):
+        state = _make_state(tmp_path)
+        # Give the referenced folder a tag list and register the vocabulary so
+        # the inheritance validation (ids must exist) passes.
+        state._folders[0]["tags"] = list(folder_tags)
+        state._tags = [
+            {"id": tid, "name": tid, "color": "#6b7280", "order": i}
+            for i, tid in enumerate(folder_tags)
+        ]
+        # Direct population stands in for a successful load_tags(), which is
+        # what makes the vocabulary authoritative (the inheritance validator
+        # deliberately fails open when it is not).
+        state._tags_authoritative = True
+        return state
+
+    @staticmethod
+    def _app_with_folder_patch(state) -> web.Application:
+        from kiro_crew.dashboard.chat import api_chat_slot_create
+        from kiro_crew.dashboard.chat_folders import api_chat_slot_folder
+
+        app = web.Application()
+        app["state"] = state
+        app.router.add_post("/api/chat/slots", api_chat_slot_create)
+        app.router.add_patch("/api/chat/slots/{slot}/folder", api_chat_slot_folder)
+        return app
+
+    @pytest.mark.asyncio
+    async def test_new_slot_in_folder_inherits_the_folders_tags(self, tmp_path):
+        """(c) A genuinely new chat filed into a tagged folder copies its tags."""
+        state = self._tagged_state(tmp_path, ["t1", "t2"])
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots", json={"name": "fresh", "folder_id": FOLDER_ID}
+            )
+            assert resp.status == 200
+            assert sorted((await resp.json())["tags"]) == ["t1", "t2"]
+        assert sorted(state._slots["fresh"].tags) == ["t1", "t2"]
+
+    @pytest.mark.asyncio
+    async def test_new_slot_without_folder_inherits_nothing(self, tmp_path):
+        """A chat created outside any folder gets no tags — the guard is folder-scoped."""
+        state = self._tagged_state(tmp_path, ["t1"])
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post("/api/chat/slots", json={"name": "loose"})
+            assert resp.status == 200
+            assert (await resp.json())["tags"] == []
+        assert state._slots["loose"].tags == []
+
+    @pytest.mark.asyncio
+    async def test_reopening_an_existing_slot_does_not_re_stamp_tags(self, tmp_path):
+        """(d) Addressing an ALREADY-OPEN slot by name is not a mint — no inheritance.
+
+        The slot is created first with no folder, then re-created by the same
+        name into the tagged folder. It is filed (folder membership updates), but
+        the folder's tags must NOT be copied on — only a genuinely new chat
+        inherits.
+        """
+        state = self._tagged_state(tmp_path, ["t1", "t2"])
+        async with TestClient(TestServer(_make_app(state))) as client:
+            first = await client.post("/api/chat/slots", json={"name": "reused"})
+            assert first.status == 200
+            assert (await first.json())["tags"] == []
+
+            again = await client.post(
+                "/api/chat/slots", json={"name": "reused", "folder_id": FOLDER_ID}
+            )
+            assert again.status == 200
+            body = await again.json()
+            # Filed into the folder...
+            assert body["folder_id"] == FOLDER_ID
+            # ...but tags were NOT retro-stamped: it was not a fresh slot.
+            assert body["tags"] == []
+        assert state._slots["reused"].tags == []
+
+    @pytest.mark.asyncio
+    async def test_moving_an_existing_slot_into_a_tagged_folder_does_not_retro_tag(
+        self, tmp_path
+    ):
+        """(e) PATCH /slots/{slot}/folder moves without inheriting the folder's tags."""
+        state = self._tagged_state(tmp_path, ["t1", "t2"])
+        async with TestClient(TestServer(self._app_with_folder_patch(state))) as client:
+            # A slot created outside the folder, untagged.
+            created = await client.post("/api/chat/slots", json={"name": "mover"})
+            assert created.status == 200
+            assert (await created.json())["tags"] == []
+
+            # Move it into the tagged folder via the folder PATCH endpoint.
+            moved = await client.patch(
+                "/api/chat/slots/mover/folder", json={"folder_id": FOLDER_ID}
+            )
+            assert moved.status == 200
+        assert state._slots["mover"].folder_id == FOLDER_ID
+        # The move must not have copied the folder's tags onto the slot.
+        assert state._slots["mover"].tags == []
+
+    @pytest.mark.asyncio
+    async def test_untagged_folder_leaves_a_new_slot_untagged(self, tmp_path):
+        """An empty/absent folder tag list is inherited as no tags."""
+        state = _make_state(tmp_path)  # folder has no `tags` key
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots", json={"name": "fresh", "folder_id": FOLDER_ID}
+            )
+            assert resp.status == 200
+            assert (await resp.json())["tags"] == []
+
+    @pytest.mark.asyncio
+    async def test_stale_folder_tag_id_is_not_copied_onto_the_slot(self, tmp_path):
+        """A folder id that no longer exists in the vocabulary is dropped, not stamped."""
+        state = _make_state(tmp_path)
+        state._folders[0]["tags"] = ["gone", "t1"]
+        # Only t1 is a live tag; "gone" was deleted from the vocabulary.
+        state._tags = [{"id": "t1", "name": "t1", "color": "#6b7280", "order": 0}]
+        state._tags_authoritative = True
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots", json={"name": "fresh", "folder_id": FOLDER_ID}
+            )
+            assert resp.status == 200
+            assert (await resp.json())["tags"] == ["t1"]
+
+    @pytest.mark.asyncio
+    async def test_malformed_folder_tag_entry_does_not_crash_slot_creation(self, tmp_path):
+        """A non-string entry in a folder's persisted tags is skipped, never raised on.
+
+        folders.json is hand-editable: a dict (or any unhashable) in `tags`
+        would blow up the set-membership test AFTER the slot was inserted,
+        turning one malformed store row into a 500 on every chat created in
+        that folder. The isinstance guard skips it and still copies the valid
+        sibling ids.
+        """
+        state = _make_state(tmp_path)
+        state._folders[0]["tags"] = [{}, None, 42, "t1"]
+        state._tags = [{"id": "t1", "name": "t1", "color": "#6b7280", "order": 0}]
+        state._tags_authoritative = True
+        async with TestClient(TestServer(_make_app(state))) as client:
+            resp = await client.post(
+                "/api/chat/slots", json={"name": "fresh", "folder_id": FOLDER_ID}
+            )
+            assert resp.status == 200
+            assert (await resp.json())["tags"] == ["t1"]
+        assert state._slots["fresh"].tags == ["t1"]
+
+
+class TestDurableWriteOrdering:
+    """The durable write runs INSIDE the suspension, ahead of the broadcast.
+
+    ``suspend_slots_push``'s ``__exit__`` flushes the owed push, and on the
+    coalescing window's LEADING edge that flush broadcasts synchronously — so an
+    exception there escapes ``__exit__`` and unwinds the rest of the handler.
+    With the forced save sitting after the ``with`` block, that unwind skipped a
+    metadata mutation the request had already acknowledged, and this save is the
+    only durable record of a recreate's folder filing or pinned title.
+
+    ``session_control.py``'s create span already keeps its persist inside the
+    suspension for the same reason ("a slot whose birth write fails is never
+    broadcast at all"); these pin the ordering here, not the exception, so any
+    future raise from the flush is covered too.
+    """
+
+    @pytest.mark.asyncio
+    async def test_raising_exit_broadcast_cannot_skip_the_folder_write(self, tmp_path):
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            # A session that has been used, which is the case the forced save is
+            # the only durable record for: re-filing an EXISTING slot. Its
+            # window is non-empty, so the save takes the full-save path.
+            slot = state.get_or_create_slot("s1")
+            slot.append("user", "hello")
+            slot.drain()
+            pinned = slot_history_key(slot)
+
+            # get_or_create_slot above already consumed a leading edge. Wait the
+            # window out, or the flush below is deferred to the trailing timer,
+            # the handler returns 200, and this test proves nothing.
+            await asyncio.sleep(_SLOTS_BROADCAST_INTERVAL_S + 0.05)
+            state._broadcast = _raise_on_slots  # type: ignore[method-assign]
+
+            resp = await client.post("/api/chat/slots", json={"name": "s1", "folder_id": FOLDER_ID})
+
+        # The failure still reaches the caller: this is an ordering fix, not a
+        # swallow. Whether an already-committed create should answer 500 at all
+        # is the half of #6532 that was declined, and folding it in here would
+        # resurrect it.
+        assert resp.status == 500
+        # But the acknowledged mutation is on disk. Outside the suspension, the
+        # escaping exception skipped this write entirely and nothing reconciled
+        # the in-memory slot against it.
+        meta = state.conversation_log._read_metadata(pinned) or {}
+        assert meta.get("folder_id") == FOLDER_ID, (
+            "the folder filing never reached disk — a broadcast failure unwound "
+            "past the durable write, so a restart resurrects the old placement"
+        )
+
+    @pytest.mark.asyncio
+    async def test_raising_exit_broadcast_cannot_skip_the_pinned_title_write(self, tmp_path):
+        """Same ordering, via the other field that reaches disk only here."""
+        state = _make_state(tmp_path)
+        async with TestClient(TestServer(_make_app(state))) as client:
+            slot = state.get_or_create_slot("s1")
+            slot.append("user", "hello")
+            slot.drain()
+            pinned = slot_history_key(slot)
+
+            await asyncio.sleep(_SLOTS_BROADCAST_INTERVAL_S + 0.05)
+            state._broadcast = _raise_on_slots  # type: ignore[method-assign]
+
+            resp = await client.post("/api/chat/slots", json={"name": "s1", "title": "Pinned"})
+
+        assert resp.status == 500
+        meta = state.conversation_log._read_metadata(pinned) or {}
+        assert meta.get("title") == "Pinned", (
+            "the pinned title never reached disk — a restart rehydrates the old "
+            "title with a refreshable 'auto' origin"
+        )

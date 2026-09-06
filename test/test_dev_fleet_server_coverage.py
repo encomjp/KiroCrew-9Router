@@ -24,7 +24,15 @@ from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 import kiro_crew.apps.builtins.dev_fleet.server as mod
-from kiro_crew.apps.builtins.dev_fleet import gateway_service
+from kiro_crew.apps.builtins.dev_fleet import (
+    fleet_state,
+    gateway_service,
+    http_api,
+    live,
+    repository,
+    runtime,
+    worktree_ops,
+)
 
 # The launchd label derivation imports the pod launchd module for its label
 # prefix; on a host where that optional module is unavailable the function
@@ -50,7 +58,7 @@ class _CapturingSel:
 
 def _sel_capture(monkeypatch) -> _CapturingSel:
     sink = _CapturingSel()
-    monkeypatch.setattr(mod, "_sel", lambda: sink)
+    monkeypatch.setattr(runtime, "_sel", lambda: sink)
     return sink
 
 
@@ -88,19 +96,19 @@ def _same(a: str, b: str) -> bool:
 @pytest.fixture(autouse=True)
 def _pin_module_state(monkeypatch):
     """Neutralise the module's cached globals so tests never share state."""
-    monkeypatch.setattr(mod, "_UPSTREAM_REMOTE", "origin")
-    monkeypatch.setattr(mod, "_HTML_BASE", None)
-    monkeypatch.setattr(mod, "_PR_CACHE", {})
-    monkeypatch.setattr(mod, "_FALLBACK_REPOS", [])
-    monkeypatch.setattr(mod, "_WT_LOCKS", {})
-    monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {})
-    monkeypatch.setattr(mod, "_RUNS", {})
-    monkeypatch.setattr(mod, "_BUILD_PATH_CACHE", "/usr/bin")
-    monkeypatch.setattr(mod, "_warm_build_path", AsyncMock())
-    monkeypatch.setattr(mod, "_pod_env", lambda: {})
+    monkeypatch.setattr(repository, "_UPSTREAM_REMOTE", "origin")
+    monkeypatch.setattr(fleet_state, "_HTML_BASE", None)
+    monkeypatch.setattr(fleet_state, "_PR_CACHE", {})
+    monkeypatch.setattr(repository, "_FALLBACK_REPOS", [])
+    monkeypatch.setattr(worktree_ops, "_WT_LOCKS", {})
+    monkeypatch.setattr(fleet_state, "_PROVISION_INFLIGHT", {})
+    monkeypatch.setattr(runtime, "_RUNS", {})
+    monkeypatch.setattr(runtime, "_BUILD_PATH_CACHE", "/usr/bin")
+    monkeypatch.setattr(runtime, "_warm_build_path", AsyncMock())
+    monkeypatch.setattr(worktree_ops, "_pod_env", lambda: {})
     # Shutdown admission state: each test starts with a clean (non-shutdown) process.
-    monkeypatch.setattr(mod, "_SHUTDOWN_IN_PROGRESS", False)
-    monkeypatch.setattr(mod, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
+    monkeypatch.setattr(runtime, "_SHUTDOWN_IN_PROGRESS", False)
+    monkeypatch.setattr(runtime, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
 
 
 # --------------------------------------------------------------------------
@@ -116,7 +124,7 @@ def test_load_dev_fleet_cfg_overlay_wins(monkeypatch, tmp_path):
     )
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
 
-    assert mod._load_dev_fleet_cfg() == {"a": 2, "keep": "yes", "b": 3}
+    assert repository._load_dev_fleet_cfg() == {"a": 2, "keep": "yes", "b": 3}
 
 
 def test_load_dev_fleet_cfg_ignores_unusable_files(monkeypatch, tmp_path):
@@ -127,7 +135,7 @@ def test_load_dev_fleet_cfg_ignores_unusable_files(monkeypatch, tmp_path):
     )
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path)
 
-    assert mod._load_dev_fleet_cfg() == {}
+    assert repository._load_dev_fleet_cfg() == {}
 
 
 def test_load_dev_fleet_cfg_config_dir_failure_is_empty(monkeypatch):
@@ -136,7 +144,7 @@ def test_load_dev_fleet_cfg_config_dir_failure_is_empty(monkeypatch):
         raise RuntimeError("no home")
 
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", _boom)
-    assert mod._load_dev_fleet_cfg() == {}
+    assert repository._load_dev_fleet_cfg() == {}
 
 
 # --------------------------------------------------------------------------
@@ -148,7 +156,7 @@ def test_launchd_live_worktree_missing_launcher_is_none(monkeypatch, tmp_path):
     monkeypatch.setattr(
         gateway_service.LaunchdBackend, "live_program", staticmethod(lambda: missing)
     )
-    assert mod._launchd_live_worktree() is None
+    assert live._launchd_live_worktree() is None
 
 
 @_LAUNCHD_ONLY
@@ -165,7 +173,7 @@ def test_launchd_live_worktree_unusable_exec_is_none(monkeypatch, tmp_path, scri
     monkeypatch.setattr(
         gateway_service.LaunchdBackend, "live_program", staticmethod(lambda: launcher)
     )
-    assert mod._launchd_live_worktree() is None
+    assert live._launchd_live_worktree() is None
 
 
 @_LAUNCHD_ONLY
@@ -181,7 +189,7 @@ def test_launchd_live_worktree_resolves_checkout(monkeypatch, tmp_path):
         gateway_service.LaunchdBackend, "live_program", staticmethod(lambda: launcher)
     )
 
-    resolved = mod._launchd_live_worktree()
+    resolved = live._launchd_live_worktree()
     assert resolved is not None
     assert _same(resolved, str(checkout))
 
@@ -192,6 +200,7 @@ def test_launchd_live_worktree_resolves_checkout(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_load_fallback_repos_collects_ancestor_remotes(monkeypatch):
     """A differently named repo whose base is an ancestor becomes a fallback repo."""
+
     async def fake_run(cmd, **kw):
         if cmd[-1] == "remote":
             return 0, "origin\nold\nstale\n", ""
@@ -207,17 +216,17 @@ async def test_load_fallback_repos_collects_ancestor_remotes(monkeypatch):
             return 0, "git@github.com:someone/kirocrew-old.git\n", ""
         return 1, "", "unexpected"
 
-    monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
-    monkeypatch.setattr(mod, "_run_cmd", fake_run)
-    await mod._load_fallback_repos()
-    assert mod._FALLBACK_REPOS == ["someone/kirocrew-old"]
+    monkeypatch.setattr(repository, "_repo", lambda: "/fake/repo")
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run)
+    await repository._load_fallback_repos()
+    assert repository._FALLBACK_REPOS == ["someone/kirocrew-old"]
 
 
 @pytest.mark.asyncio
 async def test_load_fallback_repos_empty_when_remote_listing_fails(monkeypatch):
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(1, "", "boom")))
-    await mod._load_fallback_repos()
-    assert mod._FALLBACK_REPOS == []
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(1, "", "boom")))
+    await repository._load_fallback_repos()
+    assert repository._FALLBACK_REPOS == []
 
 
 @pytest.mark.asyncio
@@ -229,6 +238,7 @@ async def test_load_fallback_repos_skips_duplicate_upstream_alias(monkeypatch):
     ``merge-base --is-ancestor`` is trivially true. Upstream's own name must
     not enter the fallback list (which would flag every worktree as legacy).
     """
+
     async def fake_run(cmd, **kw):
         if cmd[-1] == "remote":
             return 0, "kirocrew\norigin\n", ""
@@ -239,11 +249,11 @@ async def test_load_fallback_repos_skips_duplicate_upstream_alias(monkeypatch):
             return 0, "https://github.com/kirodotdev/KiroCrew.git\n", ""
         return 1, "", "unexpected"
 
-    monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
-    monkeypatch.setattr(mod, "_UPSTREAM_REMOTE", "kirocrew")
-    monkeypatch.setattr(mod, "_run_cmd", fake_run)
-    await mod._load_fallback_repos()
-    assert mod._FALLBACK_REPOS == []
+    monkeypatch.setattr(repository, "_repo", lambda: "/fake/repo")
+    monkeypatch.setattr(repository, "_UPSTREAM_REMOTE", "kirocrew")
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run)
+    await repository._load_fallback_repos()
+    assert repository._FALLBACK_REPOS == []
 
 
 @pytest.mark.asyncio
@@ -254,6 +264,7 @@ async def test_load_fallback_repos_recognizes_scp_and_git_suffix_as_same(monkeyp
     ``.git``-suffixed spelling; both normalize to the same identity, so the
     alias is skipped rather than treated as a distinct fork.
     """
+
     async def fake_run(cmd, **kw):
         if cmd[-1] == "remote":
             return 0, "kirocrew\norigin\n", ""
@@ -266,16 +277,17 @@ async def test_load_fallback_repos_recognizes_scp_and_git_suffix_as_same(monkeyp
             return 0, "git@github.com:KiroDotDev/kirocrew\n", ""
         return 1, "", "unexpected"
 
-    monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
-    monkeypatch.setattr(mod, "_UPSTREAM_REMOTE", "kirocrew")
-    monkeypatch.setattr(mod, "_run_cmd", fake_run)
-    await mod._load_fallback_repos()
-    assert mod._FALLBACK_REPOS == []
+    monkeypatch.setattr(repository, "_repo", lambda: "/fake/repo")
+    monkeypatch.setattr(repository, "_UPSTREAM_REMOTE", "kirocrew")
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run)
+    await repository._load_fallback_repos()
+    assert repository._FALLBACK_REPOS == []
 
 
 @pytest.mark.asyncio
 async def test_load_fallback_repos_dedupes_multiple_aliases_of_one_repo(monkeypatch):
     """Two aliases of one genuine pre-rename repo collapse to a single entry."""
+
     async def fake_run(cmd, **kw):
         if cmd[-1] == "remote":
             return 0, "kirocrew\nold-a\nold-b\n", ""
@@ -291,11 +303,11 @@ async def test_load_fallback_repos_dedupes_multiple_aliases_of_one_repo(monkeypa
             return 0, "https://github.com/someone/KiroCrew-Old\n", ""  # same repo, other spelling
         return 1, "", "unexpected"
 
-    monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
-    monkeypatch.setattr(mod, "_UPSTREAM_REMOTE", "kirocrew")
-    monkeypatch.setattr(mod, "_run_cmd", fake_run)
-    await mod._load_fallback_repos()
-    assert mod._FALLBACK_REPOS == ["someone/kirocrew-old"]
+    monkeypatch.setattr(repository, "_repo", lambda: "/fake/repo")
+    monkeypatch.setattr(repository, "_UPSTREAM_REMOTE", "kirocrew")
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run)
+    await repository._load_fallback_repos()
+    assert repository._FALLBACK_REPOS == ["someone/kirocrew-old"]
 
 
 @pytest.mark.asyncio
@@ -308,6 +320,7 @@ async def test_load_fallback_repos_skips_same_named_fork(monkeypatch):
     that every current-convention worktree matches — flagging the whole fleet as
     legacy.
     """
+
     async def fake_run(cmd, **kw):
         if cmd[-1] == "remote":
             return 0, "kirocrew\nfork\n", ""
@@ -321,11 +334,11 @@ async def test_load_fallback_repos_skips_same_named_fork(monkeypatch):
             return 0, "git@github.com:someone/KiroCrew.git\n", ""
         return 1, "", "unexpected"
 
-    monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
-    monkeypatch.setattr(mod, "_UPSTREAM_REMOTE", "kirocrew")
-    monkeypatch.setattr(mod, "_run_cmd", fake_run)
-    await mod._load_fallback_repos()
-    assert mod._FALLBACK_REPOS == []
+    monkeypatch.setattr(repository, "_repo", lambda: "/fake/repo")
+    monkeypatch.setattr(repository, "_UPSTREAM_REMOTE", "kirocrew")
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run)
+    await repository._load_fallback_repos()
+    assert repository._FALLBACK_REPOS == []
 
 
 @pytest.mark.asyncio
@@ -335,6 +348,7 @@ async def test_load_fallback_repos_keeps_renamed_repo_alongside_a_fork(monkeypat
     Both candidates' mains are ancestors of upstream's, so only the repo name
     tells them apart — proving the guard is not a blanket skip of every ancestor.
     """
+
     async def fake_run(cmd, **kw):
         if cmd[-1] == "remote":
             return 0, "kirocrew\nfork\nold\n", ""
@@ -349,24 +363,24 @@ async def test_load_fallback_repos_keeps_renamed_repo_alongside_a_fork(monkeypat
             return 0, "git@github.com:kirodotdev/kirocrew-old.git\n", ""
         return 1, "", "unexpected"
 
-    monkeypatch.setattr(mod, "_repo", lambda: "/fake/repo")
-    monkeypatch.setattr(mod, "_UPSTREAM_REMOTE", "kirocrew")
-    monkeypatch.setattr(mod, "_run_cmd", fake_run)
-    await mod._load_fallback_repos()
-    assert mod._FALLBACK_REPOS == ["kirodotdev/kirocrew-old"]
+    monkeypatch.setattr(repository, "_repo", lambda: "/fake/repo")
+    monkeypatch.setattr(repository, "_UPSTREAM_REMOTE", "kirocrew")
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run)
+    await repository._load_fallback_repos()
+    assert repository._FALLBACK_REPOS == ["kirodotdev/kirocrew-old"]
 
 
 def test_normalize_repo_identity_spellings_and_host():
     """Same repo across https/scp/.git spellings is one identity; host matters."""
-    https = mod._normalize_repo_identity("https://github.com/kirodotdev/KiroCrew.git")
-    scp = mod._normalize_repo_identity("git@github.com:KiroDotDev/kirocrew")
+    https = repository._normalize_repo_identity("https://github.com/kirodotdev/KiroCrew.git")
+    scp = repository._normalize_repo_identity("git@github.com:KiroDotDev/kirocrew")
     assert https == scp == ("github.com", "kirodotdev/kirocrew")
     # Same owner/repo on a different forge is a DISTINCT identity.
-    other = mod._normalize_repo_identity("https://gitlab.com/kirodotdev/kirocrew.git")
+    other = repository._normalize_repo_identity("https://gitlab.com/kirodotdev/kirocrew.git")
     assert other == ("gitlab.com", "kirodotdev/kirocrew")
     assert other != https
     # Unparseable URL yields None.
-    assert mod._normalize_repo_identity("not-a-url") is None
+    assert repository._normalize_repo_identity("not-a-url") is None
 
 
 # --------------------------------------------------------------------------
@@ -386,10 +400,10 @@ async def test_git_info_returns_full_oid_and_short_display_head(monkeypatch):
         }
         return values.get(args)
 
-    monkeypatch.setattr(mod, "_git", fake_git)
-    monkeypatch.setattr(mod, "_upstream_remote", AsyncMock(return_value="origin"))
+    monkeypatch.setattr(repository, "_git", fake_git)
+    monkeypatch.setattr(repository, "_upstream_remote", AsyncMock(return_value="origin"))
 
-    info = await mod._git_info("/wt")
+    info = await repository._git_info("/wt")
 
     assert info["head_oid"] == full_head
     assert info["head"] == full_head[:7]
@@ -401,9 +415,9 @@ async def test_git_info_returns_full_oid_and_short_display_head(monkeypatch):
 @pytest.mark.asyncio
 async def test_pr_status_cached_skips_base_branch(monkeypatch):
     fetch = AsyncMock(return_value={"state": "OPEN"})
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
-    assert await mod._pr_status_cached(mod.BASE_BRANCH) is None
-    assert await mod._pr_status_cached("") is None
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
+    assert await fleet_state._pr_status_cached(repository.BASE_BRANCH) is None
+    assert await fleet_state._pr_status_cached("") is None
     fetch.assert_not_awaited()
 
 
@@ -411,10 +425,12 @@ async def test_pr_status_cached_skips_base_branch(monkeypatch):
 async def test_pr_status_cached_merged_entry_is_terminal(monkeypatch):
     """A MERGED entry is served regardless of age — no refetch."""
     fetch = AsyncMock(return_value={"state": "OPEN"})
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
-    monkeypatch.setattr(mod, "_PR_CACHE", {"feat": {"data": {"state": "MERGED"}, "ts": 0.0}})
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(
+        fleet_state, "_PR_CACHE", {"feat": {"data": {"state": "MERGED"}, "ts": 0.0}}
+    )
 
-    assert (await mod._pr_status_cached("feat"))["state"] == "MERGED"
+    assert (await fleet_state._pr_status_cached("feat"))["state"] == "MERGED"
     fetch.assert_not_awaited()
 
 
@@ -422,22 +438,24 @@ async def test_pr_status_cached_merged_entry_is_terminal(monkeypatch):
 async def test_pr_status_cached_stale_closed_entry_refetches(monkeypatch):
     """A CLOSED entry can be reopened, so it expires on the normal TTL."""
     fetch = AsyncMock(return_value={"state": "OPEN"})
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
-    monkeypatch.setattr(mod, "_PR_CACHE", {"feat": {"data": {"state": "CLOSED"}, "ts": 0.0}})
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(
+        fleet_state, "_PR_CACHE", {"feat": {"data": {"state": "CLOSED"}, "ts": 0.0}}
+    )
 
-    assert (await mod._pr_status_cached("feat"))["state"] == "OPEN"
+    assert (await fleet_state._pr_status_cached("feat"))["state"] == "OPEN"
     fetch.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_pr_status_cached_fresh_entry_is_served(monkeypatch):
     fetch = AsyncMock(return_value={"state": "MERGED"})
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
     monkeypatch.setattr(
-        mod, "_PR_CACHE", {"feat": {"data": {"state": "OPEN"}, "ts": time.time()}}
+        fleet_state, "_PR_CACHE", {"feat": {"data": {"state": "OPEN"}, "ts": time.time()}}
     )
 
-    assert (await mod._pr_status_cached("feat"))["state"] == "OPEN"
+    assert (await fleet_state._pr_status_cached("feat"))["state"] == "OPEN"
     fetch.assert_not_awaited()
 
 
@@ -445,14 +463,14 @@ async def test_pr_status_cached_fresh_entry_is_served(monkeypatch):
 async def test_pr_status_cached_merged_same_head_retains_terminal_cache(monkeypatch):
     """Same branch + same head OID → MERGED entry remains terminal (no refetch)."""
     fetch = AsyncMock(return_value={"state": "OPEN"})
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
     monkeypatch.setattr(
-        mod,
+        fleet_state,
         "_PR_CACHE",
         {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": "a" * 40}},
     )
 
-    result = await mod._pr_status_cached("feat", head_oid="a" * 40)
+    result = await fleet_state._pr_status_cached("feat", head_oid="a" * 40)
     assert result is not None and result["state"] == "MERGED"
     fetch.assert_not_awaited()
 
@@ -461,14 +479,14 @@ async def test_pr_status_cached_merged_same_head_retains_terminal_cache(monkeypa
 async def test_pr_status_cached_merged_new_head_invalidates_and_refetches(monkeypatch):
     """Same branch + new head OID → stale MERGED entry is discarded; fresh lookup runs."""
     fetch = AsyncMock(return_value={"state": "OPEN"})
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
     monkeypatch.setattr(
-        mod,
+        fleet_state,
         "_PR_CACHE",
         {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": "a" * 40}},
     )
 
-    result = await mod._pr_status_cached("feat", head_oid="b" * 40)
+    result = await fleet_state._pr_status_cached("feat", head_oid="b" * 40)
     # The stale MERGED entry must NOT be returned after a head change.
     assert result is not None and result["state"] == "OPEN"
     fetch.assert_awaited_once()
@@ -480,20 +498,20 @@ async def test_pr_status_cached_rejects_old_merged_pr_for_reused_head(monkeypatc
     new_head = "b" * 40
     fetch = AsyncMock(return_value={"state": "MERGED", "_head_oid": old_head})
     contained = AsyncMock(return_value=False)
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
-    monkeypatch.setattr(mod, "_head_contained_in_pr", contained)
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(fleet_state, "_head_contained_in_pr", contained)
     monkeypatch.setattr(
-        mod,
+        fleet_state,
         "_PR_CACHE",
         {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": old_head}},
     )
 
-    result = await mod._pr_status_cached("feat", head_oid=new_head)
+    result = await fleet_state._pr_status_cached("feat", head_oid=new_head)
 
     assert result is None
-    contained.assert_awaited_once_with(mod._repo(), new_head, old_head)
-    assert mod._PR_CACHE["feat"]["data"] is None
-    assert mod._PR_CACHE["feat"]["cached_head"] == new_head
+    contained.assert_awaited_once_with(repository._repo(), new_head, old_head)
+    assert fleet_state._PR_CACHE["feat"]["data"] is None
+    assert fleet_state._PR_CACHE["feat"]["cached_head"] == new_head
 
 
 @pytest.mark.asyncio
@@ -502,42 +520,42 @@ async def test_pr_status_cached_accepts_local_ancestor_of_merged_pr_head(monkeyp
     pr_head = "b" * 40
     fetch = AsyncMock(return_value={"state": "MERGED", "_head_oid": pr_head})
     contained = AsyncMock(return_value=True)
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
-    monkeypatch.setattr(mod, "_head_contained_in_pr", contained)
-    monkeypatch.setattr(mod, "_PR_CACHE", {})
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(fleet_state, "_head_contained_in_pr", contained)
+    monkeypatch.setattr(fleet_state, "_PR_CACHE", {})
 
-    result = await mod._pr_status_cached("feat", head_oid=local_head)
+    result = await fleet_state._pr_status_cached("feat", head_oid=local_head)
 
     assert result is not None and result["state"] == "MERGED"
-    contained.assert_awaited_once_with(mod._repo(), local_head, pr_head)
-    assert mod._PR_CACHE["feat"]["cached_head"] == local_head
+    contained.assert_awaited_once_with(repository._repo(), local_head, pr_head)
+    assert fleet_state._PR_CACHE["feat"]["cached_head"] == local_head
 
 
 @pytest.mark.asyncio
 async def test_pr_status_cached_accepts_fetched_merged_pr_for_same_head(monkeypatch):
     head = "a" * 40
     fetch = AsyncMock(return_value={"state": "MERGED", "_head_oid": head})
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
-    monkeypatch.setattr(mod, "_PR_CACHE", {})
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(fleet_state, "_PR_CACHE", {})
 
-    result = await mod._pr_status_cached("feat", head_oid=head)
+    result = await fleet_state._pr_status_cached("feat", head_oid=head)
 
     assert result is not None and result["state"] == "MERGED"
-    assert mod._PR_CACHE["feat"]["cached_head"] == head
+    assert fleet_state._PR_CACHE["feat"]["cached_head"] == head
 
 
 @pytest.mark.asyncio
 async def test_pr_status_cached_merged_no_head_oid_remains_terminal(monkeypatch):
     """Callers that omit head_oid continue to treat MERGED as terminal (fail-soft)."""
     fetch = AsyncMock(return_value={"state": "OPEN"})
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
     monkeypatch.setattr(
-        mod,
+        fleet_state,
         "_PR_CACHE",
         {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": "a" * 40}},
     )
 
-    result = await mod._pr_status_cached("feat")  # no head_oid
+    result = await fleet_state._pr_status_cached("feat")  # no head_oid
     assert result is not None and result["state"] == "MERGED"
     fetch.assert_not_awaited()
 
@@ -546,14 +564,14 @@ async def test_pr_status_cached_merged_no_head_oid_remains_terminal(monkeypatch)
 async def test_pr_status_cached_lookup_failure_does_not_cache_stale_merged(monkeypatch):
     """When the fresh lookup returns None (gh failure), the cache stores None safely."""
     fetch = AsyncMock(return_value=None)
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
     monkeypatch.setattr(
-        mod,
+        fleet_state,
         "_PR_CACHE",
         {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": "a" * 40}},
     )
 
-    result = await mod._pr_status_cached("feat", head_oid="b" * 40)
+    result = await fleet_state._pr_status_cached("feat", head_oid="b" * 40)
     assert result is None
     fetch.assert_awaited_once()
 
@@ -563,15 +581,15 @@ async def test_pr_status_cached_null_cached_head_invalidated_by_new_head(monkeyp
     """Entry written without head_oid (cached_head=None) is invalidated when a head-bearing
     caller provides a head_oid — prevents re-armed staleness after no-head write-back."""
     fetch = AsyncMock(return_value={"state": "OPEN"})
-    monkeypatch.setattr(mod, "_fetch_pr_status", fetch)
+    monkeypatch.setattr(fleet_state, "_fetch_pr_status", fetch)
     # Simulate a cache entry that was written by a no-head caller (cached_head missing/None).
     monkeypatch.setattr(
-        mod,
+        fleet_state,
         "_PR_CACHE",
         {"feat": {"data": {"state": "MERGED"}, "ts": 0.0, "cached_head": None}},
     )
 
-    result = await mod._pr_status_cached("feat", head_oid="a" * 40)
+    result = await fleet_state._pr_status_cached("feat", head_oid="a" * 40)
     # An unknown cached identity cannot match a known full head, so refetch.
     assert result is not None and result["state"] == "OPEN"
     fetch.assert_awaited_once()
@@ -579,23 +597,25 @@ async def test_pr_status_cached_null_cached_head_invalidated_by_new_head(monkeyp
 
 @pytest.mark.asyncio
 async def test_html_repo_base_from_remote_url(monkeypatch):
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "git@github.com:o/r.git\n", "")))
-    assert await mod._html_repo_base() == "https://github.com/o/r"
+    monkeypatch.setattr(
+        runtime, "_run_cmd", AsyncMock(return_value=(0, "git@github.com:o/r.git\n", ""))
+    )
+    assert await fleet_state._html_repo_base() == "https://github.com/o/r"
 
 
 @pytest.mark.asyncio
 async def test_html_repo_base_falls_back_to_owner_repo(monkeypatch):
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(1, "", "no remote")))
-    monkeypatch.setattr(mod, "_get_owner_repo", AsyncMock(return_value="o/r"))
-    assert await mod._html_repo_base() == "https://github.com/o/r"
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(1, "", "no remote")))
+    monkeypatch.setattr(fleet_state, "_get_owner_repo", AsyncMock(return_value="o/r"))
+    assert await fleet_state._html_repo_base() == "https://github.com/o/r"
 
 
 @pytest.mark.asyncio
 async def test_html_repo_base_cached_value_short_circuits(monkeypatch):
     run = AsyncMock(return_value=(0, "", ""))
-    monkeypatch.setattr(mod, "_run_cmd", run)
-    monkeypatch.setattr(mod, "_HTML_BASE", "https://example.invalid/o/r")
-    assert await mod._html_repo_base() == "https://example.invalid/o/r"
+    monkeypatch.setattr(runtime, "_run_cmd", run)
+    monkeypatch.setattr(fleet_state, "_HTML_BASE", "https://example.invalid/o/r")
+    assert await fleet_state._html_repo_base() == "https://example.invalid/o/r"
     run.assert_not_awaited()
 
 
@@ -613,15 +633,15 @@ def _pin_cfg(tmp_path: Path, text: str | None) -> SimpleNamespace:
 
 def test_read_pin_strict_no_env_file_is_unpinned(tmp_path):
     cfg = _pin_cfg(tmp_path, None)
-    assert mod._read_pin_strict(cfg, "feat") == (False, None)
+    assert worktree_ops._read_pin_strict(cfg, "feat") == (False, None)
 
 
 def test_read_pin_strict_refused_read_raises(monkeypatch, tmp_path):
     """A hooks-gate refusal is a DENY, never 'unpinned'."""
     cfg = _pin_cfg(tmp_path, "CHECKOUT=/x\n")
-    monkeypatch.setattr(mod.hooks, "safe_read_file_bytes_nolink", lambda *a, **k: None)
+    monkeypatch.setattr(worktree_ops.hooks, "safe_read_file_bytes_nolink", lambda *a, **k: None)
     with pytest.raises(OSError, match="refused by hooks read gate"):
-        mod._read_pin_strict(cfg, "feat")
+        worktree_ops._read_pin_strict(cfg, "feat")
 
 
 @pytest.mark.parametrize(
@@ -636,9 +656,11 @@ def test_read_pin_strict_refused_read_raises(monkeypatch, tmp_path):
 def test_read_pin_strict_parses_checkout(monkeypatch, tmp_path, body, expected):
     cfg = _pin_cfg(tmp_path, body)
     monkeypatch.setattr(
-        mod.hooks, "safe_read_file_bytes_nolink", lambda *a, **k: body.encode()
+        worktree_ops.hooks,
+        "safe_read_file_bytes_nolink",
+        lambda *a, **k: body.encode(),
     )
-    assert mod._read_pin_strict(cfg, "feat") == expected
+    assert worktree_ops._read_pin_strict(cfg, "feat") == expected
 
 
 # --------------------------------------------------------------------------
@@ -646,84 +668,102 @@ def test_read_pin_strict_parses_checkout(monkeypatch, tmp_path, body, expected):
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_pod_guard_unknown_worktree(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=(None, None)))
-    assert "unknown worktree" in (await mod._pod_checkout_guard("ghost") or "")
+    monkeypatch.setattr(repository, "_find_worktree", AsyncMock(return_value=(None, None)))
+    assert "unknown worktree" in (await worktree_ops._pod_checkout_guard("ghost") or "")
 
 
 @pytest.mark.asyncio
 async def test_pod_guard_no_pod_subsystem_allows(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: None)
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", False)
-    assert await mod._pod_checkout_guard("feat") is None
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: None)
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", False)
+    assert await worktree_ops._pod_checkout_guard("feat") is None
 
 
 @pytest.mark.asyncio
 async def test_pod_guard_unloadable_config_denies(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: None)
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
-    assert await mod._pod_checkout_guard("feat") == (
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: None)
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
+    assert await worktree_ops._pod_checkout_guard("feat") == (
         "cannot load pod configuration to verify pod identity"
     )
 
 
 @pytest.mark.asyncio
 async def test_pod_guard_unreadable_pin_denies(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
 
     def _boom(cfg, name):
         raise OSError("pin unreadable")
 
-    monkeypatch.setattr(mod, "_read_pin_strict", _boom)
-    assert "cannot verify pod checkout pin" in (await mod._pod_checkout_guard("feat") or "")
+    monkeypatch.setattr(worktree_ops, "_read_pin_strict", _boom)
+    assert "cannot verify pod checkout pin" in (
+        await worktree_ops._pod_checkout_guard("feat") or ""
+    )
 
 
 @pytest.mark.asyncio
 async def test_pod_guard_active_pod_without_pin_denies(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
-    monkeypatch.setattr(mod, "_read_pin_strict", lambda cfg, name: (False, None))
     monkeypatch.setattr(
-        mod, "rt", SimpleNamespace(active_names=lambda cfg: {"feat"}), raising=False
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
     )
-    assert "unattributable pod identity" in (await mod._pod_checkout_guard("feat") or "")
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(worktree_ops, "_read_pin_strict", lambda cfg, name: (False, None))
+    monkeypatch.setattr(
+        runtime, "rt", SimpleNamespace(active_names=lambda cfg: {"feat"}), raising=False
+    )
+    assert "unattributable pod identity" in (await worktree_ops._pod_checkout_guard("feat") or "")
 
 
 @pytest.mark.asyncio
 async def test_pod_guard_inactive_pod_without_pin_allows(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
-    monkeypatch.setattr(mod, "_read_pin_strict", lambda cfg, name: (False, None))
-    monkeypatch.setattr(mod, "rt", SimpleNamespace(active_names=lambda cfg: set()), raising=False)
-    assert await mod._pod_checkout_guard("feat") is None
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(worktree_ops, "_read_pin_strict", lambda cfg, name: (False, None))
+    monkeypatch.setattr(
+        runtime, "rt", SimpleNamespace(active_names=lambda cfg: set()), raising=False
+    )
+    assert await worktree_ops._pod_checkout_guard("feat") is None
 
 
 @pytest.mark.asyncio
 async def test_pod_guard_active_names_failure_denies(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
-    monkeypatch.setattr(mod, "_read_pin_strict", lambda cfg, name: (False, None))
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(worktree_ops, "_read_pin_strict", lambda cfg, name: (False, None))
 
     def _boom(cfg):
         raise RuntimeError("systemctl gone")
 
-    monkeypatch.setattr(mod, "rt", SimpleNamespace(active_names=_boom), raising=False)
-    assert "cannot verify active pods" in (await mod._pod_checkout_guard("feat") or "")
+    monkeypatch.setattr(runtime, "rt", SimpleNamespace(active_names=_boom), raising=False)
+    assert "cannot verify active pods" in (await worktree_ops._pod_checkout_guard("feat") or "")
 
 
 @pytest.mark.asyncio
 async def test_pod_guard_pin_without_checkout_denies(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
-    monkeypatch.setattr(mod, "_read_pin_strict", lambda cfg, name: (True, None))
-    assert "ambiguous pod identity" in (await mod._pod_checkout_guard("feat") or "")
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(worktree_ops, "_read_pin_strict", lambda cfg, name: (True, None))
+    assert "ambiguous pod identity" in (await worktree_ops._pod_checkout_guard("feat") or "")
 
 
 @pytest.mark.asyncio
@@ -733,12 +773,14 @@ async def test_pod_guard_foreign_checkout_denies(monkeypatch, tmp_path):
     mine.mkdir()
     theirs.mkdir()
     monkeypatch.setattr(
-        mod, "_find_worktree", AsyncMock(return_value=({"path": str(mine)}, None))
+        repository, "_find_worktree", AsyncMock(return_value=({"path": str(mine)}, None))
     )
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
-    monkeypatch.setattr(mod, "_read_pin_strict", lambda cfg, name: (True, str(theirs)))
-    assert "cross-repository pod operation" in (await mod._pod_checkout_guard("feat") or "")
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(worktree_ops, "_read_pin_strict", lambda cfg, name: (True, str(theirs)))
+    assert "cross-repository pod operation" in (
+        await worktree_ops._pod_checkout_guard("feat") or ""
+    )
 
 
 @pytest.mark.asyncio
@@ -746,12 +788,12 @@ async def test_pod_guard_matching_checkout_allows(monkeypatch, tmp_path):
     mine = tmp_path / "mine"
     mine.mkdir()
     monkeypatch.setattr(
-        mod, "_find_worktree", AsyncMock(return_value=({"path": str(mine)}, None))
+        repository, "_find_worktree", AsyncMock(return_value=({"path": str(mine)}, None))
     )
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
-    monkeypatch.setattr(mod, "_read_pin_strict", lambda cfg, name: (True, str(mine)))
-    assert await mod._pod_checkout_guard("feat") is None
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(worktree_ops, "_read_pin_strict", lambda cfg, name: (True, str(mine)))
+    assert await worktree_ops._pod_checkout_guard("feat") is None
 
 
 # --------------------------------------------------------------------------
@@ -760,253 +802,271 @@ async def test_pod_guard_matching_checkout_allows(monkeypatch, tmp_path):
 @pytest.fixture
 def allow_pod(monkeypatch):
     """Pod guard passes and pod state verification is opt-in per test."""
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: None)
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", False)
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: None)
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", False)
 
 
 @pytest.mark.asyncio
 async def test_pod_up_refused_by_guard(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value="nope"))
-    assert await mod._pod_up("feat") == {"ok": False, "error": "nope"}
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value="nope"))
+    assert await worktree_ops._pod_up("feat") == {"ok": False, "error": "nope"}
 
 
 @pytest.mark.asyncio
 async def test_pod_up_cli_failure_is_reported(monkeypatch, allow_pod):
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(1, "", "boom")))
-    assert await mod._pod_up("feat") == {"ok": False, "error": "boom"}
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(1, "", "boom")))
+    assert await worktree_ops._pod_up("feat") == {"ok": False, "error": "boom"}
 
 
 @pytest.mark.asyncio
 async def test_pod_up_non_json_output_still_ok(monkeypatch, allow_pod):
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "not json", "")))
-    assert await mod._pod_up("feat") == {"ok": True, "output": "not json"}
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "not json", "")))
+    assert await worktree_ops._pod_up("feat") == {"ok": True, "output": "not json"}
 
 
 @pytest.mark.asyncio
 async def test_pod_up_json_output_is_merged(monkeypatch, allow_pod):
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, '{"port": 9999}', "")))
-    assert await mod._pod_up("feat") == {"ok": True, "port": 9999}
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, '{"port": 9999}', "")))
+    assert await worktree_ops._pod_up("feat") == {"ok": True, "port": 9999}
 
 
 @pytest.mark.asyncio
 async def test_pod_up_inactive_after_start_fails_closed(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "{}", "")))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
-    monkeypatch.setattr(mod, "rt", SimpleNamespace(active_names=lambda cfg: set()), raising=False)
-    assert await mod._pod_up("feat") == {"ok": False, "error": "pod not active after start"}
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "{}", "")))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(
+        runtime, "rt", SimpleNamespace(active_names=lambda cfg: set()), raising=False
+    )
+    assert await worktree_ops._pod_up("feat") == {
+        "ok": False,
+        "error": "pod not active after start",
+    }
 
 
 @pytest.mark.asyncio
 async def test_pod_up_unverifiable_start_fails_closed(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "{}", "")))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "{}", "")))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
 
     def _boom(cfg):
         raise RuntimeError("no bus")
 
-    monkeypatch.setattr(mod, "rt", SimpleNamespace(active_names=_boom), raising=False)
-    res = await mod._pod_up("feat")
+    monkeypatch.setattr(runtime, "rt", SimpleNamespace(active_names=_boom), raising=False)
+    res = await worktree_ops._pod_up("feat")
     assert res["ok"] is False
     assert "cannot verify pod start" in res["error"]
 
 
 @pytest.mark.asyncio
 async def test_pod_down_refused_by_guard(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value="denied"))
-    assert await mod._pod_down("feat") == {"ok": False, "error": "denied"}
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value="denied"))
+    assert await worktree_ops._pod_down("feat") == {"ok": False, "error": "denied"}
 
 
 @pytest.mark.asyncio
 async def test_pod_down_cli_failure_is_reported(monkeypatch, allow_pod):
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(2, "out", "")))
-    assert await mod._pod_down("feat") == {"ok": False, "error": "out"}
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(2, "out", "")))
+    assert await worktree_ops._pod_down("feat") == {"ok": False, "error": "out"}
 
 
 @pytest.mark.asyncio
 async def test_pod_down_still_active_fails_closed(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "", "")))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
     monkeypatch.setattr(
-        mod, "rt", SimpleNamespace(active_names=lambda cfg: {"feat"}), raising=False
+        runtime, "rt", SimpleNamespace(active_names=lambda cfg: {"feat"}), raising=False
     )
-    assert await mod._pod_down("feat") == {
-        "ok": False, "error": "pod still active after shutdown",
+    assert await worktree_ops._pod_down("feat") == {
+        "ok": False,
+        "error": "pod still active after shutdown",
     }
 
 
 @pytest.mark.asyncio
 async def test_pod_down_unverifiable_shutdown_fails_closed(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "", "")))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
 
     def _boom(cfg):
         raise RuntimeError("no bus")
 
-    monkeypatch.setattr(mod, "rt", SimpleNamespace(active_names=_boom), raising=False)
-    res = await mod._pod_down("feat")
+    monkeypatch.setattr(runtime, "rt", SimpleNamespace(active_names=_boom), raising=False)
+    res = await worktree_ops._pod_down("feat")
     assert res["ok"] is False
     assert "cannot verify pod shutdown" in res["error"]
 
 
 @pytest.mark.asyncio
 async def test_pod_down_success(monkeypatch, allow_pod):
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
-    assert await mod._pod_down("feat") == {"ok": True, "error": None}
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "", "")))
+    assert await worktree_ops._pod_down("feat") == {"ok": True, "error": None}
 
 
 @pytest.mark.asyncio
 async def test_pod_restart_stops_on_failed_shutdown(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_down", AsyncMock(return_value={"ok": False, "error": "stuck"}))
+    monkeypatch.setattr(
+        worktree_ops, "_pod_down", AsyncMock(return_value={"ok": False, "error": "stuck"})
+    )
     up = AsyncMock(return_value={"ok": True})
-    monkeypatch.setattr(mod, "_pod_up", up)
+    monkeypatch.setattr(worktree_ops, "_pod_up", up)
 
-    res = await mod._pod_restart("feat")
+    res = await worktree_ops._pod_restart("feat")
     assert res == {"ok": False, "error": "pod shutdown failed: stuck"}
     up.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_pod_restart_starts_after_clean_shutdown(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_down", AsyncMock(return_value={"ok": True, "error": None}))
-    monkeypatch.setattr(mod, "_pod_up", AsyncMock(return_value={"ok": True, "port": 1}))
-    assert await mod._pod_restart("feat") == {"ok": True, "port": 1}
+    monkeypatch.setattr(
+        worktree_ops, "_pod_down", AsyncMock(return_value={"ok": True, "error": None})
+    )
+    monkeypatch.setattr(worktree_ops, "_pod_up", AsyncMock(return_value={"ok": True, "port": 1}))
+    assert await worktree_ops._pod_restart("feat") == {"ok": True, "port": 1}
 
 
 @pytest.mark.asyncio
 async def test_pod_token_refused_by_guard(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value="denied"))
-    assert await mod._pod_token("feat") == {"ok": False, "error": "denied"}
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value="denied"))
+    assert await worktree_ops._pod_token("feat") == {"ok": False, "error": "denied"}
 
 
 @pytest.mark.asyncio
 async def test_pod_token_without_config(monkeypatch, allow_pod):
-    assert await mod._pod_token("feat") == {"ok": False, "error": "PodConfig unavailable"}
+    assert await worktree_ops._pod_token("feat") == {"ok": False, "error": "PodConfig unavailable"}
 
 
 @pytest.mark.asyncio
 async def test_pod_token_mints_url(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
     monkeypatch.setattr(
-        mod, "rt",
+        runtime,
+        "rt",
         SimpleNamespace(
             mint_token=lambda cfg, name, ttl: "SECRET",
             derive_port=lambda cfg, name: 9123,
         ),
         raising=False,
     )
-    res = await mod._pod_token("feat")
+    res = await worktree_ops._pod_token("feat")
     assert res["ok"] is True
     assert res["url"].endswith("9123/?token=SECRET")
 
 
 @pytest.mark.asyncio
 async def test_pod_token_reports_mint_failure(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
 
     def _boom(cfg, name, ttl):
         raise RuntimeError("keyring locked")
 
-    monkeypatch.setattr(mod, "rt", SimpleNamespace(mint_token=_boom), raising=False)
-    assert await mod._pod_token("feat") == {"ok": False, "error": "keyring locked"}
+    monkeypatch.setattr(runtime, "rt", SimpleNamespace(mint_token=_boom), raising=False)
+    assert await worktree_ops._pod_token("feat") == {"ok": False, "error": "keyring locked"}
 
 
 @pytest.mark.asyncio
 async def test_pod_logs_refused_by_guard(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value="denied"))
-    assert await mod._pod_logs("feat") == {"ok": False, "error": "denied"}
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value="denied"))
+    assert await worktree_ops._pod_logs("feat") == {"ok": False, "error": "denied"}
 
 
 @pytest.mark.asyncio
 async def test_pod_logs_without_config(monkeypatch, allow_pod):
-    assert await mod._pod_logs("feat") == {"ok": False, "error": "PodConfig unavailable"}
+    assert await worktree_ops._pod_logs("feat") == {"ok": False, "error": "PodConfig unavailable"}
 
 
 @pytest.mark.asyncio
 async def test_pod_logs_returns_redacted_journal(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
     monkeypatch.setattr(
-        mod, "rt",
+        runtime,
+        "rt",
         SimpleNamespace(recent_journal=lambda cfg, name, n: f"lines={n}"),
         raising=False,
     )
-    assert await mod._pod_logs("feat", 7) == {"ok": True, "logs": "lines=7"}
+    assert await worktree_ops._pod_logs("feat", 7) == {"ok": True, "logs": "lines=7"}
 
 
 @pytest.mark.asyncio
 async def test_pod_provision_refused_by_guard(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value="denied"))
-    assert await mod._pod_provision("feat") == {"ok": False, "error": "denied"}
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value="denied"))
+    assert await worktree_ops._pod_provision("feat") == {"ok": False, "error": "denied"}
 
 
 @pytest.mark.asyncio
 async def test_pod_provision_single_flights_running_build(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {"feat": "run-1"})
-    monkeypatch.setattr(mod, "_RUNS", {"run-1": {"status": "running"}})
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(fleet_state, "_PROVISION_INFLIGHT", {"feat": "run-1"})
+    monkeypatch.setattr(runtime, "_RUNS", {"run-1": {"status": "running"}})
     start = AsyncMock(return_value="run-2")
-    monkeypatch.setattr(mod, "_start_run", start)
+    monkeypatch.setattr(runtime, "_start_run", start)
 
-    assert await mod._pod_provision("feat") == {
-        "ok": False, "error": "provision already running", "run_id": "run-1",
+    assert await worktree_ops._pod_provision("feat") == {
+        "ok": False,
+        "error": "provision already running",
+        "run_id": "run-1",
     }
     start.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_pod_provision_starts_run_and_records_it(monkeypatch):
-    monkeypatch.setattr(mod, "_pod_checkout_guard", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {"feat": "run-0"})
-    monkeypatch.setattr(mod, "_RUNS", {"run-0": {"status": "done"}})
+    monkeypatch.setattr(worktree_ops, "_pod_checkout_guard", AsyncMock(return_value=None))
+    monkeypatch.setattr(fleet_state, "_PROVISION_INFLIGHT", {"feat": "run-0"})
+    monkeypatch.setattr(runtime, "_RUNS", {"run-0": {"status": "done"}})
     monkeypatch.setattr(
-        mod, "sandboxed_spawn_argv", lambda argv, tier, env=None: (list(argv), {}, None)
+        worktree_ops,
+        "sandboxed_spawn_argv",
+        lambda argv, tier, env=None: (list(argv), {}, None),
     )
-    monkeypatch.setattr(mod, "_start_run", AsyncMock(return_value="run-9"))
+    monkeypatch.setattr(runtime, "_start_run", AsyncMock(return_value="run-9"))
 
-    assert await mod._pod_provision("feat") == {"ok": True, "run_id": "run-9"}
-    assert mod._PROVISION_INFLIGHT["feat"] == "run-9"
+    assert await worktree_ops._pod_provision("feat") == {"ok": True, "run_id": "run-9"}
+    assert fleet_state._PROVISION_INFLIGHT["feat"] == "run-9"
 
 
 @pytest.mark.asyncio
 async def test_pod_provision_dismiss_forgets_matching_terminal_run(monkeypatch):
-    monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {"feat": "run-1"})
-    monkeypatch.setattr(mod, "_RUNS", {"run-1": {"status": "done", "exit_code": 1}})
+    monkeypatch.setattr(fleet_state, "_PROVISION_INFLIGHT", {"feat": "run-1"})
+    monkeypatch.setattr(runtime, "_RUNS", {"run-1": {"status": "done", "exit_code": 1}})
 
-    assert await mod._pod_provision_dismiss("feat", "run-1") == {
-        "ok": True, "dismissed": True,
+    assert await worktree_ops._pod_provision_dismiss("feat", "run-1") == {
+        "ok": True,
+        "dismissed": True,
     }
-    assert "feat" not in mod._PROVISION_INFLIGHT
+    assert "feat" not in fleet_state._PROVISION_INFLIGHT
 
 
 @pytest.mark.asyncio
 async def test_pod_provision_dismiss_cannot_clear_replacement_run(monkeypatch):
-    monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {"feat": "run-new"})
+    monkeypatch.setattr(fleet_state, "_PROVISION_INFLIGHT", {"feat": "run-new"})
 
-    assert await mod._pod_provision_dismiss("feat", "run-old") == {
-        "ok": True, "dismissed": False,
+    assert await worktree_ops._pod_provision_dismiss("feat", "run-old") == {
+        "ok": True,
+        "dismissed": False,
     }
-    assert mod._PROVISION_INFLIGHT["feat"] == "run-new"
+    assert fleet_state._PROVISION_INFLIGHT["feat"] == "run-new"
 
 
 @pytest.mark.asyncio
 async def test_pod_provision_dismiss_refuses_running_run(monkeypatch):
-    monkeypatch.setattr(mod, "_PROVISION_INFLIGHT", {"feat": "run-1"})
-    monkeypatch.setattr(mod, "_RUNS", {"run-1": {"status": "running"}})
+    monkeypatch.setattr(fleet_state, "_PROVISION_INFLIGHT", {"feat": "run-1"})
+    monkeypatch.setattr(runtime, "_RUNS", {"run-1": {"status": "running"}})
 
-    result = await mod._pod_provision_dismiss("feat", "run-1")
+    result = await worktree_ops._pod_provision_dismiss("feat", "run-1")
     assert result == {"ok": False, "error": "cannot dismiss a running provision"}
-    assert mod._PROVISION_INFLIGHT["feat"] == "run-1"
+    assert fleet_state._PROVISION_INFLIGHT["feat"] == "run-1"
 
 
 # --------------------------------------------------------------------------
@@ -1014,51 +1074,219 @@ async def test_pod_provision_dismiss_refuses_running_run(monkeypatch):
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_disk_in_progress_returns_snapshot(monkeypatch):
-    monkeypatch.setattr(mod, "_DISK", {"status": "computing", "total_mb": None, "per": {}})
-    assert (await mod._disk())["status"] == "computing"
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "computing", "total_mb": None, "per": {}})
+    assert (await fleet_state._disk())["status"] == "computing"
 
 
 @pytest.mark.asyncio
-async def test_disk_done_snapshot_resets_to_idle(monkeypatch):
-    monkeypatch.setattr(mod, "_DISK", {"status": "done", "total_mb": 42, "per": {"a": 42}})
-    snap = await mod._disk()
-    assert snap["total_mb"] == 42
-    assert mod._DISK["status"] == "idle"
+async def test_disk_fresh_result_served_without_rescan(monkeypatch):
+    """A completed result inside the TTL is a cache, not a one-read handoff."""
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "done", "total_mb": 42, "per": {"a": 42}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", time.monotonic())
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    monkeypatch.setattr(
+        repository, "_discover_worktrees", AsyncMock(side_effect=AssertionError("must not scan"))
+    )
+    for _ in range(2):
+        snap = await fleet_state._disk()
+        assert snap == {"status": "done", "total_mb": 42, "per": {"a": 42}}
+    assert fleet_state._DISK["status"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_disk_six_sequential_polls_run_one_aggregation(monkeypatch):
+    """Regression for #8787: an open dashboard polling /disk must not re-scan.
+
+    Six sequential endpoint reads on main ran three full aggregations because
+    the done branch reset the state machine to idle on every snapshot. With
+    the TTL cache the same six reads run exactly one.
+    """
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", 0.0)
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    discoveries = 0
+    du_calls: list = []
+
+    async def fake_discover():
+        nonlocal discoveries
+        discoveries += 1
+        return [{"path": "/repo/wt-a"}]
+
+    async def fake_run(cmd, **kw):
+        du_calls.append(cmd)
+        return (0, "12\t/repo/wt-a", "")
+
+    monkeypatch.setattr(repository, "_discover_worktrees", fake_discover)
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run)
+
+    assert (await fleet_state._disk())["status"] == "computing"
+    for _ in range(50):
+        if fleet_state._DISK["status"] == "done":
+            break
+        await asyncio.sleep(0.01)
+    for _ in range(5):
+        snap = await fleet_state._disk()
+        assert snap == {"status": "done", "total_mb": 12, "per": {"wt-a": 12}}
+        await asyncio.sleep(0)  # give any wrongly-spawned refresh a chance to run
+    assert discoveries == 1
+    assert len(du_calls) == 1
+    assert fleet_state._DISK["status"] == "done"  # never reset back to idle
+
+
+@pytest.mark.asyncio
+async def test_disk_stale_cache_coalesces_one_refresh(monkeypatch):
+    """Concurrent polls past the TTL start exactly one background refresh."""
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "done", "total_mb": 42, "per": {"a": 42}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(
+        fleet_state, "_DISK_COMPUTED_AT", time.monotonic() - fleet_state._DISK_TTL - 1
+    )
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    started = 0
+    release = asyncio.Event()
+
+    async def fake_discover():
+        nonlocal started
+        started += 1
+        await release.wait()
+        return [{"path": "/repo/wt-a"}]
+
+    monkeypatch.setattr(repository, "_discover_worktrees", fake_discover)
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "7\t/repo/wt-a", "")))
+
+    snaps = await asyncio.gather(*(fleet_state._disk() for _ in range(6)))
+    # Every concurrent poll keeps observing the stale numbers, never a reset.
+    assert all(s == {"status": "done", "total_mb": 42, "per": {"a": 42}} for s in snaps)
+    await asyncio.sleep(0)  # let the refresh task reach the discovery await
+    assert started == 1
+    release.set()
+    for _ in range(50):
+        if fleet_state._DISK["total_mb"] == 7:
+            break
+        await asyncio.sleep(0.01)
+    assert fleet_state._DISK == {"status": "done", "total_mb": 7, "per": {"wt-a": 7}}
+    assert started == 1
+
+
+@pytest.mark.asyncio
+async def test_disk_invalidate_forces_refresh_on_next_read(monkeypatch):
+    """A worktree mutation drops the freshness stamp; the next read re-scans."""
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "done", "total_mb": 42, "per": {"a": 42}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", time.monotonic())
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    monkeypatch.setattr(
+        repository, "_discover_worktrees", AsyncMock(return_value=[{"path": "/repo/wt-b"}])
+    )
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "9\t/repo/wt-b", "")))
+
+    fleet_state._disk_invalidate()
+    # The stale numbers keep serving while the refresh runs behind them.
+    assert await fleet_state._disk() == {"status": "done", "total_mb": 42, "per": {"a": 42}}
+    for _ in range(50):
+        if fleet_state._DISK["total_mb"] == 9:
+            break
+        await asyncio.sleep(0.01)
+    assert fleet_state._DISK == {"status": "done", "total_mb": 9, "per": {"wt-b": 9}}
+
+
+@pytest.mark.asyncio
+async def test_disk_mid_flight_invalidation_leaves_result_stale(monkeypatch):
+    """An aggregation overlapped by a mutation must not be stamped fresh."""
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", 0.0)
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    release = asyncio.Event()
+
+    async def fake_discover():
+        await release.wait()
+        return [{"path": "/repo/wt-a"}]
+
+    monkeypatch.setattr(repository, "_discover_worktrees", fake_discover)
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "5\t/repo/wt-a", "")))
+
+    await fleet_state._disk()  # starts the aggregation
+    fleet_state._disk_invalidate()  # a mutation lands mid-flight
+    release.set()
+    for _ in range(50):
+        if fleet_state._DISK["status"] == "done":
+            break
+        await asyncio.sleep(0.01)
+    # The measurement is kept for display but left stale: the next read starts
+    # a fresh aggregation instead of serving pre-mutation numbers for a TTL.
+    assert fleet_state._DISK_COMPUTED_AT == 0.0
 
 
 @pytest.mark.asyncio
 async def test_disk_idle_starts_background_aggregation(monkeypatch):
-    monkeypatch.setattr(mod, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", 0.0)
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
     monkeypatch.setattr(
-        mod, "_discover_worktrees",
+        repository,
+        "_discover_worktrees",
         AsyncMock(return_value=[{"path": "/repo/wt-a"}, {"path": "/repo/wt-b"}]),
     )
 
     async def fake_run(cmd, **kw):
         return (0, "12\t" + cmd[-1], "") if cmd[-1].endswith("wt-a") else (1, "", "err")
 
-    monkeypatch.setattr(mod, "_run_cmd", fake_run)
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run)
 
-    assert await mod._disk() == {"status": "computing", "total_mb": None, "per": {}}
+    assert await fleet_state._disk() == {"status": "computing", "total_mb": None, "per": {}}
     for _ in range(50):
-        if mod._DISK["status"] == "done":
+        if fleet_state._DISK["status"] == "done":
             break
         await asyncio.sleep(0.01)
-    assert mod._DISK["per"] == {"wt-a": 12}
-    assert mod._DISK["total_mb"] == 12
+    assert fleet_state._DISK["per"] == {"wt-a": 12}
+    assert fleet_state._DISK["total_mb"] == 12
 
 
 @pytest.mark.asyncio
 async def test_disk_aggregation_failure_reports_unknown(monkeypatch):
-    monkeypatch.setattr(mod, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
-    monkeypatch.setattr(mod, "_discover_worktrees", AsyncMock(side_effect=RuntimeError("git")))
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "idle", "total_mb": None, "per": {}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTED_AT", 0.0)
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    monkeypatch.setattr(
+        repository, "_discover_worktrees", AsyncMock(side_effect=RuntimeError("git"))
+    )
 
-    await mod._disk()
+    await fleet_state._disk()
     for _ in range(50):
-        if mod._DISK["status"] == "done":
+        if fleet_state._DISK["status"] == "done":
             break
         await asyncio.sleep(0.01)
-    assert mod._DISK == {"status": "done", "total_mb": None, "per": {}}
+    assert fleet_state._DISK == {"status": "done", "total_mb": None, "per": {}}
+
+
+@pytest.mark.asyncio
+async def test_disk_transient_failure_preserves_numbers_and_retries(monkeypatch):
+    """A failed refresh keeps the previous result and is never cached fresh."""
+    monkeypatch.setattr(fleet_state, "_DISK", {"status": "done", "total_mb": 42, "per": {"a": 42}})
+    monkeypatch.setattr(fleet_state, "_DISK_COMPUTING", False)
+    monkeypatch.setattr(
+        fleet_state, "_DISK_COMPUTED_AT", time.monotonic() - fleet_state._DISK_TTL - 1
+    )
+    monkeypatch.setattr(fleet_state, "_DISK_EPOCH", 0)
+    monkeypatch.setattr(
+        repository, "_discover_worktrees", AsyncMock(side_effect=RuntimeError("git timeout"))
+    )
+
+    # Stale read starts the refresh, which fails behind the scenes.
+    assert await fleet_state._disk() == {"status": "done", "total_mb": 42, "per": {"a": 42}}
+    for _ in range(50):
+        if not fleet_state._DISK_COMPUTING:
+            break
+        await asyncio.sleep(0.01)
+    # Good numbers survive the failure, and the stamp stays 0.0 so the next
+    # read retries instead of serving the failure for a full TTL.
+    assert fleet_state._DISK == {"status": "done", "total_mb": 42, "per": {"a": 42}}
+    assert fleet_state._DISK_COMPUTED_AT == 0.0
 
 
 # --------------------------------------------------------------------------
@@ -1066,17 +1294,20 @@ async def test_disk_aggregation_failure_reports_unknown(monkeypatch):
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_rebase_unknown_worktree(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=(None, "gone")))
-    assert await mod._rebase("feat") == {"ok": False, "error": "gone"}
+    monkeypatch.setattr(repository, "_find_worktree", AsyncMock(return_value=(None, "gone")))
+    assert await worktree_ops._rebase("feat") == {"ok": False, "error": "gone"}
 
 
 @pytest.mark.asyncio
 async def test_rebase_refuses_main_checkout(monkeypatch):
     monkeypatch.setattr(
-        mod, "_find_worktree", AsyncMock(return_value=({"path": "/r", "is_main": True}, None))
+        repository,
+        "_find_worktree",
+        AsyncMock(return_value=({"path": "/r", "is_main": True}, None)),
     )
-    assert await mod._rebase("main") == {
-        "ok": False, "error": "refusing to rebase the main checkout",
+    assert await worktree_ops._rebase("main") == {
+        "ok": False,
+        "error": "refusing to rebase the main checkout",
     }
 
 
@@ -1085,12 +1316,13 @@ async def test_rebase_rejects_concurrent_run(monkeypatch):
     lock = asyncio.Lock()
     await lock.acquire()
     try:
-        monkeypatch.setattr(mod, "_WT_LOCKS", {"feat": lock})
+        monkeypatch.setattr(worktree_ops, "_WT_LOCKS", {"feat": lock})
         monkeypatch.setattr(
-            mod, "_find_worktree", AsyncMock(return_value=({"path": "/r"}, None))
+            repository, "_find_worktree", AsyncMock(return_value=({"path": "/r"}, None))
         )
-        assert await mod._rebase("feat") == {
-            "ok": False, "error": "rebase already running for this worktree",
+        assert await worktree_ops._rebase("feat") == {
+            "ok": False,
+            "error": "rebase already running for this worktree",
         }
     finally:
         lock.release()
@@ -1098,21 +1330,20 @@ async def test_rebase_rejects_concurrent_run(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rebase_locked_unverifiable_state(monkeypatch):
-    monkeypatch.setattr(mod, "_git", AsyncMock(return_value=None))
-    assert await mod._rebase_locked({"path": "/r"}) == {
-        "ok": False, "error": "cannot verify worktree state (git status failed)",
+    monkeypatch.setattr(repository, "_git", AsyncMock(return_value=None))
+    assert await worktree_ops._rebase_locked({"path": "/r"}) == {
+        "ok": False,
+        "error": "cannot verify worktree state (git status failed)",
     }
 
 
 @pytest.mark.asyncio
 async def test_rebase_locked_refuses_dirty_worktree(monkeypatch):
-    monkeypatch.setattr(mod, "_git", AsyncMock(return_value=" M file.py"))
+    monkeypatch.setattr(repository, "_git", AsyncMock(return_value=" M file.py"))
     # The untracked half of _dirt_report -> _dirty_split now goes through
     # _run_cmd; feed it one untracked path so the detail tail is populated.
-    monkeypatch.setattr(
-        mod, "_run_cmd", AsyncMock(return_value=(0, "scratch.log\0", ""))
-    )
-    res = await mod._rebase_locked({"path": "/r"})
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "scratch.log\0", "")))
+    res = await worktree_ops._rebase_locked({"path": "/r"})
     assert res["ok"] is False
     # The message no longer equals the bare legacy string: it now appends a
     # dirt-detail tail. The legacy prefix is preserved for clients keying on it.
@@ -1129,8 +1360,8 @@ async def test_rebase_locked_fetch_failure(monkeypatch):
     async def fake_git(path, *args, **kw):
         return "" if args[0] == "status" else None
 
-    monkeypatch.setattr(mod, "_git", fake_git)
-    res = await mod._rebase_locked({"path": "/r"})
+    monkeypatch.setattr(repository, "_git", fake_git)
+    res = await worktree_ops._rebase_locked({"path": "/r"})
     assert res["ok"] is False
     assert res["error"] == "git fetch origin main failed"
 
@@ -1140,13 +1371,16 @@ async def test_rebase_locked_success(monkeypatch):
     async def fake_git(path, *args, **kw):
         return "" if args[0] == "status" else "ok"
 
-    monkeypatch.setattr(mod, "_git", fake_git)
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "", "")))
+    monkeypatch.setattr(repository, "_git", fake_git)
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "", "")))
     monkeypatch.setattr(
-        mod, "_git_info", AsyncMock(return_value={"head": "abc1234", "behind": 0})
+        repository, "_git_info", AsyncMock(return_value={"head": "abc1234", "behind": 0})
     )
-    assert await mod._rebase_locked({"path": "/r"}) == {
-        "ok": True, "rebased": True, "head": "abc1234", "behind": 0,
+    assert await worktree_ops._rebase_locked({"path": "/r"}) == {
+        "ok": True,
+        "rebased": True,
+        "head": "abc1234",
+        "behind": 0,
     }
 
 
@@ -1155,9 +1389,9 @@ async def test_rebase_locked_conflict_aborted(monkeypatch):
     async def fake_git(path, *args, **kw):
         return "" if args[0] == "status" else "ok"
 
-    monkeypatch.setattr(mod, "_git", fake_git)
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(1, "CONFLICT", "in f.py")))
-    res = await mod._rebase_locked({"path": "/r"})
+    monkeypatch.setattr(repository, "_git", fake_git)
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(1, "CONFLICT", "in f.py")))
+    res = await worktree_ops._rebase_locked({"path": "/r"})
     assert res["ok"] is False and res["conflict"] is True
     assert "aborted" in res["error"]
 
@@ -1165,6 +1399,7 @@ async def test_rebase_locked_conflict_aborted(monkeypatch):
 @pytest.mark.asyncio
 async def test_rebase_locked_conflict_with_failed_abort(monkeypatch):
     """A failed --abort must never be reported as 'aborted'."""
+
     async def fake_git(path, *args, **kw):
         if args[0] == "status":
             return ""
@@ -1172,9 +1407,9 @@ async def test_rebase_locked_conflict_with_failed_abort(monkeypatch):
             return None
         return "ok"
 
-    monkeypatch.setattr(mod, "_git", fake_git)
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(1, "CONFLICT", "")))
-    res = await mod._rebase_locked({"path": "/r"})
+    monkeypatch.setattr(repository, "_git", fake_git)
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(1, "CONFLICT", "")))
+    res = await worktree_ops._rebase_locked({"path": "/r"})
     assert res["conflict"] is True
     assert "manual recovery required" in res["error"]
 
@@ -1184,70 +1419,78 @@ async def test_rebase_locked_conflict_with_failed_abort(monkeypatch):
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_prunable_dirty_check_failure(monkeypatch):
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=None))
-    v = await mod._prunable("/nope/missing", "feat")
+    monkeypatch.setattr(fleet_state, "_pr_status_cached", AsyncMock(return_value=None))
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=None))
+    v = await worktree_ops._prunable("/nope/missing", "feat")
     assert v == {**v, "ok": False, "code": "dirty_check_failed"}
     assert v["age_h"] is None
 
 
 @pytest.mark.asyncio
 async def test_prunable_merged_but_dirty(monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "MERGED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=1))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=True))
-    assert (await mod._prunable(str(tmp_path), "feat"))["code"] == "merged_dirty"
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "MERGED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=1))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=True))
+    assert (await worktree_ops._prunable(str(tmp_path), "feat"))["code"] == "merged_dirty"
 
 
 @pytest.mark.asyncio
 async def test_prunable_merged_unverified_when_oid_missing(monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "MERGED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
-    monkeypatch.setattr(mod, "_git", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_fetch_pr_head_oid", AsyncMock(return_value=None))
-    assert (await mod._prunable(str(tmp_path), "feat"))["code"] == "merged_unverified"
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "MERGED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
+    monkeypatch.setattr(repository, "_git", AsyncMock(return_value=None))
+    monkeypatch.setattr(fleet_state, "_fetch_pr_head_oid", AsyncMock(return_value=None))
+    assert (await worktree_ops._prunable(str(tmp_path), "feat"))["code"] == "merged_unverified"
 
 
 @pytest.mark.asyncio
 async def test_prunable_merged_with_new_commits(monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "MERGED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
-    monkeypatch.setattr(mod, "_git", AsyncMock(return_value="aaa"))
-    monkeypatch.setattr(mod, "_fetch_pr_head_oid", AsyncMock(return_value="bbb"))
-    monkeypatch.setattr(mod, "_head_contained_in_pr", AsyncMock(return_value=False))
-    assert (await mod._prunable(str(tmp_path), "feat"))["code"] == "merged_new_commits"
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "MERGED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
+    monkeypatch.setattr(repository, "_git", AsyncMock(return_value="aaa"))
+    monkeypatch.setattr(fleet_state, "_fetch_pr_head_oid", AsyncMock(return_value="bbb"))
+    monkeypatch.setattr(fleet_state, "_head_contained_in_pr", AsyncMock(return_value=False))
+    assert (await worktree_ops._prunable(str(tmp_path), "feat"))["code"] == "merged_new_commits"
 
 
 @pytest.mark.asyncio
 async def test_prunable_merged_clean_is_candidate(monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "MERGED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
-    monkeypatch.setattr(mod, "_git", AsyncMock(return_value="aaa"))
-    monkeypatch.setattr(mod, "_fetch_pr_head_oid", AsyncMock(return_value="aaa"))
-    monkeypatch.setattr(mod, "_head_contained_in_pr", AsyncMock(return_value=True))
-    v = await mod._prunable(str(tmp_path), "feat")
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "MERGED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
+    monkeypatch.setattr(repository, "_git", AsyncMock(return_value="aaa"))
+    monkeypatch.setattr(fleet_state, "_fetch_pr_head_oid", AsyncMock(return_value="aaa"))
+    monkeypatch.setattr(fleet_state, "_head_contained_in_pr", AsyncMock(return_value=True))
+    v = await worktree_ops._prunable(str(tmp_path), "feat")
     assert v["ok"] is True and v["code"] == "merged"
 
 
 @pytest.mark.asyncio
 async def test_prunable_fresh_empty_worktree_is_kept(monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
-    v = await mod._prunable(str(tmp_path), "feat")
+    monkeypatch.setattr(fleet_state, "_pr_status_cached", AsyncMock(return_value=None))
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
+    v = await worktree_ops._prunable(str(tmp_path), "feat")
     assert v["ok"] is False and v["code"] == "fresh"
 
 
 @pytest.mark.asyncio
 async def test_prunable_active_worktree_is_kept(monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "OPEN"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=3))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
-    assert (await mod._prunable(str(tmp_path), "feat"))["code"] == "active"
+    monkeypatch.setattr(fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "OPEN"}))
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=3))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
+    assert (await worktree_ops._prunable(str(tmp_path), "feat"))["code"] == "active"
 
 
 def _bind_closed_head(monkeypatch, *, contained=True, pr_oid="pr-head"):
@@ -1257,9 +1500,9 @@ def _bind_closed_head(monkeypatch, *, contained=True, pr_oid="pr-head"):
     a closed PR is looked up by branch NAME, so a reused branch would otherwise
     inherit a stale CLOSED verdict. These two seams are what that guard reads.
     """
-    monkeypatch.setattr(mod, "_git", AsyncMock(return_value="local-head"))
-    monkeypatch.setattr(mod, "_fetch_pr_head_oid", AsyncMock(return_value=pr_oid))
-    monkeypatch.setattr(mod, "_head_contained_in_pr", AsyncMock(return_value=contained))
+    monkeypatch.setattr(repository, "_git", AsyncMock(return_value="local-head"))
+    monkeypatch.setattr(fleet_state, "_fetch_pr_head_oid", AsyncMock(return_value=pr_oid))
+    monkeypatch.setattr(fleet_state, "_head_contained_in_pr", AsyncMock(return_value=contained))
 
 
 @pytest.mark.asyncio
@@ -1267,11 +1510,13 @@ async def test_prunable_closed_clean_is_candidate_not_merged(monkeypatch, tmp_pa
     """A CLOSED-PR worktree with a clean tree is a `closed` candidate — a
     distinct class from `merged`, so the manual checklist can group and warn on
     it separately."""
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
     _bind_closed_head(monkeypatch)
-    v = await mod._prunable(str(tmp_path), "feat")
+    v = await worktree_ops._prunable(str(tmp_path), "feat")
     assert v["ok"] is True
     assert v["code"] == "closed"
     # It must NOT be classified as merged — a merged tree's content is on the
@@ -1290,11 +1535,13 @@ async def test_prunable_closed_reused_branch_is_refused(monkeypatch, tmp_path):
     basis would destroy work unrelated to the PR that was declined, which is the
     exact data loss this whole class exists to prevent. The local head not being
     contained in the closed PR's head is what detects it."""
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=5))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=5))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
     _bind_closed_head(monkeypatch, contained=False)
-    v = await mod._prunable(str(tmp_path), "feat")
+    v = await worktree_ops._prunable(str(tmp_path), "feat")
     assert v["ok"] is False
     assert v["code"] == "closed_new_commits"
     # The ancestry warning still travels with the refusal.
@@ -1306,11 +1553,13 @@ async def test_prunable_closed_unverifiable_head_is_refused(monkeypatch, tmp_pat
     """Fail-closed: when the closed PR's head OID cannot be established the
     verdict withholds the candidate rather than trusting the name-based lookup.
     An unverifiable guard must never read as a pass."""
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=1))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=1))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
     _bind_closed_head(monkeypatch, pr_oid=None)
-    v = await mod._prunable(str(tmp_path), "feat")
+    v = await worktree_ops._prunable(str(tmp_path), "feat")
     assert v["ok"] is False
     assert v["code"] == "closed_unverified"
 
@@ -1319,11 +1568,13 @@ async def test_prunable_closed_unverifiable_head_is_refused(monkeypatch, tmp_pat
 async def test_prunable_closed_ahead_of_base_flags_unmerged_commits(monkeypatch, tmp_path):
     """A clean closed tree whose branch is ahead of base carries the ancestry
     warning (`unmerged_commits`) — a stronger signal than a merged candidate."""
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=4))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=4))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
     _bind_closed_head(monkeypatch)
-    v = await mod._prunable(str(tmp_path), "feat")
+    v = await worktree_ops._prunable(str(tmp_path), "feat")
     assert v["ok"] is True and v["code"] == "closed"
     assert v["unmerged_commits"] is True
 
@@ -1332,11 +1583,13 @@ async def test_prunable_closed_ahead_of_base_flags_unmerged_commits(monkeypatch,
 async def test_prunable_closed_clean_no_own_commits_no_unmerged_warning(monkeypatch, tmp_path):
     """A clean closed tree with no commits ahead of base is still a candidate,
     but the unmerged-commits alarm is off."""
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
     _bind_closed_head(monkeypatch)
-    v = await mod._prunable(str(tmp_path), "feat")
+    v = await worktree_ops._prunable(str(tmp_path), "feat")
     assert v["code"] == "closed"
     assert v["unmerged_commits"] is False
 
@@ -1346,15 +1599,18 @@ async def test_prunable_closed_dirty_is_refused_with_loss_summary(monkeypatch, t
     """A CLOSED-PR worktree with a dirty tree is REFUSED without force
     (code `closed_dirty`), and the verdict names what a removal would lose:
     the tracked-modification flag and the untracked-file count."""
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"}))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=2))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        fleet_state, "_pr_status_cached", AsyncMock(return_value={"state": "CLOSED"})
+    )
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=2))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=True))
     # One modified tracked file plus three untracked files — the loss summary.
     monkeypatch.setattr(
-        mod, "_dirty_split",
+        repository,
+        "_dirty_split",
         AsyncMock(return_value=(True, ["a.py", "b.py", "c.py"])),
     )
-    v = await mod._prunable(str(tmp_path), "feat")
+    v = await worktree_ops._prunable(str(tmp_path), "feat")
     assert v["ok"] is False
     assert v["code"] == "closed_dirty"
     # Loss summary: modified tracked files + untracked count are surfaced so the
@@ -1371,12 +1627,15 @@ async def test_prune_candidates_surfaces_closed_unmerged_flag(monkeypatch):
     """`_prune_candidates` carries the closed candidate's `unmerged_commits`
     flag onto its row (and only onto closed rows, not merged ones)."""
     monkeypatch.setattr(
-        mod, "_discover_worktrees",
-        AsyncMock(return_value=[
-            {"path": "/r", "is_main": True},
-            {"path": "/r/wt-closed", "branch": "c"},
-            {"path": "/r/wt-merged", "branch": "m"},
-        ]),
+        repository,
+        "_discover_worktrees",
+        AsyncMock(
+            return_value=[
+                {"path": "/r", "is_main": True},
+                {"path": "/r/wt-closed", "branch": "c"},
+                {"path": "/r/wt-merged", "branch": "m"},
+            ]
+        ),
     )
 
     async def fake_prunable(path, branch):
@@ -1384,8 +1643,8 @@ async def test_prune_candidates_surfaces_closed_unmerged_flag(monkeypatch):
             return {"ok": True, "code": "closed", "unmerged_commits": True}
         return {"ok": True, "code": "merged"}
 
-    monkeypatch.setattr(mod, "_prunable", fake_prunable)
-    out = await mod._prune_candidates()
+    monkeypatch.setattr(worktree_ops, "_prunable", fake_prunable)
+    out = await worktree_ops._prune_candidates()
     by_name = {c["name"]: c for c in out["candidates"]}
     assert by_name["wt-closed"]["code"] == "closed"
     assert by_name["wt-closed"]["unmerged_commits"] is True
@@ -1399,22 +1658,29 @@ async def test_prune_candidates_closed_dirty_lands_in_kept_with_loss_counts(monk
     """A `closed_dirty` worktree is a KEPT row (refused by default), and its
     dirt breakdown is surfaced so the checklist can show the loss summary."""
     monkeypatch.setattr(
-        mod, "_discover_worktrees",
-        AsyncMock(return_value=[
-            {"path": "/r", "is_main": True},
-            {"path": "/r/wt-cd", "branch": "cd"},
-        ]),
+        repository,
+        "_discover_worktrees",
+        AsyncMock(
+            return_value=[
+                {"path": "/r", "is_main": True},
+                {"path": "/r/wt-cd", "branch": "cd"},
+            ]
+        ),
     )
 
     async def fake_prunable(path, branch):
         return {
-            "ok": False, "code": "closed_dirty", "dirty": True,
-            "dirty_tracked": True, "dirty_untracked": 2,
-            "dirty_untracked_paths": ["x", "y"], "unmerged_commits": True,
+            "ok": False,
+            "code": "closed_dirty",
+            "dirty": True,
+            "dirty_tracked": True,
+            "dirty_untracked": 2,
+            "dirty_untracked_paths": ["x", "y"],
+            "unmerged_commits": True,
         }
 
-    monkeypatch.setattr(mod, "_prunable", fake_prunable)
-    out = await mod._prune_candidates()
+    monkeypatch.setattr(worktree_ops, "_prunable", fake_prunable)
+    out = await worktree_ops._prune_candidates()
     assert [c["name"] for c in out["candidates"]] == []
     kept = {k["name"]: k for k in out["kept"]}
     assert kept["wt-cd"]["code"] == "closed_dirty"
@@ -1428,13 +1694,13 @@ async def test_prunable_passes_full_head_oid_to_pr_status_cached(monkeypatch, tm
     """Prune cache invalidation uses full commit identity for branch reuse."""
     full_head = "a" * 40
     cache = AsyncMock(return_value=None)
-    monkeypatch.setattr(mod, "_pr_status_cached", cache)
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(mod, "_real_dirty", AsyncMock(return_value=False))
+    monkeypatch.setattr(fleet_state, "_pr_status_cached", cache)
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(repository, "_real_dirty", AsyncMock(return_value=False))
     git = AsyncMock(return_value=full_head)
-    monkeypatch.setattr(mod, "_git", git)
+    monkeypatch.setattr(repository, "_git", git)
 
-    await mod._prunable(str(tmp_path), "feat")
+    await worktree_ops._prunable(str(tmp_path), "feat")
 
     git.assert_awaited_once_with(str(tmp_path), "rev-parse", "HEAD")
     cache.assert_awaited_once_with("feat", full_head)
@@ -1443,20 +1709,23 @@ async def test_prunable_passes_full_head_oid_to_pr_status_cached(monkeypatch, tm
 @pytest.mark.asyncio
 async def test_prune_candidates_splits_and_skips_main(monkeypatch):
     monkeypatch.setattr(
-        mod, "_discover_worktrees",
-        AsyncMock(return_value=[
-            {"path": "/r", "is_main": True},
-            {"path": "/r/wt-a", "branch": "a"},
-            {"path": "/r/wt-b", "branch": "b"},
-        ]),
+        repository,
+        "_discover_worktrees",
+        AsyncMock(
+            return_value=[
+                {"path": "/r", "is_main": True},
+                {"path": "/r/wt-a", "branch": "a"},
+                {"path": "/r/wt-b", "branch": "b"},
+            ]
+        ),
     )
 
     async def fake_prunable(path, branch):
         ok = branch == "a"
         return {"ok": ok, "code": "merged" if ok else "active"}
 
-    monkeypatch.setattr(mod, "_prunable", fake_prunable)
-    out = await mod._prune_candidates()
+    monkeypatch.setattr(worktree_ops, "_prunable", fake_prunable)
+    out = await worktree_ops._prune_candidates()
     assert out["scanned"] == 2
     assert [c["name"] for c in out["candidates"]] == ["wt-a"]
     assert [k["name"] for k in out["kept"]] == ["wt-b"]
@@ -1466,17 +1735,17 @@ async def test_prune_candidates_splits_and_skips_main(monkeypatch):
 # fleet cache helpers
 # --------------------------------------------------------------------------
 def test_drop_worktrees_ignores_malformed_payload():
-    assert mod._drop_worktrees({"worktrees": "nope"}, {"x"}) == {"worktrees": "nope"}
+    assert fleet_state._drop_worktrees({"worktrees": "nope"}, {"x"}) == {"worktrees": "nope"}
 
 
 def test_drop_worktrees_returns_same_object_when_nothing_matches():
     data = {"worktrees": [{"name": "a"}]}
-    assert mod._drop_worktrees(data, {"z"}) is data
+    assert fleet_state._drop_worktrees(data, {"z"}) is data
 
 
 def test_drop_worktrees_copies_without_named_rows():
     data = {"worktrees": [{"name": "a"}, {"name": "b"}], "other": 1}
-    out = mod._drop_worktrees(data, {"a"})
+    out = fleet_state._drop_worktrees(data, {"a"})
     assert out["worktrees"] == [{"name": "b"}]
     assert out["other"] == 1
     assert data["worktrees"] == [{"name": "a"}, {"name": "b"}]
@@ -1494,7 +1763,7 @@ async def test_log_fleet_rebuild_failure_ignores_cancellation():
         await task
     except asyncio.CancelledError:
         pass
-    mod._log_fleet_rebuild_failure(task)  # must not raise
+    fleet_state._log_fleet_rebuild_failure(task)  # must not raise
 
 
 @pytest.mark.asyncio
@@ -1507,8 +1776,8 @@ async def test_log_fleet_rebuild_failure_warns_on_exception(caplog):
         await task
     except RuntimeError:
         pass
-    with caplog.at_level("WARNING", logger=mod.logger.name):
-        mod._log_fleet_rebuild_failure(task)
+    with caplog.at_level("WARNING", logger=runtime.logger.name):
+        fleet_state._log_fleet_rebuild_failure(task)
     assert "rebuild died" in caplog.text
 
 
@@ -1517,17 +1786,17 @@ async def test_log_fleet_rebuild_failure_warns_on_exception(caplog):
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_fleet_handler_reports_discovery_error(monkeypatch):
-    monkeypatch.setattr(mod, "_fleet_cached", AsyncMock(side_effect=RuntimeError("no git")))
-    resp = await mod.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet"))
+    monkeypatch.setattr(fleet_state, "_fleet_cached", AsyncMock(side_effect=RuntimeError("no git")))
+    resp = await http_api.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet"))
     assert json.loads(resp.text) == {"worktrees": [], "error": "no git"}
 
 
 @pytest.mark.asyncio
 async def test_fleet_handler_fresh_bypasses_cache(monkeypatch):
     refresh = AsyncMock(return_value={"worktrees": [{"name": "a"}]})
-    monkeypatch.setattr(mod, "_fleet_refresh", refresh)
-    monkeypatch.setattr(mod, "_fleet_cached", AsyncMock(return_value={"worktrees": []}))
-    resp = await mod.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet?fresh=1"))
+    monkeypatch.setattr(fleet_state, "_fleet_refresh", refresh)
+    monkeypatch.setattr(fleet_state, "_fleet_cached", AsyncMock(return_value={"worktrees": []}))
+    resp = await http_api.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet?fresh=1"))
     # The row also carries the request-time `provision_run_id` overlay, which is
     # authoritative: a provision that finished after the snapshot was built has
     # no reattachable run, so the pointer must read None rather than the id the
@@ -1553,12 +1822,12 @@ async def test_fleet_handler_overlays_runs_started_after_snapshot(monkeypatch):
         ],
         "sync_run_id": None,
     }
-    monkeypatch.setattr(mod, "_fleet_cached", AsyncMock(return_value=cached))
-    monkeypatch.setattr(mod, "_SYNC_RID", "rid-after-snapshot")
+    monkeypatch.setattr(fleet_state, "_fleet_cached", AsyncMock(return_value=cached))
+    monkeypatch.setattr(worktree_ops, "_SYNC_RID", "rid-after-snapshot")
     monkeypatch.setattr(
-        mod, "_provision_reattach_ids", AsyncMock(return_value={"feature-x": "prov-rid-7"})
+        fleet_state, "_provision_reattach_ids", AsyncMock(return_value={"feature-x": "prov-rid-7"})
     )
-    resp = await mod.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet"))
+    resp = await http_api.api_dev_fleet_fleet(make_mocked_request("GET", "/api/fleet"))
     body = json.loads(resp.text)
     assert body["sync_run_id"] == "rid-after-snapshot"
     rows = {w["name"]: w["provision_run_id"] for w in body["worktrees"]}
@@ -1571,37 +1840,37 @@ async def test_fleet_handler_overlays_runs_started_after_snapshot(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_worktree_handler_requires_name():
-    resp = await mod.api_dev_fleet_worktree(make_mocked_request("GET", "/api/worktree"))
+    resp = await http_api.api_dev_fleet_worktree(make_mocked_request("GET", "/api/worktree"))
     assert resp.status == 400
     assert "missing 'name'" in json.loads(resp.text)["error"]
 
 
 @pytest.mark.asyncio
 async def test_worktree_handler_rejects_unknown_name(monkeypatch):
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"other"}))
-    resp = await mod.api_dev_fleet_worktree(make_mocked_request("GET", "/api/worktree?name=x"))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"other"}))
+    resp = await http_api.api_dev_fleet_worktree(make_mocked_request("GET", "/api/worktree?name=x"))
     assert resp.status == 400
     assert "unknown worktree" in json.loads(resp.text)["error"]
 
 
 @pytest.mark.asyncio
 async def test_worktree_handler_returns_detail(monkeypatch):
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"x"}))
-    monkeypatch.setattr(mod, "_worktree_detail", AsyncMock(return_value={"name": "x"}))
-    resp = await mod.api_dev_fleet_worktree(make_mocked_request("GET", "/api/worktree?name=x"))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"x"}))
+    monkeypatch.setattr(fleet_state, "_worktree_detail", AsyncMock(return_value={"name": "x"}))
+    resp = await http_api.api_dev_fleet_worktree(make_mocked_request("GET", "/api/worktree?name=x"))
     assert json.loads(resp.text) == {"name": "x"}
 
 
 @pytest.mark.asyncio
 async def test_pod_logs_handler_requires_name():
-    resp = await mod.api_dev_fleet_pod_logs(make_mocked_request("GET", "/api/pod/logs"))
+    resp = await http_api.api_dev_fleet_pod_logs(make_mocked_request("GET", "/api/pod/logs"))
     assert resp.status == 400
 
 
 @pytest.mark.asyncio
 async def test_pod_logs_handler_rejects_unknown_name(monkeypatch):
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value=set()))
-    resp = await mod.api_dev_fleet_pod_logs(make_mocked_request("GET", "/api/pod/logs?name=x"))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value=set()))
+    resp = await http_api.api_dev_fleet_pod_logs(make_mocked_request("GET", "/api/pod/logs?name=x"))
     assert resp.status == 400
 
 
@@ -1611,15 +1880,15 @@ async def test_pod_logs_handler_rejects_unknown_name(monkeypatch):
     [("", 120), ("&n=notanint", 120), ("&n=0", 1), ("&n=99999", 1000), ("&n=25", 25)],
 )
 async def test_pod_logs_handler_clamps_line_count(monkeypatch, query, expected_n):
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"x"}))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"x"}))
     seen: list[int] = []
 
     async def fake_logs(name, n):
         seen.append(n)
         return {"ok": True, "logs": ""}
 
-    monkeypatch.setattr(mod, "_pod_logs", fake_logs)
-    await mod.api_dev_fleet_pod_logs(
+    monkeypatch.setattr(worktree_ops, "_pod_logs", fake_logs)
+    await http_api.api_dev_fleet_pod_logs(
         make_mocked_request("GET", f"/api/pod/logs?name=x{query}")
     )
     assert seen == [expected_n]
@@ -1627,22 +1896,22 @@ async def test_pod_logs_handler_clamps_line_count(monkeypatch, query, expected_n
 
 @pytest.mark.asyncio
 async def test_run_handler_requires_id():
-    resp = await mod.api_dev_fleet_run(make_mocked_request("GET", "/api/run"))
+    resp = await http_api.api_dev_fleet_run(make_mocked_request("GET", "/api/run"))
     assert resp.status == 400
 
 
 @pytest.mark.asyncio
 async def test_run_handler_unknown_id_is_404(monkeypatch):
-    monkeypatch.setattr(mod, "_RUNS", {})
-    resp = await mod.api_dev_fleet_run(make_mocked_request("GET", "/api/run?id=nope"))
+    monkeypatch.setattr(runtime, "_RUNS", {})
+    resp = await http_api.api_dev_fleet_run(make_mocked_request("GET", "/api/run?id=nope"))
     assert resp.status == 404
 
 
 @pytest.mark.asyncio
 async def test_run_handler_tails_and_redacts_output(monkeypatch):
     lines = [f"line {i}" for i in range(80)]
-    monkeypatch.setattr(mod, "_RUNS", {"r1": {"status": "running", "output": lines}})
-    resp = await mod.api_dev_fleet_run(make_mocked_request("GET", "/api/run?id=r1"))
+    monkeypatch.setattr(runtime, "_RUNS", {"r1": {"status": "running", "output": lines}})
+    resp = await http_api.api_dev_fleet_run(make_mocked_request("GET", "/api/run?id=r1"))
     payload = json.loads(resp.text)
     assert len(payload["output"]) == 60
     assert payload["output"][0] == "line 20"
@@ -1650,15 +1919,15 @@ async def test_run_handler_tails_and_redacts_output(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_prune_and_disk_handlers_pass_through(monkeypatch):
-    monkeypatch.setattr(mod, "_prune_candidates", AsyncMock(return_value={"ok": True}))
-    monkeypatch.setattr(mod, "_prune_status", AsyncMock(return_value={"running": False}))
-    monkeypatch.setattr(mod, "_disk", AsyncMock(return_value={"status": "idle"}))
+    monkeypatch.setattr(worktree_ops, "_prune_candidates", AsyncMock(return_value={"ok": True}))
+    monkeypatch.setattr(worktree_ops, "_prune_status", AsyncMock(return_value={"running": False}))
+    monkeypatch.setattr(fleet_state, "_disk", AsyncMock(return_value={"status": "idle"}))
 
-    r1 = await mod.api_dev_fleet_prune_candidates(
+    r1 = await http_api.api_dev_fleet_prune_candidates(
         make_mocked_request("GET", "/api/prune-candidates")
     )
-    r2 = await mod.api_dev_fleet_prune_status(make_mocked_request("GET", "/api/prune-status"))
-    r3 = await mod.api_dev_fleet_disk(make_mocked_request("GET", "/api/disk"))
+    r2 = await http_api.api_dev_fleet_prune_status(make_mocked_request("GET", "/api/prune-status"))
+    r3 = await http_api.api_dev_fleet_disk(make_mocked_request("GET", "/api/disk"))
     assert json.loads(r1.text) == {"ok": True}
     assert json.loads(r2.text) == {"running": False}
     assert json.loads(r3.text) == {"status": "idle"}
@@ -1669,13 +1938,13 @@ async def test_prune_and_disk_handlers_pass_through(monkeypatch):
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_json_body_rejects_invalid_json():
-    body, err = await mod._json_body(_raw_request(b"{oops", json_error=ValueError("bad")))
+    body, err = await http_api._json_body(_raw_request(b"{oops", json_error=ValueError("bad")))
     assert body is None and err is not None and err.status == 400
 
 
 @pytest.mark.asyncio
 async def test_json_body_rejects_non_object():
-    body, err = await mod._json_body(_raw_request(b"[1, 2]"))
+    body, err = await http_api._json_body(_raw_request(b"[1, 2]"))
     assert body is None and err is not None
     assert "must be an object" in json.loads(err.text)["error"]
 
@@ -1684,15 +1953,27 @@ async def test_json_body_rejects_non_object():
 async def test_json_body_empty_request_is_empty_dict():
     request = MagicMock()
     request.content_length = 0
-    body, err = await mod._json_body(request)
+    body, err = await http_api._json_body(request)
     assert body == {} and err is None
+
+
+@pytest.mark.asyncio
+async def test_json_body_unknown_charset_is_400_not_500():
+    # An unknown ``charset=`` codec makes aiohttp's decode step raise LookupError,
+    # not JSONDecodeError. The catch was ValueError-only, so this used to escape as
+    # a 500; it is a client-input mistake and must answer 400. Guards the widened
+    # (LookupError, RecursionError, ValueError) catch against a regression.
+    body, err = await http_api._json_body(
+        _raw_request(b"{}", json_error=LookupError("unknown encoding: bogus-codec"))
+    )
+    assert body is None and err is not None and err.status == 400
 
 
 @pytest.mark.asyncio
 async def test_worktree_remove_handler_rejects_non_bool_force(monkeypatch):
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
-    resp = await mod.api_dev_fleet_worktree_remove(
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
+    resp = await http_api.api_dev_fleet_worktree_remove(
         _json_request({"name": "feat", "force": "yes"})
     )
     assert resp.status == 400
@@ -1702,11 +1983,13 @@ async def test_worktree_remove_handler_rejects_non_bool_force(monkeypatch):
 @pytest.mark.asyncio
 async def test_worktree_remove_handler_forwards_force(monkeypatch):
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
     remove = AsyncMock(return_value={"ok": True})
-    monkeypatch.setattr(mod, "_worktree_remove", remove)
+    monkeypatch.setattr(worktree_ops, "_worktree_remove", remove)
 
-    resp = await mod.api_dev_fleet_worktree_remove(_json_request({"name": "feat", "force": True}))
+    resp = await http_api.api_dev_fleet_worktree_remove(
+        _json_request({"name": "feat", "force": True})
+    )
     assert resp.status == 200
     remove.assert_awaited_once_with("feat", True, discard_untracked_paths=None)
 
@@ -1719,9 +2002,9 @@ async def test_make_live_handler_rejects_malformed_expected_staged(monkeypatch, 
     malformed shapes) with a 400 before _make_live ever runs."""
     _sel_capture(monkeypatch)
     make_live = AsyncMock(return_value={"ok": True})
-    monkeypatch.setattr(mod, "_make_live", make_live)
+    monkeypatch.setattr(live, "_make_live", make_live)
 
-    resp = await mod.api_dev_fleet_make_live(
+    resp = await http_api.api_dev_fleet_make_live(
         _json_request({"path": "/w/x", "expected_staged": bad})
     )
     assert resp.status == 400
@@ -1733,19 +2016,19 @@ def test_same_path_survives_unresolvable_operands(tmp_path):
     """Defense in depth behind the handler gate: an operand Path.resolve()
     rejects (embedded NUL, or a symlink loop — RuntimeError on some
     platform/version combinations) means "not the same path", never a crash."""
-    assert mod._same_path("\x00", "/tmp") is False
-    assert mod._same_path("/tmp", "a\x00b") is False
+    assert repository._same_path("\x00", "/tmp") is False
+    assert repository._same_path("/tmp", "a\x00b") is False
     if sys.platform != "win32":
         a, b = tmp_path / "loop-a", tmp_path / "loop-b"
         a.symlink_to(b)
         b.symlink_to(a)
-        assert mod._same_path(str(a), str(tmp_path)) is False
+        assert repository._same_path(str(a), str(tmp_path)) is False
 
 
 @pytest.mark.asyncio
 async def test_prune_run_handler_rejects_invalid_json(monkeypatch):
     _sel_capture(monkeypatch)
-    resp = await mod.api_dev_fleet_prune_run(_raw_request(b"{", json_error=ValueError("bad")))
+    resp = await http_api.api_dev_fleet_prune_run(_raw_request(b"{", json_error=ValueError("bad")))
     assert resp.status == 400
     assert json.loads(resp.text)["ok"] is False
 
@@ -1753,7 +2036,7 @@ async def test_prune_run_handler_rejects_invalid_json(monkeypatch):
 @pytest.mark.asyncio
 async def test_prune_run_handler_rejects_non_object_body(monkeypatch):
     _sel_capture(monkeypatch)
-    resp = await mod.api_dev_fleet_prune_run(_raw_request(b"[]"))
+    resp = await http_api.api_dev_fleet_prune_run(_raw_request(b"[]"))
     assert resp.status == 400
     assert "must be an object" in json.loads(resp.text)["error"]
 
@@ -1761,7 +2044,7 @@ async def test_prune_run_handler_rejects_non_object_body(monkeypatch):
 @pytest.mark.asyncio
 async def test_prune_run_handler_rejects_non_string_names(monkeypatch):
     _sel_capture(monkeypatch)
-    resp = await mod.api_dev_fleet_prune_run(_json_request({"names": ["a", 7]}))
+    resp = await http_api.api_dev_fleet_prune_run(_json_request({"names": ["a", 7]}))
     assert resp.status == 400
     assert "list of strings" in json.loads(resp.text)["error"]
 
@@ -1769,8 +2052,8 @@ async def test_prune_run_handler_rejects_non_string_names(monkeypatch):
 @pytest.mark.asyncio
 async def test_prune_run_handler_rejects_when_no_name_is_valid(monkeypatch):
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"other"}))
-    resp = await mod.api_dev_fleet_prune_run(_json_request({"names": ["ghost"]}))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"other"}))
+    resp = await http_api.api_dev_fleet_prune_run(_json_request({"names": ["ghost"]}))
     assert resp.status == 400
     assert json.loads(resp.text)["error"] == "no valid names"
 
@@ -1778,11 +2061,11 @@ async def test_prune_run_handler_rejects_when_no_name_is_valid(monkeypatch):
 @pytest.mark.asyncio
 async def test_prune_run_handler_filters_to_valid_names(monkeypatch):
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"a"}))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"a"}))
     run = AsyncMock(return_value={"ok": True})
-    monkeypatch.setattr(mod, "_prune_run", run)
+    monkeypatch.setattr(worktree_ops, "_prune_run", run)
 
-    resp = await mod.api_dev_fleet_prune_run(_json_request({"names": ["a", "ghost"]}))
+    resp = await http_api.api_dev_fleet_prune_run(_json_request({"names": ["a", "ghost"]}))
     assert resp.status == 200
     run.assert_awaited_once_with(["a"])
 
@@ -1790,7 +2073,7 @@ async def test_prune_run_handler_filters_to_valid_names(monkeypatch):
 @pytest.mark.asyncio
 async def test_pod_name_action_rejects_empty_name(monkeypatch):
     _sel_capture(monkeypatch)
-    resp = await mod.api_dev_fleet_pod_up(_json_request({"name": ""}))
+    resp = await http_api.api_dev_fleet_pod_up(_json_request({"name": ""}))
     assert resp.status == 400
     assert "non-empty string" in json.loads(resp.text)["error"]
 
@@ -1800,9 +2083,9 @@ async def test_pod_name_action_rejects_ambiguous_basename(monkeypatch):
     """_find_worktree, not set membership, is the validator (collision safety)."""
     _sel_capture(monkeypatch)
     monkeypatch.setattr(
-        mod, "_find_worktree", AsyncMock(return_value=(None, "ambiguous name 'feat'"))
+        repository, "_find_worktree", AsyncMock(return_value=(None, "ambiguous name 'feat'"))
     )
-    resp = await mod.api_dev_fleet_pod_restart(_json_request({"name": "feat"}))
+    resp = await http_api.api_dev_fleet_pod_restart(_json_request({"name": "feat"}))
     assert resp.status == 400
     assert json.loads(resp.text)["error"] == "ambiguous name 'feat'"
 
@@ -1821,9 +2104,11 @@ async def test_pod_name_action_rejects_ambiguous_basename(monkeypatch):
 )
 async def test_pod_handlers_dispatch_to_their_action(monkeypatch, handler_name, action_name):
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
     action = AsyncMock(return_value={"ok": True, "via": action_name})
-    monkeypatch.setattr(mod, action_name, action)
+    monkeypatch.setattr(worktree_ops, action_name, action)
 
     resp = await getattr(mod, handler_name)(_json_request({"name": "feat"}))
     assert json.loads(resp.text) == {"ok": True, "via": action_name}
@@ -1833,11 +2118,13 @@ async def test_pod_handlers_dispatch_to_their_action(monkeypatch, handler_name, 
 @pytest.mark.asyncio
 async def test_pod_provision_dismiss_handler_validates_and_dispatches(monkeypatch):
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None)))
+    monkeypatch.setattr(
+        repository, "_find_worktree", AsyncMock(return_value=({"path": "/w"}, None))
+    )
     dismiss = AsyncMock(return_value={"ok": True, "dismissed": True})
-    monkeypatch.setattr(mod, "_pod_provision_dismiss", dismiss)
+    monkeypatch.setattr(worktree_ops, "_pod_provision_dismiss", dismiss)
 
-    resp = await mod.api_dev_fleet_pod_provision_dismiss(
+    resp = await http_api.api_dev_fleet_pod_provision_dismiss(
         _json_request({"name": "feat", "run_id": "run-1"})
     )
 
@@ -1853,9 +2140,7 @@ async def test_pod_provision_dismiss_handler_validates_and_dispatches(monkeypatc
         (b"[1, 2]", None),
     ],
 )
-async def test_pod_provision_dismiss_handler_codes_a_malformed_body(
-    monkeypatch, raw, json_error
-):
+async def test_pod_provision_dismiss_handler_codes_a_malformed_body(monkeypatch, raw, json_error):
     """Every rejection from this endpoint carries a machine-readable code.
 
     A malformed or non-object body is rejected by the shared body parser, whose
@@ -1864,9 +2149,9 @@ async def test_pod_provision_dismiss_handler_codes_a_malformed_body(
     """
     _sel_capture(monkeypatch)
     dismiss = AsyncMock()
-    monkeypatch.setattr(mod, "_pod_provision_dismiss", dismiss)
+    monkeypatch.setattr(worktree_ops, "_pod_provision_dismiss", dismiss)
 
-    resp = await mod.api_dev_fleet_pod_provision_dismiss(
+    resp = await http_api.api_dev_fleet_pod_provision_dismiss(
         _raw_request(raw, json_error=json_error)
     )
 
@@ -1879,23 +2164,25 @@ async def test_pod_provision_dismiss_handler_codes_a_malformed_body(
 async def test_sync_handler_maps_already_running_to_409(monkeypatch):
     _sel_capture(monkeypatch)
     monkeypatch.setattr(
-        mod, "_sync", AsyncMock(return_value={"ok": False, "error": "sync already running"})
+        worktree_ops,
+        "_sync",
+        AsyncMock(return_value={"ok": False, "error": "sync already running"}),
     )
     request = MagicMock()
     request.content_length = 0
     request.can_read_body = False
-    resp = await mod.api_dev_fleet_sync(request)
+    resp = await http_api.api_dev_fleet_sync(request)
     assert resp.status == 409
 
 
 @pytest.mark.asyncio
 async def test_sync_handler_success_is_200(monkeypatch):
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_sync", AsyncMock(return_value={"ok": True}))
+    monkeypatch.setattr(worktree_ops, "_sync", AsyncMock(return_value={"ok": True}))
     request = MagicMock()
     request.content_length = 0
     request.can_read_body = False
-    resp = await mod.api_dev_fleet_sync(request)
+    resp = await http_api.api_dev_fleet_sync(request)
     assert resp.status == 200
 
 
@@ -1905,7 +2192,7 @@ async def test_sync_handler_success_is_200(monkeypatch):
 @pytest.mark.asyncio
 async def test_make_live_handler_requires_path(monkeypatch):
     _sel_capture(monkeypatch)
-    resp = await mod.api_dev_fleet_make_live(_json_request({"path": ""}))
+    resp = await http_api.api_dev_fleet_make_live(_json_request({"path": ""}))
     assert resp.status == 400
     assert "non-empty string" in json.loads(resp.text)["error"]
 
@@ -1913,7 +2200,7 @@ async def test_make_live_handler_requires_path(monkeypatch):
 @pytest.mark.asyncio
 async def test_make_live_handler_rejects_non_bool_dry_run(monkeypatch):
     _sel_capture(monkeypatch)
-    resp = await mod.api_dev_fleet_make_live(_json_request({"path": "/w", "dry_run": "1"}))
+    resp = await http_api.api_dev_fleet_make_live(_json_request({"path": "/w", "dry_run": "1"}))
     assert resp.status == 400
     assert "dry_run must be a boolean" in json.loads(resp.text)["error"]
 
@@ -1922,9 +2209,9 @@ async def test_make_live_handler_rejects_non_bool_dry_run(monkeypatch):
 async def test_make_live_handler_forwards_dry_run(monkeypatch):
     sink = _sel_capture(monkeypatch)
     make_live = AsyncMock(return_value={"ok": True, "dry_run": True})
-    monkeypatch.setattr(mod, "_make_live", make_live)
+    monkeypatch.setattr(live, "_make_live", make_live)
 
-    resp = await mod.api_dev_fleet_make_live(_json_request({"path": "/w", "dry_run": True}))
+    resp = await http_api.api_dev_fleet_make_live(_json_request({"path": "/w", "dry_run": True}))
     assert resp.status == 200
     make_live.assert_awaited_once_with("/w", True, expected_staged=None)
     assert sink.events[0]["resources"] == "/w"
@@ -1937,7 +2224,7 @@ async def test_make_live_handler_forwards_dry_run(monkeypatch):
 async def test_audited_bodyless_request_has_empty_target(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         return web.json_response({"ok": True})
 
@@ -1953,7 +2240,7 @@ async def test_audited_bodyless_request_has_empty_target(monkeypatch):
 async def test_audited_joins_list_target(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         return web.json_response({"ok": True})
 
@@ -1965,7 +2252,7 @@ async def test_audited_joins_list_target(monkeypatch):
 async def test_audited_ignores_unparsable_body(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         return web.json_response({"ok": True})
 
@@ -1977,7 +2264,7 @@ async def test_audited_ignores_unparsable_body(monkeypatch):
 async def test_audited_non_dict_body_has_empty_target(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         return web.json_response({"ok": True})
 
@@ -1989,7 +2276,7 @@ async def test_audited_non_dict_body_has_empty_target(monkeypatch):
 async def test_audited_read_failure_does_not_break_handler(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         return web.json_response({"ok": True})
 
@@ -2005,7 +2292,7 @@ async def test_audited_read_failure_does_not_break_handler(monkeypatch):
 async def test_audited_handler_exception_is_audited_and_reraised(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         raise KeyError("kaboom")
 
@@ -2019,7 +2306,7 @@ async def test_audited_handler_exception_is_audited_and_reraised(monkeypatch):
 async def test_audited_server_error_is_failure(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         return web.json_response({"error": "internal"}, status=500)
 
@@ -2032,7 +2319,7 @@ async def test_audited_server_error_is_failure(monkeypatch):
 async def test_audited_non_json_response_still_audits_success(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         return web.Response(text="plain body")
 
@@ -2044,7 +2331,7 @@ async def test_audited_non_json_response_still_audits_success(monkeypatch):
 async def test_audited_non_dict_json_response_is_success(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         return web.json_response([1, 2])
 
@@ -2056,7 +2343,7 @@ async def test_audited_non_dict_json_response_is_success(monkeypatch):
 async def test_audited_error_free_denial_falls_back_to_status(monkeypatch):
     sink = _sel_capture(monkeypatch)
 
-    @mod._audited("probe")
+    @http_api._audited("probe")
     async def handler(request):
         return web.json_response({}, status=403)
 
@@ -2071,7 +2358,7 @@ async def test_audited_preserves_handler_identity():
         """Docstring stays."""
         return web.json_response({})
 
-    wrapped = mod._audited("probe")(original)
+    wrapped = http_api._audited("probe")(original)
     assert wrapped.__name__ == "original"
     assert wrapped.__doc__ == "Docstring stays."
 
@@ -2087,7 +2374,7 @@ async def test_hmac_health_path_is_exempt(monkeypatch):
         called.append(True)
         return web.json_response({"status": "ok"})
 
-    await mod.hmac_proxy_middleware(make_mocked_request("GET", "/health"), handler)
+    await http_api.hmac_proxy_middleware(make_mocked_request("GET", "/health"), handler)
     assert called == [True]
 
 
@@ -2104,13 +2391,13 @@ async def test_hmac_health_path_is_exempt(monkeypatch):
 )
 async def test_hmac_denials(monkeypatch, headers, secret, reason):
     sink = _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_load_app_secret", lambda: secret)
+    monkeypatch.setattr(http_api, "_load_app_secret", lambda: secret)
 
     async def handler(request):  # pragma: no cover - must never run
         raise AssertionError("handler must not be reached")
 
     request = make_mocked_request("GET", "/api/fleet", headers=headers)
-    resp = await mod.hmac_proxy_middleware(request, handler)
+    resp = await http_api.hmac_proxy_middleware(request, handler)
     assert resp.status == 401
     assert reason in json.loads(resp.text)["error"]
     assert sink.events[0]["outcome"] == "denied"
@@ -2120,17 +2407,18 @@ async def test_hmac_denials(monkeypatch, headers, secret, reason):
 @pytest.mark.asyncio
 async def test_hmac_denial_survives_audit_sink_failure(monkeypatch, caplog):
     """A broken SEL sink must never mask the 401."""
+
     def _boom():
         raise RuntimeError("sel down")
 
-    monkeypatch.setattr(mod, "_sel", _boom)
-    monkeypatch.setattr(mod, "_load_app_secret", lambda: "s3cr3t")
+    monkeypatch.setattr(runtime, "_sel", _boom)
+    monkeypatch.setattr(http_api, "_load_app_secret", lambda: "s3cr3t")
 
     async def handler(request):  # pragma: no cover - must never run
         raise AssertionError("handler must not be reached")
 
-    with caplog.at_level("WARNING", logger=mod.logger.name):
-        resp = await mod.hmac_proxy_middleware(
+    with caplog.at_level("WARNING", logger=runtime.logger.name):
+        resp = await http_api.hmac_proxy_middleware(
             make_mocked_request("GET", "/api/fleet"), handler
         )
     assert resp.status == 401
@@ -2142,13 +2430,13 @@ async def test_hmac_denial_survives_audit_sink_failure(monkeypatch, caplog):
 # --------------------------------------------------------------------------
 def test_gateway_unit_name_defaults_to_live_unit(monkeypatch, tmp_path):
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path / "home")
-    assert mod._gateway_unit_name() == mod._LIVE_GATEWAY_UNIT
+    assert live._gateway_unit_name() == live._LIVE_GATEWAY_UNIT
 
 
 def test_gateway_unit_name_uses_pod_instance(monkeypatch, tmp_path):
     home = tmp_path / ".kirocrew-pods" / "feat"
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: home)
-    assert mod._gateway_unit_name() == "kirocrew-pod@feat.service"
+    assert live._gateway_unit_name() == "kirocrew-pod@feat.service"
 
 
 def test_gateway_unit_name_falls_back_when_home_unresolvable(monkeypatch):
@@ -2156,12 +2444,12 @@ def test_gateway_unit_name_falls_back_when_home_unresolvable(monkeypatch):
         raise RuntimeError("no home")
 
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", _boom)
-    assert mod._gateway_unit_name() == mod._LIVE_GATEWAY_UNIT
+    assert live._gateway_unit_name() == live._LIVE_GATEWAY_UNIT
 
 
 def test_gateway_label_defaults_to_live_agent(monkeypatch, tmp_path):
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: tmp_path / "home")
-    assert mod._gateway_label() == mod._LIVE_GATEWAY_LABEL
+    assert live._gateway_label() == live._LIVE_GATEWAY_LABEL
 
 
 def test_gateway_label_uses_pod_agent(monkeypatch, tmp_path):
@@ -2171,7 +2459,7 @@ def test_gateway_label_uses_pod_agent(monkeypatch, tmp_path):
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: home)
     monkeypatch.delenv("KIROCREW_POD_UNIT_PREFIX", raising=False)
     expected = f"{launchd.LABEL_PREFIX}.{pod_config.DEFAULT_UNIT_PREFIX}.feat"
-    assert mod._gateway_label() == expected
+    assert live._gateway_label() == expected
 
 
 def test_gateway_label_honours_unit_prefix_override(monkeypatch, tmp_path):
@@ -2179,7 +2467,7 @@ def test_gateway_label_honours_unit_prefix_override(monkeypatch, tmp_path):
     home = tmp_path / ".kirocrew-pods" / "feat"
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", lambda: home)
     monkeypatch.setenv("KIROCREW_POD_UNIT_PREFIX", "altplane")
-    assert mod._gateway_label() == f"{launchd.LABEL_PREFIX}.altplane.feat"
+    assert live._gateway_label() == f"{launchd.LABEL_PREFIX}.altplane.feat"
 
 
 @pytest.mark.parametrize(
@@ -2190,7 +2478,7 @@ def test_in_pod_detection(monkeypatch, tmp_path, home_parts, expected):
     monkeypatch.setattr(
         "kiro_crew.config.loader.config_dir", lambda: tmp_path.joinpath(*home_parts)
     )
-    assert mod._in_pod() is expected
+    assert live._in_pod() is expected
 
 
 def test_in_pod_is_none_when_home_unresolvable(monkeypatch):
@@ -2198,50 +2486,72 @@ def test_in_pod_is_none_when_home_unresolvable(monkeypatch):
         raise RuntimeError("no home")
 
     monkeypatch.setattr("kiro_crew.config.loader.config_dir", _boom)
-    assert mod._in_pod() is None
+    assert live._in_pod() is None
 
 
 def test_foreground_backend_is_none_off_posix(monkeypatch):
-    monkeypatch.setattr(mod.sys, "platform", "win32")
-    assert mod._foreground_backend() is None
+    monkeypatch.setattr(live.sys, "platform", "win32")
+    assert live._foreground_backend() is None
 
 
 # --------------------------------------------------------------------------
 # drop-in rollback + path selector
 # --------------------------------------------------------------------------
-def test_restore_dropin_deletes_when_there_was_none(tmp_path):
+def _systemd_backend(dropin: Path) -> gateway_service.SystemdBackend:
+    """A SystemdBackend whose drop-in path is *dropin*.
+
+    ``rollback`` touches only the injected drop-in path and the module-level
+    ``atomic_write_text``, so the remaining seams stay inert stubs.
+    """
+    return gateway_service.SystemdBackend(
+        AsyncMock(return_value=(0, "", "")),
+        lambda: "kirocrew.service",
+        platform="linux",
+        which=lambda _name: "/usr/bin/systemctl",
+        dropin_path=lambda: dropin,
+        dropin_content=lambda _wt, _kcbin: "",
+    )
+
+
+def test_service_rollback_deletes_the_dropin_when_there_was_none(tmp_path):
+    """No prior drop-in -> the file staged over it is removed, not left behind."""
     dropin = tmp_path / "make-live.conf"
     dropin.write_text("[Service]\n", encoding="utf-8", newline="\n")
-    assert mod._restore_dropin(dropin, None) is True
+    assert _systemd_backend(dropin).rollback(None) is True
     assert not dropin.exists()
 
 
-def test_restore_dropin_rewrites_prior_content(tmp_path):
+def test_service_rollback_rewrites_prior_content(tmp_path):
+    """A prior drop-in -> its exact content is restored over the staged one."""
     dropin = tmp_path / "make-live.conf"
     dropin.write_text("new\n", encoding="utf-8", newline="\n")
-    assert mod._restore_dropin(dropin, "prior\n") is True
+    assert _systemd_backend(dropin).rollback("prior\n") is True
     assert dropin.read_text(encoding="utf-8") == "prior\n"
 
 
-def test_restore_dropin_reports_failure(monkeypatch, tmp_path):
+def test_service_rollback_reports_failure(monkeypatch, tmp_path):
+    """A failed restore returns False so the caller can report
+    ``rolled_back: false`` rather than claiming a rollback that did not land."""
+
     def _boom(path, content):
         raise OSError("read-only fs")
 
     monkeypatch.setattr(gateway_service, "atomic_write_text", _boom)
-    assert mod._restore_dropin(tmp_path / "make-live.conf", "prior") is False
+    backend = _systemd_backend(tmp_path / "make-live.conf")
+    assert backend.rollback("prior") is False
 
 
 @pytest.mark.asyncio
 async def test_find_worktree_by_path_requires_path():
-    wt, err = await mod._find_worktree_by_path("")
+    wt, err = await repository._find_worktree_by_path("")
     assert wt is None
     assert err is not None and "non-empty string" in err
 
 
 @pytest.mark.asyncio
 async def test_find_worktree_by_path_unknown_path(monkeypatch, tmp_path):
-    monkeypatch.setattr(mod, "_discover_worktrees", AsyncMock(return_value=[]))
-    wt, err = await mod._find_worktree_by_path(str(tmp_path / "nope"))
+    monkeypatch.setattr(repository, "_discover_worktrees", AsyncMock(return_value=[]))
+    wt, err = await repository._find_worktree_by_path(str(tmp_path / "nope"))
     assert wt is None
     assert err is not None and "not a known worktree" in err
 
@@ -2251,10 +2561,11 @@ async def test_find_worktree_by_path_matches_known_worktree(monkeypatch, tmp_pat
     wanted = tmp_path / "kirocrew-wt-alpha"
     wanted.mkdir()
     monkeypatch.setattr(
-        mod, "_discover_worktrees",
+        repository,
+        "_discover_worktrees",
         AsyncMock(return_value=[{"path": str(tmp_path / "other")}, {"path": str(wanted)}]),
     )
-    wt, err = await mod._find_worktree_by_path(str(wanted))
+    wt, err = await repository._find_worktree_by_path(str(wanted))
     assert err is None
     assert wt is not None and _same(wt["path"], str(wanted))
 
@@ -2275,20 +2586,20 @@ async def test_cleanup_kills_runs_and_cancels_workers(monkeypatch):
     proc.returncode = None
     proc.pid = 4242
     kill_tree = AsyncMock()
-    monkeypatch.setattr(mod, "_kill_tree", kill_tree)
-    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {"r1": (run_task, proc)})
-    monkeypatch.setattr(mod, "_refresher_task", refresher)
-    monkeypatch.setattr(mod, "_warm_task", None)
-    monkeypatch.setattr(mod, "_reaper_task", None)
+    monkeypatch.setattr(runtime, "_kill_tree", kill_tree)
+    monkeypatch.setattr(runtime, "_ACTIVE_RUNS", {"r1": (run_task, proc)})
+    monkeypatch.setattr(worktree_ops, "_refresher_task", refresher)
+    monkeypatch.setattr(worktree_ops, "_warm_task", None)
+    monkeypatch.setattr(worktree_ops, "_reaper_task", None)
 
     await mod.dev_fleet_cleanup(MagicMock())
 
     kill_tree.assert_awaited_once_with(4242)
     proc.kill.assert_called_once()
-    assert mod._ACTIVE_RUNS == {}
+    assert runtime._ACTIVE_RUNS == {}
     assert run_task.cancelled() or run_task.done()
     assert refresher.cancelled() or refresher.done()
-    assert mod._refresher_task is None
+    assert worktree_ops._refresher_task is None
 
 
 @pytest.mark.asyncio
@@ -2303,14 +2614,14 @@ async def test_cleanup_tolerates_already_dead_process(monkeypatch):
     proc.returncode = None
     proc.pid = 77
     proc.kill.side_effect = ProcessLookupError
-    monkeypatch.setattr(mod, "_kill_tree", AsyncMock())
-    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {"r1": (run_task, proc)})
-    monkeypatch.setattr(mod, "_refresher_task", None)
-    monkeypatch.setattr(mod, "_warm_task", None)
-    monkeypatch.setattr(mod, "_reaper_task", None)
+    monkeypatch.setattr(runtime, "_kill_tree", AsyncMock())
+    monkeypatch.setattr(runtime, "_ACTIVE_RUNS", {"r1": (run_task, proc)})
+    monkeypatch.setattr(worktree_ops, "_refresher_task", None)
+    monkeypatch.setattr(worktree_ops, "_warm_task", None)
+    monkeypatch.setattr(worktree_ops, "_reaper_task", None)
 
     await mod.dev_fleet_cleanup(MagicMock())
-    assert mod._ACTIVE_RUNS == {}
+    assert runtime._ACTIVE_RUNS == {}
 
 
 @pytest.mark.asyncio
@@ -2324,11 +2635,11 @@ async def test_cleanup_skips_finished_process(monkeypatch):
     proc = MagicMock()
     proc.returncode = 0
     kill_tree = AsyncMock()
-    monkeypatch.setattr(mod, "_kill_tree", kill_tree)
-    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {"r1": (run_task, proc)})
-    monkeypatch.setattr(mod, "_refresher_task", None)
-    monkeypatch.setattr(mod, "_warm_task", None)
-    monkeypatch.setattr(mod, "_reaper_task", None)
+    monkeypatch.setattr(runtime, "_kill_tree", kill_tree)
+    monkeypatch.setattr(runtime, "_ACTIVE_RUNS", {"r1": (run_task, proc)})
+    monkeypatch.setattr(worktree_ops, "_refresher_task", None)
+    monkeypatch.setattr(worktree_ops, "_warm_task", None)
+    monkeypatch.setattr(worktree_ops, "_reaper_task", None)
 
     await mod.dev_fleet_cleanup(MagicMock())
     kill_tree.assert_not_awaited()
@@ -2348,11 +2659,7 @@ def test_create_app_registers_lifecycle_hooks_by_name():
 
 def test_create_app_exposes_health_on_both_paths():
     app = mod.create_app()
-    paths = {
-        r.resource.canonical
-        for r in app.router.routes()
-        if r.resource is not None
-    }
+    paths = {r.resource.canonical for r in app.router.routes() if r.resource is not None}
     assert {"/health", "/api/health"} <= paths
     assert "/api/make-live" in paths
 
@@ -2366,7 +2673,7 @@ def test_main_runs_the_app_on_loopback(monkeypatch):
     monkeypatch.setattr(mod.web, "run_app", fake_run_app)
     assert mod.main() == 0
     assert seen["host"] == "127.0.0.1"
-    assert seen["port"] == mod.PORT
+    assert seen["port"] == http_api.PORT
 
 
 # --------------------------------------------------------------------------
@@ -2374,24 +2681,31 @@ def test_main_runs_the_app_on_loopback(monkeypatch):
 # --------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_worktree_detail_unknown_name(monkeypatch):
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=(None, "gone")))
-    assert await mod._worktree_detail("ghost") == {"error": "gone"}
+    monkeypatch.setattr(repository, "_find_worktree", AsyncMock(return_value=(None, "gone")))
+    assert await fleet_state._worktree_detail("ghost") == {"error": "gone"}
 
 
 @pytest.mark.asyncio
 async def test_worktree_detail_includes_pod_state_and_design_docs(monkeypatch, tmp_path):
     wt = {"path": str(tmp_path), "branch": "feat", "is_main": False}
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=(wt, None)))
+    monkeypatch.setattr(repository, "_find_worktree", AsyncMock(return_value=(wt, None)))
     monkeypatch.setattr(
-        mod, "_git_info",
-        AsyncMock(return_value={
-            "branch": "feat", "head": "abc1234", "dirty": False,
-            "ahead": 0, "behind": 0, "last_updated_at": None,
-        }),
+        repository,
+        "_git_info",
+        AsyncMock(
+            return_value={
+                "branch": "feat",
+                "head": "abc1234",
+                "dirty": False,
+                "ahead": 0,
+                "behind": 0,
+                "last_updated_at": None,
+            }
+        ),
     )
-    monkeypatch.setattr(mod, "_pr_status_cached", AsyncMock(return_value=None))
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=1))
-    monkeypatch.setattr(mod, "_context_cached", AsyncMock(return_value={}))
+    monkeypatch.setattr(fleet_state, "_pr_status_cached", AsyncMock(return_value=None))
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=1))
+    monkeypatch.setattr(fleet_state, "_context_cached", AsyncMock(return_value={}))
 
     async def fake_git(path, *args, **kw):
         if args[0] == "log":
@@ -2400,13 +2714,14 @@ async def test_worktree_detail_includes_pod_state_and_design_docs(monkeypatch, t
             return "docs/design/plan.md\nsrc/app.py\ndocs/design/plan.md\n"
         return ""
 
-    monkeypatch.setattr(mod, "_git", fake_git)
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(0, "31\t.", "")))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: SimpleNamespace())
-    monkeypatch.setattr(mod, "_POD_AVAILABLE", True)
+    monkeypatch.setattr(repository, "_git", fake_git)
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(0, "31\t.", "")))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: SimpleNamespace())
+    monkeypatch.setattr(runtime, "_POD_AVAILABLE", True)
     name = Path(str(tmp_path)).name
     monkeypatch.setattr(
-        mod, "rt",
+        runtime,
+        "rt",
         SimpleNamespace(
             active_names=lambda cfg: {name},
             derive_port=lambda cfg, nm: 9321,
@@ -2414,7 +2729,7 @@ async def test_worktree_detail_includes_pod_state_and_design_docs(monkeypatch, t
         raising=False,
     )
 
-    detail = await mod._worktree_detail(name)
+    detail = await fleet_state._worktree_detail(name)
     assert detail["pod_running"] is True
     assert detail["pod_port"] == 9321
     assert detail["disk_mb"] == 31
@@ -2427,21 +2742,28 @@ async def test_worktree_detail_includes_pod_state_and_design_docs(monkeypatch, t
 @pytest.mark.asyncio
 async def test_worktree_detail_survives_pod_probe_failure(monkeypatch, tmp_path):
     wt = {"path": str(tmp_path), "branch": None, "is_main": True}
-    monkeypatch.setattr(mod, "_find_worktree", AsyncMock(return_value=(wt, None)))
+    monkeypatch.setattr(repository, "_find_worktree", AsyncMock(return_value=(wt, None)))
     monkeypatch.setattr(
-        mod, "_git_info",
-        AsyncMock(return_value={
-            "branch": "main", "head": "abc1234", "dirty": False,
-            "ahead": 0, "behind": 0, "last_updated_at": None,
-        }),
+        repository,
+        "_git_info",
+        AsyncMock(
+            return_value={
+                "branch": "main",
+                "head": "abc1234",
+                "dirty": False,
+                "ahead": 0,
+                "behind": 0,
+                "last_updated_at": None,
+            }
+        ),
     )
-    monkeypatch.setattr(mod, "_own_commits_count", AsyncMock(return_value=0))
-    monkeypatch.setattr(mod, "_context_cached", AsyncMock(return_value={}))
-    monkeypatch.setattr(mod, "_git", AsyncMock(return_value=""))
-    monkeypatch.setattr(mod, "_run_cmd", AsyncMock(return_value=(1, "", "du failed")))
-    monkeypatch.setattr(mod, "_load_cfg", lambda: None)
+    monkeypatch.setattr(repository, "_own_commits_count", AsyncMock(return_value=0))
+    monkeypatch.setattr(fleet_state, "_context_cached", AsyncMock(return_value={}))
+    monkeypatch.setattr(repository, "_git", AsyncMock(return_value=""))
+    monkeypatch.setattr(runtime, "_run_cmd", AsyncMock(return_value=(1, "", "du failed")))
+    monkeypatch.setattr(runtime, "_load_cfg", lambda: None)
 
-    detail = await mod._worktree_detail(Path(str(tmp_path)).name)
+    detail = await fleet_state._worktree_detail(Path(str(tmp_path)).name)
     assert detail["pod_running"] is False
     assert detail["disk_mb"] is None
     assert detail["commits"] == []
@@ -2552,9 +2874,11 @@ async def test_dirty_split_classifies_tracked_vs_untracked(
         assert "ls-files" in cmd, cmd
         return (0, lsfiles_out, "")
 
-    with patch.object(mod, "_git", side_effect=git), \
-         patch.object(mod, "_run_cmd", side_effect=run_cmd):
-        tracked, untracked = await mod._dirty_split("/wt/x")
+    with (
+        patch.object(repository, "_git", side_effect=git),
+        patch.object(runtime, "_run_cmd", side_effect=run_cmd),
+    ):
+        tracked, untracked = await repository._dirty_split("/wt/x")
     assert tracked is expect_tracked
     assert untracked == expect_untracked
 
@@ -2570,9 +2894,11 @@ async def test_dirty_split_lsfiles_failure_is_fail_closed_empty():
         assert "ls-files" in cmd, cmd
         return (1, "", "fatal: not a git repo")
 
-    with patch.object(mod, "_git", side_effect=git), \
-         patch.object(mod, "_run_cmd", side_effect=run_cmd):
-        tracked, untracked = await mod._dirty_split("/wt/x")
+    with (
+        patch.object(repository, "_git", side_effect=git),
+        patch.object(runtime, "_run_cmd", side_effect=run_cmd),
+    ):
+        tracked, untracked = await repository._dirty_split("/wt/x")
     assert tracked is True
     assert untracked == []
 
@@ -2595,24 +2921,49 @@ def _remove_stubs(
     a flag git reports there (a `locked` tree, for instance).
     """
     stack = ExitStack()
-    stack.enter_context(patch.object(
-        mod, "_find_worktree", new_callable=AsyncMock,
-        return_value=(
-            target or {"path": "/wt/feat", "branch": "feat/x", "is_main": False},
-            None,
-        ),
-    ))
-    stack.enter_context(patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None))
-    stack.enter_context(patch.object(mod, "_own_checkout_path", return_value=None))
-    stack.enter_context(patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True))
-    stack.enter_context(patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value={"state": pr_state}))
-    stack.enter_context(patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=own))
-    stack.enter_context(patch.object(mod, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="a" * 40))
-    stack.enter_context(patch.object(mod, "_head_contained_in_pr", new_callable=AsyncMock, return_value=contained))
-    stack.enter_context(patch.object(mod, "_load_cfg", return_value=None))
-    stack.enter_context(patch.object(mod, "_POD_AVAILABLE", False))
-    stack.enter_context(patch.object(mod, "_git", side_effect=git))
-    stack.enter_context(patch.object(mod, "_run_cmd", side_effect=run_cmd))
+    stack.enter_context(
+        patch.object(
+            repository,
+            "_find_worktree",
+            new_callable=AsyncMock,
+            return_value=(
+                target or {"path": "/wt/feat", "branch": "feat/x", "is_main": False},
+                None,
+            ),
+        )
+    )
+    stack.enter_context(
+        patch.object(live, "_live_worktree_path", new_callable=AsyncMock, return_value=None)
+    )
+    stack.enter_context(patch.object(live, "_own_checkout_path", return_value=None))
+    stack.enter_context(
+        patch.object(repository, "_real_dirty", new_callable=AsyncMock, return_value=True)
+    )
+    stack.enter_context(
+        patch.object(
+            fleet_state,
+            "_pr_status_cached",
+            new_callable=AsyncMock,
+            return_value={"state": pr_state},
+        )
+    )
+    stack.enter_context(
+        patch.object(repository, "_own_commits_count", new_callable=AsyncMock, return_value=own)
+    )
+    stack.enter_context(
+        patch.object(
+            fleet_state, "_fetch_pr_head_oid", new_callable=AsyncMock, return_value="a" * 40
+        )
+    )
+    stack.enter_context(
+        patch.object(
+            fleet_state, "_head_contained_in_pr", new_callable=AsyncMock, return_value=contained
+        )
+    )
+    stack.enter_context(patch.object(runtime, "_load_cfg", return_value=None))
+    stack.enter_context(patch.object(runtime, "_POD_AVAILABLE", False))
+    stack.enter_context(patch.object(repository, "_git", side_effect=git))
+    stack.enter_context(patch.object(runtime, "_run_cmd", side_effect=run_cmd))
     try:
         yield
     finally:
@@ -2636,7 +2987,7 @@ async def test_discard_refused_when_a_tracked_file_is_modified():
         raise AssertionError("removal must not run for a refused discard")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="OPEN"):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", discard_untracked_paths=["scratch.log"]
         )
     assert res["ok"] is False
@@ -2659,7 +3010,7 @@ async def test_discard_untracked_forced_unmerged_runs_clean_before_removal(monke
         discarded.append((worktree, list(rel_paths)))
         return None  # success
 
-    monkeypatch.setattr(mod, "_discard_untracked_files", discard_spy)
+    monkeypatch.setattr(repository, "_discard_untracked_files", discard_spy)
 
     async def git(path, *args, **kw):
         sub = args[0] if args else ""
@@ -2680,7 +3031,7 @@ async def test_discard_untracked_forced_unmerged_runs_clean_before_removal(monke
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="OPEN", own=1):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=["note.txt"]
         )
     assert res.get("ok") is True, res
@@ -2700,7 +3051,7 @@ async def test_discard_ordering_refused_request_destroys_nothing(monkeypatch):
         cleaned["ran"] = True  # pragma: no cover - must never run
         return None
 
-    monkeypatch.setattr(mod, "_discard_untracked_files", discard_spy)
+    monkeypatch.setattr(repository, "_discard_untracked_files", discard_spy)
 
     async def git(path, *args, **kw):
         sub = args[0] if args else ""
@@ -2720,7 +3071,7 @@ async def test_discard_ordering_refused_request_destroys_nothing(monkeypatch):
     # force=False + unmerged (OPEN) + own>0 -> the PR-not-merged gate returns
     # before the discard/removal block is ever reached.
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="OPEN", own=1):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=False, discard_untracked_paths=["note.txt"]
         )
     assert res["ok"] is False
@@ -2752,7 +3103,7 @@ async def test_discard_aborts_removal_when_clean_fails():
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="OPEN", own=1):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=["note.txt"]
         )
     assert res["ok"] is False
@@ -2765,9 +3116,7 @@ async def test_refusal_payload_carries_dirt_fields_and_legacy_substring():
     """A refusal payload carries dirty_tracked/dirty_untracked/
     dirty_untracked_paths, and the message still contains 'uncommitted
     changes' (other tests and the client depend on that substring)."""
-    git = _git_by_subcommand(
-        {"status": " M a.py\n", "rev-parse": "a" * 40}
-    )
+    git = _git_by_subcommand({"status": " M a.py\n", "rev-parse": "a" * 40})
 
     async def run_cmd(cmd, timeout=None, **kw):
         if "ls-files" in cmd:
@@ -2775,7 +3124,7 @@ async def test_refusal_payload_carries_dirt_fields_and_legacy_substring():
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="OPEN"):
-        res = await mod._worktree_remove_locked("feat", force=False)
+        res = await worktree_ops._worktree_remove_locked("feat", force=False)
     assert res["ok"] is False
     assert res["dirty_tracked"] is True
     assert res["dirty_untracked"] == 2
@@ -2786,9 +3135,9 @@ async def test_refusal_payload_carries_dirt_fields_and_legacy_substring():
 def test_dirt_detail_never_suggests_force_and_is_empty_when_unverifiable():
     """_dirt_detail never says 'use force to override' (force is refused for
     tracked edits too), and returns '' when tracked_dirty is None."""
-    assert mod._dirt_detail(None, []) == ""
-    assert mod._dirt_detail(None, ["a", "b"]) == ""
-    detail = mod._dirt_detail(True, ["a.py"])
+    assert repository._dirt_detail(None, []) == ""
+    assert repository._dirt_detail(None, ["a", "b"]) == ""
+    detail = repository._dirt_detail(True, ["a.py"])
     assert "use force to override" not in detail
     assert "tracked files are modified" in detail
 
@@ -2797,7 +3146,7 @@ def test_dirt_fields_caps_paths_at_20_but_counts_the_true_total():
     """dirty_untracked_paths is capped at 20 for payload size while
     dirty_untracked reports the real total."""
     untracked = [f"f{i}.txt" for i in range(37)]
-    fields = mod._dirt_fields(False, untracked)
+    fields = repository._dirt_fields(False, untracked)
     assert fields["dirty_untracked"] == 37
     assert len(fields["dirty_untracked_paths"]) == 20
     assert fields["dirty_untracked_paths"] == untracked[:20]
@@ -2813,12 +3162,16 @@ async def test_prunable_verdict_carries_dirt_fields_for_dirty_tree():
         assert "ls-files" in cmd, cmd
         return (0, "scratch.log\0note.txt\0", "")
 
-    with patch.object(mod, "_pr_status_cached", new_callable=AsyncMock, return_value={"state": "OPEN"}), \
-         patch.object(mod, "_own_commits_count", new_callable=AsyncMock, return_value=2), \
-         patch.object(mod, "_real_dirty", new_callable=AsyncMock, return_value=True), \
-         patch.object(mod, "_run_cmd", side_effect=run_cmd), \
-         patch.object(mod, "_git", side_effect=git):
-        v = await mod._prunable("/wt/feat", "feat/x")
+    with (
+        patch.object(
+            fleet_state, "_pr_status_cached", new_callable=AsyncMock, return_value={"state": "OPEN"}
+        ),
+        patch.object(repository, "_own_commits_count", new_callable=AsyncMock, return_value=2),
+        patch.object(repository, "_real_dirty", new_callable=AsyncMock, return_value=True),
+        patch.object(runtime, "_run_cmd", side_effect=run_cmd),
+        patch.object(repository, "_git", side_effect=git),
+    ):
+        v = await worktree_ops._prunable("/wt/feat", "feat/x")
     assert v["ok"] is False
     assert v["dirty_tracked"] is True
     assert v["dirty_untracked"] == 2
@@ -2836,19 +3189,16 @@ async def test_remove_handler_rejects_non_bool_discard_untracked(monkeypatch):
     response missing its code.
     """
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
     remove = AsyncMock(return_value={"ok": True})
-    monkeypatch.setattr(mod, "_worktree_remove", remove)
-    resp = await mod.api_dev_fleet_worktree_remove(
+    monkeypatch.setattr(worktree_ops, "_worktree_remove", remove)
+    resp = await http_api.api_dev_fleet_worktree_remove(
         _json_request({"name": "feat", "discard_untracked_paths": "yes"})
     )
     assert resp.status == 400
     body = json.loads(resp.text)
     assert body["code"] == "invalid_discard_paths"
-    assert (
-        "discard_untracked_paths must be a list of non-empty strings"
-        in body["error"]
-    )
+    assert "discard_untracked_paths must be a list of non-empty strings" in body["error"]
     remove.assert_not_awaited()
 
 
@@ -2857,7 +3207,7 @@ async def test_prune_run_handler_rejects_malformed_discard_paths(monkeypatch):
     """discard_untracked_paths='x' (not a name->list map) -> 400 with code
     invalid_discard_paths."""
     _sel_capture(monkeypatch)
-    resp = await mod.api_dev_fleet_prune_run(
+    resp = await http_api.api_dev_fleet_prune_run(
         _json_request({"names": [], "discard_untracked_paths": "x"})
     )
     assert resp.status == 400
@@ -2870,16 +3220,15 @@ async def test_prune_run_handler_guards_protected_worktree_in_discard_paths(monk
     """A protected (live) worktree named ONLY in discard_untracked_paths is
     screened by the same guard as force_names -> 400 protected_worktree."""
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"live-wt"}))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"live-wt"}))
+    monkeypatch.setattr(live, "_live_worktree_path", AsyncMock(return_value="/repo/live-wt"))
+    monkeypatch.setattr(live, "_staged_target", lambda: None)
     monkeypatch.setattr(
-        mod, "_live_worktree_path", AsyncMock(return_value="/repo/live-wt")
-    )
-    monkeypatch.setattr(mod, "_staged_target", lambda: None)
-    monkeypatch.setattr(
-        mod, "_find_worktree",
+        repository,
+        "_find_worktree",
         AsyncMock(return_value=({"path": "/repo/live-wt", "is_main": False}, None)),
     )
-    resp = await mod.api_dev_fleet_prune_run(
+    resp = await http_api.api_dev_fleet_prune_run(
         _json_request({"names": [], "discard_untracked_paths": {"live-wt": ["n.txt"]}})
     )
     assert resp.status == 400
@@ -2907,39 +3256,41 @@ async def test_prune_run_discard_only_name_reaches_remove_and_skips_recheck(monk
         return {"ok": False, "code": "merged_dirty"}
 
     async def fake_remove(
-        nm, force=False, progress=None, _caller="handler",
+        nm,
+        force=False,
+        progress=None,
+        _caller="handler",
         discard_untracked_paths=None,
     ):
-        remove_kwargs.append(
-            {"name": nm, "force": force, "discard": discard_untracked_paths}
-        )
+        remove_kwargs.append({"name": nm, "force": force, "discard": discard_untracked_paths})
         return {"ok": True, "removed": True}
 
-    monkeypatch.setattr(mod, "_PRUNE_LOCK", asyncio.Lock())
+    monkeypatch.setattr(worktree_ops, "_PRUNE_LOCK", asyncio.Lock())
     monkeypatch.setattr(
-        mod, "_PRUNE_STATE",
+        worktree_ops,
+        "_PRUNE_STATE",
         {"running": False, "total": 0, "done": 0, "current": None, "results": [], "items": {}},
     )
-    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
-         patch.object(mod, "_prunable", side_effect=fake_prunable), \
-         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
-         patch.object(mod, "_staged_target", return_value=None), \
-         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
-        r = await mod._prune_run([], discard_paths={"wt-scratch": ["note.txt"]})
+    with (
+        patch.object(repository, "_find_worktree", side_effect=fake_find),
+        patch.object(worktree_ops, "_prunable", side_effect=fake_prunable),
+        patch.object(live, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(live, "_staged_target", return_value=None),
+        patch.object(worktree_ops, "_worktree_remove", side_effect=fake_remove),
+    ):
+        r = await worktree_ops._prune_run([], discard_paths={"wt-scratch": ["note.txt"]})
         assert r == {"ok": True, "total": 1}
         for _ in range(500):
-            if not mod._PRUNE_STATE["running"]:
+            if not worktree_ops._PRUNE_STATE["running"]:
                 break
             await asyncio.sleep(0)
 
-    assert mod._PRUNE_STATE["running"] is False
+    assert worktree_ops._PRUNE_STATE["running"] is False
     # _prunable IS now consulted for a discard-only name...
     assert prunable_calls == ["/wt/wt-scratch"]
     # ...and its overridable refusal did not stop the removal: the name still
     # reached _worktree_remove carrying the exact consented list, force=False.
-    assert remove_kwargs == [
-        {"name": "wt-scratch", "force": False, "discard": ["note.txt"]}
-    ]
+    assert remove_kwargs == [{"name": "wt-scratch", "force": False, "discard": ["note.txt"]}]
 
 
 @pytest.mark.asyncio
@@ -2953,7 +3304,7 @@ async def test_discard_rel_paths_scoped_to_approved_paths(monkeypatch):
         discarded.append((worktree, list(rel_paths)))
         return None  # success
 
-    monkeypatch.setattr(mod, "_discard_untracked_files", discard_spy)
+    monkeypatch.setattr(repository, "_discard_untracked_files", discard_spy)
 
     async def git(path, *args, **kw):
         sub = args[0] if args else ""
@@ -2970,7 +3321,7 @@ async def test_discard_rel_paths_scoped_to_approved_paths(monkeypatch):
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="OPEN", own=1):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=["note.txt", "probe.sh"]
         )
     assert res.get("ok") is True, res
@@ -3011,7 +3362,7 @@ async def test_discard_file_appearing_after_approval_is_not_destroyed():
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="OPEN", own=1):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=["note.txt"]
         )
     assert res["ok"] is False
@@ -3032,9 +3383,11 @@ async def test_dirty_split_untracked_paths_survive_byte_exact():
         # first entry has a LEADING space, last has a TRAILING space
         return (0, " leading.txt\0middle.txt\0trailing.txt \0", "")
 
-    with patch.object(mod, "_git", side_effect=git), \
-         patch.object(mod, "_run_cmd", side_effect=run_cmd):
-        tracked, untracked = await mod._dirty_split("/wt/x")
+    with (
+        patch.object(repository, "_git", side_effect=git),
+        patch.object(runtime, "_run_cmd", side_effect=run_cmd),
+    ):
+        tracked, untracked = await repository._dirty_split("/wt/x")
     assert tracked is False
     assert untracked == [" leading.txt", "middle.txt", "trailing.txt "]
     # The whitespace is preserved, not stripped (which the _git helper would do).
@@ -3070,38 +3423,40 @@ async def test_discard_override_respects_overridable_codes(monkeypatch, code, sh
         return {"ok": False, "code": code}
 
     async def fake_remove(
-        nm, force=False, progress=None, _caller="handler",
+        nm,
+        force=False,
+        progress=None,
+        _caller="handler",
         discard_untracked_paths=None,
     ):
-        remove_kwargs.append(
-            {"name": nm, "force": force, "discard": discard_untracked_paths}
-        )
+        remove_kwargs.append({"name": nm, "force": force, "discard": discard_untracked_paths})
         return {"ok": True, "removed": True}
 
-    monkeypatch.setattr(mod, "_PRUNE_LOCK", asyncio.Lock())
+    monkeypatch.setattr(worktree_ops, "_PRUNE_LOCK", asyncio.Lock())
     monkeypatch.setattr(
-        mod, "_PRUNE_STATE",
+        worktree_ops,
+        "_PRUNE_STATE",
         {"running": False, "total": 0, "done": 0, "current": None, "results": [], "items": {}},
     )
-    with patch.object(mod, "_find_worktree", side_effect=fake_find), \
-         patch.object(mod, "_prunable", side_effect=fake_prunable), \
-         patch.object(mod, "_live_worktree_path", new_callable=AsyncMock, return_value=None), \
-         patch.object(mod, "_staged_target", return_value=None), \
-         patch.object(mod, "_worktree_remove", side_effect=fake_remove):
-        r = await mod._prune_run([], discard_paths={"wt-x": ["note.txt"]})
+    with (
+        patch.object(repository, "_find_worktree", side_effect=fake_find),
+        patch.object(worktree_ops, "_prunable", side_effect=fake_prunable),
+        patch.object(live, "_live_worktree_path", new_callable=AsyncMock, return_value=None),
+        patch.object(live, "_staged_target", return_value=None),
+        patch.object(worktree_ops, "_worktree_remove", side_effect=fake_remove),
+    ):
+        r = await worktree_ops._prune_run([], discard_paths={"wt-x": ["note.txt"]})
         assert r == {"ok": True, "total": 1}
         for _ in range(500):
-            if not mod._PRUNE_STATE["running"]:
+            if not worktree_ops._PRUNE_STATE["running"]:
                 break
             await asyncio.sleep(0)
 
     if should_reach_remove:
-        assert remove_kwargs == [
-            {"name": "wt-x", "force": False, "discard": ["note.txt"]}
-        ]
+        assert remove_kwargs == [{"name": "wt-x", "force": False, "discard": ["note.txt"]}]
     else:
         assert remove_kwargs == [], f"{code} must not reach _worktree_remove"
-        results = mod._PRUNE_STATE["items"]["wt-x"]
+        results = worktree_ops._PRUNE_STATE["items"]["wt-x"]
         assert results["status"] == "failed"
         assert results["error"] == f"not prunable: {code}"
 
@@ -3147,7 +3502,7 @@ async def test_discard_refused_when_submitted_omits_a_file_now_on_disk():
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="MERGED", own=0):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=["note.txt"]
         )
     assert res["ok"] is False
@@ -3184,7 +3539,7 @@ async def test_discard_refused_when_submitted_names_a_file_no_longer_there():
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="MERGED", own=0):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=["note.txt", "gone.txt"]
         )
     assert res["ok"] is False
@@ -3201,7 +3556,7 @@ async def test_discard_refused_when_more_than_sample_untracked_files():
     nothing cleaned or removed."""
     cleaned = {"ran": False}
     ran_remove = {"v": False}
-    n = mod._DIRTY_PATH_SAMPLE + 1
+    n = repository._DIRTY_PATH_SAMPLE + 1
     files = [f"f{i}.txt" for i in range(n)]
 
     async def git(path, *args, **kw):
@@ -3223,7 +3578,7 @@ async def test_discard_refused_when_more_than_sample_untracked_files():
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="MERGED", own=0):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=files
         )
     assert res["ok"] is False
@@ -3239,14 +3594,14 @@ async def test_discard_accepts_exactly_sample_untracked_files(monkeypatch):
     within the shown list, so a matching consent set is ACCEPTED, the discard
     runs against all 20, and the removal proceeds."""
     discarded: list[tuple] = []
-    n = mod._DIRTY_PATH_SAMPLE
+    n = repository._DIRTY_PATH_SAMPLE
     files = [f"f{i}.txt" for i in range(n)]
 
     def discard_spy(worktree, rel_paths):
         discarded.append((worktree, list(rel_paths)))
         return None  # success
 
-    monkeypatch.setattr(mod, "_discard_untracked_files", discard_spy)
+    monkeypatch.setattr(repository, "_discard_untracked_files", discard_spy)
 
     async def git(path, *args, **kw):
         sub = args[0] if args else ""
@@ -3263,7 +3618,7 @@ async def test_discard_accepts_exactly_sample_untracked_files(monkeypatch):
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="MERGED", own=0):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=files
         )
     assert res.get("ok") is True, res
@@ -3277,15 +3632,15 @@ def test_dirt_fields_and_detail_pass_paths_through_redact(monkeypatch):
     """REDACTION: `_dirt_fields` and `_dirt_detail` emit paths passed through
     `_redact`. Patch `_redact` with a recognisable transform and assert the
     emitted values carry it."""
-    monkeypatch.setattr(mod, "_redact", lambda s: f"REDACTED::{s}")
+    monkeypatch.setattr(runtime, "_redact", lambda s: f"REDACTED::{s}")
     untracked = ["a.txt", "b.txt", "c.txt", "d.txt"]
 
-    fields = mod._dirt_fields(False, untracked)
+    fields = repository._dirt_fields(False, untracked)
     assert fields["dirty_untracked_paths"] == [f"REDACTED::{p}" for p in untracked]
     # the count is the true total, unredacted
     assert fields["dirty_untracked"] == 4
 
-    detail = mod._dirt_detail(False, untracked)
+    detail = repository._dirt_detail(False, untracked)
     # _dirt_detail names the first three, each redacted
     assert "REDACTED::a.txt" in detail
     assert "REDACTED::b.txt" in detail
@@ -3301,14 +3656,14 @@ async def test_discard_emitted_paths_are_redacted_but_pathspec_is_raw(monkeypatc
     payload's emitted paths carry the transform. The discard itself is refused
     outright in that case -- a lossy rendering cannot identify the consented
     file -- so `_discard_untracked_files` is never called."""
-    monkeypatch.setattr(mod, "_redact", lambda s: f"R::{s}")
+    monkeypatch.setattr(runtime, "_redact", lambda s: f"R::{s}")
     discarded: list[tuple] = []
 
     def discard_spy(worktree, rel_paths):
         discarded.append((worktree, list(rel_paths)))  # pragma: no cover - refusal, must not run
         return None
 
-    monkeypatch.setattr(mod, "_discard_untracked_files", discard_spy)
+    monkeypatch.setattr(repository, "_discard_untracked_files", discard_spy)
 
     async def git(path, *args, **kw):
         sub = args[0] if args else ""
@@ -3327,7 +3682,7 @@ async def test_discard_emitted_paths_are_redacted_but_pathspec_is_raw(monkeypatc
     # refused BEFORE any set comparison: a rewritten name cannot be pinned to
     # one file. Emitted paths still carry the transform.
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="MERGED", own=0):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=["note.txt"]
         )
     assert res["ok"] is False
@@ -3347,14 +3702,14 @@ async def test_discard_refused_when_a_filename_is_rewritten_by_redaction(monkeyp
     rewritten on the way out -- even when the client faithfully echoes exactly
     what it was shown. Refusing costs a manual cleanup; the alternative loses a
     file nobody approved."""
-    monkeypatch.setattr(mod, "_redact", lambda s: f"R::{s}")
+    monkeypatch.setattr(runtime, "_redact", lambda s: f"R::{s}")
     discarded: list[tuple] = []
 
     def discard_spy(worktree, rel_paths):
         discarded.append((worktree, list(rel_paths)))  # pragma: no cover - must never run
         return None
 
-    monkeypatch.setattr(mod, "_discard_untracked_files", discard_spy)
+    monkeypatch.setattr(repository, "_discard_untracked_files", discard_spy)
 
     async def git(path, *args, **kw):
         sub = args[0] if args else ""
@@ -3373,8 +3728,9 @@ async def test_discard_refused_when_a_filename_is_rewritten_by_redaction(monkeyp
     # Under the old two-space rule this was ACCEPTED; it is now refused, because
     # `R::note.txt` cannot be traced back to one file on disk.
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="MERGED", own=0):
-        res = await mod._worktree_remove_locked(
-            "feat", force=True,
+        res = await worktree_ops._worktree_remove_locked(
+            "feat",
+            force=True,
             discard_untracked_paths=["R::note.txt", "R::probe.sh"],
         )
     assert res["ok"] is False
@@ -3387,14 +3743,14 @@ async def test_discard_accepted_when_redaction_is_identity(monkeypatch):
     """The control for the guard above: with `_redact` left as the identity on
     these filenames, the echoed set matches the raw set and the discard runs,
     handed exactly those raw literal paths (no `:(literal)` wrapping)."""
-    monkeypatch.setattr(mod, "_redact", lambda s: s)
+    monkeypatch.setattr(runtime, "_redact", lambda s: s)
     discarded: list[tuple] = []
 
     def discard_spy(worktree, rel_paths):
         discarded.append((worktree, list(rel_paths)))
         return None  # success
 
-    monkeypatch.setattr(mod, "_discard_untracked_files", discard_spy)
+    monkeypatch.setattr(repository, "_discard_untracked_files", discard_spy)
 
     async def git(path, *args, **kw):
         sub = args[0] if args else ""
@@ -3410,8 +3766,9 @@ async def test_discard_accepted_when_redaction_is_identity(monkeypatch):
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="MERGED", own=0):
-        res = await mod._worktree_remove_locked(
-            "feat", force=True,
+        res = await worktree_ops._worktree_remove_locked(
+            "feat",
+            force=True,
             discard_untracked_paths=["note.txt", "probe.sh"],
         )
     assert res.get("ok") is True, res
@@ -3473,7 +3830,7 @@ def test_discard_untracked_files_refuses_a_symlinked_worktree_root(tmp_path):
     as_link = tmp_path / "worktree-link"
     as_link.symlink_to(real, target_is_directory=True)
 
-    reason = mod._discard_untracked_files(str(as_link), ["probe.py"])
+    reason = repository._discard_untracked_files(str(as_link), ["probe.py"])
     assert reason is not None
     assert "is a symlink" in reason
     assert victim.exists(), "followed a symlinked worktree root and deleted an external file"
@@ -3502,7 +3859,7 @@ def test_discard_untracked_files_refuses_a_symlinked_ancestor(tmp_path):
     link_parent = tmp_path / "link-parent"
     link_parent.symlink_to(real, target_is_directory=True)
 
-    reason = mod._discard_untracked_files(str(link_parent / "wt"), ["probe.py"])
+    reason = repository._discard_untracked_files(str(link_parent / "wt"), ["probe.py"])
     assert reason is not None
     assert "is a symlink" in reason
     assert kept.exists(), "deleted through a symlinked ancestor instead of refusing"
@@ -3518,7 +3875,7 @@ def test_discard_untracked_files_plain_path_still_deletes(tmp_path):
     (wt / "probe.py").write_text("x")
     (wt / "sub" / "harness.py").write_text("y")
 
-    reason = mod._discard_untracked_files(str(wt), ["probe.py", "sub/harness.py"])
+    reason = repository._discard_untracked_files(str(wt), ["probe.py", "sub/harness.py"])
     assert reason is None, reason
     assert not (wt / "probe.py").exists()
     assert not (wt / "sub" / "harness.py").exists()
@@ -3539,7 +3896,7 @@ def test_discard_untracked_files_fails_closed_without_openat(tmp_path, monkeypat
     # Simulate a platform whose unlink cannot take a dir_fd.
     monkeypatch.setattr(os, "supports_dir_fd", set())
 
-    reason = mod._discard_untracked_files(str(tmp_path), ["probe.py"])
+    reason = repository._discard_untracked_files(str(tmp_path), ["probe.py"])
     assert reason is not None
     assert "cannot discard untracked files safely on this platform" in reason
     # and it refused BEFORE touching anything
@@ -3560,7 +3917,7 @@ def test_discard_untracked_files_type_change_refuses_and_keeps_unapproved(tmp_pa
     victim = scratch / "not-approved.txt"
     victim.write_text("keep me")
 
-    reason = mod._discard_untracked_files(str(tmp_path), ["scratch"])
+    reason = repository._discard_untracked_files(str(tmp_path), ["scratch"])
 
     assert reason is not None
     assert "scratch" in reason
@@ -3581,9 +3938,7 @@ def test_discard_untracked_files_deletes_files_but_leaves_emptied_dir(tmp_path):
     sub.mkdir()
     (sub / "harness.py").write_text("y")
 
-    reason = mod._discard_untracked_files(
-        str(tmp_path), ["top.txt", "sub/harness.py"]
-    )
+    reason = repository._discard_untracked_files(str(tmp_path), ["top.txt", "sub/harness.py"])
 
     assert reason is None
     assert not (tmp_path / "top.txt").exists()
@@ -3604,7 +3959,7 @@ def test_discard_untracked_files_refuses_escapes_and_deletes_nothing(tmp_path):
     inner.write_text("inside")
 
     for bad in ("../outside.txt", str(outside), "sub/../../x"):
-        reason = mod._discard_untracked_files(str(tmp_path), [bad])
+        reason = repository._discard_untracked_files(str(tmp_path), [bad])
         assert reason is not None, bad
         assert "refusing" in reason.lower(), (bad, reason)
 
@@ -3619,7 +3974,7 @@ def test_discard_untracked_files_missing_path_is_idempotent(tmp_path):
     partially-completed discard is not an error."""
     _need_unsymlinked_tmp(tmp_path)
     assert not (tmp_path / "gone.txt").exists()
-    reason = mod._discard_untracked_files(str(tmp_path), ["gone.txt"])
+    reason = repository._discard_untracked_files(str(tmp_path), ["gone.txt"])
     assert reason is None
 
 
@@ -3634,7 +3989,7 @@ def test_discard_untracked_files_magic_filename_is_literal(tmp_path):
     sibling = tmp_path / "sibling.txt"
     sibling.write_text("not approved")
 
-    reason = mod._discard_untracked_files(str(tmp_path), [":(glob)*"])
+    reason = repository._discard_untracked_files(str(tmp_path), [":(glob)*"])
 
     assert reason is None
     assert not magic.exists()
@@ -3648,10 +4003,10 @@ async def test_remove_handler_rejects_discard_bool(monkeypatch):
     """HANDLER VALIDATION: discard_untracked_paths as a bool -> 400, remove
     never called."""
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
     remove = AsyncMock(return_value={"ok": True})
-    monkeypatch.setattr(mod, "_worktree_remove", remove)
-    resp = await mod.api_dev_fleet_worktree_remove(
+    monkeypatch.setattr(worktree_ops, "_worktree_remove", remove)
+    resp = await http_api.api_dev_fleet_worktree_remove(
         _json_request({"name": "feat", "discard_untracked_paths": True})
     )
     assert resp.status == 400
@@ -3667,10 +4022,10 @@ async def test_remove_handler_rejects_discard_list_with_empty_string(monkeypatch
     """HANDLER VALIDATION: discard_untracked_paths containing an empty string
     -> 400, remove never called."""
     _sel_capture(monkeypatch)
-    monkeypatch.setattr(mod, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
+    monkeypatch.setattr(repository, "_valid_worktree_names", AsyncMock(return_value={"feat"}))
     remove = AsyncMock(return_value={"ok": True})
-    monkeypatch.setattr(mod, "_worktree_remove", remove)
-    resp = await mod.api_dev_fleet_worktree_remove(
+    monkeypatch.setattr(worktree_ops, "_worktree_remove", remove)
+    resp = await http_api.api_dev_fleet_worktree_remove(
         _json_request({"name": "feat", "discard_untracked_paths": ["ok.txt", ""]})
     )
     assert resp.status == 400
@@ -3686,7 +4041,7 @@ async def test_prune_run_handler_rejects_discard_list_instead_of_map(monkeypatch
     """HANDLER VALIDATION: prune's discard_untracked_paths given as a LIST
     instead of a name->list map -> 400 with code invalid_discard_paths."""
     _sel_capture(monkeypatch)
-    resp = await mod.api_dev_fleet_prune_run(
+    resp = await http_api.api_dev_fleet_prune_run(
         _json_request({"names": [], "discard_untracked_paths": ["wt-a"]})
     )
     assert resp.status == 400
@@ -3699,10 +4054,8 @@ async def test_prune_run_handler_rejects_discard_map_with_empty_string_entry(mon
     """HANDLER VALIDATION: prune's discard_untracked_paths map carrying a list
     with an empty string -> 400 with code invalid_discard_paths."""
     _sel_capture(monkeypatch)
-    resp = await mod.api_dev_fleet_prune_run(
-        _json_request(
-            {"names": [], "discard_untracked_paths": {"wt-a": ["ok.txt", ""]}}
-        )
+    resp = await http_api.api_dev_fleet_prune_run(
+        _json_request({"names": [], "discard_untracked_paths": {"wt-a": ["ok.txt", ""]}})
     )
     assert resp.status == 400
     body = json.loads(resp.text)
@@ -3721,7 +4074,7 @@ async def test_locked_worktree_refused_before_any_discard_runs(monkeypatch):
         clean_ran.append((worktree, list(rel_paths)))  # pragma: no cover - must never happen
         return None
 
-    monkeypatch.setattr(mod, "_discard_untracked_files", discard_spy)
+    monkeypatch.setattr(repository, "_discard_untracked_files", discard_spy)
 
     async def git(path, *args, **kw):
         sub = args[0] if args else ""
@@ -3735,11 +4088,18 @@ async def test_locked_worktree_refused_before_any_discard_runs(monkeypatch):
         return (0, "", "")
 
     with _remove_stubs(
-        git=git, run_cmd=run_cmd, pr_state="MERGED", own=0,
-        target={"path": "/wt/held", "branch": "held", "is_main": False,
-                "locked": "keeping this for the repro"},
+        git=git,
+        run_cmd=run_cmd,
+        pr_state="MERGED",
+        own=0,
+        target={
+            "path": "/wt/held",
+            "branch": "held",
+            "is_main": False,
+            "locked": "keeping this for the repro",
+        },
     ):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "held", force=True, discard_untracked_paths=["probe.py"]
         )
     assert res["ok"] is False
@@ -3761,7 +4121,7 @@ async def test_removal_failure_after_discard_says_files_were_discarded(monkeypat
         cleaned.append((worktree, list(rel_paths)))  # discard succeeds
         return None
 
-    monkeypatch.setattr(mod, "_discard_untracked_files", discard_spy)
+    monkeypatch.setattr(repository, "_discard_untracked_files", discard_spy)
 
     async def git(path, *args, **kw):
         sub = args[0] if args else ""
@@ -3783,7 +4143,7 @@ async def test_removal_failure_after_discard_says_files_were_discarded(monkeypat
         return (0, "", "")
 
     with _remove_stubs(git=git, run_cmd=run_cmd, pr_state="MERGED", own=0):
-        res = await mod._worktree_remove_locked(
+        res = await worktree_ops._worktree_remove_locked(
             "feat", force=True, discard_untracked_paths=["probe.py"]
         )
     assert res["ok"] is False

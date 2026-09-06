@@ -4,8 +4,14 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 it("Linux BrowserWindows carry the packaged application icon", () => {
-  const main = fs.readFileSync(path.join(__dirname, "..", "main.js"), "utf8");
-  assert.match(main, /if \(IS_WIN \|\| IS_LINUX\) \{[\s\S]*?opts\.icon = path\.join\(__dirname, iconFile\)/);
+  const windowLifecycle = fs.readFileSync(
+    path.join(__dirname, "..", "window-lifecycle.js"),
+    "utf8",
+  );
+  assert.match(
+    windowLifecycle,
+    /if \(includeIcon && \(IS_WIN \|\| IS_LINUX\)\) \{[\s\S]*?opts\.icon = path\.join\(__dirname, iconFile\)/,
+  );
 });
 
 const ROOT = path.resolve(__dirname, "..");
@@ -109,21 +115,45 @@ function bmpDarkPixelCount(file, { left, top, right, bottom }) {
   return count;
 }
 
+const { BUILD_TIME_INPUTS } = require("./build-time-inputs");
+
 describe("electron-builder files list", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
   const bundledFiles = pkg.build.files;
 
-  it("includes every local require() from main.js", () => {
-    const main = fs.readFileSync(path.join(ROOT, "main.js"), "utf8");
-    const localRequires = [...main.matchAll(/require\("\.\/([^"]+)"\)/g)].map(m => m[1] + ".js");
+  it("includes every local require() from main.js and its extracted owners", () => {
+    const ownerFiles = [
+      "main.js",
+      "gateway-supervisor.js",
+      "window-lifecycle.js",
+      "ipc-registrar.js",
+    ];
+    const localRequires = ownerFiles.flatMap((ownerFile) => {
+      const source = fs.readFileSync(path.join(ROOT, ownerFile), "utf8");
+      return [...source.matchAll(/require\("\.\/([^"]+)"\)/g)]
+        .map((match) => match[1] + ".js");
+    });
 
-    const missing = localRequires.filter(f => !bundledFiles.includes(f));
+    const missing = [...new Set(localRequires)].filter(f => !bundledFiles.includes(f));
     assert.deepStrictEqual(missing, [], `Missing from build.files: ${missing.join(", ")}`);
   });
 
   it("does not reference files that no longer exist", () => {
-    const stale = bundledFiles.filter(f => !fs.existsSync(path.join(ROOT, f)));
+    // Every entry is checked-in source EXCEPT the build-time inputs a build
+    // places here on demand (BUILD_TIME_INPUTS, shared with shell-contract.test.js):
+    // absent in a checkout by design, so their absence is not staleness.
+    const stale = bundledFiles.filter(f => !fs.existsSync(path.join(ROOT, f)) && !BUILD_TIME_INPUTS.has(f));
     assert.deepStrictEqual(stale, [], `Stale entries in build.files: ${stale.join(", ")}`);
+  });
+
+  it("lists the baked EXTERNALLY-MANAGED marker so a build that places it packs it into app.asar", () => {
+    // build-desktop.sh copies KIROCREW_MANAGED_INSTALL_MARKER here; without this
+    // entry electron-builder would leave it out and readExternallyManaged would
+    // find nothing beside main.js -- the edition silently ships un-managed.
+    assert.ok(bundledFiles.includes("EXTERNALLY-MANAGED"));
+    const script = fs.readFileSync(path.join(ROOT, "..", "..", "packaging", "build-desktop.sh"), "utf8");
+    assert.match(script, /KIROCREW_MANAGED_INSTALL_MARKER/);
+    assert.match(script, /\$ELECTRON_DIR\/EXTERNALLY-MANAGED/);
   });
 });
 
@@ -287,6 +317,107 @@ describe("first-download installer design contract", () => {
       buildScript,
       /precompile_windows\.py" \\\r?\n\s*--root "\$out" --module kiro_crew\.cli_server/
     );
+  });
+
+  it("compiles the whole macOS tree, so the signed bundle is never written to", () => {
+    // codesign seals every file under a .app's Contents/, so bytecode written
+    // there after signing makes Gatekeeper refuse the app as "damaged". The
+    // desktop shell forbids the write (gatewayBytecodeEnvironment); shipping a
+    // cache for EVERY module is what removes the reason to want one.
+    //
+    // Whole tree, not the traced closure the Windows lane ships: Authenticode
+    // seals no resource tree so a later write on Windows is harmless, while on
+    // macOS any uncovered module is a latent signature break.
+    const buildScript = fs.readFileSync(
+      path.join(REPO_ROOT, "packaging", "build-desktop.sh"),
+      "utf8"
+    );
+    const macStart = buildScript.indexOf("build_backend() {");
+    const macEnd = buildScript.indexOf("build_backend_windows() {", macStart);
+    assert.ok(macStart >= 0 && macEnd > macStart, "could not locate build_backend()");
+    const macBuilder = buildScript.slice(macStart, macEnd);
+
+    assert.match(
+      macBuilder,
+      /-m compileall -q -f \\\r?\n\s*--invalidation-mode checked-hash "\$out\/lib"/,
+      "the macOS backend ships no precompiled tree, so the runtime would have to " +
+        "compile on first use — the write that breaks the signature"
+    );
+    assert.doesNotMatch(
+      macBuilder,
+      /--invalidation-mode timestamp/,
+      "a timestamp pyc records the source mtime, and ditto restamps sources at " +
+        "extraction, so every shipped timestamp pyc is rewritten on first use"
+    );
+    // It must run AFTER the prune that deletes pip's timestamp pycs, or its
+    // output is deleted.
+    assert.ok(
+      macBuilder.indexOf("-name __pycache__ -prune") <
+        macBuilder.indexOf("-m compileall"),
+      "compiling before the prune would have its output deleted"
+    );
+    // And the coverage has to be gated, or a silent compileall failure ships a
+    // tree the runtime wants to write to.
+    assert.match(
+      macBuilder,
+      /shipped without a bytecode cache/,
+      "nothing asserts the tree actually shipped with caches"
+    );
+  });
+
+  it("bundles the voice runtime, downloads models on demand, and gates supported targets", () => {
+    const buildScript = fs.readFileSync(
+      path.join(REPO_ROOT, "packaging", "build-desktop.sh"),
+      "utf8"
+    );
+    const windowsStart = buildScript.indexOf("build_backend_windows() {");
+    const windowsEnd = buildScript.indexOf("\n# Stdlib-probe agreement gate", windowsStart);
+    assert.ok(windowsStart >= 0 && windowsEnd > windowsStart);
+    const windowsBuilder = buildScript.slice(windowsStart, windowsEnd);
+    // A model remains a deliberate one-click download, not installer payload.
+    assert.doesNotMatch(buildScript, /bundled-models|bundle_default_stt_model/);
+    // The recogniser, compressed-audio decoder, and every Python/runtime
+    // dependency are installer payload. The gate executes a hash-authenticated,
+    // immutable view of the decoder, so pip metadata alone cannot make a release pass.
+    assert.match(buildScript, /imageio-ffmpeg==0\.6\.0/);
+    assert.match(buildScript, /ERROR: no prebuilt speech recogniser for supported target/);
+    assert.match(buildScript, /macOS Intel[^\n]+legacy backend unsupported/);
+    assert.doesNotMatch(buildScript, /bundling without it/);
+    assert.match(buildScript, /from kiro_crew\.stt\.engine import probe/);
+    assert.match(buildScript, /from kiro_crew\.transcribe import _packaged_ffmpeg_version_probe/);
+    assert.match(buildScript, /decoder = _packaged_ffmpeg_version_probe\(\)/);
+    // Both halves of the decoder verdict are pinned, because collapsing them back
+    // into one boolean is the regression this shape exists to prevent.
+    // AUTHENTICITY gates the release everywhere (exit 1 -> the build stops), so
+    // pip metadata or a swapped payload still cannot publish. EXECUTABILITY does
+    // not, because it is a property of the build host rather than the artifact:
+    // an image lacking an OS library the executable load-time imports refuses it
+    // before its entry point runs, while the same bytes run for a user, so that
+    // case warns and ships (exit 2).
+    assert.match(buildScript, /raise SystemExit\(1 if not decoder\.authentic else 2\)/);
+    assert.match(buildScript, /ERROR: bundled local voice runtime cannot load/);
+    assert.match(buildScript, /authenticated but does not run on THIS host/);
+    // The Apple-Silicon decoder must ship as a PLAIN Mach-O so the app signer
+    // signs it. Sealing it as a compressed payload (#6746) made Apple's notary
+    // service decompress the member, find an unsigned executable inside, and
+    // fail the whole macOS release.
+    assert.doesNotMatch(buildScript, /seal_macos_ffmpeg_payload/);
+    assert.doesNotMatch(buildScript, /source\.with_name\(source\.name \+ "\.gz"\)/);
+    assert.match(buildScript, /do NOT re-introduce a compressed payload/);
+    assert.match(buildScript, /local_voice_runtime_gate "\$out\/bin\/python3\.12"/);
+    assert.match(windowsBuilder, /local_voice_runtime_gate "\$out\/python\.exe"/);
+
+    // Git Bash does not convert /d/a/... once an extras suffix is appended. The
+    // Windows build must pass pip a PEP 508 file URI and must not tolerate a
+    // failed recogniser install.
+    assert.match(
+      windowsBuilder,
+      /root_uri="\$\(cd "\$ROOT" && "\$out\/python\.exe" -c[\s\S]*?sys\.stdout\.write\(Path\.cwd\(\)\.as_uri\(\)\)/
+    );
+    assert.match(windowsBuilder, /"kirocrew\[voice-aws\] @ \$root_uri"/);
+    assert.match(windowsBuilder, /"kirocrew\[voice\] @ \$root_uri"/);
+    assert.doesNotMatch(windowsBuilder, /"\$ROOT\[voice(?:-aws)?\]"/);
+    assert.doesNotMatch(windowsBuilder, /if\s+!\s+[\s\S]*?kirocrew\[voice\]/);
   });
 
   it("shows native progress for updates without adding setup decisions", () => {

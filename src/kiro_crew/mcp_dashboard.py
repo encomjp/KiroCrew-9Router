@@ -76,8 +76,7 @@ from kiro_crew.mcp_core import (
     _patch,
     _post,
     _resolve_session_key,
-    _resolve_session_key_strict,
-    strict_identity_diagnosis,
+    require_strict_session_key,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.platform import redact_via_context as redact
@@ -87,6 +86,7 @@ from kiro_crew.validation import (
     CHAT_FOLDER_MOVE_SESSION_SCHEMA,
     CHAT_FOLDER_TREE_SCHEMA,
     MCP_DASHBOARD_SCHEMAS,
+    SESSION_CLOSE_SCHEMA,
     SESSION_CREATE_SCHEMA,
     SESSION_READ_MESSAGE_SCHEMA,
     SESSION_SEND_SCHEMA,
@@ -108,6 +108,7 @@ SERVER_VERSION = "1.0.0"
 SESSION_CONTROL_TOOLS: tuple[str, ...] = (
     "session_create",
     "session_stop",
+    "session_close",
     "session_send",
     "session_read_message",
 )
@@ -246,6 +247,15 @@ def _tool_definitions() -> list[dict[str, Any]]:
                             "Agent to bind the session to. Omit to use the default agent."
                         ),
                     },
+                    "folder": {
+                        "type": "string",
+                        "description": (
+                            "Sidebar folder to file the new session into, atomically with "
+                            "creation — a folder id or a '/'-separated human path. Missing "
+                            "path segments are created (mkdir -p), like chat_folder_create's "
+                            "`parent`. Omit to leave the session at the top level."
+                        ),
+                    },
                 },
                 "required": [],
             },
@@ -256,12 +266,38 @@ def _tool_definitions() -> list[dict[str, Any]]:
                 "Stop another session's in-flight turn — the same thing as pressing Stop "
                 "in that tab. Use it when a peer session is working on something you now "
                 "know is wrong or already done, and letting it finish would waste the run "
-                "or make a conflicting change. The first call cancels cooperatively; "
-                "calling again while that is still pending escalates to a hard kill. "
+                "or make a conflicting change. The stop is cooperative and safe to "
+                "re-send: a repeat within two minutes reports that the earlier stop is "
+                "still in progress instead of escalating to a hard kill, so retrying a "
+                "call that timed out cannot discard the target's queued messages. "
                 "A stop card appears in the "
                 "target's transcript so the person reading it sees what happened. Stopping "
                 "discards the turn's work, so read the session first when you are not sure "
                 "what it is doing."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Session key from list_sessions, or its exact title.",
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+        {
+            "name": "session_close",
+            "description": (
+                "Close another session — the same thing as pressing the ✕ on that tab. "
+                "The conversation is archived to history (it can be reopened later); "
+                "this is NOT a permanent delete, but it does dismiss the live tab and, "
+                "if the target is mid-turn, cancels that turn first and discards its "
+                "work. Use it to tidy up a peer session you created and are done with "
+                "(a finished watcher, a workstream you handed off), not to interrupt one "
+                "you might still need — for that, session_stop only cancels the turn and "
+                "leaves the tab open. Read the session first when you are unsure what it "
+                "is doing."
             ),
             "inputSchema": {
                 "type": "object",
@@ -470,9 +506,13 @@ def _resolve_chat_folder_ref(
     paths = _chat_folder_paths(folders)
     exact = sorted(fid for fid, p in paths.items() if p.strip().lower() == ref.lower())
     if len(exact) > 1:
-        return "", [], (
-            f"{len(exact)} folders render the same path {redact(ref)} "
-            f"({', '.join(exact)}) — pass the folder id instead of a path"
+        return (
+            "",
+            [],
+            (
+                f"{len(exact)} folders render the same path {redact(ref)} "
+                f"({', '.join(exact)}) — pass the folder id instead of a path"
+            ),
         )
 
     # Reading 3: walk the segments. When the exact reading already resolved, the
@@ -486,9 +526,13 @@ def _resolve_chat_folder_ref(
         return "", created, walk_err
 
     if exact and walked and walked != exact[0]:
-        return "", [], (
-            f"{redact(ref)} is ambiguous: it is both a folder's own name "
-            f"({exact[0]}) and a nested path ({walked}) — pass the folder id"
+        return (
+            "",
+            [],
+            (
+                f"{redact(ref)} is ambiguous: it is both a folder's own name "
+                f"({exact[0]}) and a nested path ({walked}) — pass the folder id"
+            ),
         )
     if exact:
         return exact[0], [], None
@@ -581,9 +625,7 @@ def _ensure_chat_folder_path(
     segments are real folders, and each must be created under the identity the
     caller's gate verified rather than one the write helper re-derives.
     """
-    return _resolve_chat_folder_ref(
-        ref, folders, create_missing=True, session_key=session_key
-    )
+    return _resolve_chat_folder_ref(ref, folders, create_missing=True, session_key=session_key)
 
 
 def _resolve_chat_slot_key(ref: str, slots: list[dict]) -> tuple[str, str | None]:
@@ -746,13 +788,13 @@ def _visible_chat_slots() -> tuple[list[dict], str | None]:
     if err:
         return [], err
     live = [r for r in rows if str(r.get("memory_mode") or "persistent") == "persistent"]
-    caller_key = _resolve_session_key_strict()
+    caller_key, strict_err = require_strict_session_key(
+        "cannot verify which session is calling, so the session list is "
+        "withheld — these tools scope what they show to the caller",
+        server=SERVER_NAME,
+    )
     if not caller_key:
-        return [], (
-            "cannot verify which session is calling, so the session list is "
-            "withheld — these tools scope what they show to the caller"
-            + strict_identity_diagnosis(SERVER_NAME)
-        )
+        return [], strict_err
     scope = _caller_app_scope(caller_key, rows)
     if scope is None:
         return [], (
@@ -790,14 +832,14 @@ def _refuse_tree_shaping_if_unverifiable(verb: str) -> tuple[str, str | None]:
     the endpoint looking like the unconfined person. Every caller of this gate
     must pass what it returns straight to the write.
     """
-    caller_key = _resolve_session_key_strict()
+    caller_key, strict_err = require_strict_session_key(
+        f"Error: cannot verify which session is calling, so {verb} is "
+        "refused — reshaping the shared folder tree requires a caller "
+        "identity the gateway can vouch for.",
+        server=SERVER_NAME,
+    )
     if not caller_key:
-        return "", (
-            f"Error: cannot verify which session is calling, so {verb} is "
-            "refused — reshaping the shared folder tree requires a caller "
-            "identity the gateway can vouch for."
-            + strict_identity_diagnosis(SERVER_NAME)
-        )
+        return "", strict_err
     rows, err = _get_rows("/api/chat/slots")
     if err:
         return "", f"Error: {err}"
@@ -848,26 +890,79 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # authorize the check and the action as potentially different sessions:
         # the lenient walk reads mutable process state, so what it answers at
         # request time need not be what the gate approved.
-        caller_key = _resolve_session_key_strict()
+        caller_key, strict_err = require_strict_session_key(
+            "Error: this session cannot be identified well enough to control another "
+            "session. Session control authorizes on the calling session's identity, and "
+            "only a gateway-issued key counts — a spawned subagent has none of its own.",
+            server=SERVER_NAME,
+        )
         if not caller_key:
-            return (
-                "Error: this session cannot be identified well enough to control another "
-                "session. Session control authorizes on the calling session's identity, and "
-                "only a gateway-issued key counts — a spawned subagent has none of its own."
-                + strict_identity_diagnosis(SERVER_NAME)
-            )
+            return strict_err
 
     if name == "session_create":
         args = validate_tool_args(args, SESSION_CREATE_SCHEMA)
+        payload: dict[str, Any] = {"title": args.get("title", ""), "agent": args.get("agent", "")}
+        folder_ref = str(args.get("folder") or "")
+        folder_label = ""
+        made_note = ""
+        if folder_ref:
+            # Filing at creation resolves the reference with
+            # ``chat_folder_create``'s `parent` semantics — missing path segments
+            # are CREATED — and creating folders is tree shaping, so the same
+            # gate applies rather than a second authorization path: a caller
+            # that could not reshape the tree by creating a folder must not
+            # reach the same write by naming the path here (#6118). The gate's
+            # verified key is what the segment creation writes under, per its
+            # own contract.
+            gate_key, gate = _refuse_tree_shaping_if_unverifiable(
+                "filing a new session at creation"
+            )
+            if gate:
+                return gate
+            # An app-scoped caller may create folders, but it can NEVER complete
+            # session_create (the endpoint refuses `app_scoped_caller`), so
+            # resolving the folder for it would only leave created path
+            # segments behind for a call that cannot succeed. This is a
+            # side-effect guard, not a second authorization home: the
+            # endpoint's refusal stays authoritative for the create itself.
+            scope_rows, scope_err = _get_rows("/api/chat/slots")
+            if scope_err:
+                return redact(f"Error: {scope_err}")
+            if _caller_app_scope(gate_key, scope_rows):
+                return (
+                    "Error: an app-scoped session cannot create sessions, so there is "
+                    "nothing to file — folder resolution is refused before it would "
+                    "create path segments for a create that cannot succeed."
+                )
+            chat_folders, folders_err = _get_rows("/api/chat/folders")
+            if folders_err:
+                return redact(f"Error: {folders_err}")
+            fld_id, created_segments, fld_err = _ensure_chat_folder_path(
+                folder_ref, chat_folders, session_key=gate_key
+            )
+            if created_segments:
+                made_note = f" (created folder path: {'/'.join(created_segments)})"
+            if fld_err:
+                # Refuse the whole create: the caller asked for a session filed
+                # in this folder, and "created but unfiled" would silently honor
+                # half of that. No SESSION exists yet; path segments the mkdir -p
+                # walk already created DO persist and are reported in
+                # `made_note` — the same partial-report posture
+                # chat_folder_create takes, since folder deletion is
+                # deliberately not a capability this server has.
+                return redact(f"Error: {fld_err}{made_note}")
+            payload["folder_id"] = fld_id
+            folder_label = _chat_folder_paths(chat_folders).get(fld_id, fld_id)
         resp = _post(
             "/api/session-control/create",
-            {"title": args.get("title", ""), "agent": args.get("agent", "")},
+            payload,
             session_key=caller_key,
         )
         if resp.get("error"):
-            return f"Error: could not create a session: {resp['error']}"
-        return (
-            f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}). "
+            return redact(f"Error: could not create a session: {resp['error']}{made_note}")
+        filed = f" filed in `{folder_label}`" if folder_label else ""
+        return redact(
+            f"\U0001f195 Opened `{resp.get('target')}` ({resp.get('title')}){filed}.{made_note} "
             "It is empty and waiting in the user's sidebar; watch it with "
             "session_read_message."
         )
@@ -884,10 +979,31 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         target = resp.get("target", args["target"])
         info = resp.get("info")
         if info:
-            # The target was not running (or a stop was already in flight) — say
-            # so rather than implying a turn was cancelled.
+            # Two different facts share this reply and must not read alike. A
+            # target that was never running has nothing to stop; one whose
+            # cooperative cancel is still in flight IS stopping, and after #5074 a
+            # re-sent stop lands there routinely — telling that caller "nothing to
+            # stop" would report the opposite of what happened and invite it to
+            # act as though the target were still free-running.
+            if resp.get("already_stopping"):
+                return f"\u2139\ufe0f `{target}`: {info} — the earlier stop still stands."
             return f"\u2139\ufe0f `{target}`: {info} — nothing to stop."
         return f"\U0001f6d1 Stop sent to `{target}`. Its transcript now shows the stop card."
+
+    if name == "session_close":
+        args = validate_tool_args(args, SESSION_CLOSE_SCHEMA)
+        resp = _post(
+            "/api/session-control/close",
+            {"target": args["target"]},
+            session_key=caller_key,
+        )
+        if resp.get("error"):
+            return f"Error: could not close that session: {resp['error']}"
+        target = resp.get("target", args["target"])
+        return (
+            f"\U0001f5d1\ufe0f Closed `{target}` — the tab is dismissed and the "
+            "conversation archived to history (it can be reopened later)."
+        )
 
     if name == "session_send":
         args = validate_tool_args(args, SESSION_SEND_SCHEMA)
@@ -1140,13 +1256,14 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         # an unresolved identity reaches the endpoint as no header at all, where
         # it reads as the unconfined dashboard user. Refuse instead of writing
         # with an authority we cannot name.
-        caller_key = _resolve_session_key_strict()
+        caller_key, strict_err = require_strict_session_key(
+            "Error: cannot verify which session is calling, so this move is "
+            "refused — filing another session requires a caller identity the "
+            "gateway can vouch for.",
+            server=SERVER_NAME,
+        )
         if not caller_key:
-            return (
-                "Error: cannot verify which session is calling, so this move is "
-                "refused — filing another session requires a caller identity the "
-                "gateway can vouch for." + strict_identity_diagnosis(SERVER_NAME)
-            )
+            return strict_err
         # The verified key is passed through unchanged: re-resolving inside the
         # helper would let the write carry a different session's authority than
         # the one checked here.

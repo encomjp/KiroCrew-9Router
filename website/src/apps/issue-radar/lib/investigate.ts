@@ -33,10 +33,12 @@ export interface UseInvestigate {
   busy: boolean
   error: Error | null
   concludedFor: string | null
+  /** Go to the chat page with Older Sessions open — see `useAgentSession`. */
+  openOlderSessions: () => void
 }
 
 export function useInvestigate(): UseInvestigate {
-  const { openSession, busy, error, concludedFor } = useAgentSession()
+  const { openSession, busy, error, concludedFor, openOlderSessions } = useAgentSession()
   // Read the live selection, not the stored one: a browser that refuses the
   // persistence write (private mode, quota) still has to honour the language
   // the user just picked, and the prompt is built at click time.
@@ -62,5 +64,5 @@ export function useInvestigate(): UseInvestigate {
     [openSession, aiLanguage],
   )
 
-  return { investigate, busy, error, concludedFor }
+  return { investigate, busy, error, concludedFor, openOlderSessions }
 }

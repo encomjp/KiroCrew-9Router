@@ -15,6 +15,7 @@ Layout::
     <data>/meetings/<safe_id>/transcript.jsonl # finalized speech + typed lines
     <data>/meetings/<safe_id>/<agent>.md     # per-agent output (markdown)
     <data>/meetings/<safe_id>/<agent>.html   # per-agent output (html widget)
+    <data>/edits/<safe_id>/<agent>.md        # owner-authored output edit
 
 Security posture (AUTOSDE ``backend-security-controls``):
 
@@ -266,7 +267,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "meeting_agents": DEFAULT_MEETING_AGENTS,
     "stt_provider": k.DEFAULT_STT_PROVIDER,
     "task_provider": k.DEFAULT_TASK_PROVIDER,
-    "calendar": {"provider": k.DEFAULT_CALENDAR_PROVIDER, "source": ""},
+    "calendar": {
+        "provider": k.DEFAULT_CALENDAR_PROVIDER,
+        "source": "",
+        # The background poller (calendar_poller.py). It only ever runs against a
+        # configured provider, so leaving it on by default costs nothing for the
+        # default `none`.
+        "auto_sync": True,
+        "poll_interval_secs": k.CALENDAR_POLL_INTERVAL_SECS,
+        "precreate_lead_minutes": k.CALENDAR_PRECREATE_LEAD_MINUTES,
+    },
     "presets": {},
     "default_preset": "",
     "poll_interval_active": 5000,
@@ -329,6 +339,10 @@ def read_config(root: Path | None = None) -> dict[str, Any]:
         config["meeting_agents"] = _repair_builtin_agent_refs(config["meeting_agents"])
     if not isinstance(config.get("calendar"), dict):
         config["calendar"] = dict(DEFAULT_CONFIG["calendar"])
+    else:
+        # The top-level merge does not reach nested keys, so a `calendar` block
+        # written before the poller's settings existed is filled the same way.
+        config["calendar"] = {**DEFAULT_CONFIG["calendar"], **config["calendar"]}
     return config
 
 
@@ -425,7 +439,7 @@ def list_meetings(root: Path | None = None) -> list[dict[str, Any]]:
 
 
 def delete_meeting(meeting_id: str, root: Path | None = None) -> bool:
-    """Permanently remove one meeting's app-owned data directory.
+    """Permanently remove one meeting's app-owned data and edit directories.
 
     The meeting id passes through the same containment barrier as every read and
     write. A directory link is rejected before resolving the deletion target: an
@@ -438,6 +452,12 @@ def delete_meeting(meeting_id: str, root: Path | None = None) -> bool:
     safe_id = safe_meeting_id(meeting_id)
     entry = meetings_root(root) / safe_id
     resolved = contain(entry, operation="meetings.delete", root=root)
+    # Built from the RESOLVED data dir so ``_refuse_linked`` covers the whole
+    # chain — a linked edits ROOT would redirect this rmtree just as surely as a
+    # linked per-meeting entry.
+    edit_entry = data_dir(root).resolve() / k.AGENT_EDITS_DIR / safe_id
+    contain(edit_entry, operation="meetings.delete_edits", root=root)
+    edit_resolved = _refuse_linked(edit_entry, operation="meetings.delete_edits")
 
     # ``contain`` deliberately follows links to detect an escape. For deletion,
     # following an in-root link would still select the wrong meeting directory.
@@ -454,6 +474,10 @@ def delete_meeting(meeting_id: str, root: Path | None = None) -> bool:
         if not meta.is_file():
             return False
         shutil.rmtree(resolved)
+        if edit_resolved.is_dir():
+            shutil.rmtree(edit_resolved)
+        elif edit_resolved.exists():
+            edit_resolved.unlink()
     return True
 
 
@@ -768,6 +792,189 @@ def write_agent_output(
     path = agent_output_path(meeting_id, fname, root)
     path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write(path, content)
+
+
+# ── editable minutes: user edits of agent output, as sidecars ───────────────
+#
+# The one place this app's agent-ownership model bends, so the bargain is written
+# down rather than implied:
+#
+#   The agent keeps sole ownership of its OWN file. A user edit is a SEPARATE file
+#   that takes precedence when the output is read. So the agent's next rewrite
+#   cannot destroy the user's correction, the user's correction cannot destroy the
+#   agent's work, and reverting is a delete rather than a restore.
+#
+# The cost of that, and it is a real one: while an edit exists the user stops seeing
+# what the agent writes. During a LIVE meeting that matters, so an edit records
+# nothing but its own mtime and :func:`read_agent_edit` compares it against the
+# generated file's — which is what lets the dashboard say "the agent has written
+# more since you edited this" instead of quietly freezing the panel.
+#
+# The sidecars live under a fixed app-owned root rather than the per-meeting agent
+# workspace. That root is registered with the shared sensitive-path gate; keeping
+# it outside the directory named in agent prompts is the durable ownership boundary.
+
+
+def _refuse_linked(path: Path, *, operation: str) -> Path:
+    """*path*, after confirming no component of it is a symlink or junction.
+
+    The class-closing invariant for the edits tree: ``contain`` anchors at the
+    whole data dir, so a link ANYWHERE in the sidecar chain — the edits root,
+    the per-meeting directory, or the sidecar file — can resolve to a generated
+    output file while still passing containment, redirecting every sidecar
+    operation onto the agent's own document. Point checks on one component keep
+    leaving the sibling open (the file was refused in one round, the directory
+    surfaced the next), so this refuses the whole family at once: a path whose
+    ``resolve()`` differs from its lexical spelling has a link somewhere in it.
+    The lexical spelling is built from the resolved data root plus validated
+    components only, so on a link-free chain the two are always equal.
+    """
+    if path.resolve() != path:
+        _audit(operation, str(path), outcome="denied")
+        raise MeetingsPathError("edit path must not traverse a link", status=403)
+    return path
+
+
+def agent_edits_root(root: Path | None = None) -> Path:
+    """App-owned root for all user edits, outside agent-writable meeting dirs.
+
+    Built lexically from the RESOLVED data dir so :func:`_refuse_linked` can
+    compare against the unresolved spelling — a linked ``edits/`` entry itself
+    is refused, not followed.
+    """
+    candidate = data_dir(root).resolve() / k.AGENT_EDITS_DIR
+    contain(candidate, operation="meetings.agent_edits_root", root=root)
+    return _refuse_linked(candidate, operation="meetings.agent_edits_root")
+
+
+def agent_edits_dir(meeting_id: str, root: Path | None = None) -> Path:
+    """One meeting's containment-checked, link-free user-edit directory."""
+    candidate = agent_edits_root(root) / safe_meeting_id(meeting_id)
+    contain(candidate, operation="meetings.agent_edits", root=root)
+    return _refuse_linked(candidate, operation="meetings.agent_edits")
+
+
+def agent_edit_path(
+    meeting_id: str, agent_def: dict[str, Any], root: Path | None = None
+) -> Path | None:
+    """Path of one agent's edit sidecar, or None for an agent with no output file.
+
+    The filename is :func:`agent_output_filename`'s, so it is derived from the
+    agent's VALIDATED id plus the fixed extension for its widget type — never from a
+    request. Reusing that derivation rather than accepting an id here is deliberate:
+    it means this function adds no new place a client string could become a path.
+
+    The sidecar keeps the output's extension so an edit renders through the same
+    widget path as the text it replaces.
+    """
+    fname = agent_output_filename(agent_def)
+    if not fname:
+        return None
+    # The directory chain is link-free (each builder above enforces
+    # ``_refuse_linked``), and ``fname`` is derived from the validated agent id,
+    # so the same invariant on the joined path refuses a linked SIDECAR FILE —
+    # the last remaining component a link could occupy.
+    candidate = agent_edits_dir(meeting_id, root) / fname
+    contain(candidate, operation="meetings.agent_edit", root=root)
+    return _refuse_linked(candidate, operation="meetings.agent_edit")
+
+
+def _mtime(path: Path) -> float:
+    """*path*'s mtime, or 0.0 when it cannot be stat'd (missing, raced, denied)."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def read_agent_edit(
+    meeting_id: str, agent_def: dict[str, Any], root: Path | None = None
+) -> dict[str, Any] | None:
+    """One agent's edit, or None when the user has not edited it. BLOCKING.
+
+    ``stale`` is True when the agent has rewritten its own output SINCE the edit was
+    saved. Derived from the two mtimes rather than stored, so there is no second
+    piece of state that can drift out of true — and the sidecar stays a plain
+    markdown file a person can open in an editor.
+    """
+    path = agent_edit_path(meeting_id, agent_def, root)
+    if path is None or not path.is_file():
+        return None
+    try:
+        # ``newline=""`` disables universal-newline translation: the promise is
+        # byte-for-byte, and the default mode would silently rewrite a saved
+        # ``\r\n`` document as ``\n`` on every read.
+        with path.open(encoding="utf-8", errors="replace", newline="") as fh:
+            content = fh.read()
+    except OSError:  # pragma: no cover — raced with a revert
+        return None
+    edited_at = _mtime(path)
+    fname = agent_output_filename(agent_def)
+    generated_at = _mtime(agent_output_path(meeting_id, fname, root)) if fname else 0.0
+    return {
+        "content": content,
+        "stale": generated_at > edited_at,
+    }
+
+
+def read_agent_edits(
+    meeting_id: str, agents: list[dict[str, Any]], root: Path | None = None
+) -> dict[str, dict[str, Any]]:
+    """Every agent's edit, keyed by agent id. BLOCKING.
+
+    Agents the user has not edited are ABSENT rather than present-and-empty, so the
+    dashboard can treat "has an edit" as a key check. An unusable agent definition
+    is skipped for the same reason :func:`read_agent_outputs` skips one — one bad
+    config entry must not blank the whole poll.
+    """
+    edits: dict[str, dict[str, Any]] = {}
+    for agent_def in agents:
+        try:
+            agent_id = safe_agent_id(agent_def.get("id"))
+            edit = read_agent_edit(meeting_id, agent_def, root)
+        except MeetingsPathError:
+            continue
+        if edit is not None:
+            edits[agent_id] = edit
+    return edits
+
+
+def write_agent_edit(
+    meeting_id: str, agent_def: dict[str, Any], content: str, root: Path | None = None
+) -> None:
+    """Persist the user's edit of one agent's output. BLOCKING.
+
+    Writes the SIDECAR and never the agent's file — the whole point of the design.
+
+    This is a whole-file replace with no read-modify-write to protect, so
+    ``atomic_write`` alone makes it all-or-nothing and a lock would buy nothing.
+    """
+    path = agent_edit_path(meeting_id, agent_def, root)
+    if path is None:
+        raise MeetingsPathError(
+            "this agent has no output file to edit", status=409, code="agent_has_no_output"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # ``newline=""`` — the byte-for-byte promise again: the default translation
+    # rewrites ``\n`` to ``\r\n`` on Windows, and a document that is read back,
+    # edited and saved would accumulate carriage returns on every round trip.
+    atomic_write(path, content, newline="")
+
+
+def revert_agent_edit(meeting_id: str, agent_def: dict[str, Any], root: Path | None = None) -> bool:
+    """Delete an edit sidecar so the agent's own output is served again. BLOCKING.
+
+    Returns whether one existed. Reverting is a delete and nothing else, which is
+    exactly what makes it always safe — the generated file was never touched.
+    """
+    path = agent_edit_path(meeting_id, agent_def, root)
+    if path is None or not path.is_file():
+        return False
+    try:
+        path.unlink()
+    except OSError:  # pragma: no cover — raced with another revert
+        return False
+    return True
 
 
 # ── calendar cache ──────────────────────────────────────────────────────────

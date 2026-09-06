@@ -1,10 +1,12 @@
 import { useState, useRef, useEffect, useCallback, useMemo, type ReactNode } from 'react'
 import Modal from '../components/Modal'
-import { Hourglass, Ear, Check, X, Wrench, Radio, VolumeX, User, MessageSquare, Users, Zap, AlertTriangle, RotateCcw } from 'lucide-react'
-import { useAppSelector } from '../store'
+import { Hourglass, Ear, Check, X, Wrench, Radio, VolumeX, User, MessageSquare, Users, Zap, RotateCcw } from 'lucide-react'
+import { useAppSelector, useAppDispatch } from '../store'
+import { triggerRefresh } from '../store/dashboardSlice'
 import type { RootState } from '../store'
 import { api } from '../api/client'
 import ApprovalCard from '../components/ApprovalCard'
+import ErrorNotice from '../components/ErrorNotice'
 import { Btn, Input, Badge, EmptyState, PageHeader } from '../components/ui'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import AgentSelector from '../components/AgentSelector'
@@ -131,9 +133,19 @@ function AgentBadge({ agent, index }: { agent: ChannelAgent; index: number }) {
   )
 }
 
+/** Tool title embedded in a channel approval message by the backend
+ * (`⚠️ Approval needed: **<name>**` + fenced input). Greedy up to the LAST
+ * `**` before the input fence so a command containing `**` stays whole.
+ * Empty when the message carries no name (legacy messages). The approval
+ * card's TrustDropdown derives its trust_command / trust_base patterns from
+ * this title, so it must be the tool's identity, never the agent role. */
+export function approvalToolTitle(content: string): string {
+  return /^⚠️ Approval needed: \*\*([\s\S]*)\*\*\n```/.exec(content)?.[1] || ''
+}
+
 function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }: {
   msg: ChannelMessage; agents: ChannelAgent[]
-  onReply?: () => void; onOpenThread?: () => void; onApprove?: (action: string) => Promise<unknown>
+  onReply?: () => void; onOpenThread?: () => void; onApprove?: (action: string, pattern?: string) => Promise<unknown>
 }) {
   const isHuman = msg.fromId === 'human'
   const approvalMode = useAppSelector((s: RootState) => s.dashboard.approvalMode)
@@ -157,20 +169,21 @@ function MessageBubble({ msg, agents, onReply, onOpenThread, onApprove }: {
           <span className="text-[13px] text-muted ml-auto">{time}</span>
         </div>
         <div className="text-sm text-text">{msg.msgType === 'approval' ? <span className="whitespace-pre-wrap">{msg.content}</span> : <MarkdownRenderer content={msg.content} />}</div>
-        {/* Approval card. hasCommand={false}: the channel approval message has
-            no STRUCTURED command field — the card is titled with the agent's
-            ROLE, and the fenced content is the tool input after credential
-            redaction and truncation (channel.py), which must never serve as an
-            exact-match trust pattern. The approve endpoint also accepts only
-            approved/rejected/trust, so command-scoped tiers stay off this
-            surface until the message schema actually carries a command.
-            trustAllLabelKey: the channel `trust` decision is channel-wide and
-            persisted to disk (it sets the channel's trusted flag and saves it),
-            so the trust-all option must say so — the default label reads as
-            session-scoped. */}
+        {/* Approval card. The title is the tool name the backend embedded in
+            the message — the TrustDropdown derives its trust_command /
+            trust_base patterns from it, so the agent ROLE (fromRole) is only
+            a fallback for legacy messages without a name. Per-command tiers
+            are shell-only on channels (the endpoint refuses them for
+            non-shell tools with pattern_underivable), so a non-shell card
+            offers just Approve / blanket Trust / Reject. */}
         {msg.msgType === 'approval' && onApprove && (
           <div className="mt-2">
-            <ApprovalCard title={msg.fromRole} hasCommand={false} toolInput={msg.content.replace(/^⚠️ Approval needed:.*\n```\n?/, '').replace(/\n?```$/, '')} showButtons={approvalMode === 'normal'} trustAllLabelKey="components.trustDropdown.trust_all_tools_channel" onApprove={onApprove} />
+            {(() => {
+              const title = approvalToolTitle(msg.content)
+              const toolInput = msg.content.replace(/^⚠️ Approval needed:.*\n```\n?/, '').replace(/\n?```$/, '')
+              const hasCommand = title.startsWith('Running: ') && !/\[REDACTED/.test(toolInput)
+              return <ApprovalCard title={title || msg.fromRole} hasCommand={hasCommand} toolInput={toolInput} showButtons={approvalMode === 'normal'} trustAllLabelKey="components.trustDropdown.trust_all_tools_channel" onApprove={onApprove} />
+            })()}
           </div>
         )}
         {/* Thread badge + reply */}
@@ -271,7 +284,7 @@ function AgentControlRow({ agent, onDismiss, onListenChange, onClearContext }: {
         </div>
       </div>
       {alive && <Btn onClick={onClearContext} aria-label={i18nT('pages.channelPage.clear_context')} title={i18nT('pages.channelPage.clear_context')}><RotateCcw className="lucide-inline" /></Btn>}
-      {alive && <Btn onClick={onDismiss} aria-label={i18nT('pages.channelPage.dismiss')} danger title={i18nT('pages.channelPage.dismiss')}><X className="lucide-inline" /></Btn>}
+      <Btn onClick={onDismiss} aria-label={i18nT('pages.channelPage.dismiss')} danger title={i18nT('pages.channelPage.dismiss')}><X className="lucide-inline" /></Btn>
     </div>
   )
 }
@@ -361,7 +374,6 @@ function NewChannelDialog({ onClose, onCreate, presets }: { onClose: () => void;
     // which predates this conversion and differs from the rendered title only in
     // case. The eslint disable below covers the label/Input association
     // (label-has-for cannot see through the custom <Input>).
-    /* eslint-disable jsx-a11y/label-has-for */
     <Modal
       open
       onClose={onClose}
@@ -394,7 +406,6 @@ function NewChannelDialog({ onClose, onCreate, presets }: { onClose: () => void;
         ))}
       </div>
     </Modal>
-    /* eslint-enable jsx-a11y/label-has-for */
   )
 }
 
@@ -464,13 +475,20 @@ function AddAgentForm({ onAdd, onCancel }: { onAdd: (role: string, task: string,
   const ime = useImeGuard()
   const [role, setRole] = useState('')
   const [task, setTask] = useState('')
-  const { agents, defaultAgent } = useAgents(0)
+  const { agents, defaultAgent, error: rosterError, reload: reloadRoster, reloading: rosterReloading } = useAgents(0)
+  const dispatch = useAppDispatch()
+  // Recover every roster consumer, not just this form — see SchedulePage's note.
+  const recoverRoster = useCallback(() => {
+    reloadRoster()
+    dispatch(triggerRefresh())
+  }, [reloadRoster, dispatch])
+  const rosterFailure = rosterError ? { reloading: rosterReloading, onReload: recoverRoster } : undefined
   const [agent, setAgent] = useState('')
   return (
     <div className="p-2 space-y-2 border-t border-border">
       <div>
         <span className="text-[11px] text-muted font-medium mb-1 block">{i18nT('pages.channelPage.agent')}</span>
-        <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent || defaultAgent} onChange={setAgent} />
+        <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent || defaultAgent} onChange={setAgent} rosterFailure={rosterFailure} />
       </div>
       <Input value={role} onChange={e => setRole(e.target.value)} placeholder={i18nT('pages.channelPage.role_e_g_logs_agent')} aria-label={i18nT('pages.channelPage.role')} autoFocus
         className="w-full text-[13px]" />
@@ -527,7 +545,22 @@ export default function ChannelPage() {
   const { isMobile, showList, showDetail, openDetail, closeDetail } = useListDetailView()
   const [showAddAgent, setShowAddAgent] = useState(false)
   const [loading, setLoading] = useState(true)
+  /** The last channel-list read was refused, so an empty list is unknown, not empty. */
+  const [listFailed, setListFailed] = useState(false)
   const [error, setError] = useState<ChannelPageError | null>(null)
+  // A rejected channelPost, kept apart from `error`: its notice sits next to
+  // the composer that still holds the unsent text (keyed by thread so it shows
+  // beside the right one), so it must not offer the agent hand-off `error` does.
+  const [postError, setPostError] = useState<{ message: string; threadId: string | null } | null>(null)
+  // Every failed request on this page lands in the one in-page ErrorNotice;
+  // `title` names the action, the body is the backend's message.
+  const fail = useCallback((titleKey: string, err: unknown, opts?: { keepExisting?: boolean }) => {
+    const title = i18nT(titleKey)
+    const next = { title, message: apiError(err, title) }
+    // `keepExisting`: a secondary read (the team presets) must not paper over
+    // the primary one (the channel list) when both fail on the same load.
+    setError(prev => (opts?.keepExisting && prev ? prev : next))
+  }, [])
   const [threadId, setThreadId] = useState<string | null>(null)
   // Which thread the unsent reply belongs to, so it is neither discarded on
   // navigation nor inherited by a different thread.
@@ -545,12 +578,18 @@ export default function ChannelPage() {
       const res = await api.channelsList()
       const mapped = (res.channels || []).map(mapChannel)
       setChannels(mapped)
+      setListFailed(false)
       if (!activeId && mapped.length > 0) setActiveId(mapped[0].id)
-    } catch { /* empty */ }
+    } catch (e) { setListFailed(true); fail('pages.channelPage.failed_to_load_channels', e) }
     setLoading(false)
-  }, [activeId])
+  }, [activeId, fail])
 
-  useEffect(() => { reload(); api.channelPresets().then(r => setPresets(r.presets || FALLBACK_PRESETS)).catch(() => {}) }, []) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    reload()
+    api.channelPresets()
+      .then(r => setPresets(r.presets || FALLBACK_PRESETS))
+      .catch(e => fail('pages.channelPage.failed_to_load_presets', e, { keepExisting: true }))
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // A thread id and the agents panel both belong to one channel: `threadId` names a
   // message in it, and the panel lists its members. Leaving either set across a change
@@ -567,8 +606,8 @@ export default function ChannelPage() {
     api.channelGet(activeId).then(res => {
       const full = mapChannel(res)
       setChannels(prev => prev.map(c => c.id === activeId ? full : c))
-    }).catch(() => {})
-  }, [activeId])
+    }).catch(e => fail('pages.channelPage.failed_to_load_channel', e))
+  }, [activeId, fail])
 
   // Channel WS events dispatched via existing useWebSocket in App.tsx
   // Listen for custom events on window
@@ -606,11 +645,20 @@ export default function ChannelPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [channel?.messages.length, activeId])
 
-  const sendMessage = async (text: string, tid?: string) => {
-    if (!text.trim() || !channel) return
+  // Resolves true only when the post was accepted; callers keep the composer
+  // text on false so a rejected send does not also drop the message.
+  const sendMessage = async (text: string, tid?: string): Promise<boolean> => {
+    if (!text.trim() || !channel) return false
     const msg = text.trim()
     const mentionIds = channel.agents.filter(a => msg.toLowerCase().includes('@' + a.role.toLowerCase())).map(a => a.id)
-    try { await api.channelPost(channel.id, msg, mentionIds.length ? mentionIds : undefined, tid) } catch { /* WS will deliver */ }
+    setPostError(null)
+    try {
+      await api.channelPost(channel.id, msg, mentionIds.length ? mentionIds : undefined, tid)
+      return true
+    } catch (e) {
+      setPostError({ message: apiError(e, i18nT('pages.channelPage.failed_to_send_message')), threadId: tid ?? null })
+      return false
+    }
   }
 
   const threadInput = threadId ? (threadDrafts[threadId] ?? '') : ''
@@ -631,20 +679,41 @@ export default function ChannelPage() {
 
   const handleSend = async () => {
     if (!input.trim()) return
-    await sendMessage(input)
-    setInput('')
+    if (await sendMessage(input)) setInput('')
   }
 
+  // After a refused optimistic change, re-read the channel from the server and
+  // let ITS answer replace the row. A hand-rolled rollback cannot tell the
+  // optimistic value from one a socket event (`channel_agent_left`) or a
+  // newer request wrote in the meantime, so it could resurrect a genuinely
+  // removed agent or overwrite a later, successful change. If the re-read
+  // fails too, the row is left as is; the notice already names the failure.
+  const reconcileChannel = useCallback(async (channelId: string) => {
+    try {
+      const res = await api.channelGet(channelId)
+      setChannels(prev => prev.map(c => c.id === channelId ? mapChannel(res) : c))
+    } catch { /* the failure notice is already showing; nothing better to say */ }
+  }, [])
+
+  // Optimistic, but a refusal reconciles the row from the server: a notice that
+  // says "Failed to dismiss agent" beside a row that shows it dismissed would
+  // contradict itself until the next reload.
   const handleDismiss = async (agentId: string) => {
     if (!channel) return
     setChannels(prev => prev.map(c => c.id !== channel.id ? c : { ...c, agents: c.agents.map(a => a.id === agentId ? { ...a, state: 'done' as const } : a) }))
-    try { await api.channelDismissAgent(channel.id, agentId) } catch { /* optimistic */ }
+    try { await api.channelDismissAgent(channel.id, agentId) } catch (e) {
+      await reconcileChannel(channel.id)
+      fail('pages.channelPage.failed_to_dismiss_agent', e)
+    }
   }
 
   const handleListenChange = async (agentId: string, mode: ChannelAgent['listenMode']) => {
     if (!channel) return
     setChannels(prev => prev.map(c => c.id !== channel.id ? c : { ...c, agents: c.agents.map(a => a.id === agentId ? { ...a, listenMode: mode } : a) }))
-    try { await api.channelUpdateAgent(channel.id, agentId, { listen: mode }) } catch { /* optimistic */ }
+    try { await api.channelUpdateAgent(channel.id, agentId, { listen: mode }) } catch (e) {
+      await reconcileChannel(channel.id)
+      fail('pages.channelPage.failed_to_update_agent', e)
+    }
   }
 
   if (loading) return <div className="flex items-center justify-center h-full text-muted">{i18nT('pages.channelPage.loading_channels')}</div>
@@ -664,8 +733,7 @@ export default function ChannelPage() {
         openDetail()
       }
     } catch (err) {
-      const title = i18nT('pages.channelPage.failed_to_create_channel')
-      setError({ title, message: apiError(err, title) })
+      fail('pages.channelPage.failed_to_create_channel', err)
     }
   }
 
@@ -673,23 +741,22 @@ export default function ChannelPage() {
     <>
       <PageHeader title={i18nT('pages.channelPage.channels')} subtitle={i18nT('pages.channelPage.multi_agent_collaboration_spaces')} />
       <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+    {/* Failed create / add-agent / clear-context / load requests. Every input
+        behind these was already submitted (or never existed), so the hand-off
+        risks nothing; the composer's own failure renders beside it instead.
+        `apiError` falls back to the title when the backend sent no text, so
+        the title is dropped rather than shown twice. */}
+    <ErrorNotice
+      title={error && error.message !== error.title ? error.title : undefined}
+      message={error?.message}
+      onDismiss={() => setError(null)}
+      askAgent
+      className="mb-2"
+      testId="channel-error"
+    />
     <div className={`flex h-full relative ${isMobile ? '-mx-4 -mb-8' : ''}`}>
       {showNew && <NewChannelDialog onClose={() => setShowNew(false)} presets={presets} onCreate={handleCreateChannel} />}
 
-      <Modal
-        open={!!error}
-        onClose={() => setError(null)}
-        title={error?.title ?? ''}
-        maxWidth={360}
-        footer={<Btn onClick={() => setError(null)} primary>{i18nT('pages.channelPage.ok')}</Btn>}
-      >
-        {error && error.message !== error.title ? (
-          <div className="flex items-start gap-3 text-sm text-text">
-            <AlertTriangle className="shrink-0 text-warn" />
-            <span>{error.message}</span>
-          </div>
-        ) : null}
-      </Modal>
 
       {/* Channel list sidebar */}
       <div className={`flex flex-col ${showList ? '' : 'hidden'} ${isMobile ? 'w-full' : 'w-64 shrink-0 border-r border-border'}`}>
@@ -698,7 +765,9 @@ export default function ChannelPage() {
           <Btn onClick={() => setShowNew(true)} primary title={i18nT('pages.channelPage.new_channel_2')}>{i18nT('pages.channelPage.new')}</Btn>
         </div>
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
-          {channels.length === 0 && <EmptyState icon={<MessageSquare className="lucide-inline" />} title={i18nT('pages.channelPage.no_channels_yet')} subtitle={i18nT('pages.channelPage.click_new_to_create_one')} />}
+          {/* An empty list is only "no channels yet" when the read succeeded:
+              under a load failure the onboarding copy would claim zero channels. */}
+          {channels.length === 0 && !listFailed && <EmptyState icon={<MessageSquare className="lucide-inline" />} title={i18nT('pages.channelPage.no_channels_yet')} subtitle={i18nT('pages.channelPage.click_new_to_create_one')} />}
           {channels.map(ch => (
             <ChannelListItem key={ch.id} ch={ch} active={ch.id === activeId} onClick={() => { setActiveId(ch.id); openDetail() }} />
           ))}
@@ -726,13 +795,15 @@ export default function ChannelPage() {
                   await api.channelClearContext(channel.id, 'all')
                   const res = await api.channelGet(channel.id)
                   setChannels(prev => prev.map(c => c.id === channel.id ? mapChannel(res) : c))
-                } catch (e) { alert(i18nT('pages.channelPage.failed_to_clear_context_error', { error: e instanceof Error ? e.message : i18nT('pages.channelPage.unknown_error') })) }
+                } catch (e) { fail('pages.channelPage.failed_to_clear_context', e) }
               }} title={i18nT('pages.channelPage.clear_all_context')}>
                 <RotateCcw className="lucide-inline" /> {i18nT('pages.channelPage.clear_context_2')}
               </Btn>
               <Btn onClick={async () => {
                 if (!confirm(i18nT('pages.channelPage.close_this_channel_all_agents_will_be_dismissed'))) return
-                try { await api.channelClose(channel.id) } catch { /* WS handles removal */ }
+                // A refused close keeps the channel in the list: removing it
+                // would show the action as done under a notice saying it failed.
+                try { await api.channelClose(channel.id) } catch (e) { fail('pages.channelPage.failed_to_close_channel', e); return }
                 setChannels(prev => prev.filter(c => c.id !== channel.id))
                 setActiveId(null)
                 // Without this the narrow layout keeps the transcript pane while no
@@ -754,7 +825,7 @@ export default function ChannelPage() {
                 <MessageBubble key={msg.id} msg={msg} agents={channel.agents}
                   onReply={() => openThread(msg.id)}
                   onOpenThread={() => openThread(msg.id)}
-                  onApprove={msg.msgType === 'approval' ? (action) => api.channelApproveAgent(channel.id, msg.fromId, action) : undefined} />
+                  onApprove={msg.msgType === 'approval' ? (action, pattern) => api.channelApproveAgent(channel.id, msg.fromId, action, pattern) : undefined} />
               ))}
               {channel.agents.filter(a => a.state === 'working' || a.state === 'tool_running').map(a => (
                 <div key={a.id + '-typing'} className="flex items-center gap-2 px-3 py-1.5 text-[13px] text-muted animate-pulse">
@@ -771,19 +842,27 @@ export default function ChannelPage() {
               const replies = channel.messages.filter(m => m.threadId === threadId)
               return (
                 <DetailPanel key="thread-panel" title={i18nT('pages.channelPage.thread')} onClose={() => setThreadId(null)} initialWidth={320} minWidth={260} storageKey="mc-channel-thread-width" footer={
-                  <MentionInput agents={channel.agents} value={threadInput} onChange={setThreadInput} onSend={async () => {
-                    if (!threadInput.trim() || !threadId) return
-                    await sendMessage(threadInput, threadId)
-                    discardThreadDraft(threadId)
-                  }} />
+                  <>
+                    {/* No hand-off: the unsent thread reply (threadDrafts[threadId]) */}
+                    <ErrorNotice
+                      title={i18nT('pages.channelPage.failed_to_send_message')}
+                      message={postError?.threadId === threadId ? postError.message : null}
+                      onDismiss={() => setPostError(null)}
+                      className="mb-2"
+                    />
+                    <MentionInput agents={channel.agents} value={threadInput} onChange={setThreadInput} onSend={async () => {
+                      if (!threadInput.trim() || !threadId) return
+                      if (await sendMessage(threadInput, threadId)) discardThreadDraft(threadId)
+                    }} />
+                  </>
                 }>
                   <div className="flex flex-col gap-1 -mx-3 -mt-2">
                     {parent && <MessageBubble key={parent.id} msg={parent} agents={channel.agents}
-                      onApprove={parent.msgType === 'approval' ? (action) => api.channelApproveAgent(channel.id, parent.fromId, action) : undefined} />}
+                      onApprove={parent.msgType === 'approval' ? (action, pattern) => api.channelApproveAgent(channel.id, parent.fromId, action, pattern) : undefined} />}
                     {replies.length > 0 && <div className="border-t border-border my-2" />}
                     {replies.map(msg => (
                       <MessageBubble key={msg.id} msg={msg} agents={channel.agents}
-                        onApprove={msg.msgType === 'approval' ? (action) => api.channelApproveAgent(channel.id, msg.fromId, action) : undefined} />
+                        onApprove={msg.msgType === 'approval' ? (action, pattern) => api.channelApproveAgent(channel.id, msg.fromId, action, pattern) : undefined} />
                     ))}
                     {channel.agents.filter(a => a.state === 'working' || a.state === 'tool_running').map(a => (
                       <div key={a.id + '-typing-t'} className="flex items-center gap-2 px-2 py-1 text-[13px] text-muted animate-pulse">
@@ -813,7 +892,7 @@ export default function ChannelPage() {
                           await api.channelClearContext(channel.id, 'agent', agent.id)
                           const res = await api.channelGet(channel.id)
                           setChannels(prev => prev.map(c => c.id === channel.id ? mapChannel(res) : c))
-                        } catch (e) { alert(i18nT('pages.channelPage.failed_to_clear_context_error', { error: e instanceof Error ? e.message : i18nT('pages.channelPage.unknown_error') })) }
+                        } catch (e) { fail('pages.channelPage.failed_to_clear_context', e) }
                       }} />
                   ))}
                 </div>
@@ -823,8 +902,7 @@ export default function ChannelPage() {
                       if (!channel) return
                       setShowAddAgent(false)
                       try { await api.channelAddAgent(channel.id, { role, task: task || channel.topic, agent }) } catch (err) {
-                        const title = i18nT('pages.channelPage.failed_to_add_agent')
-                        setError({ title, message: apiError(err, title) })
+                        fail('pages.channelPage.failed_to_add_agent', err)
                       }
                     }} />
                   ) : (
@@ -836,6 +914,13 @@ export default function ChannelPage() {
           </div>
 
           <div className={`border-t border-border px-4 py-3 ${isMobile && (threadId || showAgents) ? 'hidden' : ''}`}>
+            {/* No hand-off: the unsent message text (`input`) */}
+            <ErrorNotice
+              title={i18nT('pages.channelPage.failed_to_send_message')}
+              message={postError && postError.threadId === null ? postError.message : null}
+              onDismiss={() => setPostError(null)}
+              className="mb-2"
+            />
             <div className="flex gap-2">
               <MentionInput agents={channel.agents} value={input} onChange={setInput} onSend={handleSend} />
               <Btn onClick={handleSend} primary>{i18nT('pages.channelPage.send')}</Btn>
@@ -844,7 +929,7 @@ export default function ChannelPage() {
         </div>
       ) : (
         <div className="flex-1 flex items-center justify-center">
-          <EmptyState icon={<Users className="lucide-inline" />} title={i18nT('pages.channelPage.create_a_channel_to_get_started')} />
+          {!listFailed && <EmptyState icon={<Users className="lucide-inline" />} title={i18nT('pages.channelPage.create_a_channel_to_get_started')} />}
         </div>
       )}
     </div>

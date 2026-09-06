@@ -24,16 +24,26 @@ function browseCards(page: Page) {
 }
 
 /**
- * An installed app in the Library. InstalledAppCard's root is a bare div with no
- * testid or aria-label, but it renders the app name as a real <button> wired to
- * onDetail -- so role-scope it rather than matching loose text.
- *
- * Scoped to the #main-content landmark: an installed builtin also appears in
- * the nav rail, so an unscoped role+name lookup resolves to 2 elements. This
- * mirrors the convention capabilities.spec.ts already uses.
+ * An installed app in the Library launchpad grid. Each app renders as a
+ * LaunchpadTile whose root carries `data-testid="launchpad-tile-<name>"`
+ * (the app NAME, e.g. "projects" -- not the display name). Anchoring on the
+ * testid also keeps the lookup unambiguous: the tile's pin badge and
+ * overflow trigger are buttons whose accessible names CONTAIN the display
+ * name ("Pin Task Runner to the sidebar", "More actions for Task Runner"),
+ * and an installed builtin also appears in the nav rail.
  */
-function libraryCard(page: Page, displayName: string) {
-  return page.locator('#main-content').getByRole('button', { name: displayName, exact: true })
+function launchpadTile(page: Page, appName: string) {
+  return page.getByTestId(`launchpad-tile-${appName}`)
+}
+
+/**
+ * The tile face -- a real <button> (aria-label = display name, exact) that
+ * opens the app or its detail page. Asserting on it pins both that the tile
+ * exists AND that it wears the right accessible name, the same contract the
+ * old InstalledAppCard name-button assertion carried.
+ */
+function tileFace(page: Page, appName: string, displayName: string) {
+  return launchpadTile(page, appName).getByRole('button', { name: displayName, exact: true })
 }
 
 async function gotoDiscover(page: Page) {
@@ -107,21 +117,23 @@ test.describe('Discover Page — /apps', () => {
 })
 
 test.describe('Library Page — /apps/library', () => {
-  test('lists the installed Task Runner app', async ({ page }) => {
+  test('lists the installed Task Runner app as a launchpad tile', async ({ page }) => {
     await gotoLibrary(page)
-    await expect(libraryCard(page, 'Task Runner')).toBeVisible({ timeout: 10000 })
+    await expect(launchpadTile(page, 'projects')).toBeVisible({ timeout: 10000 })
+    await expect(tileFace(page, 'projects', 'Task Runner')).toBeVisible()
   })
 
   test('search narrows to matching installed apps', async ({ page }) => {
     await gotoLibrary(page)
-    await expect(libraryCard(page, 'Task Runner')).toBeVisible({ timeout: 10000 })
+    await expect(tileFace(page, 'projects', 'Task Runner')).toBeVisible({ timeout: 10000 })
 
     const search = page.getByRole('textbox', { name: 'Search library' })
     await search.fill('zzz_no_match_xyz')
     await expect(page.getByTestId('empty-state-title')).toHaveText('No matching apps', { timeout: 5000 })
+    await expect(launchpadTile(page, 'projects')).toHaveCount(0)
 
     await search.clear()
-    await expect(libraryCard(page, 'Task Runner')).toBeVisible({ timeout: 5000 })
+    await expect(tileFace(page, 'projects', 'Task Runner')).toBeVisible({ timeout: 5000 })
   })
 
   test('page round-trip: Library and Discover are independently routable', async ({ page }) => {
@@ -129,7 +141,7 @@ test.describe('Library Page — /apps/library', () => {
     await expect(page.getByRole('heading', { name: 'All apps' })).toBeVisible({ timeout: 5000 })
 
     await gotoLibrary(page)
-    await expect(libraryCard(page, 'Task Runner')).toBeVisible({ timeout: 10000 })
+    await expect(tileFace(page, 'projects', 'Task Runner')).toBeVisible({ timeout: 10000 })
     await expect(page.getByRole('heading', { name: 'All apps' })).toHaveCount(0)
 
     await gotoDiscover(page)

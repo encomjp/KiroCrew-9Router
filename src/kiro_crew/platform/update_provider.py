@@ -242,11 +242,23 @@ def _trusted_path_env() -> dict[str, str] | None:
     # command has no business inheriting an interpreter search path.
     for var in _INJECTABLE_LOADER_VARS:
         env.pop(var, None)
+    # Exported shell FUNCTIONS are the same threat carrying an open-ended name:
+    # bash imports ``BASH_FUNC_<name>%%`` (4.3+) or ``BASH_FUNC_<name>()`` (the
+    # patched-4.2 form), and the resulting function shadows that command word
+    # outright -- beating the narrowed PATH above rather than competing in it.
+    # Matched by PREFIX because the suffix is version-specific, so neither form
+    # can be missed and no future one has to be enumerated.
+    for var in [k for k in env if k.startswith("BASH_FUNC_")]:
+        env.pop(var, None)
     return env
 
 
-#: Environment variables that make an interpreter or dynamic linker load code
-#: from a caller-controlled path. Removed from every update-command child.
+#: Environment variables that make an interpreter, a dynamic linker, or the
+#: shell itself load code from a caller-controlled path. Removed from every
+#: update-command child. ``SHELLOPTS``/``PS4`` are the shell's own pair: the
+#: command runs via ``[<sh>, "-c", ...]`` and where that ``sh`` is bash,
+#: ``SHELLOPTS=xtrace`` enables tracing while ``PS4`` is expanded with command
+#: substitution, so a payload there runs before the command does.
 _INJECTABLE_LOADER_VARS: tuple[str, ...] = (
     "PYTHONPATH",
     "PYTHONHOME",
@@ -262,6 +274,8 @@ _INJECTABLE_LOADER_VARS: tuple[str, ...] = (
     "DYLD_FRAMEWORK_PATH",
     "BASH_ENV",
     "ENV",
+    "SHELLOPTS",
+    "PS4",
     "IFS",
 )
 
@@ -448,16 +462,22 @@ class CommandProvider:
             # Redact credentials AND token-bearing URLs before logging stderr,
             # so neither an inline token nor a presigned/token URL enters the
             # persistent ring buffer or the /api/logs dashboard stream.
-            from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+            #
+            # Through the CONTEXT, not `security.redact` directly: an installer
+            # error is prime territory for a host-specific credential shape (an
+            # internal registry cookie, an SSO token in a fetch URL), and those
+            # live in a loaded companion's regexes rather than in the OSS
+            # baseline. Reading the baseline here would scan a companion host's
+            # stderr with the weaker pass and log what it missed. The `_log_`
+            # spelling is the one that cannot raise -- see its docstring.
+            from kiro_crew.platform.context import redact_log_via_context
 
             # Redact BEFORE truncating. Slicing first can cut a credential in
             # half, and half a token no longer matches the redactors' patterns
             # (an AWS key needs its full 20 chars to match), so the surviving
             # fragment would reach gateway.log and /api/logs verbatim. The
             # 500-char cap is for log volume, so it belongs last.
-            err_text = (stderr or b"").decode(errors="replace")
-            err_text, _ = redact_exfiltration_urls(err_text)
-            err_text, _ = redact_credentials(err_text)
+            err_text = redact_log_via_context((stderr or b"").decode(errors="replace"))
             err_text = err_text[:500]
             logger.error(
                 "CommandProvider.apply: failed (rc=%d): %s",

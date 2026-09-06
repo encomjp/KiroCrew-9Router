@@ -139,6 +139,11 @@ class _FakeBackend:
 
     def __init__(self) -> None:
         self.callers: list[Any] = []
+        # Per-connection nonces the handler forwarded, in order. Recorded rather
+        # than swallowed so this double keeps ANSWERING the identity question it
+        # exists for: a nonce is what tells two co-tenants apart when the caller
+        # is None.
+        self.nonces: list[str] = []
         self.forwarded = asyncio.Event()
         self._pending_requests: dict = {}
 
@@ -154,8 +159,11 @@ class _FakeBackend:
     async def recycle_if_idle(self) -> bool:
         return False
 
-    async def forward_from_stub(self, _uuid: str, _msg: dict, caller: Any = None) -> None:
+    async def forward_from_stub(
+        self, _uuid: str, _msg: dict, caller: Any = None, tenant_nonce: str = ""
+    ) -> None:
         self.callers.append(caller)
+        self.nonces.append(tenant_nonce)
         self.forwarded.set()
 
 
@@ -242,6 +250,13 @@ async def test_claim_retargets_live_connection(monkeypatch: pytest.MonkeyPatch) 
     assert len(fb.callers) == 2
     assert fb.callers[1] is not None
     assert fb.callers[1].session_key == "dashboard:chat-CP-1"
+    # The nonce names the CONNECTION, not the session, so a claim that retargets
+    # the identity must leave it alone. If it moved with the identity, a backend
+    # keying per-tenant state on it would lose that state the moment its session
+    # was named — and the pre-claim frames would be attributed to a namespace no
+    # later frame can reach.
+    assert len(fb.nonces) == 2
+    assert fb.nonces[0] and fb.nonces[0] == fb.nonces[1]
     events = _claim_events(sel)
     assert len(events) == 1 and events[0]["outcome"] == "allowed"
     assert events[0]["caller"] == "dashboard:chat-CP-1"

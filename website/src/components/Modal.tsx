@@ -65,7 +65,7 @@ function ModalDialog({ onClose, title, ariaLabel, footer, headerActions, maxWidt
   // than per call site so all ~24 `Modal` users get it.
   // Escape remains on Modal's bubble-phase listener so a nested layer can
   // consume it with preventDefault before the outer dialog decides to close.
-  useDialogFocusTrap(dialogRef, dismiss, true, false)
+  useDialogFocusTrap(dialogRef, dismiss, { handleEscape: false })
 
   // Keyboard isolation for the whole dialog, the header X button included. The
   // page's global shortcuts bind bubble-phase `document` keydown
@@ -96,9 +96,14 @@ function ModalDialog({ onClose, title, ariaLabel, footer, headerActions, maxWidt
   const imeLatch = useDocumentImeLatch()
   const isolateKeys = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape') {
-      // A declined claim consumed the NATIVE event; React walks its own flag
-      // when dispatching to component ancestors, so stop the synthetic too.
-      if (!imeLatch.claimKey(e.nativeEvent)) e.stopPropagation()
+      // `claimSyntheticKey` owns both halves of a decline — it consumes the
+      // NATIVE event (so the Escape never reaches Modal's own window
+      // listener and cannot discard a part-composed draft) and React's own
+      // propagation flag, which React walks when dispatching to component
+      // ancestors. An Escape it ACCEPTS is deliberately left to propagate:
+      // that is the exception documented above, and Modal's dismissal
+      // depends on it.
+      imeLatch.claimSyntheticKey(e)
       return
     }
     e.stopPropagation()

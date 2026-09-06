@@ -34,6 +34,7 @@ from kiro_crew.agent_discovery import (
     project_agent_files,
     project_agent_name,
 )
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config import KiroCrewConfig
@@ -54,7 +55,7 @@ from kiro_crew.config.paths import (
 )
 from kiro_crew.config.superseded_defaults import render_doctor_section
 from kiro_crew.constants import MIN_NODE_MAJOR
-from kiro_crew.cron import unhealthy_jobs_from_disk
+from kiro_crew.cron import job_pause_state_from_disk, unhealthy_jobs_from_disk
 from kiro_crew.dashboard.crash_dump_store import (
     dump_age_seconds,
     dump_first_stack_lines,
@@ -66,6 +67,7 @@ from kiro_crew.dashboard.origin import (
     machine_hostname,
     parse_dashboard_url,
 )
+from kiro_crew.deny_guidance import credential_vendor_server_ids
 from kiro_crew.discord import install_url, intent_probe
 from kiro_crew.doctor_deadpath import doctor_dead_paths
 from kiro_crew.embeddings import (
@@ -78,6 +80,7 @@ from kiro_crew.embeddings import (
     resolve_custom_model,
     verify_vendored_libs,
 )
+from kiro_crew.extras import install_hint
 from kiro_crew.kiro_cli import mcp_governance_may_apply, resolve_kiro_cli
 from kiro_crew.mcp_cleanup import ALWAYS_ON_BIN_MCP_SERVERS as _ALWAYS_ON_MCPS
 from kiro_crew.mcp_cleanup import KIROCREW_BIN_MCP_SERVERS as _MANAGED_MCPS
@@ -86,9 +89,14 @@ from kiro_crew.mcp_discovery import McpServerInfo, probe_server
 from kiro_crew.model_registry import acp_id_correction
 from kiro_crew.platform import (
     PlatformCompositionError,
+)
+from kiro_crew.platform import context as platform_context
+from kiro_crew.platform import (
     current_context,
     safe_context_call,
 )
+from kiro_crew.platform.capability_bound import bind_capability_manager
+from kiro_crew.platform.defaults import DefaultCapabilityManager
 from kiro_crew.platform.governance import CU_MCP_SERVER, may_skip_gate_now
 from kiro_crew.sandbox import warm_backend
 from kiro_crew.security import is_sensitive_path
@@ -98,6 +106,7 @@ from kiro_crew.service import common as common_service
 from kiro_crew.service import controller as service_controller
 from kiro_crew.service import linux as service_linux
 from kiro_crew.session_pid_sig import signing_health
+from kiro_crew.stall_attribution import attribute_dump, describe
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 from kiro_crew.transcribe import _find_ffmpeg, availability_detail, ensure_ffmpeg_in_path
 from kiro_crew.validation import _AGENT_NAME_RE
@@ -355,10 +364,29 @@ def _os_fix_hint(mac: str, linux: str, windows: str | None = None) -> str:
     return linux
 
 
-# KiroCrew's agent backend is kiro-cli (the sole public ACP backend). The
-# claude-agent-acp binary below is only the dormant protocol seam an internal
-# companion re-registers (see acp/client.py) — report it, when present, as that
-# optional seam rather than as a user-facing backend.
+# The Linux arm of the missing-ffmpeg fix, a module constant so the test can hold
+# it against the resolver's real search set. An earlier version told the user to
+# drop a static build into ``~/.local/bin``, which ``transcribe._find_ffmpeg``
+# deliberately never searches (``_ffmpeg_candidate_dirs`` documents removing it:
+# a generic user-writable PATH dir would let agent-written code run as the
+# gateway), so a user who followed the advice still ended at "not found" (#8897).
+# Name only remedies that actually resolve: the dashboard's decoder download
+# installs into the digest-verified store ``_find_ffmpeg`` checks last and needs
+# no PATH reasoning (the working fix on distros with no packaged ffmpeg, e.g.
+# AL2023 — pinned artifacts exist for x86_64 and aarch64, the Linux ISAs the
+# desktop matrix ships; on any other ISA the fetch is refused and the second
+# clause is the remedy), and ``/usr/local/bin`` is both a real
+# ``_FFMPEG_CANDIDATE_DIRS`` entry and the conventional manual-install prefix.
+_FFMPEG_LINUX_HINT = (
+    "download the audio decoder from the dashboard (Settings → Speech-to-Text), "
+    "or install ffmpeg into /usr/local/bin"
+)
+
+
+# kiro-cli is the DEFAULT agent backend; the claude-agent-acp binary below belongs
+# to Claude Code, which is also selectable. Doctor reports it as an optional
+# backend, and the verdict comes from ``agent_sdk.probe_backend`` so doctor and the
+# dashboard cannot give different answers.
 _CLAUDE_ACP_BIN = "claude-agent-acp"
 
 # Managed servers doctor must NEVER add to ``allowedTools``.
@@ -421,7 +449,7 @@ def _agent_spec_model_problems(
     """
     # The retained claude_code seam accepts its own registered wire ids. The
     # correction below is specifically an ACP/kiro-cli spelling audit.
-    if provider == "claude_code":
+    if is_claude_code(provider):
         return []
 
     problems: list[tuple[str, str, str]] = []
@@ -825,11 +853,14 @@ def _doctor_mcp_governance(
         logger.debug("config load failed in governance check", exc_info=True)
         declared = False
 
-    try:
-        spec = json.loads(agent_path.read_text(encoding="utf-8"))
-        servers = spec.get("mcpServers") or {}
-    except Exception:
-        servers = {}
+    # Same hardened reader as this file's other spec reads: the agents dir is
+    # user-writable, so an oversized or sensitively-symlinked spec is refused
+    # (and audited) rather than parsed. No try/except: the reader's contract is
+    # return-``None``-never-raise, which the five sibling sites migrated
+    # alongside this one also rely on bare. ``None`` degrades to no declared
+    # servers, exactly as the blanket ``except`` here used to.
+    spec = _read_agent_spec(agent_path, operation="doctor", source="cli")
+    servers = (spec or {}).get("mcpServers") or {}
     if not isinstance(servers, dict):
         # `or {}` only replaces a FALSY value, so a string or list here survives
         # and the membership walk below would raise, aborting the whole doctor
@@ -983,6 +1014,62 @@ def _doctor_data_home() -> None:
     )
 
 
+def _doctor_cron_script_sources(issues: list[str]) -> None:
+    """Report deployed cron scripts that no longer agree with their skill-asset source.
+
+    The packaged-to-installed hop is content-verified, ``scripts/`` included. The
+    installed-to-``crons/`` hop is a hand-run ``cp`` documented in the owning
+    skill, and nothing compares its two sides -- so a deploy can run superseded
+    code indefinitely while looking healthy, which is how the shipped PR watch
+    came to re-emit its wake footer once per observation long after the package
+    had split that out.
+
+    Divergence is reported WITHOUT a direction. A cron script body is
+    LLM-writeable by design, so the two sides disagreeing can mean a stale deploy
+    or a deliberate local edit, and nothing on disk distinguishes them. Doctor
+    surfaces the disagreement and leaves the reconciliation to whoever knows
+    which they intended.
+
+    Silent when nothing deployed has a source: a cron script without one is out
+    of scope here, not a finding.
+    """
+    from kiro_crew.skills import (
+        CRON_SOURCE_DIVERGED,
+        CRON_SOURCE_IN_SYNC,
+        deployed_cron_script_sources,
+    )
+
+    states = deployed_cron_script_sources()
+    if not states:
+        return
+
+    print("\nCron Script Sources")
+    for state in states:
+        # Both halves are read off disk and BOTH go through _safe_display. The
+        # crons dir is agent-writeable by design (see cron_script.py), so a
+        # deployed script's name is not merely untrusted in the abstract -- the
+        # design deliberately lets an agent choose it. A diagnostic that reads
+        # those names and prints them raw is exactly the wrong consumer for such
+        # a directory: an OSC/ANSI sequence or a newline in a filename would
+        # drive the terminal or forge the surrounding verdict lines.
+        name = _safe_display(state.name)
+        source = _safe_display(str(state.source))
+        if state.state == CRON_SOURCE_IN_SYNC:
+            print(f"  {name}:  ✅ agrees with {source}")
+        elif state.state == CRON_SOURCE_DIVERGED:
+            print(f"  {name}:  ❌ DIVERGED from {source}")
+        else:
+            print(f"  {name}:  ⏹ could not be compared against {source}")
+
+    if any(state.state == CRON_SOURCE_DIVERGED for state in states):
+        issues.append("deployed cron script diverged from its skill source")
+        print(
+            "               Reconcile using the owning skill's own copy recipe. "
+            "A diverged copy may be a stale deploy OR an intentional local edit "
+            "-- doctor cannot tell which, so it does not overwrite either one."
+        )
+
+
 def _doctor_managed_service_policy(issues: list[str]) -> None:
     """Surface installed service definitions that predate launch-class policy."""
     state = service_controller.installed_service_has_managed_marker()
@@ -995,6 +1082,58 @@ def _doctor_managed_service_policy(issues: list[str]) -> None:
     print("  watchdog:    ⚠️  installed definition predates managed-service defaults")
     print("               Fix: run `kirocrew service install` once, then restart the service")
     issues.append("managed service definition is outdated")
+
+
+def _doctor_claude_backend() -> None:
+    """Report Claude Code as an optional agent backend, installed or not.
+
+    Its own function, not an inline block, so a test can exercise the reporting
+    without running the whole doctor -- the full ``_doctor()`` shells out to
+    ``kiro-cli whoami`` and probes the host, and a test must not reach an
+    operator's real installation to check three print statements.
+
+    Claude Code needs TWO binaries and the probe names whichever is absent, so a
+    half-install does not read as a total one. Never a hard failure: it is an
+    optional backend and kiro-cli is the floor. The verdict comes from
+    ``agent_sdk.probe_backend`` -- the same owner ``GET /api/acp-backends`` uses --
+    so doctor and the dashboard cannot give different answers.
+    """
+    try:
+        from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE
+        from kiro_crew.agent_sdk import INSTALLED, MISSING, probe_backend
+
+        claude_state = probe_backend(ACP_BACKEND_CLAUDE)
+    except Exception:
+        claude_state = None
+    if claude_state is None:
+        print("  claude-acp:  ⚠️  could not check")
+    elif claude_state.installed == INSTALLED:
+        # The probe resolves the adapter through the spawn's own resolver, which honours
+        # CLAUDE_AGENT_ACP_BIN, a vendored node_modules and a mise shim -- none of which
+        # a plain PATH lookup sees. So `which` is best-effort here and its miss must not
+        # print as a location: naming the path only when we actually have one beats
+        # printing "✅ None" for a working install.
+        #
+        # Says "installed", NOT "selectable": this branch reads the INSTALL probe, and
+        # whether the deployment may select the backend is a separate answer that
+        # ``apply_selectable_denials`` can say no to. Calling an install "selectable"
+        # would print the opposite of the truth on a policy-denied deployment.
+        where = shutil.which(_CLAUDE_ACP_BIN)
+        if where:
+            print(f"  claude-acp:  ✅ {where} (Claude Code installed)")
+        else:
+            print("  claude-acp:  ✅ resolved off PATH (Claude Code installed)")
+    elif claude_state.installed == MISSING:
+        missing = ", ".join(claude_state.missing_components) or "components"
+        print(f"  claude-acp:  ⏭  {missing} not found (optional agent backend)")
+        if claude_state.install_command:
+            print(f"               {claude_state.install_command}")
+    else:
+        # UNKNOWN: the check itself failed. Reporting that as "not found" would send
+        # someone to install what they may already have -- the exact collapse the
+        # probe's three-valued verdict exists to prevent, and which the dashboard
+        # also refuses to make.
+        print("  claude-acp:  ⚠️  could not check")
 
 
 def _doctor_path_launcher() -> None:
@@ -1360,6 +1499,8 @@ def _linger_enabled(user: str) -> bool | None:
             ["loginctl", "show-user", user, "-p", "Linger", "--value"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
@@ -1596,6 +1737,8 @@ def _detect_userspace_oom_killer() -> str | bool | None:
                 [systemctl, "is-active", unit],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
         except (OSError, subprocess.SubprocessError):
@@ -1893,6 +2036,228 @@ def _doctor_model_url_reachable(issues: list[str]) -> None:
         print(f"  model url:   ❌ unreachable ({exc}) {safe}")
         print("               Check network connectivity; the background download will")
         print("               keep retrying with backoff on every gateway boot.")
+
+
+#: Ceiling on each ``aws configure`` probe in the Credentials section. Doctor is
+#: interactive, and an AWS CLI that stalls on a network-backed credential source
+#: must cost a bounded pause rather than hanging the whole run.
+_AWS_PROBE_TIMEOUT_SECS = 10
+
+#: Where an operator can actually READ the packaged blocked-commands doc.
+#: Deliberately a GitHub URL rather than a dashboard page or a repo-relative
+#: path: the dashboard has no Docs surface (packaged docs are reached as GitHub
+#: links, the base `TipCard` uses), and `src/kiro_crew/...` does not exist on a
+#: host that installed the wheel. A pointer an operator cannot follow costs more
+#: trust than no pointer, and this line prints on every run where ~/.aws exists.
+_BLOCKED_COMMANDS_DOC_URL = (
+    "https://github.com/kirodotdev/KiroCrew/blob/main/src/kiro_crew/docs/blocked-commands.md"
+)
+
+
+def _aws_probe_env() -> dict[str, str]:
+    """Child environment for the ``aws configure`` probes.
+
+    Drops the two variables that relocate the CLI's files. This section decides
+    WHETHER to report from ``~/.aws`` existence but asks the CLI for the profile
+    NAMES, and a subprocess inherits the environment — so with
+    ``AWS_CONFIG_FILE`` / ``AWS_SHARED_CREDENTIALS_FILE`` set, the two halves
+    describe DIFFERENT files. That is not hypothetical: the agent sandbox points
+    both at a per-session directory, so ``doctor`` run from such a shell reported
+    a profile that is absent from the operator's own config while its own probe
+    said that config file does not exist. Dropping them makes the CLI resolve the
+    same default locations the existence probe checks, so the halves cannot
+    disagree. Everything else is inherited — ``PATH`` still has to work.
+    """
+    env = dict(os.environ)
+    for relocator in ("AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"):
+        env.pop(relocator, None)
+    return env
+
+
+def _aws_profile_names() -> list[str] | None:
+    """Profiles as the SANCTIONED path reports them. ``None`` = could not ask.
+
+    Deliberately NOT a parse of ``~/.aws/config``. That file sits inside a
+    directory ``security._SENSITIVE_HOME_DIRS`` fences from the agent, and
+    ``kirocrew doctor`` is reachable from a tool call — so opening it here would
+    hand back through a diagnostic exactly what the floor refuses directly,
+    which is the "just use a different reader" move this whole feature exists to
+    talk the agent out of. ``aws configure list-profiles`` is the command the
+    remediation text names and ``test_deny_guidance`` pins as allowed, so the
+    report now comes through the same door the guidance points at.
+
+    ``None`` rather than ``[]`` when the CLI is absent or fails, because "cannot
+    ask" and "asked, and there are none" are different things to tell an
+    operator.
+
+    Resolved through ``trusted_system_bin`` rather than ``PATH``: a gateway's
+    ``PATH`` can lead with a directory the agent itself can write (a worktree
+    venv's ``bin``), and this runs when an OPERATOR types ``kirocrew doctor`` —
+    outside the agent's sandbox. A miss degrades to the same "cannot ask" answer
+    as an absent CLI, which is the honest reading either way.
+    """
+    aws_bin = platform_compat.trusted_system_bin("aws")
+    if not aws_bin:
+        return None
+    try:
+        proc = subprocess.run(
+            [aws_bin, "configure", "list-profiles"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_AWS_PROBE_TIMEOUT_SECS,
+            env=_aws_probe_env(),
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    names: list[str] = []
+    for line in (proc.stdout or "").splitlines():
+        name = line.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def _aws_auto_refreshes() -> bool:
+    """Whether the profile the agent will ACTUALLY use auto-refreshes.
+
+    Asked of the CLI rather than by looking for the string ``credential_process``
+    somewhere in the config file — that substring test answered "yes" when the
+    key belonged to any other profile, so the effective-profile question is both
+    more accurate and reachable without a fenced read. One invocation, resolving
+    the same default profile the agent's own AWS calls will resolve.
+
+    Resolved through ``trusted_system_bin`` for the same reason as the profile
+    probe: this runs under an operator's ``kirocrew doctor``, and a ``PATH`` that
+    leads with an agent-writable directory would let a planted shim answer.
+    """
+    aws_bin = platform_compat.trusted_system_bin("aws")
+    if not aws_bin:
+        return False
+    try:
+        proc = subprocess.run(
+            [aws_bin, "configure", "get", "credential_process"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_AWS_PROBE_TIMEOUT_SECS,
+            env=_aws_probe_env(),
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+
+def _credential_vendor_line() -> str:
+    """The edition's credential-vending MCP servers, or "" when there are none.
+
+    Phrased for the OPERATOR, not reused from the agent's refusal hint: that hint
+    tells its reader to prefer the vendor and says it supersedes "the guidance
+    above", neither of which is true for a human reading a terminal. Only the
+    server ids are shared with the refusal path.
+
+    Runs the capability-manager lookup on its own event loop because ``doctor`` is
+    synchronous. Degrades to "" on any failure — including an already-running loop
+    — since the absence of this line is indistinguishable from the public
+    edition's normal state and must never fail the run.
+    """
+    try:
+        manager = platform_context.safe_context_call(
+            lambda: platform_context.current_context().capability_manager,
+            fallback_factory=lambda: bind_capability_manager(DefaultCapabilityManager()),
+            log_message=None,
+        )
+        if not manager.available():
+            return ""
+        ids = credential_vendor_server_ids(asyncio.run(manager.list_mcp()))
+        if not ids:
+            return ""
+        listed = ", ".join(_safe_display(name) for name in ids)
+        return (
+            f"agents mint credentials through {listed} rather than reading these "
+            "files, so the files being unreadable to them is expected, not a fault."
+        )
+    except Exception:
+        return ""
+
+
+def _doctor_credentials(issues: list[str]) -> None:
+    """Report the AWS / credential posture the agent will actually see.
+
+    Exists because "my agent cannot reach AWS" had no self-service answer: the
+    agent is allowed to run AWS CLI calls but not to read credential files, so a
+    refused read looks identical to having no credentials at all, and nothing on
+    either side of that told the operator which one they had.
+
+    Advisory only, like the pod-session-bus and memory-pressure probes: ``issues``
+    is doctor's exit-code channel, and an unconfigured AWS profile is not a Kiro
+    Crew fault. Reporting it is right; failing on it would make ``doctor`` red on
+    every host that simply does not use AWS.
+
+    No secret value is read or printed, and nothing under ``~/.aws`` is OPENED:
+    the two files are probed for existence, and the profile set and refresh
+    posture come from ``aws configure``, the sanctioned path the guidance itself
+    names. A diagnostic that parsed the fenced file would be the "different
+    reader" this feature talks the agent out of looking for.
+    """
+    del issues  # advisory-only diagnostic; keeps the call-site signature uniform
+    print("\nCredentials")
+    aws_dir = Path.home() / ".aws"
+    has_config = (aws_dir / "config").is_file()
+    has_creds = (aws_dir / "credentials").is_file()
+    if not has_config and not has_creds:
+        print("  aws:         ⏹ no ~/.aws config — agents can still run AWS CLI calls")
+        _print_wrapped(
+            "once you configure one: the SDK resolves credentials itself, so the agent "
+            "never needs to read the files. If you use AWS, run `aws configure sso` or "
+            "`aws configure` in your own terminal."
+        )
+    else:
+        profiles = _aws_profile_names()
+        if profiles:
+            shown = ", ".join(_safe_display(name) for name in profiles[:6])
+            extra = f" (+{len(profiles) - 6} more)" if len(profiles) > 6 else ""
+            print(f"  profiles:    ✅ {shown}{extra}")
+        elif profiles is None:
+            # No aws CLI to ask, and the config file is not ours to read — so the
+            # honest report is that the files exist and the profile set is unknown.
+            print("  profiles:    ℹ️  ~/.aws present; install the AWS CLI to list profiles")
+        elif has_creds:
+            print("  profiles:    ✅ default (from ~/.aws/credentials)")
+        else:
+            print("  profiles:    ⚠️  ~/.aws present but `aws configure` lists no profile")
+        # credential_process is the setup worth calling out: it vends short-lived
+        # credentials on demand, so the agent's AWS calls keep working across a
+        # token expiry without anyone re-running a login.
+        if _aws_auto_refreshes():
+            print("  refresh:     ✅ credential_process configured (auto-refreshing)")
+        else:
+            print("  refresh:     ⏹ no credential_process — credentials may expire mid-task")
+    vendor = _credential_vendor_line()
+    if vendor:
+        print("  vending MCP: ✅ available")
+        _print_wrapped(vendor)
+    print("  note:        ℹ️  agents cannot READ credential files; AWS CLI calls are allowed")
+    if has_config or has_creds:
+        # Only true once something IS configured. On a host with nothing set up the
+        # missing setup is the real answer, and steering the operator away from it
+        # would contradict the "no ~/.aws config" line printed above.
+        _print_wrapped(
+            "So if an agent reports that AWS is unavailable, it most likely hit the "
+            "credential-file block rather than a missing setup — see:"
+        )
+        # Printed OUTSIDE the wrapper on purpose. `_print_wrapped` breaks on width
+        # and split this URL across two lines at its hyphen, which an operator
+        # cannot copy back out intact — a broken link is barely better than the
+        # dead pointer this replaced.
+        print(f"    {_BLOCKED_COMMANDS_DOC_URL}")
+    else:
+        _print_wrapped(
+            "With nothing configured, an agent reporting no AWS access is reporting "
+            "the truth — configure a profile first, then re-run this check."
+        )
 
 
 def _doctor_headless_auth(issues: list[str]) -> None:
@@ -2440,48 +2805,42 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Dependencies ──
     print("Dependencies")
-    # kiro-cli is the default agent backend; claude-agent-acp becomes the
-    # backend when agent.provider is "claude_code" (fork). Report the active
-    # backend as required and the other as optional.
+    # kiro-cli is the DEFAULT agent backend and the floor every deployment keeps.
+    # Claude Code is selectable too (``BASELINE_SELECTABLE_BACKENDS``), so it is
+    # reported as a real optional backend -- present or absent -- rather than only
+    # when it happens to be installed. The verdict comes from the same owner the
+    # dashboard asks, so doctor and the panel cannot disagree.
     _cfg_provider: str = "acp"
     try:
         _loaded = KiroCrewConfig.load()
         _cfg_provider = _loaded.agent.provider or "acp"
     except Exception:
         pass
-    _backend_is_claude = _cfg_provider == "claude_code"
     kiro = shutil.which(KIRO_CLI_BIN)
     if kiro:
-        print(f"  kiro-cli:    {'✅' if not _backend_is_claude else '⏭ '} {kiro}")
-        if not _backend_is_claude:
-            # Check login status — best-effort, never a hard failure
-            try:
-                r = subprocess.run(
-                    [KIRO_CLI_BIN, "whoami"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if r.returncode == 0:
-                    print("  kiro login:  ✅")
-                else:
-                    print("  kiro login:  ⏹ not logged in (run: kiro-cli login)")
-            except Exception:
-                print("  kiro login:  ⚠️  could not check")
+        print(f"  kiro-cli:    ✅ {kiro}")
+        # Check login status — best-effort, never a hard failure
+        try:
+            r = subprocess.run(
+                [KIRO_CLI_BIN, "whoami"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+            )
+            if r.returncode == 0:
+                print("  kiro login:  ✅")
+            else:
+                print("  kiro login:  ⏹ not logged in (run: kiro-cli login)")
+        except Exception:
+            print("  kiro login:  ⚠️  could not check")
         _doctor_headless_auth(issues)
     else:
-        print(f"  kiro-cli:    {'❌' if not _backend_is_claude else '⏭ '} not found")
-        if not _backend_is_claude:
-            print("               Install kiro-cli per its docs, then: kiro-cli login")
+        print("  kiro-cli:    ⏭  not found (the default agent backend)")
+        print("               Install kiro-cli per its docs, then: kiro-cli login")
 
-    claude_acp = shutil.which(_CLAUDE_ACP_BIN)
-    if claude_acp:
-        status = "✅" if _backend_is_claude else "⏭ "
-        print(f"  claude-acp:  {status} {claude_acp}"
-              f"{' (active backend)' if _backend_is_claude else ' (dormant seam)'}")
-    elif _backend_is_claude:
-        print("  claude-acp:  ❌ not found (active backend for provider=claude_code)")
-        print("               Install it with: npm i -g @agentclientprotocol/claude-agent-acp")
+    _doctor_claude_backend()
 
     # ── Fork: router settings validation + connectivity probe ──────────
     if _cfg_provider in ("claude_code", "opencode"):
@@ -2529,6 +2888,8 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
                 ["node", "-v"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=5,
             )
             major = int(node_ver_result.stdout.strip().lstrip("v").split(".")[0])
@@ -2668,9 +3029,16 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
 
     # ── Data Home (+ leftover legacy home) ──
     _doctor_data_home()
+    _doctor_cron_script_sources(issues)
     _doctor_path_launcher()
     _doctor_trust_root()
     _doctor_strict_identity(cfg)
+
+    # ── Credentials (AWS / credential-vending MCP) ──
+    # After identity, before the agent-facing sections: this is the answer to
+    # "the agent says it cannot reach AWS", which is a credential-posture
+    # question rather than an agent one.
+    _doctor_credentials(issues)
 
     # ── Agents dir janitor (orphaned atomic-write temps + stale backups) ──
     _doctor_agents_janitor(issues, cfg.agent.sweep_agents_backups)
@@ -2924,8 +3292,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
                 "               Fix: "
                 + _os_fix_hint(
                     "brew install ffmpeg",
-                    "drop a static ffmpeg build into ~/.local/bin "
-                    "(not in AL2023 repos; Kiro Crew auto-detects it)",
+                    _FFMPEG_LINUX_HINT,
                     windows="winget install Gyan.FFmpeg",
                 )
             )
@@ -2944,7 +3311,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  transcribe:  ✅ amazon_transcribe importable (optional)")
         except ImportError:
             print("  transcribe:  ⏹ optional cloud STT not installed")
-            print("               Install: pip install 'kirocrew[voice]'")
+            print(f"               Install: {install_hint('voice-aws')}")
 
         try:
             import boto3  # noqa: F401
@@ -2952,7 +3319,7 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
             print("  boto3:       ✅ importable (optional)")
         except ImportError:
             print("  boto3:       ⏹ optional AWS SDK not installed")
-            print("               Install: pip install 'kirocrew[voice]'")
+            print(f"               Install: {install_hint('voice-aws')}")
 
     # Apple's on-device speech is a host capability rather than an install, so the
     # only useful thing to print is the reason it cannot run. Reaching a not-ok
@@ -3077,6 +3444,25 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
                     print("  MainThread stuck at:")
                     for _line in _stack:
                         print(f"    {_line}")
+                # Who the loop was working for. Read from the dump's wedged
+                # stack and the cron in-flight markers on disk -- no gateway
+                # needed -- and phrased as evidence plus the one action it
+                # supports, or the statement that it supports none.
+                _attribution = attribute_dump(_latest, config_dir())
+                print("  attribution:")
+                for _line in describe(_attribution):
+                    print(f"    {_line}")
+                # Same predicate as the breaker and describe(): a lone marker
+                # under a chat/Slack stack is a bystander, not the culprit.
+                if _attribution.is_cron and _attribution.job is not None:
+                    _paused_job = job_pause_state_from_disk(_attribution.job.job_id)
+                    if _paused_job is not None:
+                        print(f"    job is currently {_paused_job}")
+                    issues.append(
+                        "loop-stall dump attributed to cron job "
+                        f"{_safe_display(_attribution.job.name)} "
+                        f"({_safe_display(_attribution.job.job_id)})"
+                    )
                 issues.append(f"recent loop-stall crash dump ({_age_h:.0f}h ago)")
             else:
                 print(
@@ -3092,7 +3478,12 @@ def _doctor(platform_boot_error: "Exception | None" = None, bundle: bool = False
     print("\nConnectivity")
     if kiro:
         kiro_result = subprocess.run(
-            [KIRO_CLI_BIN, "--version"], capture_output=True, text=True, timeout=5
+            [KIRO_CLI_BIN, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
         )
         if kiro_result.returncode == 0:
             ver = kiro_result.stdout.strip() or kiro_result.stderr.strip()

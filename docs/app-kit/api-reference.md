@@ -13,16 +13,24 @@ How you talk to the Gateway depends on where your code runs:
   [getting-started.md](getting-started.md) and the [App SDK Hooks](#app-sdk-hooks)
   section below.
 - **Python apps / external CLI tools / services** — use the standalone
-  `kirocrew-client` package (`pip install kirocrew-client`). It is async
-  (`aiohttp`) and has no dependency on the KiroCrew main package. See the
-  [Python Client](#python-client) section.
+  `kirocrew-client` package, carried in this repository under
+  `packages/kirocrew-client-py/`. It is async (`aiohttp`) and has no dependency on
+  the Kiro Crew main package, but it is not published to PyPI — use it from a source
+  checkout. See the [Python Client](#python-client) section.
 - **Node.js / Electron apps** — call the Gateway REST/WS endpoints directly via
   `fetch()` / a WebSocket. The full endpoint list is in
   [Gateway REST API Endpoints](#gateway-rest-api-endpoints).
 
-There is no published TypeScript gateway-client npm package. The `kirocrew-client`
-method names below describe the canonical Gateway API surface — the same
-endpoints any client (including raw `fetch`) talks to.
+There is no published TypeScript gateway-client npm package, and none is planned
+here — the camelCase names used throughout the sections below are **labels for
+Gateway endpoints**, not callable methods. Read them as endpoint identifiers.
+The `@kirocrew/app-sdk` hooks are real and callable — see the next section; they
+resolve from the host import map. The `kirocrew-client` Python package is **not
+published**: it lives in this repository under `packages/kirocrew-client-py/`, is
+outside the installed distribution, and has no release on PyPI, so `pip install
+kirocrew-client` does not work. Use it from a source checkout, or call the
+endpoints directly with `fetch` or `aiohttp`. Its method list is in
+[Python Client](#python-client).
 
 ## App SDK Hooks (dashboard UI)
 
@@ -44,6 +52,31 @@ function MyPage() {
 paths your `app.json` declares. The host injects auth automatically.
 
 For the full hook list see [getting-started.md](getting-started.md#app-sdk-hooks).
+
+## Native Chat Panel
+
+`ChatPanel` mounts Kiro Crew's native chat experience for an existing session. The required
+`slotKey` selects the session. By default, the component keeps the standard embedded ChatPage
+behavior.
+
+```tsx
+import { ChatPanel } from '@kirocrew/app-sdk'
+
+<ChatPanel slotKey="coder-abc123" />
+```
+
+Set `conversationOnly` when the host app already provides navigation and needs the conversation
+without ChatPage's sessions rail. This mode keeps the native transcript, composer, and composer
+controls, and it leaves the host page in charge of the browser URL.
+
+```tsx
+<ChatPanel slotKey="coder-abc123" conversationOnly />
+```
+
+| Prop | Type | Required | Purpose |
+|---|---|---|---|
+| `slotKey` | `string` | yes | Select the Kiro Crew session rendered by the panel |
+| `conversationOnly` | `boolean` | no | Hide ChatPage's sessions rail and disable ChatPage URL synchronization |
 
 ## Chat Marker Protocol
 
@@ -237,11 +270,16 @@ that genuinely needs live app state is supplied by the host as an entry.
 
 ## Gateway API Surface
 
-The sections below document the canonical Gateway API surface as exposed by the
-`kirocrew-client` Python package (see the [Python Client](#python-client)
-section for the constructor and full method list). Method names are also a
-convenient way to refer to each endpoint — the same endpoints any client
-(including raw `fetch`) talks to.
+The sections below name the Gateway API surface. A name here is an **endpoint
+label**, not a guarantee that a client method exists for it: the source-only
+`kirocrew-client` Python package covers part of this surface, and
+[Python Client](#python-client) marks which part. For anything it does not
+implement, call the endpoint directly — the paths are in
+[Gateway REST API Endpoints](#gateway-rest-api-endpoints).
+
+The `Returns` column describes the response shape. It is not a TypeScript type:
+no TypeScript client ships, so `SlotInfo`, `GatewayStatus`, `SystemInfo` and
+their siblings are response-shape names rather than importable types.
 
 When `app_name` is set and no explicit auth is provided, the client auto-reads
 the app secret from `~/.kiro/crew/apps/{name}/.app_secret` and exchanges it
@@ -251,26 +289,26 @@ for a short-lived token via `POST /api/apps/{name}/token`.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `authenticate()` | `Promise<boolean>` | Exchange app secret for token (auto-called if appName set) |
+| `authenticate()` | `boolean` | Exchange app secret for token (auto-called if appName set) |
 | `setToken(token)` | `void` | Manually set auth token on both HTTP and WS clients |
 
 ### Connection
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `ping()` | `Promise<boolean>` | Check if Gateway is reachable |
-| `getStatus()` | `Promise<GatewayStatus>` | Gateway health (version, uptime, slots, provider) |
-| `getSystemInfo()` | `Promise<SystemInfo>` | CPU, memory, disk metrics |
+| `ping()` | `boolean` | Check if Gateway is reachable |
+| `getStatus()` | `GatewayStatus` | Gateway health (version, uptime, slots, provider) |
+| `getSystemInfo()` | `SystemInfo` | CPU, memory, disk metrics |
 
 ### Chat Slots
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `createSlot(name, agent?)` | `Promise<SlotInfo>` | Create a new chat session |
-| `listSlots()` | `Promise<SlotInfo[]>` | List all active sessions |
-| `deleteSlot(slotId)` | `Promise<void>` | Remove a session |
-| `getSlotHistory(slotId, limit?)` | `Promise<{messages, total}>` | Get slot message history |
-| `sendMessage(slotId, message)` | `Promise<void>` | Send a message (validates length, auto-flushes pending context) |
+| `createSlot(name, agent?)` | `SlotInfo` | Create a new chat session |
+| `listSlots()` | `SlotInfo[]` | List all active sessions |
+| `deleteSlot(slotId)` | `—` (no body) | Remove a session |
+| `getSlotHistory(slotId, limit?)` | `{messages, total}` | Get slot message history |
+| `sendMessage(slotId, message)` | `—` (no body) | Send a message (validates length, auto-flushes pending context) |
 
 ### WebSocket Events
 
@@ -298,21 +336,21 @@ WebSocket event types: `chat_chunk`, `chat_done`, `chat_message`, `chat_error`,
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `spawn(task, agent?)` | `Promise<string>` | Spawn a background subagent |
-| `spawnMany(tasks, agents?)` | `Promise<string[]>` | Spawn multiple subagents in parallel |
-| `listSubagents()` | `Promise<SubagentInfo[]>` | List all subagents |
-| `getSubagentStatus(id)` | `Promise<SubagentResult>` | Get subagent output |
+| `spawn(task, agent?)` | `string` | Spawn a background subagent |
+| `spawnMany(tasks, agents?)` | `string[]` | Spawn multiple subagents in parallel |
+| `listSubagents()` | `SubagentInfo[]` | List all subagents |
+| `getSubagentStatus(id)` | `SubagentResult` | Get subagent output |
 
 ### Cron Jobs
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `addCron(name, options)` | `Promise<CronJob>` | Create a scheduled job |
-| `listCrons()` | `Promise<CronJob[]>` | List all cron jobs |
-| `updateCron(id, options)` | `Promise<CronJob>` | Update a cron job |
-| `removeCron(id)` | `Promise<void>` | Delete a cron job |
-| `pauseCron(id)` | `Promise<void>` | Pause without deleting |
-| `resumeCron(id)` | `Promise<void>` | Resume a paused job |
+| `addCron(name, options)` | `CronJob` | Create a scheduled job |
+| `listCrons()` | `CronJob[]` | List all cron jobs |
+| `updateCron(id, options)` | `CronJob` | Update a cron job |
+| `removeCron(id)` | `—` (no body) | Delete a cron job |
+| `pauseCron(id)` | `—` (no body) | Pause without deleting |
+| `resumeCron(id)` | `—` (no body) | Resume a paused job |
 
 #### Watching something without paying for a model call (`kiro_crew.irq`)
 
@@ -332,7 +370,7 @@ Schedule a **script** cron instead and build it on `kiro_crew.irq`, the
 interrupt controller. The script runs in a subprocess with no model call at
 all; a quiet tick is free. Only an unexpected observation raises a wake, and the
 wake is delivered into the session that armed the cron as a real agent turn.
-Full design: `docs/system-specs/features/agent-interrupt-controller.md`.
+Full design: `docs/system-specs/modules/agent-interrupt-controller.md`.
 
 You write the two things that are your domain knowledge — what to poll, and
 what counts as an anomaly — and the module owns masking (so one condition wakes
@@ -412,44 +450,44 @@ Rules:
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `addLesson(rule, category, scope?)` | `Promise<void>` | Save a learned rule |
-| `listLessons()` | `Promise<Lesson[]>` | List all lessons |
-| `removeLesson(query)` | `Promise<void>` | Remove matching lessons |
+| `addLesson(rule, category, scope?)` | `—` (no body) | Save a learned rule |
+| `listLessons()` | `Lesson[]` | List all lessons |
+| `removeLesson(query)` | `—` (no body) | Remove matching lessons |
 
 ### Notifications
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `sendNotification(text, options?)` | `Promise<void>` | Send via Slack or dashboard |
-| `listNotifications()` | `Promise<{notifications}>` | List notifications |
-| `ackNotifications()` | `Promise<void>` | Acknowledge all notifications |
+| `sendNotification(text, options?)` | `—` (no body) | Send via Slack or dashboard |
+| `listNotifications()` | `{notifications}` | List notifications |
+| `ackNotifications()` | `—` (no body) | Acknowledge all notifications |
 
 ### Approvals
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `approveAction(slotId, taskId)` | `Promise<void>` | Approve a pending tool action |
-| `rejectAction(slotId, taskId)` | `Promise<void>` | Reject a pending tool action |
-| `resolveApproval(approvalId, approved)` | `Promise<void>` | Resolve an approval by ID |
-| `getApprovalMode()` | `Promise<'auto'\|'interactive'>` | Get current approval mode |
-| `setApprovalMode(mode)` | `Promise<void>` | Set approval mode |
+| `approveAction(slotId, taskId)` | `—` (no body) | Approve a pending tool action |
+| `rejectAction(slotId, taskId)` | `—` (no body) | Reject a pending tool action |
+| `resolveApproval(approvalId, approved)` | `—` (no body) | Resolve an approval by ID |
+| `getApprovalMode()` | `'auto'` \| `'interactive'` | Get current approval mode |
+| `setApprovalMode(mode)` | `—` (no body) | Set approval mode |
 
 ### Models
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `listModels()` | `Promise<ModelInfo[]>` | List available LLM models |
-| `setSlotModel(slotId, model)` | `Promise<void>` | Set model for a slot |
+| `listModels()` | `ModelInfo[]` | List available LLM models |
+| `setSlotModel(slotId, model)` | `—` (no body) | Set model for a slot |
 
 ### MCP Servers
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `listMcpServers()` | `Promise<McpServerInfo[]>` | List registered MCP servers |
-| `registerMcpServer(def)` | `Promise<void>` | Register an MCP server (requires name + command) |
-| `removeMcpServer(name)` | `Promise<void>` | Remove an MCP server |
-| `registerAppMcp(name, entry)` | `Promise<void>` | Write MCP entry to `~/.kiro/crew/mcp.json` (Node.js only) |
-| `unregisterAppMcp(name)` | `Promise<void>` | Remove MCP entry from `~/.kiro/crew/mcp.json` (Node.js only) |
+| `listMcpServers()` | `McpServerInfo[]` | List registered MCP servers |
+| `registerMcpServer(def)` | `—` (no body) | Register an MCP server (requires name + command) |
+| `removeMcpServer(name)` | `—` (no body) | Remove an MCP server |
+| `registerAppMcp(name, entry)` | `—` (no body) | Write MCP entry to `~/.kiro/crew/mcp.json` (Node.js only) |
+| `unregisterAppMcp(name)` | `—` (no body) | Remove MCP entry from `~/.kiro/crew/mcp.json` (Node.js only) |
 
 ### Agent & Skill Installation (Node.js only)
 
@@ -464,30 +502,30 @@ Rules:
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `dispatchAgent(agent, prompt)` | `Promise<TaskResult>` | Run agent synchronously |
-| `dispatchAgentAsync(agent, prompt)` | `Promise<string>` | Run agent in background |
-| `getTaskResult(taskId)` | `Promise<TaskResult>` | Poll task status |
+| `dispatchAgent(agent, prompt)` | `TaskResult` | Run agent synchronously |
+| `dispatchAgentAsync(agent, prompt)` | `string` | Run agent in background |
+| `getTaskResult(taskId)` | `TaskResult` | Poll task status |
 
 ### Gateway Config
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getGatewayConfig(key)` | `Promise<Record<string, unknown>>` | Read gateway config section |
-| `setGatewayConfig(key, value)` | `Promise<void>` | Write gateway config section |
+| `getGatewayConfig(key)` | a JSON object | Read gateway config section |
+| `setGatewayConfig(key, value)` | `—` (no body) | Write gateway config section |
 
 ### App Storage
 
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `getAppDataDir()` | `string` | App-scoped data directory path |
-| `getAppConfig()` | `Promise<Record<string, unknown>>` | Read app config via REST |
-| `setAppConfig(config)` | `Promise<void>` | Write app config via REST |
+| `getAppConfig()` | a JSON object | Read app config via REST |
+| `setAppConfig(config)` | `—` (no body) | Write app config via REST |
 
 ### Memory
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `memorySearch(query, topK?)` | `Promise<MemoryResult[]>` | Semantic memory search |
+| `memorySearch(query, topK?)` | `MemoryResult[]` | Semantic memory search |
 
 ### Context Injection
 
@@ -495,8 +533,8 @@ Silent background context for LLM — content appears in the next user-initiated
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `injectContext(slotId, content, options?)` | `Promise<void>` | Inject context (null slotId = buffer locally) |
-| `flushPendingContext(slotId)` | `Promise<void>` | Flush buffered entries to a slot |
+| `injectContext(slotId, content, options?)` | `—` (no body) | Inject context (null slotId = buffer locally) |
+| `flushPendingContext(slotId)` | `—` (no body) | Flush buffered entries to a slot |
 | `setDefaultSlot(slotId)` | `void` | Auto-flush pending context on sendMessage |
 | `pendingContextCount` | `number` | Number of buffered context entries |
 
@@ -528,7 +566,6 @@ Verify that an incoming request was signed by the KiroCrew gateway reverse proxy
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `verifyProxyRequest(req, appName, opts?)` | `boolean` | Verify HMAC signature on any Node.js request object |
 
 Options: `{ secret?: string, maxAgeSecs?: number }`
 
@@ -536,8 +573,10 @@ Options: `{ secret?: string, maxAgeSecs?: number }`
 
 ## Python Client
 
-Standalone async client using `aiohttp` — `pip install kirocrew-client`. Covers
-the full Gateway API surface documented above.
+Standalone async client using `aiohttp`, carried in this repository under
+`packages/kirocrew-client-py/`. It is not published to PyPI, so use it from a
+source checkout rather than by installing it. It covers part of the Gateway API
+surface documented above.
 
 ```python
 from kirocrew_client import KiroCrewClient
@@ -564,8 +603,16 @@ KiroCrewClient(
 
 ### Method Reference
 
-Method names use `snake_case` per Python convention. The left column is the
-canonical API-surface name used in the sections above:
+The left column is the endpoint label used in the sections above; the right
+column is the shipped Python method, in `snake_case` per Python convention.
+
+Rows marked *not implemented* are Gateway endpoints the shipped Python client
+does not wrap yet. Call those endpoints directly with `aiohttp` (or any HTTP
+client) using the paths in
+[Gateway REST API Endpoints](#gateway-rest-api-endpoints). The client also ships
+no WebSocket surface, so the `connect` / `disconnect` / `on*` handlers in
+[WebSocket Events](#websocket-events) are endpoint documentation for a raw
+WebSocket connection rather than client methods.
 
 | API surface | Python |
 |-----------|--------|
@@ -575,7 +622,7 @@ canonical API-surface name used in the sections above:
 | `createSlot(name, agent?)` | `create_slot(name, agent="")` |
 | `listSlots()` | `list_slots()` |
 | `deleteSlot(id)` | `delete_slot(id)` |
-| `getSlotHistory(id, limit?)` | `get_slot_history(id, limit=50)` |
+| `getSlotHistory(id, limit?)` | *not implemented — call the endpoint* |
 | `sendMessage(id, msg)` | `send_message(id, msg)` |
 | `spawn(task, agent?)` | `spawn(task, agent="")` |
 | `spawnMany(tasks, agents?)` | `spawn_many(tasks, agents=None)` |
@@ -591,26 +638,26 @@ canonical API-surface name used in the sections above:
 | `listLessons()` | `list_lessons()` |
 | `removeLesson(query)` | `remove_lesson(query)` |
 | `sendNotification(text, opts?)` | `send_notification(text, **opts)` |
-| `listNotifications()` | `list_notifications()` |
-| `ackNotifications()` | `ack_notifications()` |
-| `approveAction(slot, task)` | `approve_action(slot, task)` |
-| `rejectAction(slot, task)` | `reject_action(slot, task)` |
-| `resolveApproval(id, ok)` | `resolve_approval(id, ok)` |
-| `getApprovalMode()` | `get_approval_mode()` |
-| `setApprovalMode(mode)` | `set_approval_mode(mode)` |
-| `listModels()` | `list_models()` |
-| `setSlotModel(slot, model)` | `set_slot_model(slot, model)` |
-| `getGatewayConfig(key)` | `get_gateway_config(key)` |
-| `setGatewayConfig(key, val)` | `set_gateway_config(key, val)` |
+| `listNotifications()` | *not implemented — call the endpoint* |
+| `ackNotifications()` | *not implemented — call the endpoint* |
+| `approveAction(slot, task)` | *not implemented — call the endpoint* |
+| `rejectAction(slot, task)` | *not implemented — call the endpoint* |
+| `resolveApproval(id, ok)` | *not implemented — call the endpoint* |
+| `getApprovalMode()` | *not implemented — call the endpoint* |
+| `setApprovalMode(mode)` | *not implemented — call the endpoint* |
+| `listModels()` | *not implemented — call the endpoint* |
+| `setSlotModel(slot, model)` | *not implemented — call the endpoint* |
+| `getGatewayConfig(key)` | *not implemented — call the endpoint* |
+| `setGatewayConfig(key, val)` | *not implemented — call the endpoint* |
 | `listMcpServers()` | `list_mcp_servers()` |
 | `registerMcpServer(def)` | `register_mcp_server(name, cmd, args?, env?)` |
 | `removeMcpServer(name)` | `remove_mcp_server(name)` |
-| `registerAppMcp(name, entry)` | `register_app_mcp(name, *, url?, cmd?, ...)` |
-| `unregisterAppMcp(name)` | `unregister_app_mcp(name)` |
-| `installAgentConfig(name, cfg)` | `install_agent_config(name, cfg)` |
-| `removeAgentConfig(name)` | `remove_agent_config(name)` |
-| `installSkill(name, dir)` | `install_skill(name, dir)` |
-| `removeSkill(name)` | `remove_skill(name)` |
+| `registerAppMcp(name, entry)` | *not implemented — call the endpoint* |
+| `unregisterAppMcp(name)` | *not implemented — call the endpoint* |
+| `installAgentConfig(name, cfg)` | *not implemented — call the endpoint* |
+| `removeAgentConfig(name)` | *not implemented — call the endpoint* |
+| `installSkill(name, dir)` | *not implemented — call the endpoint* |
+| `removeSkill(name)` | *not implemented — call the endpoint* |
 | `dispatchAgent(agent, prompt)` | `dispatch_agent(agent, prompt)` |
 | `dispatchAgentAsync(agent, prompt)` | `dispatch_agent_async(agent, prompt)` |
 | `getTaskResult(id)` | `get_task_result(id)` |
@@ -626,8 +673,6 @@ canonical API-surface name used in the sections above:
 
 | API surface | Python |
 |-----------|--------|
-| `verifyProxyRequest(req, appName, opts?)` | `verify_proxy_request(request, app_name, *, secret?, max_age_secs?)` |
-| — | `verify_proxy_request_raw(header, method, path, app_name, ...)` |
 
 ---
 
@@ -737,22 +782,38 @@ app secret as the key, where `sha256(body)` is the hex SHA-256 digest of the raw
 tampered body invalidates the signature. Backends verify with a constant-time comparison and
 reject requests whose timestamp is not within ±60s of now.
 
-Python app backends verify this with `kirocrew-client`:
+A Python app backend whose environment can import `kiro_crew` (the built-in app backends run as child processes and still import it) verifies this with the gateway's own helper:
 
 ```python
-from kirocrew_client import verify_proxy_request
-if not verify_proxy_request(request, 'my-app'): return Response(status=401)
+from kiro_crew.apps.proxy_auth import raw_request_target, verify_proxy_request
+
+body = await request.read()
+if not verify_proxy_request(
+    request.headers.get('X-KiroCrew-Proxy', ''),
+    method=request.method,
+    target=raw_request_target(request),
+    body=body,
+):
+    return Response(status=401)
 ```
+
+Every argument after the header value is keyword-only. Pass the target through
+`raw_request_target`: the gateway signs the request-target exactly as it went on
+the wire, and rebuilding it from a decoded path diverges from the signed bytes as
+soon as a query parameter carries a space or a non-ASCII character.
+
+A backend that cannot import `kiro_crew` (a different language, or a Python
+environment without the package) computes the HMAC itself, exactly as the Node.js
+paragraph below describes.
 
 Node.js app backends can verify the signature directly: compute
 `HMAC-SHA256(timestamp:method:/api/path[?query]:sha256(body), app_secret)` and compare against
 the value in the `X-KiroCrew-Proxy` header (constant-time), rejecting stale timestamps.
 
-> **Breaking change (body-bound signature):** `verify_proxy_request` /
-> `verify_proxy_request_raw` in the `kirocrew-client` package MUST be regenerated in lockstep
-> to bind `sha256(body)` while keeping the constant-time compare and ±60s freshness. A gateway
-> that signs body-bound HMACs will fail verification against any deployed old verifier, so the
-> client release must ship together with this change.
+> **Body-bound signature:** every verifier must bind `sha256(body)` while keeping the
+> constant-time compare and the ±60s freshness window. A gateway that signs body-bound
+> HMACs fails verification against any verifier that omits the body hash, so a
+> backend that implements the HMAC itself has to be updated in lockstep with the gateway.
 
 ## App Dev Mode (live reload)
 
@@ -760,25 +821,121 @@ Dev mode speeds up app-UI iteration: no manual copy-and-hard-refresh loop. When
 an installed app is in dev mode the gateway serves its UI files with
 `Cache-Control: no-store` and watches the app's `ui/` directory; on any file
 change it broadcasts an `app_reload` WebSocket event and the dashboard reloads
-the app so edits appear immediately. The recommended setup symlinks
-`~/.kiro/crew/apps/<name>/ui/` to your source tree so the watcher sees edits at
-the real files.
+the app so edits appear immediately.
+
+The recommended setup symlinks the **whole `ui/` directory** —
+`~/.kiro/crew/apps/<name>/ui` → your source tree — so the watcher sees edits at
+the real files. Link the directory, **never individual files inside it**: the
+UI route opens the final path component with `O_NOFOLLOW` (a swap-resistant
+open), so a per-file symlink like `ln -s ~/src/app/dist/index.mjs ui/index.mjs`
+answers `404` — indistinguishable from "not built yet". The directory link
+works because the route resolves the ui root *through* the link before
+validating files against it.
 
 **Contract surface:**
 
 - **`installed.json` field — `dev: bool`** (default `false`): persisted per-app
   flag. Tolerant on read (absent ⇒ `false`); reversible; no migration needed.
-  Builtin apps cannot enter dev mode.
+  Builtin apps cannot enter dev mode. This field controls **watching and
+  `no-store` serving only** — it is app-writable metadata and never authorizes
+  anything by itself (see the grant record below).
 - **Endpoint — `POST /api/apps/{name}/dev`**, body `{"enabled": <bool>}`.
   Returns `{"name": <name>, "dev": <bool>}`. `400` for a non-boolean body,
-  a builtin app, or an unsafe app name; `404` if the app is not installed.
-  Behind the standard gateway auth; emits an `app_dev_mode` SEL audit event.
+  a builtin app, an unsafe app name, or a refused grant (see below); `404` if
+  the app is not installed. Behind the standard gateway auth; emits an
+  `app_dev_mode` SEL audit event. The endpoint deliberately has no field to
+  confirm an out-of-install root — that confirmation is CLI-only (below).
 - **WebSocket event — `app_reload`**, payload `{"app": <name>, "ts": <float>}`.
   Re-dispatched to the frontend as the `mc:app-reload` window CustomEvent; the
   AppHost triggers a full page reload for the matching app.
-- **CLI — `kirocrew app dev <name> [--off]`**: toggles the flag out-of-process;
-  the gateway watcher picks up the change within one poll interval, so no
-  gateway restart is needed.
+- **CLI — `kirocrew app dev <name> [--off] [--confirm-out-of-install-root]`**:
+  toggles the flag out-of-process; the gateway watcher picks up the change
+  within one poll interval, so no gateway restart is needed.
+
+### The operator grant record
+
+Enabling dev mode also records an **operator grant**: a file at the apps root
+(`~/.kiro/crew/apps/.dev-grants.json`) mapping the app name to the ui root's
+**resolved path at toggle time** (`realpath` of `<install>/ui`). It is written
+**only by the dev-mode toggle** (and revoked on disable/uninstall) — never by
+the gateway's startup reconcile, and never derived from `installed.json`. The
+UI route requires it before serving a ui root that resolves **outside the
+app's install directory**: without a grant that exactly matches the current
+resolved root, out-of-install files answer `400`.
+
+Two files, two jobs: `installed.json` `dev` (plus an internal sentinel cache,
+below) drives *watching and cache headers*; the grant record is the
+*authorization*. An app can write `dev: true` into its own metadata, but it
+cannot mint a grant — that separation is what stops an app from pointing `ui`
+at an arbitrary directory and having the UI route serve it.
+
+Because the grant binds one exact resolved root, it is **self-invalidating**:
+repointing `ui` after the toggle (an app update, a swapped link, a reinstall
+under the same name) yields a root that no longer equals the granted one, and
+the route answers `400` for those files until the operator re-toggles.
+**Re-toggle after re-pointing** is the workflow — run the toggle again (enable
+while already enabled is fine) to bind the grant to the new root. The same
+applies after upgrading from a gateway version that predates the grant record:
+an app already in dev mode on an out-of-install root has no grant, so its UI
+answers `400` until one re-toggle.
+
+### Refused and confirmed grants
+
+The toggle validates the resolved ui root **before writing anything** (a
+refusal never disturbs existing state):
+
+- **Sensitive roots are never grantable.** A root that resolves *into* a
+  sensitive location (credential stores, key material) or *contains* sensitive
+  leaves at toggle time is refused outright with `400` and an error naming the
+  resolved root — no confirmation can override this. The screen is
+  **point-in-time**: it inspects the tree as it exists when the toggle runs,
+  and serving afterwards re-checks only that the resolved root still equals
+  the granted one. Confirming a grant approves the *tree location*, not a
+  permanent screen of its future contents.
+- **Out-of-install roots are refused over HTTP; confirm from the host.**
+  App UI bundles run as same-origin modules with the dashboard's own
+  credentials, so a request-body flag can never prove operator intent — the
+  endpoint therefore has no confirmation field at all. Enabling dev mode on a
+  root outside the install directory always answers `400` with
+  `code: "dev_mode_out_of_install_confirmation_required"` and an error naming
+  the fix: run `kirocrew app dev <name> --confirm-out-of-install-root` on the
+  gateway host. The CLI is the confirmation boundary because running it
+  requires the operator's own process on the host — a boundary page code
+  cannot cross. This gate is a fail-closed default that blocks self-granting
+  and unwitting scripted callers; the load-bearing serving guarantees remain
+  the resolved-root equality binding and the sensitivity screen. Roots inside
+  the install directory need no confirmation.
+- **The flag is operator-only on the agent side too — three tiers.** First,
+  the builtin agent deny rule
+  `self-protection-dev-mode-out-of-root-confirm` refuses any agent shell
+  command carrying the flag — matched both as literal text and, via the
+  rule's argv floor, on the shell-de-escaped command, so quote-splitting the
+  token (`--confirm-out-of-install-'root'`) is denied the same as the plain
+  spelling; the `dev` subparser is built with `allow_abbrev=False`, so
+  argparse rejects abbreviated spellings (`--confirm`) that would otherwise
+  reach the flag without its literal text ever appearing. Second — because a
+  command can *synthesize* the flag at runtime (`$(printf ...)`) so that no
+  command-text scan sees it — the flag's consumption point performs a
+  runtime human-vs-agent check: a process showing evidence of agent-shell
+  confinement (the launcher-set sandbox marker, or on macOS the kernel's own
+  Seatbelt verdict) is refused with
+  `code: "dev_mode_operator_attestation_required"`. Third — because an
+  environment can be scrubbed — the grant record itself
+  (`~/.kiro/crew/apps/.dev-grants.json`) is sealed read-only inside the
+  agent OS sandbox (Seatbelt / mount namespaces, alongside the other
+  keystone ceilings), so a sandboxed process cannot mint, extend, or rewrite
+  a grant no matter how the toggle is spelled; the gateway materializes the
+  record at startup so the seal always has a target, and any grant-touching
+  toggle from a process that cannot write the record is refused up front
+  (`code: "dev_mode_grant_record_readonly"`, SEL-audited) rather than
+  half-applied — use the dashboard toggle from such a process. The
+  confirmation must come from the operator's own terminal, which none of
+  these tiers govern.
+- **Both outcomes are audited.** The unconfirmed refusal and the confirmed
+  grant each emit a security event log (SEL) entry
+  (`operation: dev_mode_out_of_install_grant`, outcome `denied`/`granted`,
+  naming the resolved root); the granted event is written only after the
+  grant record lands.
 
 **Cost model:** dev mode is off for essentially all gateways. The
 authoritative per-app state is the `installed.json` `dev` field above; to keep
@@ -792,4 +949,6 @@ UI-serving hot path decide the cache header with no per-request disk IO. This
 sentinel is a derived cache and **not** part of the App Kit contract: its path,
 name, and format are internal implementation details, may change without
 notice, and must not be read or written by app or third-party tooling — treat
-`installed.json` `dev` as the only supported source of truth.
+`installed.json` `dev` as the only supported source of truth for the flag, and
+the grant record as gateway-owned (written only through the toggle, never
+directly).

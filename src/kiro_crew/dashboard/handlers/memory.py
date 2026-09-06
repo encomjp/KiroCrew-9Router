@@ -41,6 +41,7 @@ from kiro_crew.embeddings import (
 from kiro_crew.executors import embed_executor, run_in_embed_pool
 from kiro_crew.history import is_incognito_transcript
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.platform_compat import kill_and_reap
 from kiro_crew.sandbox import (
     SandboxUnavailableError,
@@ -51,7 +52,7 @@ from kiro_crew.sandbox import (
 )
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
-from ._shared import _get_memory, _is_restricted_session, _redact_memory_field
+from ._shared import _get_memory, _is_restricted_session, _redact_memory_field, read_bounded_json
 from .cron import _recognize_session
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,29 @@ _history_write_lock = LoopBoundLock()
 # loader publishes into an embedder we close, and close() is terminal.
 _MODEL_LOAD_TIMEOUT_SECS = 600.0
 
+# Log-line budget for pip/ensurepip stderr in the warnings below.
+_PIP_STDERR_LOG_CHARS = 500
+
+
+def _redact_pip_stderr(raw: bytes) -> str:
+    """Redact pip/ensurepip stderr for a log line, then bound its length.
+
+    Through the CONTEXT rather than `security.redact_and_truncate`: a pip failure
+    is prime territory for a host-specific credential shape (an internal registry
+    cookie, a token in an index URL), and those live in a loaded companion's
+    regexes rather than in the OSS baseline. Reading the baseline here would scan a
+    companion host's stderr with the weaker pass and log what it missed. The
+    `_log_` spelling is the one that cannot raise, which this path needs: the
+    caller is reporting a failure, and losing the report is worse than losing the
+    line.
+
+    Redact BEFORE bounding. Slicing first can cut a credential in half, and half a
+    token no longer matches the redactors' patterns (an AWS key ID needs its full
+    20 characters), so the surviving fragment would reach gateway.log verbatim. The
+    character cap is for log volume, so it belongs last.
+    """
+    return redact_log_via_context(raw.decode(errors="replace"))[:_PIP_STDERR_LOG_CHARS]
+
 
 def _sel():
     """Late-binding sel() for test monkeypatch compatibility."""
@@ -84,10 +108,10 @@ async def api_memory_preferences(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     mem = _get_memory(state)
     if request.method == "PUT":
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        body, body_err = await read_bounded_json(request, max_bytes=None)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
         content = body.get("content", "")
         # Offloaded to a worker thread: write_preferences does synchronous
         # atomic file I/O plus an FTS index update, and this handler runs on
@@ -110,10 +134,10 @@ async def api_memory_projects(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     mem = _get_memory(state)
     if request.method == "PUT":
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        body, body_err = await read_bounded_json(request, max_bytes=None)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
         content = body.get("content", "")
         # Offloaded for the same reason as api_memory_preferences above.
         async with _projects_write_lock:
@@ -127,10 +151,10 @@ async def api_memory_history(request: web.Request) -> web.Response:
     state: DashboardState = request.app["state"]
     mem = _get_memory(state)
     if request.method == "PUT":
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        body, body_err = await read_bounded_json(request, max_bytes=None)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
         content = body.get("content", "")
         # Write to today's history file. Offloaded like the two handlers
         # above (synchronous file I/O on the event loop stalls every other
@@ -150,10 +174,10 @@ async def api_memory_settings(request: web.Request) -> web.Response:
     """GET/PUT /api/memory/settings — memory consolidation config."""
     cfg = KiroCrewConfig.load()
     if request.method == "PUT":
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        body, body_err = await read_bounded_json(request, max_bytes=None)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
         # Read existing config, update memory section only
         # Validated BEFORE the transaction: none of it reads the config, and a
         # 400 should not have taken the lock or occupied a worker.
@@ -231,6 +255,7 @@ def _get_vector_store(state: DashboardState):
         store = VectorMemoryStore(
             embedding_dim=cfg.memory.embedding_dim,
             decay_rates=cfg.memory.decay_rates or None,
+            dedup_threshold=cfg.memory.episodic_dedup_threshold,
         )
         store.init()
         state._standalone_vector = store  # type: ignore[attr-defined]
@@ -337,10 +362,10 @@ async def api_memory_semantic_write(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "Memory writes are not allowed in this session mode."}, status=403)
     store = await _get_vector_store_async(request.app["state"])
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     key = body.get("key", "")
     value = body.get("value")
     confidence = float(body.get("confidence", 1.0)) if isinstance(body.get("confidence"), (int, float)) else 1.0
@@ -654,7 +679,13 @@ def _apply_embedding_model(store: object, raw: str, loop: "asyncio.AbstractEvent
             embedder.dim,
             active_embedding_space_signature(),
         )
-        embedded = store.backfill_missing_embeddings(progress=prog.advance)  # type: ignore[attr-defined]
+        # pace=False: the user just applied a model change and is watching this
+        # progress bar, and semantic search stays degraded until the sweep ends.
+        # Bulk pacing exists to keep an UNATTENDED sweep quiet — spreading a wait
+        # someone explicitly asked for only doubles it.
+        embedded = store.backfill_missing_embeddings(  # type: ignore[attr-defined]
+            progress=prog.advance, pace=False
+        )
         prog.finish(embedded)
     except Exception as exc:  # noqa: BLE001 - surfaced to the dashboard, never crashes the app
         logger.warning("Applying the embedding model failed", exc_info=True)
@@ -688,20 +719,10 @@ async def api_memory_embedding_model(request: web.Request) -> web.Response:
             {"error": "not available in this session", "code": "restricted_session"},
             status=403,
         )
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400
-        )
-    if not isinstance(body, dict):
-        # `[]`, `"str"` and `5` are all VALID JSON, so request.json() returns them
-        # happily and only the .get() below would fail — with an AttributeError
-        # outside the try above, i.e. a 500 for what is really malformed client
-        # input. Reject them on the same 400 contract as unparseable bytes.
-        return web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400
-        )
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
 
     raw = str(body.get("path", "") or "").strip()
     validate_only = bool(body.get("validate_only"))
@@ -904,7 +925,7 @@ async def _ensure_pip_available() -> tuple[bool, str]:
             logger.warning("ensurepip bootstrap timed out")
             return False, "pip bootstrap (ensurepip) timed out"
         if proc.returncode != 0:
-            logger.warning("ensurepip bootstrap failed: %s", stderr.decode()[:500])
+            logger.warning("ensurepip bootstrap failed: %s", _redact_pip_stderr(stderr))
             return False, "pip bootstrap (ensurepip) failed"
         importlib.invalidate_caches()
         logger.info("Bootstrapped pip via ensurepip")
@@ -1055,7 +1076,9 @@ async def api_memory_enable_embeddings(request: web.Request) -> web.Response:
                             {"error": "faiss-cpu install timed out."}, status=500,
                         )
                     if proc.returncode != 0:
-                        logger.warning("faiss-cpu install failed: %s", stderr.decode()[:500])
+                        logger.warning(
+                            "faiss-cpu install failed: %s", _redact_pip_stderr(stderr)
+                        )
                         _embedding_setup_status = {
                             "step": "idle",
                             "error": "faiss-cpu installation failed — click Enable to retry",
@@ -1276,10 +1299,10 @@ async def api_memory_import(request: web.Request) -> web.Response:
         )
         return web.json_response({"error": "Memory writes are not allowed in this session mode."}, status=403)
     store = await _get_vector_store_async(request.app["state"])
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    data, data_err = await read_bounded_json(request, max_bytes=None)
+    if data_err is not None:
+        return data_err
+    assert data is not None  # read_bounded_json returns (dict, None) on success
     # import_memory embeds each imported entry via blocking in-process model
     # inference (unbounded — one per entry); offload so a large import can't
     # stall the gateway event loop.
@@ -1325,10 +1348,10 @@ async def api_memory_consolidate(request: web.Request) -> web.Response:
         return web.json_response({"error": "Memory writes are not allowed in this session mode."}, status=403)
     if not state.consolidator:
         return web.json_response({"error": "consolidator not available"}, status=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     key = body.get("key", "").strip()
     if not key:
         return web.json_response({"error": "session key required"}, status=400)
@@ -1411,10 +1434,15 @@ async def api_memory_observability(request: web.Request) -> web.Response:
 async def api_memory_promote(request: web.Request) -> web.Response:
     """POST /api/memory/promote — promote repeated episodic patterns to semantic facts."""
     store = await _get_vector_store_async(request.app["state"])
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    # allow_absent: every field below has a default, so a bodyless POST is
+    # legitimate. A body that is present but malformed is still a 400 -- the
+    # previous `except Exception: body = {}` answered 200-with-defaults to a
+    # client typo, which silently ran a different promotion than the caller
+    # asked for.
+    body, body_err = await read_bounded_json(request, max_bytes=None, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     try:
         min_count = int(body.get("min_count", 5))
         min_sim = float(body.get("min_sim", 0.75))

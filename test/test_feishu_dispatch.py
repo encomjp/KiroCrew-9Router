@@ -15,6 +15,7 @@ from kiro_crew.messaging.link import (
     CHAT_TYPE_FORUM,
     build_dm_session_key,
 )
+from kiro_crew.session_allocation import SessionClosingError
 
 # ------------------------------------------------------------------
 # Fakes
@@ -83,12 +84,22 @@ class FakeSessions:
         self.channels: list = []
         self.last_agent = None
         self._max_gen: dict[str, int] = {}
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
 
     async def get_or_create(self, key, *, agent, channel_id):
         self.last_agent = agent
         if self._raise is not None:
             raise self._raise
         return self._p, self._is_new, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, cid) -> None:
         self.channels.append((key, cid))
@@ -186,7 +197,7 @@ class FakeConvLog:
         self.agents: list[str | None] = []
         self.titles: dict[str, str] = {}
 
-    def append(self, key, role, text, *, agent=None) -> None:
+    def append(self, key, role, text, *, agent=None, mid=None) -> None:
         self.appended.append((key, role, text))
         self.agents.append(agent)
 
@@ -1017,3 +1028,61 @@ class TestSharedSessionContext:
         )
 
         assert ctx.minimal == [False], ctx.minimal
+
+
+# ------------------------------------------------------------------
+# Tests: the /compact capability gate (#8156)
+# ------------------------------------------------------------------
+
+
+class TestCompactCapabilityGate:
+    @pytest.mark.asyncio
+    async def test_compact_declined_on_auto_managed_backend(self) -> None:
+        # A backend that cannot serve /compact gets the informational reply and
+        # compact() is NEVER dispatched (#8156).
+        provider = FakeProvider([])
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        assert provider.compacted is False
+        assert any("自动压缩上下文" in c for _, c in client.replies)
+
+    @pytest.mark.asyncio
+    async def test_compact_none_capability_preserves_dispatch(self) -> None:
+        # The ABC's None (supported) default keeps the existing dispatch.
+        provider = FakeProvider([])
+        provider.manual_compact_unsupported_backend = None
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        assert provider.compacted is True
+
+    @pytest.mark.asyncio
+    async def test_thresholds_decline_silently_on_auto_managed_backend(self) -> None:
+        # Hard: no forced compaction; soft: no /compact nudge — the backend
+        # compacts on its own as context fills (#8156).
+        provider = FakeProvider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"),
+                AcpEvent(kind=EVENT_COMPLETE),
+            ]
+        )
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider, ctx_pct=96.0)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("one", message_id="m1"))
+        assert provider.compacted is False
+
+        sessions._ctx_pct = 85.0
+        await d.handle_message(_inbound("two", message_id="m2"))
+        assert not any("已自动压缩" in c for _, c in client.replies)
+        assert not any("对话上下文已较长" in c for _, c in client.replies)

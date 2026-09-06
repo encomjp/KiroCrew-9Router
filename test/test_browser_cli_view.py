@@ -63,7 +63,13 @@ def reset_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
     monkeypatch.setattr(mod, "_proc", None)
     monkeypatch.setattr(mod, "_info", None)
     monkeypatch.setattr(mod, "_relay", None)
+    monkeypatch.setattr(mod, "_child_port", None)
     monkeypatch.setattr(mod, "_last_reason", None)
+    # Ownership lookups are undecidable by default, so no test shells out to
+    # lsof/netstat by accident. `_port_owner` then answers UNPROVEN, which is the
+    # pre-identity behaviour every existing test was written against; the tests
+    # that exercise ownership opt in with `_stub_port_owner`.
+    monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: False)
     monkeypatch.setattr(
         platform_compat,
         "kill_process_tree",
@@ -73,7 +79,33 @@ def reset_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
     mod._proc = None
     mod._info = None
     mod._relay = None
+    mod._child_port = None
     mod._last_reason = None
+
+
+def _stub_port_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    listener_pids: tuple[int, ...],
+    descendants: tuple[int, ...] = (),
+    tool: bool = True,
+) -> None:
+    """Make the port->PID lookup answer with *listener_pids*.
+
+    Stubs the ``platform_compat`` primitives rather than ``_port_owner`` itself,
+    so the module's own tier logic (tool absent, empty lookup, descendant match)
+    is what the tests exercise.
+    """
+    monkeypatch.setattr(platform_compat, "listening_pid_tool_available", lambda: tool)
+    monkeypatch.setattr(
+        platform_compat,
+        "find_port_listeners",
+        lambda port: [
+            platform_compat.PortListener(pid=p, address="127.0.0.1", family="4")
+            for p in listener_pids
+        ],
+    )
+    monkeypatch.setattr(platform_compat, "process_descendants", lambda pid: list(descendants))
 
 
 def _free_port() -> int:
@@ -661,3 +693,185 @@ def test_status_does_not_start_anything(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert mod.status()["status"] == "stopped"
     assert spawns == []
+
+
+# ── port ownership: reachability is not identity ────────────────────────────
+#
+# `_free_port` releases its probe socket before the child binds it, so a local
+# process can take the number in between. `_healthy` then answers True for the
+# squatter exactly as it would for our child, and the panel frames whatever the
+# squatter serves — with input forwarding attached.
+
+
+def test_port_owner_proves_the_direct_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc = FakeProc(pid=4242)
+    _stub_port_owner(monkeypatch, listener_pids=(4242,))
+
+    assert mod._port_owner(45613, proc) == mod._OWNER_CHILD
+
+
+def test_port_owner_proves_a_descendant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI spawns Node and helpers, so the listener is often not the child."""
+    proc = FakeProc(pid=4242)
+    _stub_port_owner(monkeypatch, listener_pids=(9931,), descendants=(9931,))
+
+    assert mod._port_owner(45613, proc) == mod._OWNER_CHILD
+
+
+def test_port_owner_names_a_squatter(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc = FakeProc(pid=4242)
+    _stub_port_owner(monkeypatch, listener_pids=(777,), descendants=(9931,))
+
+    assert mod._port_owner(45613, proc) == mod._OWNER_FOREIGN
+
+
+def test_port_owner_is_unproven_without_the_lookup_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The one fail-open branch: a host without lsof must keep its panel.
+
+    Static per host rather than per start, and not attacker-controllable --
+    removing the tool needs the access that makes this panel moot.
+    """
+    proc = FakeProc(pid=4242)
+    _stub_port_owner(monkeypatch, listener_pids=(777,), tool=False)
+
+    assert mod._port_owner(45613, proc) == mod._OWNER_UNPROVEN
+
+
+def test_port_owner_refuses_when_a_working_lookup_sees_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The port just answered, so a lookup that shows no owner is not ours.
+
+    Covers a squatter owned by another user (invisible to our lsof) and a lookup
+    that timed out under load. A refused start is recoverable; adopting an
+    unverified responder is not.
+    """
+    proc = FakeProc(pid=4242)
+    _stub_port_owner(monkeypatch, listener_pids=())
+
+    assert mod._port_owner(45613, proc) == mod._OWNER_FOREIGN
+
+
+def test_port_owner_refuses_without_a_child_to_compare(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No recorded child means nothing can be proved ours."""
+    _stub_port_owner(monkeypatch, listener_pids=(4242,))
+
+    assert mod._port_owner(45613, None) == mod._OWNER_FOREIGN
+
+
+def test_ensure_running_refuses_a_squatter_on_the_child_port(
+    monkeypatch: pytest.MonkeyPatch, reset_state: list[int]
+) -> None:
+    """The whole point: a foreign responder must not become the panel."""
+    proc = FakeProc(pid=4242)
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(mod, "_spawn", lambda cli, port: proc)
+    _stub_port_owner(monkeypatch, listener_pids=(777,))
+
+    assert mod.ensure_running() is None
+    assert mod._info is None
+    assert mod._child_port is None
+    # The child we spawned is reaped rather than left holding nothing.
+    assert proc.pid in reset_state
+    status = mod.status()
+    assert status["status"] == "stopped"
+    assert "took port" in (status["reason"] or "")
+
+
+def test_ensure_running_adopts_a_proven_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc = FakeProc(pid=4242)
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(mod, "_spawn", lambda cli, port: proc)
+    _stub_port_owner(monkeypatch, listener_pids=(4242,))
+
+    info = mod.ensure_running()
+
+    assert info is not None
+    assert mod._child_port == info.port
+
+
+def test_ensure_running_adopts_when_ownership_cannot_be_proved(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No regression on a host where the lookup tool is unavailable.
+
+    Adopting on reachability alone is the pre-identity behaviour, so it is warned
+    about rather than done silently.
+    """
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(mod, "_spawn", lambda cli, port: FakeProc(pid=4242))
+    _stub_port_owner(monkeypatch, listener_pids=(777,), tool=False)
+
+    with caplog.at_level("WARNING"):
+        assert mod.ensure_running() is not None
+
+    assert any("cannot verify which process holds port" in r.message for r in caplog.records)
+
+
+def test_reuse_refuses_a_squatter_that_took_a_live_childs_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child can stay alive after losing its listener; the port is then free.
+
+    Without re-proving ownership on reuse, the next panel mount hands back the
+    squatter that took it.
+    """
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    # A FRESH child per spawn. Reusing one fake would let the reaped corpse end
+    # the second attempt at the "exited during startup" check, so the test would
+    # pass without the reuse gate having done anything.
+    spawned: list[FakeProc] = []
+
+    def _spawn_fresh(cli: str, port: int) -> FakeProc:
+        child = FakeProc(pid=4242)
+        spawned.append(child)
+        return child
+
+    monkeypatch.setattr(mod, "_spawn", _spawn_fresh)
+    _stub_port_owner(monkeypatch, listener_pids=(4242,))
+    first = mod.ensure_running()
+    assert first is not None
+
+    # The child is still alive, but a foreign process now answers its port.
+    _stub_port_owner(monkeypatch, listener_pids=(777,))
+
+    assert mod.ensure_running() is None
+    assert len(spawned) == 2, "the reuse gate did not reject the foreign responder"
+
+
+def test_status_does_not_report_a_squatter_as_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`status` is what hands the panel its URL, so it obeys the same rule."""
+    proc = FakeProc(pid=4242)
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(mod, "_spawn", lambda cli, port: proc)
+    _stub_port_owner(monkeypatch, listener_pids=(4242,))
+    assert mod.ensure_running() is not None
+    assert mod.status()["status"] == "running"
+
+    _stub_port_owner(monkeypatch, listener_pids=(777,))
+
+    assert mod.status()["status"] == "stopped"
+
+
+def test_stop_clears_the_recorded_child_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale child port would be proved against a reaped tree."""
+    monkeypatch.setattr(mod, "cli_path", lambda: "/n/pw")
+    monkeypatch.setattr(mod, "_healthy", lambda port: True)
+    monkeypatch.setattr(mod, "_spawn", lambda cli, port: FakeProc(pid=4242))
+    _stub_port_owner(monkeypatch, listener_pids=(4242,))
+    assert mod.ensure_running() is not None
+
+    mod.stop()
+
+    assert mod._child_port is None

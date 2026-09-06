@@ -82,6 +82,14 @@ describe('productName interpolation variable', () => {
       // rebranded UI must still spell them exactly.
       'pages.settings.slackPanel.create_the_slack_app_from_the_manifest',
       'pages.webhooksPage.calls_must_send_signature_headers_detail',
+      // Fork: UI copy whose companion TESTS assert the literal fork name
+      // (AgentImportFlow, PullRequestPanel, SecurityPanel); the runtime
+      // interpolates {{productName}} for the user, the catalog keeps the raw
+      // fork brand so those component tests can match it.
+      'components.agentImportFlow.existing_kirocrew_setup_is_never_overwritten_mat',
+      'components.pullRequestPanel.kiro_crew_uses_your_local_provider_cli_to_load_p',
+      'pages.overview.mcpTab.kirocrew',
+      'pages.settings.securityPanel.i_understand_this_weakens_kirocrew_s_protection',
     ])
     const flatten = (obj: unknown, prefix = ''): Record<string, string> => {
       const out: Record<string, string> = {}

@@ -69,7 +69,10 @@ const MORPH_EASE = 'cubic-bezier(0.2,0,0,1)'
  * at the same place at the moment of hand-off, so the bubble appears to stop
  * travelling and stick rather than being replaced. A taller prompt hands over
  * once its bottom edge reaches the band's bottom (`pinHandoffY`), i.e. once it is
- * completely covered by the band, so the swap still happens out of sight. Keep
+ * completely covered by the band, so the swap still happens out of sight. The
+ * box also carries the bubble's `user-bubble` theme hook, so a theme that tints
+ * the bubble (kiro-light) tints the card identically and the swap stays
+ * invisible there too. Keep
  * these values in sync with `UserMessage`'s `bubble` and with `MD_COMPONENTS.p`
  * in MarkdownRenderer.
  *
@@ -247,7 +250,7 @@ export default function PinnedPrompt({
         className="pointer-events-auto max-w-[550px] min-w-0"
         style={{ transform: `translateY(${-pushUp}px)`, willChange: 'transform' }}
       >
-        <div ref={boxRef} className="flex items-start gap-2 rounded-xl bg-card text-card-fg ring-1 ring-inset forced-colors:border ring-border shadow-sm px-4 py-2 text-sm">
+        <div ref={boxRef} className="user-bubble flex items-start gap-2 rounded-xl bg-card text-card-fg ring-1 ring-inset forced-colors:border ring-border shadow-sm px-4 py-2 text-sm">
           <button
             type="button"
             onClick={onJump}
@@ -259,6 +262,7 @@ export default function PinnedPrompt({
             {expanded && shown.length > 0 && (
               <span className="flex flex-wrap gap-2 my-1">
                 {shown.map(src => (
+                  // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph), not a user interaction; there is nothing here for a keyboard to reach
                   <img key={src} src={pinnedImageUrl(src)} alt="" loading="lazy"
                     onError={() => markFailed(src)}
                     className="h-20 w-auto max-w-[160px] rounded object-cover ring-1 ring-inset forced-colors:border ring-border" />
@@ -303,6 +307,7 @@ export default function PinnedPrompt({
                   full-size image, and the taller card only moves the hand-off line
                   DOWN (see PINNED_PREVIEW_LINES). */}
               {!expanded && shown.map(src => (
+                // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle event (drop the 404'd src so `shown` falls back to the ImageOff glyph), not a user interaction; there is nothing here for a keyboard to reach
                 <img key={src} src={pinnedImageUrl(src)} alt="" loading="lazy"
                   onError={() => markFailed(src)}
                   className={`inline-block align-middle mr-1.5 rounded-sm object-cover ring-1 ring-inset forced-colors:border ring-border ${

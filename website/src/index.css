@@ -207,6 +207,30 @@
        local('NirmalaUI-Bold'), local('Vrinda Bold');
   unicode-range: U+0980-09FF;
 }
+/* ── Straight ASCII quotes (U+0022 " and U+0027 ') ──
+   Space Grotesk — the default body face — has no straight-quote glyph: it draws
+   both code points as its CLOSING curly form, so a straight quote in UI copy, or
+   one a user types, renders as ” / ’ and hangs on the wrong side of the word
+   (issue #6374). This alias draws ONLY those two code points from a locally
+   installed straight-quote face. Like the script aliases above it is
+   unicode-range-restricted, so it is never consulted for any other character and
+   can lead the family list without changing how anything else renders. The curly
+   quotes U+2018-U+201D are deliberately NOT claimed — they keep coming from the
+   body face, unchanged, exactly as the script-fallback note below intends.
+
+   One 400-700 face, not the split 400/700 pair the CJK aliases need: a quotation
+   mark carries no meaningful weight contrast, and the range descriptor covers a
+   bold context with no synthetic bold. src is local()-only, so nothing downloads;
+   if none of the listed faces is installed the code point falls through to the
+   body face — today's rendering, never worse. */
+@font-face {
+  font-family: 'KC Straight Quotes';
+  font-style: normal; font-weight: 400 700;
+  src: local('Arial'), local('ArialMT'), local('Helvetica Neue'), local('Helvetica'),
+       local('Segoe UI'), local('SegoeUI'), local('Roboto'), local('Liberation Sans'),
+       local('DejaVu Sans'), local('Noto Sans'), local('Nimbus Sans');
+  unicode-range: U+0022, U+0027;
+}
 
 /* ─── OpenDyslexic (SIL-OFL) ── accessibility built-in ───
    Registered as its own font-family so the a11y font never leaks into
@@ -268,8 +292,11 @@
      CJK) through the wrong glyph forms. html:lang(zh-CN/ja/ko) below swap
      isolated regional faces for that UI language. A bare :lang(zh) is avoided
      — it also matches zh-TW/zh-HK. They lead each stack; unicode-range is what
-     makes leading safe. */
-  --script-fallbacks:'KC Devanagari Fallback','KC Bengali Fallback';
+     makes leading safe. 'KC Straight Quotes' leads every sans variant for the
+     same reason, fixing the straight-quote glyph (#6374) in every UI language.
+     It is sans-only: the mono stacks resolve to JetBrains Mono, whose straight
+     quotes are already correct. */
+  --script-fallbacks:'KC Straight Quotes','KC Devanagari Fallback','KC Bengali Fallback';
   --script-fallbacks-mono:'KC Devanagari Fallback','KC Bengali Fallback';
   /* An installed theme pack fills --theme-font-sans / --theme-font-mono with its
      own faces (see hooks/themeCss.ts). Reading them here means code surfaces
@@ -285,19 +312,19 @@ html:lang(zh-CN) {
   /* Isolated Simplified aliases for Chinese UI. Not :lang(zh): that also
      matches zh-TW / zh-HK / zh-Hant. Document-level only — :root/--font-body
      and useZoom already resolve var(--script-fallbacks) on <html>. */
-  --script-fallbacks:'KC Han Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks:'KC Straight Quotes','KC Han Fallback','KC Devanagari Fallback','KC Bengali Fallback';
   --script-fallbacks-mono:'KC Han Mono Fallback','KC Han Fallback','KC Devanagari Fallback','KC Bengali Fallback';
 }
 html:lang(ja) {
   /* Never retain the SC aliases here. If no named Japanese face is installed,
      falling through lets the browser use its lang-aware Japanese fallback. */
-  --script-fallbacks:'KC Japanese Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks:'KC Straight Quotes','KC Japanese Fallback','KC Devanagari Fallback','KC Bengali Fallback';
   --script-fallbacks-mono:'KC Japanese Mono Fallback','KC Japanese Fallback','KC Devanagari Fallback','KC Bengali Fallback';
 }
 html:lang(ko) {
   /* Never retain the SC or JP aliases here. Neither draws Hangul, so leaving one
      in front only delays resolution to the browser's lang-aware Korean fallback. */
-  --script-fallbacks:'KC Korean Fallback','KC Devanagari Fallback','KC Bengali Fallback';
+  --script-fallbacks:'KC Straight Quotes','KC Korean Fallback','KC Devanagari Fallback','KC Bengali Fallback';
   --script-fallbacks-mono:'KC Korean Mono Fallback','KC Korean Fallback','KC Devanagari Fallback','KC Bengali Fallback';
 }
 /* Dark theme shadows */
@@ -351,6 +378,14 @@ html:lang(ko) {
   --ctx-src-skillidx:color-mix(in srgb, #8f7bff 74%, var(--card));
   --ctx-src-tool:color-mix(in srgb, #b98cff 74%, var(--card));
   --ctx-src-mute:color-mix(in srgb, var(--text) 30%, var(--card));
+  /* Terminal ANSI hues with no semantic equivalent. The other fourteen entries
+     are derived from --bg / --text / --danger / --ok / --warn / --info, which
+     every theme already defines; only magenta and cyan need a value of their
+     own. A theme may override these two through the normal cascade. Plain hex on
+     purpose: the value is handed straight to xterm, which cannot parse a CSS
+     colour function. */
+  --term-magenta:#c678dd;
+  --term-cyan:#56b6c2;
 }
 /* Stronger shadows for some dark themes */
 [data-theme="monokai-dark"],[data-theme="solarized-dark"],[data-theme="nord-dark"],[data-theme="dracula-dark"],[data-theme="rosepine-dark"],[data-theme="catppuccin-dark"],[data-theme="tokyonight-dark"],[data-theme="gruvbox-dark"],[data-theme="ice-dark"]{
@@ -994,10 +1029,10 @@ html:lang(ko) {
   color-scheme:dark;
 }
 [data-theme="kiro-light"]{
-  --bg:#fafafa;--bg-accent:#f5f5f5;--bg-elevated:#ffffff;--bg-hover:#f0f0f0;
+  --bg:#ffffff;--bg-accent:#f5f5f5;--bg-elevated:#ffffff;--bg-hover:#f0f0f0;
   --card:#ffffff;--card-fg:#19161d;--card-hl:rgba(0,0,0,.03);
   --panel:#fafafa;--panel-strong:#f5f5f5;
-  --chrome:rgba(250,250,250,.95);
+  --chrome:rgba(255,255,255,.95);
   --text:#4a464f;--text-strong:#19161d;--muted:#5e5966;--muted-strong:#4a464f;
   --border:#e4e4e7;--border-strong:#d4d4d8;--border-hover:#a1a1aa;
   --accent:#8e48ff;--accent-fg:#ffffff;--accent-hover:#7a35e0;--accent-subtle:rgba(142,72,255,.12);
@@ -1316,13 +1351,21 @@ html:lang(ko) {
      `!important` is required to beat the inline `animationDelay` the stagger
      ladder sets. Deliberately scoped to them rather than zeroing every
      animation delay globally. */
-  @media(prefers-reduced-motion:reduce){.animate-rise,.animate-chip-hop{animation-delay:0s !important}}
+  @media(prefers-reduced-motion:reduce){.animate-rise,.animate-chip-hop,.skeleton::after{animation-delay:0s !important}}
   ::selection{background:var(--accent-subtle);color:var(--text-strong)}
   .bg-accent::selection{background:rgba(255,255,255,.25);color:white}
   ::-webkit-scrollbar{width:6px;height:6px}
   ::-webkit-scrollbar-track{background:transparent}
-  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:9999px}
-  ::-webkit-scrollbar-thumb:hover{background:var(--border-strong)}
+  /* --muted, not a --border rung: this thumb is the global scroll affordance for
+     every scroll box that carries neither .scroll-fade nor .scrollbar-overlay,
+     including on touch, where there is no hover to fall back on. It must clear
+     the WCAG 1.4.11 3:1 non-text floor against the surface it scrolls over, and
+     no border rung does in any theme but highcontrast. The grab rung is --text
+     because it has to stay legible AND read as stronger: --muted-strong is below
+     the floor in 9 themes and is not even lighter than --muted in 22 of them.
+     scrollbarThumbContrast.test.ts measures both rungs per theme. */
+  ::-webkit-scrollbar-thumb{background:var(--muted);border-radius:9999px}
+  ::-webkit-scrollbar-thumb:hover{background:var(--text)}
 }
 
 /* ── Ambient background ── */
@@ -1499,6 +1542,26 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 [data-theme="kiro-dark"] .nav-active .text-accent{color:#c19aff}
 [data-theme="kiro-light"] .nav-active,[data-theme="kiro-light"] .session-row.session-active,[data-theme="kiro-light"] .list-selected{background:#d8d2e0;color:#723acc;border-color:#c4bcd0}
 [data-theme="kiro-light"] .nav-active .text-accent{color:#723acc}
+/* Kiro light: the canvas is white and the app shell steps back. --bg is #ffffff so the chat
+   transcript and every page read as the primary surface; the nav rail and sessions list take
+   --panel (#fafafa) instead of the elevated white they use elsewhere, which is the only thing
+   separating them from the canvas — a white card on a white page has no edge but its border.
+   The user bubble is a borderless bg-card fill, so on a white canvas it needs a tint or it
+   disappears entirely; --bg-hover (#f0f0f0) keeps it in the same grey family as the shell. The
+   edit-mode box that replaces a bubble in place carries the same hook, so editing does not flip
+   the surface back to white under the caret.
+   Because --card equals --bg here, ANY borderless bg-card on the page is invisible in this theme.
+   The convention (website/docs/theming-contract.md, "A card must carry its own edge") is that a
+   card on --bg draws a border/ring/shadow; the surfaces that deliberately do not are the hooks
+   below, and src/test/kiroLightShellHooks.test.ts pins that list.
+   Scoped to kiro-light: in every other theme --panel is the page colour, not a shell colour. */
+[data-theme="kiro-light"] .focus-chrome-rail,[data-theme="kiro-light"] .sidebar-inner{background-color:var(--panel)}
+[data-theme="kiro-light"] .user-bubble{background-color:var(--bg-hover)}
+/* Kiro light: the two top-bar capsules (status readout, Request a Feature) are borderless bg-card
+   fills like the bubble, and the bar behind them is --chrome, which follows the white canvas — so
+   they too would vanish. An inset 1px ring in --border gives them the same edge the neighbouring
+   search field draws with a real border, without changing the box's size. */
+[data-theme="kiro-light"] .tb-capsule,[data-theme="kiro-light"] .feedback-pill{box-shadow:inset 0 0 0 1px var(--border)}
 /* Kiro theme: lift unselected nav labels + section headers to Prey/300 (#c1bec6, ~9.8:1) per the
    Figma settings-panel guideline (was Prey/400 #938f9b ~5.7:1). Inactive icons inherit this color
    (they only carry opacity-70), lifting them from ~3.4:1 to ~5.6:1. Active items keep .nav-active. */
@@ -1521,6 +1584,17 @@ button:hover .app-icon{--ico-a:var(--accent);--ico-b:var(--text)}
 [data-mode="light"] .msg-content pre{background:rgba(0,0,0,.04)}
 /* Reset pre inside new code/diff block components */
 .msg-content .code-block>pre{background:transparent;border-radius:0;margin:0}
+/* The staged stand-in must be the SAME HEIGHT as the Pierre surface it stands in
+   for, or the swap moves the reader's scroll position (pierreStaging.ts states
+   that invariant; PlainCodeFallback.tsx carries the measured geometry). The rule
+   above sets line-height:1.5, 10px vertical padding and a 4px margin on every
+   transcript `pre`, and its `.code-block>pre` reset MISSES the staged stand-in
+   because that element sits inside `.pierre-surface`, not directly under the
+   block. Measured: 4px of padding surplus plus 8px of unreset margin = 12px
+   per code block, so a row with three of them dropped 36px when its chunks
+   resolved. Restore Pierre's measured box here, where the conflict is
+   visible: no margin, 8px top/bottom, 20px per line. */
+.msg-content .pierre-plain{margin:0;padding-top:8px;padding-bottom:8px;line-height:20px}
 .msg-content .diff-block>pre{padding:0}
 .msg-content .diff-block,.msg-content .code-block{margin:8px 0}
 
@@ -1589,7 +1663,7 @@ file-tree-container{
   --trees-search-fg-override:var(--text);
   --trees-input-bg-override:var(--bg-elevated);
   --trees-indent-guide-bg-override:var(--border);
-  --trees-scrollbar-thumb-override:var(--border-strong);
+  --trees-scrollbar-thumb-override:var(--muted);
   --trees-font-family-override:var(--font-body);
   --trees-font-size-override:12.5px;
   --trees-padding-inline-override:0px;
@@ -1621,9 +1695,20 @@ file-tree-container{
 /* ── Auto-hiding scrollbar for code/diff blocks ── */
 .scroll-fade::-webkit-scrollbar{height:6px}
 .scroll-fade::-webkit-scrollbar-thumb{background:transparent;border-radius:3px;transition:background .2s}
-.scroll-fade:hover::-webkit-scrollbar-thumb{background:var(--border)}
+.scroll-fade:hover::-webkit-scrollbar-thumb{background:var(--muted)}
 .scroll-fade{scrollbar-width:thin;scrollbar-color:transparent transparent}
-.scroll-fade:hover{scrollbar-color:var(--border) transparent}
+.scroll-fade:hover{scrollbar-color:var(--muted) transparent}
+/* Same defect, same remedy as the overlay utility below: a finger never produces
+   the :hover that reveals the thumb, so a code block wide enough to scroll shows
+   no cue that it does. Predicate and token deliberately match that block rather
+   than making a second decision — one rung, so the two cannot drift. Separate
+   block because it sits with the utility it covers, and because it must follow
+   this utility's own transparent base rules: a media query adds no specificity,
+   so it ties them and wins on source order alone. */
+@media (pointer: coarse) {
+  .scroll-fade{scrollbar-color:var(--muted) transparent}
+  .scroll-fade::-webkit-scrollbar-thumb{background:var(--muted)}
+}
 
 /* ── Overlay auto-hiding vertical scrollbar ──
  * Reveals the thumb only on hover and overlays the content so it never
@@ -1631,12 +1716,29 @@ file-tree-container{
  * On WebKit the scrollbar is laid over the padding box (overlay); on
  * Firefox ``scrollbar-width:thin`` + transparent track approximates it. */
 .scrollbar-overlay{scrollbar-width:thin;scrollbar-color:transparent transparent}
-.scrollbar-overlay:hover{scrollbar-color:var(--border) transparent}
+.scrollbar-overlay:hover{scrollbar-color:var(--muted) transparent}
 .scrollbar-overlay::-webkit-scrollbar{width:6px}
 .scrollbar-overlay::-webkit-scrollbar-track{background:transparent}
 .scrollbar-overlay::-webkit-scrollbar-thumb{background:transparent;border-radius:9999px;transition:background .2s}
-.scrollbar-overlay:hover::-webkit-scrollbar-thumb{background:var(--border)}
-.scrollbar-overlay:hover::-webkit-scrollbar-thumb:hover{background:var(--border-strong)}
+.scrollbar-overlay:hover::-webkit-scrollbar-thumb{background:var(--muted)}
+.scrollbar-overlay:hover::-webkit-scrollbar-thumb:hover{background:var(--text)}
+/* On touch the overlay utility would stay perpetually transparent: a finger never
+   produces the :hover that restores the thumb. A coarse pointer shows a persistent
+   thin thumb instead, so a capped scroll surface keeps a real affordance. Fine
+   pointers keep the hidden-until-hover behaviour so a scrollable box does not
+   always carry the global always-visible thumb.
+   One token, --muted, across this branch and the hover reveal above it. It was
+   chosen here first, as the sole scroll affordance on touch, for clearing the
+   WCAG 1.4.11 3:1 non-text-contrast floor against --bg-elevated in every theme
+   where no border rung does. The hover reveal then kept --border for one release
+   on the argument that hover implies a pointer already engaged with the box; that
+   argument was a product judgement, not a conformance one, and 1.4.11 grants
+   hover no exemption, so both rungs now name the same measured token.
+   scrollbarThumbContrast.test.ts pins the floor per theme. */
+@media (pointer: coarse) {
+  .scrollbar-overlay{scrollbar-color:var(--muted) transparent}
+  .scrollbar-overlay::-webkit-scrollbar-thumb{background:var(--muted)}
+}
 
 /* ── Send button sweep ── */
 .btn-sweep{position:relative;overflow:hidden}
@@ -1789,16 +1891,21 @@ file-tree-container{
      the squeeze band is not. The dev-only en-XA pseudolocale is excluded from
      the budget; the segments' nowrap backstop degrades it to a clean
      leading-edge clip.
-   - <640px the pill is icon-only (34px measured + 6px gap = 40), so only the
-     terminal rung shifts, and by that footprint — an unconditional 208 there
-     would blank the whole capsule on phones for nothing. The named readout
-     rungs need no <640 form: their elements render only on the desktop layout,
-     which never exists below the 768px form switch.
+   - <640px the pill is icon-only (34px measured + 6px gap = 40) and the ladder
+     takes NO shift at all: the group's base terminal rung below (200px) is the
+     only rung that fires there. A shifted rung once lived here at 240px, and
+     because a phone hands the right group ≤240px ROUTINELY, it blanked the
+     CPU/MEM/DSK and credits readouts the entire time an update was pending
+     (issue #7698) — trading a 40px squeeze band for the whole capsule. In the
+     200–240px band with the pill mounted the segments' nowrap backstop
+     degrades to a leading-edge clip instead, which is the recoverable harm.
+     The named readout rungs likewise need no <640 form: their elements render
+     only on the desktop layout, which never exists below the 768px form
+     switch.
 
-   Without the shift, the band between the base rung and the true content width
-   kept the readouts while the content no longer fit, and flex squeeze wrapped
-   them into two clipped lines inside the h-7 capsule. */
-@container (max-width:240px){ .tb-has-update .tb-capsule > *:not(:first-child){display:none} }
+   Without the ≥640px shift, the band between the base rung and the true
+   content width kept the readouts while the content no longer fit, and flex
+   squeeze wrapped them into two clipped lines inside the h-7 capsule. */
 @media (min-width:640px){
   @container (max-width:738px){ .tb-has-update .tb-drop-metrics{display:none} }
   @container (max-width:600px){ .tb-has-update .tb-drop-usage{display:none} }
@@ -1819,6 +1926,12 @@ file-tree-container{
    visible through the shifted band; the descendant selector out-specifies the
    base hide rule. `block` matches what preflight gives the SVG, so the rule
    stays inert if the button ever stops blockifying its flex children. */
+/* Probe for the metrics rung, read by App.tsx to decide whether clicking the
+   metrics control should toggle the inline readings or open the popover. It
+   carries `.tb-drop-metrics` so every rung above -- base and update-shifted --
+   applies to it unchanged; keeping it out of flow at 0x0 means it can never
+   consume the budget those rungs are measured against. */
+.tb-metrics-probe{position:absolute;width:0;height:0;overflow:hidden;pointer-events:none}
 @container (min-width:531px){ .tb-narrow-only{display:none} }
 @media (min-width:640px){
   @container (min-width:531px) and (max-width:738px){ .tb-has-update .tb-narrow-only{display:block} }
@@ -1861,6 +1974,27 @@ file-tree-container{
   backdrop-filter:blur(18px) saturate(1.8);
   -webkit-backdrop-filter:blur(18px) saturate(1.8);
   box-shadow: inset 0 1px 0 rgba(255,255,255,.10);
+  /* Own compositing layer, for the blur above.
+
+     The two readout groups inside this header carry `container-type:
+     inline-size`, which implies layout containment. When a capsule segment
+     mounts or unmounts inside one -- the metrics readout's frame arriving, the
+     update pill shifting the ladder -- the strip it vacated has to be
+     re-sampled through the blur, and damage from a contained subtree did not
+     always reach a backdrop sharing a layer with the content under it. The old
+     blurred pixels stayed put: the reporter's "has something left in the
+     background". Promotion is the same remedy #7931 applied to the sandbox-doc
+     frames, and it is why the notification popover portals to <body> to escape
+     this containing block rather than living in it.
+
+     Two spellings on purpose, because focus mode drives this element's
+     `transform` from an INLINE style (see the header in App.tsx) which wins over
+     this rule -- so `translateZ(0)` is absent for exactly the case that animates
+     hardest. `backface-visibility` promotes on its own and nothing writes it, so
+     the glass keeps its layer while sliding. Neither declaration is visible to
+     the container queries, which measure `.tb-left`/`.tb-right`, not the header. */
+  transform:translateZ(0);
+  backface-visibility:hidden;
   transition:background-color .25s ease}
 
 /* ── Frameless Electron window (macOS) ──
@@ -1908,6 +2042,15 @@ file-tree-container{
    src/lib/electron.ts. Applied only when the window is actually frameless
    (runtime decision — see isLinuxFramelessElectron). */
 .linux-electron header.topbar-glass{padding-right:112px}
+
+/* ── Focus mode: the same caption reserve, for the surface at that corner ──
+   The insets above all hang off the DOCKED header, and focus mode takes it out
+   of flow (App.tsx makes it an absolute overlay), so the content row reaches y=0
+   with nothing clearing the caption band. The controls stay painted there on
+   both platforms — only macOS hides its own with the chrome, so only macOS needs
+   no reserve. Keep the widths in sync with the two header rules above. */
+body.mc-focus-mode .win-electron .focus-caption-reserve{padding-right:142px}
+body.mc-focus-mode .linux-electron .focus-caption-reserve{padding-right:112px}
 /* Embedded remote pane (option B): the pane is a separate document loaded in an
    iframe, so its SPA can't see Electron — `isMacElectron` is false inside it and
    the `.mac-electron` rule never applies. The parent relays whether it is a
@@ -2021,10 +2164,32 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
 .followup-chip{max-width:min(100%,clamp(18rem,calc(50% - 0.1875rem),26rem))}
 
 /* ── Skeleton shimmer placeholder ── */
+/* The highlight is its OWN element, moved with transform, so a sweep costs a
+   compositor transform instead of repainting a gradient every frame -- which
+   matters most here because a skeleton appears exactly when the main thread is
+   busiest (measuring the rows it stands in for).
+
+   It previously pointed at `@keyframes shimmer`, which translates its TARGET.
+   That is right for .animate-shimmer (a highlight element on a track) and wrong
+   here: it slid every bar sideways by its own width, read as the placeholder
+   drifting around rather than shimmering. Separate keyframes, so the two cannot
+   be confused again.
+
+   `--sk-delay` lets a caller stagger a group of bars so the sweep reads as one
+   wave travelling down them. It is set on the BAR and inherited by the
+   pseudo-element, which cannot take an inline style of its own. Duration is
+   zeroed under reduced motion by the global rule near the top of this file, and
+   the DELAY by the companion rule beside it -- that rule covers duration only, so
+   a stagger left in place would hold bars dark in sequence forever. */
+@keyframes skeleton-sweep{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}
 .skeleton{
-  background:linear-gradient(90deg,var(--bg-elevated) 25%,var(--bg-hover) 50%,var(--bg-elevated) 75%);
-  background-size:200% 100%;animation:shimmer 1.5s ease-in-out infinite;
-  border-radius:var(--radius-sm)}
+  position:relative;overflow:hidden;
+  background:var(--bg-elevated);border-radius:var(--radius-sm)}
+.skeleton::after{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(90deg,transparent 0%,var(--bg-hover) 50%,transparent 100%);
+  animation:skeleton-sweep 1.6s ease-in-out infinite;
+  animation-delay:var(--sk-delay,0s)}
 
 /* ── Consistent focus ring ── */
 .focus-ring{transition:border-color 0.2s,box-shadow 0.2s}
@@ -2109,6 +2274,16 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    fade completes (REVEAL_FLASH_FADE_MS in ChatSidebar.tsx covers it). */
 .session-row.session-reveal-flash{outline:2px solid var(--accent);outline-offset:-2px}
 .session-row.session-reveal-flash-fade{outline-color:transparent}
+/* Stalled goal loop (ChatSidebar `goalLoopStalled`): the loop is armed but its
+   last turn died and nothing is executing — the whole card flashes danger-red
+   until the user resumes. Two-class specificity outranks the Tailwind
+   bg-accent-subtle an active row carries, so the alarm wins on the selected
+   row too. The keyframe dips toward transparent at midpoint and RESTS on the
+   solid danger tint: the global reduced-motion kill-switch freezes animations
+   on their first frame, which must be the red one — a frozen transparent frame
+   would silence the alarm exactly for the users who asked for less motion. */
+.session-row.session-loop-stalled{background-color:var(--danger-subtle);animation:kc-loop-stalled-flash 1.6s ease-in-out infinite}
+@keyframes kc-loop-stalled-flash{0%,100%{background-color:var(--danger-subtle)}50%{background-color:transparent}}
 .session-row.session-colored{position:relative}
 /* Flush against the row's left edge, and inset vertically by exactly the row's
    corner radius — so the bar spans (row height - 2 * radius) and its ends stop
@@ -2287,7 +2462,7 @@ body.mc-focus-mode.mc-focus-rail .focus-chrome-rail{
    field written with an arbitrary value, an `!important` modifier or an inline style.
    Do not re-add one — `noPageZoom.test.ts` fails if a blanket element rule reappears.
    Full reasoning, and what a correct fix would need instead, live in the page-zoom
-   section of website/docs/page-layout.md and in issue #6001. */
+   section of website/docs/narrow-viewport.md. */
 
 /* ── The shell is not a zoomable document ──
    `pan-x pan-y` allows exactly the two behaviours the app needs from the browser
@@ -2518,6 +2693,31 @@ html[data-font-family="mono"] .rail-community-links{ letter-spacing:-0.05em; wor
    button's `text-ellipsis` on `Report issue` handles overflow gracefully;
    a dedicated rule can be added later if visual QA shows truncation matters. */
 
+/* ── OpenDyslexic nav-rail vertical compensation ─────────────────────────
+   OpenDyslexic's taller x-height (cap-height/UPM ~0.78 vs Space Grotesk's
+   ~0.72) increases each nav-item's painted height by ~8%. On a rail with
+   ~12 items, the cumulative growth pushes the bottom-pinned section
+   (Agent Capabilities, Settings, community row) below the rail's overflow
+   boundary.
+
+   Tighten the vertical padding from py-2 (8px) to 6px on nav items when
+   opendyslexic is active. The 2px reduction per item × ~12 items = ~24px
+   recovered — enough to keep the bottom section visible without reducing
+   font size or fighting the accessibility intent.
+
+   The selector matches every `.nav-item`, not just the expanded-rail ones.
+   That is deliberate: the collapsed rail is icon-only (the label span is
+   guarded by `!collapsed &&` in NavItem), so the 2px trim on each side
+   has no visible or functional effect there — the rail's collapsed width
+   is fixed at RAIL_W_COLLAPSED and its items have no text budget to
+   protect. The resulting min touch target under OpenDyslexic remains
+   ~44px tall (6px padding + ~22px x-height glyph + 6px padding + row gap),
+   well above WCAG SC 2.5.8's 24px floor. */
+html[data-font-family="opendyslexic"] .nav-item {
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
 /* Cut-edge rule on the pinned-crew chip row. The row is a single nowrap line with
    overflow:hidden so the trailing dropdown stays against the last chip (see
    InstanceTabBar.CrewChipRow), which means the chip at the boundary is cut rather
@@ -2566,3 +2766,28 @@ html[data-font-family="mono"] .rail-community-links{ letter-spacing:-0.05em; wor
   aspect-ratio: var(--mc-img-w) / var(--mc-img-h);
 }
 .mc-img-reserve-compact { --mc-img-cap: 180px; }
+
+/* Skeleton chat rows painted INSIDE the virtualizer's spacers. A spacer is the
+ * reserved height of rows that are not mounted (yet): while a pagination walk
+ * lands pages or the reader outruns mounting, the viewport can sit over pure
+ * spacer — which used to read as "all text vanished, only background left".
+ * Rounded bars in alternating widths read as chat rows at a glance. Colors ride
+ * the theme's muted foreground at low alpha, so every palette keeps contrast.
+ *
+ * DELIBERATELY STATIC. The first version pulsed opacity, and a spacer is
+ * routinely 20k+ px tall: animating opacity promotes the whole spacer into a
+ * compositor layer of that size, which on a phone GPU costs more than the
+ * long tasks the skeleton exists to paper over. `contain` fences the paint so
+ * the spacer can never invalidate its neighbors. */
+.vc-spacer-skeleton {
+  --vc-skel-bar: color-mix(in oklab, var(--fg, #888) 9%, transparent);
+  background-image:
+    linear-gradient(to bottom, var(--vc-skel-bar) 0 22px, transparent 22px 102px),
+    linear-gradient(to bottom, var(--vc-skel-bar) 0 22px, transparent 22px 102px),
+    linear-gradient(to bottom, var(--vc-skel-bar) 0 22px, transparent 22px 102px);
+  background-repeat: repeat-y;
+  /* One 102px tile per layer = three bars of alternating width per cycle. */
+  background-size: 62% 102px, 84% 102px, 44% 102px;
+  background-position: 24px 12px, 24px 46px, 24px 80px;
+  contain: layout paint style;
+}

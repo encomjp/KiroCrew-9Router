@@ -14,12 +14,14 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.discord import session_resume
 from kiro_crew.discord.client import DISCORD_CHUNK_LIMIT, DiscordInteraction
 from kiro_crew.discord.commands import parse_command, parse_command_argument
+from kiro_crew.discord.renderer import session_provenance_tag
 from kiro_crew.discord.transport_dispatch import DiscordDispatcher
 from kiro_crew.messaging import resume_expectation
 from kiro_crew.messaging import session_resume as session_resume_core
 from kiro_crew.messaging.link import UNBIND_REASON_UNSPECIFIED, ChannelLink
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.session import _opt_out_key
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.session_map import ConversationOwnershipConflict
 
 
@@ -114,6 +116,10 @@ class _Sessions:
 
     def __init__(self) -> None:
         self.mirror_links: dict[str, ChannelLink] = {}
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         self.flushed: list[dict] = []
         self.flush_error: Exception | None = None
         self.origin_links: dict[str, ChannelLink] = {}
@@ -221,6 +227,16 @@ class _Sessions:
         self.last_agent = kwargs.get("agent")
         return self.provider, getattr(self, "is_new_result", False), True
 
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate.
+
+        ``closing`` mirrors SessionManager._closing so this refuses the dispatch
+        the way the real gate does once close_all has run.
+        """
+        self.begin_turns = getattr(self, "begin_turns", 0) + 1
+        if getattr(self, "closing", False):
+            raise SessionClosingError("SessionManager is closing")
+
     async def set_channel(self, key: str, channel: str) -> None:
         self.set_channel_calls = getattr(self, "set_channel_calls", [])
         self.set_channel_calls.append((key, channel))
@@ -308,7 +324,9 @@ class _ConversationLog:
             rows = [row for row in rows if row.get("role") in roles]
         return rows[-max_messages:]
 
-    def append(self, key: str, role: str, content: str, agent: str | None = None) -> None:
+    def append(
+        self, key: str, role: str, content: str, agent: str | None = None, mid: str | None = None
+    ) -> None:
         self.messages.setdefault(key, []).append({"role": role, "content": content})
 
     def set_title(self, key: str, title: str) -> None:
@@ -376,7 +394,9 @@ def _message(text: str, channel_id: str = "c1", thread_id: str = "") -> InboundM
     )
 
 
-def _interaction(custom_id: str, message_id: str, channel_id: str = "c1") -> DiscordInteraction:
+def _interaction(
+    custom_id: str, message_id: str, channel_id: str = "c1", label: str = ""
+) -> DiscordInteraction:
     return DiscordInteraction(
         interaction_id="i1",
         interaction_token="tok",
@@ -384,7 +404,7 @@ def _interaction(custom_id: str, message_id: str, channel_id: str = "c1") -> Dis
         user_id="u1",
         message_id=message_id,
         custom_id=custom_id,
-        label="",
+        label=label,
         guild_id="",
     )
 
@@ -662,24 +682,36 @@ async def test_binding_claimed_during_header_edit_is_not_overwritten() -> None:
 
 @pytest.mark.asyncio
 async def test_resumed_turn_lands_in_live_dashboard_window() -> None:
-    """A resumed turn must enter the OPEN slot's window, not just disk.
-
-    The dashboard save writes meta + frozen prefix + its own window + foreign
-    tail. A disk-only append made before a later dashboard turn is therefore
-    re-serialized AFTER it and the transcript reads back out of order. Landing
-    the turn in the live window keeps it inside the region the save
-    re-serializes. Mirrors dashboard/cron_inject.py.
-    """
+    """A resumed turn is projected user-first without a new user-row broadcast."""
     log = _log()
     log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior"}]
     dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    durable: list[tuple[str, str, str]] = []
+
+    def _append_if_absent(
+        key: str,
+        role: str,
+        content: str,
+        *,
+        agent: str | None = None,
+        mid: str | None = None,
+    ) -> None:
+        durable.append((role, content, mid or ""))
+
+    log.append_if_absent = _append_if_absent  # type: ignore[attr-defined]
 
     class _Slot:
         def __init__(self) -> None:
-            self.messages: list[tuple[str, str]] = []
+            self.messages: list[dict[str, Any]] = []
+            self.broadcasts: list[tuple[str, bool]] = []
+            self.is_restricted = False
 
-        def append(self, role: str, content: str, cls: str = "", **kw: Any) -> None:
-            self.messages.append((role, content))
+        def append(self, role: str, content: str, cls: str = "", **kw: Any) -> dict[str, Any]:
+            mid = f"m-{len(self.messages) + 1:016x}"
+            row = {"role": role, "content": content, "meta": {"mid": mid}}
+            self.messages.append(row)
+            self.broadcasts.append((role, bool(kw.get("broadcast_user"))))
+            return row
 
     class _State:
         def __init__(self) -> None:
@@ -698,13 +730,93 @@ async def test_resumed_turn_lands_in_live_dashboard_window() -> None:
     await dispatcher.handle_message(_message("!sessions"))
     custom_id, message_id = _picker_button(client)
     await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    pushes_before_turn = state.pushes
     await dispatcher.handle_message(_message("continue here"))
 
     assert sessions.last_key == "dashboard:chat-1"
-    roles = [r for r, _ in state.slot.messages]
-    assert roles == ["user", "assistant"], state.slot.messages
-    assert state.slot.messages[0][1] == "continue here"
-    assert state.pushes >= 1
+    assert [(row["role"], row["content"]) for row in state.slot.messages] == [
+        ("user", "continue here"),
+        ("assistant", "Answer: continue here"),
+    ]
+    assert state.slot.broadcasts == [("user", False), ("assistant", False)]
+    assert durable == [
+        ("user", "continue here", "m-0000000000000001"),
+        ("assistant", "Answer: continue here", "m-0000000000000002"),
+    ]
+    assert state.pushes == pushes_before_turn + 1
+
+
+@pytest.mark.asyncio
+async def test_restricted_resumed_turn_is_neither_projected_nor_persisted() -> None:
+    """Discord had the same two-writer leak as Telegram.
+
+    A resumed ``dashboard:`` key gets its privacy mode from the dashboard slot.
+    Without the caller-side gate Discord projected the turn into that slot (making
+    it dirty for a later flush) and also appended it directly to durable history.
+    Neither path may see content for an incognito or temporary session.
+    """
+    log = _log()
+    log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior"}]
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    durable_before = list(log.messages["dashboard:chat-1"])
+    persist_calls: list[str] = []
+    real_persist = dispatcher._persist_turn
+
+    def _persist(*args: Any, **kwargs: Any) -> None:
+        persist_calls.append(str(args[0]))
+        real_persist(*args, **kwargs)
+
+    dispatcher._persist_turn = _persist  # type: ignore[method-assign]
+
+    class _RestrictedSlot:
+        is_restricted = True
+
+        def __init__(self) -> None:
+            self.messages: list[dict[str, Any]] = []
+
+        def append(self, role: str, content: str, cls: str = "", **kw: Any) -> dict[str, Any]:
+            row = {"role": role, "content": content, "meta": {"mid": f"m-{len(self.messages)}"}}
+            self.messages.append(row)
+            return row
+
+    class _State:
+        def __init__(self) -> None:
+            self.slot = _RestrictedSlot()
+
+        def get_slot(self, name: str) -> Any:
+            return self.slot if name == "chat-1" else None
+
+        def push_slots_update(self) -> None:
+            raise AssertionError("a restricted turn must not dirty or push its slot")
+
+    state = _State()
+    dispatcher._session_resume.dashboard_state = state
+
+    await dispatcher.handle_message(_message("!sessions"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    await dispatcher.handle_message(_message("private continuation"))
+
+    assert sessions.last_key == "dashboard:chat-1"
+    assert state.slot.messages == []
+    assert persist_calls == []
+    assert log.messages["dashboard:chat-1"] == durable_before
+
+
+@pytest.mark.asyncio
+async def test_discord_restricted_decision_allows_unknown_but_denies_live_slot() -> None:
+    """Cold ordinary resumes keep history; an affirmative live restriction wins."""
+    dispatcher, _, _ = _dispatcher({"u1"}, _log())
+
+    dispatcher._session_resume.dashboard_state = SimpleNamespace(
+        sessions=None, get_slot=lambda _name: SimpleNamespace(is_restricted=True)
+    )
+    assert await dispatcher._session_restricted("dashboard:chat-1") is True
+
+    dispatcher._session_resume.dashboard_state = SimpleNamespace(
+        sessions=None, get_slot=lambda _name: None
+    )
+    assert await dispatcher._session_restricted("dashboard:missing") is False
 
 
 @pytest.mark.asyncio
@@ -720,7 +832,11 @@ async def test_mirrored_turn_persists_idempotently() -> None:
 
     class _State:
         def get_slot(self, name: str) -> Any:
-            return type("S", (), {"append": lambda *a, **k: None})()
+            return type(
+                "S",
+                (),
+                {"append": lambda *a, **k: None, "is_restricted": False},
+            )()
 
         def push_slots_update(self) -> None:
             return None
@@ -1160,6 +1276,241 @@ async def test_resumed_session_without_recorded_agent_falls_back() -> None:
     assert sessions.last_agent == "kirocrew"
 
 
+async def _bind_to_chat1(
+    dispatcher: DiscordDispatcher, client: _Client, log: _ConversationLog
+) -> None:
+    """Bind DM c1 to dashboard:chat-1 through the real picker flow."""
+    log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior"}]
+    await dispatcher.handle_message(_message("!sessions"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    assert dispatcher._session_resume.resumed_session("c1") == "dashboard:chat-1"
+
+
+@pytest.mark.asyncio
+async def test_option_press_routes_into_resumed_session() -> None:
+    """An [OPTIONS:] press on a bound DM is the RESUMED session's turn content.
+
+    The press re-dispatches with ``interpret_commands=False`` because the label is
+    model-authored text that must never execute as a command — but that flag must
+    not also skip resume routing. The buttons were rendered on the bound session's
+    own reply (and carry its provenance tag), so the choice belongs to that
+    session. Before the fix the press ran in the native DM session: the click
+    answered a question nobody asked there, while the bound session kept waiting
+    for its answer (live incident 2026-08-30: a merge-approach choice for the
+    bound session green-lit the native session's parked debug plan instead).
+    """
+    log = _log()
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    await _bind_to_chat1(dispatcher, client, log)
+
+    tag = session_provenance_tag("dashboard:chat-1")
+    await dispatcher.on_interaction(_interaction(f"opt:0:{tag}", "m-opts", label="Ship option (a)"))
+
+    assert sessions.last_key == "dashboard:chat-1"
+    # The label reached the session as literal turn content, commands off.
+    assert any(t.startswith("> Ship option (a)") for t, _ in client.sent)
+
+
+@pytest.mark.asyncio
+async def test_untagged_press_is_refused_fail_closed() -> None:
+    """A pre-provenance button (bare ``opt:<i>``) is refused, never routed.
+
+    Discord replays old components indefinitely, so an untagged press can never
+    prove which session it belongs to — and routing it by current binding is
+    exactly the cross-session injection this fix exists to stop (server review
+    round 1, span 405abadda748: the legacy pass-through never ages out, so it
+    was the same hole with a different door). Fail closed with a type-it-instead
+    notice; no echo, no turn anywhere.
+    """
+    log = _log()
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    await _bind_to_chat1(dispatcher, client, log)
+
+    await dispatcher.on_interaction(_interaction("opt:0", "m-opts", label="Ship option (a)"))
+
+    assert any("predate" in t for t, _ in client.sent)
+    assert not any(t.startswith("> Ship option (a)") for t, _ in client.sent)
+    assert sessions.last_key == ""  # no turn ran anywhere
+
+
+@pytest.mark.asyncio
+async def test_tagged_press_is_revalidated_after_idle_rotation() -> None:
+    """Idle/daily rotation between the gate and the turn invalidates the tag.
+
+    ``maybe_rotate`` can bump the native generation AFTER the pre-busy gate
+    passed, so the turn would run under a key the tag never named. The gate is
+    re-run against the FINAL key after rotation — the same invariant ``!new``
+    enforces, applied to the reset nobody typed.
+    """
+    dispatcher, client, sessions = _dispatcher({"u1"}, _log())
+    tag = session_provenance_tag(dispatcher.current_session_key("u1"))
+    scope = dispatcher._scope_id("u1")
+
+    def _rotate_now(*args: object, **kwargs: object) -> None:
+        dispatcher._conv.bump_gen(scope)
+
+    dispatcher._conv.maybe_rotate = _rotate_now  # type: ignore[method-assign]
+
+    await dispatcher.on_interaction(_interaction(f"opt:0:{tag}", "m-opts", label="Choice A"))
+
+    assert any("moved away" in t for t, _ in client.sent)
+    assert sessions.last_key == ""  # the rotated generation never ran the press
+
+
+@pytest.mark.asyncio
+async def test_stale_tagged_press_after_rebind_is_refused() -> None:
+    """A button minted by session A, pressed after the DM was rebound to B, refuses.
+
+    Discord replays old components indefinitely: A's reply keeps its live buttons
+    after ``!unlink`` + ``!sessions`` rebinds the DM to B. Routing alone would send
+    the press into B — injecting A's model-authored choice into an unrelated
+    transcript, the GPT round-1 blocker. The provenance tag makes the press valid
+    only while the conversation still targets the session that posted it.
+    """
+    log = _log_with_titles("Alpha plan", "Beta plan")
+    log.messages["dashboard:chat-0"] = [{"role": "assistant", "content": "prior a"}]
+    log.messages["dashboard:chat-1"] = [{"role": "assistant", "content": "prior b"}]
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+
+    # Bind A (chat-0) through the real picker, as the incident did.
+    await dispatcher.handle_message(_message("!sessions Alpha"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    assert dispatcher._session_resume.resumed_session("c1") == "dashboard:chat-0"
+    stale_tag = session_provenance_tag("dashboard:chat-0")
+
+    # Rebind to B (chat-1): unlink, then pick again.
+    await dispatcher.handle_message(_message("!unlink"))
+    await dispatcher.handle_message(_message("!sessions Beta"))
+    custom_id, message_id = _picker_button(client)
+    await dispatcher.on_interaction(_interaction(custom_id, message_id))
+    assert dispatcher._session_resume.resumed_session("c1") == "dashboard:chat-1"
+    sessions.last_key = ""
+
+    await dispatcher.on_interaction(
+        _interaction(f"opt:0:{stale_tag}", "m-old-opts", label="Ship option (a)")
+    )
+
+    assert any("moved away" in t for t, _ in client.sent)
+    assert sessions.last_key == ""  # no turn ran in B, in A, or natively
+
+
+@pytest.mark.asyncio
+async def test_press_tagged_for_pre_new_conversation_is_refused() -> None:
+    """``!new`` invalidates the previous conversation's buttons.
+
+    The native key embeds the generation, so a press carrying the pre-``!new``
+    tag no longer matches — honest, since the conversation that asked the
+    question is over. Before the tag the press ran silently in the fresh
+    generation, answering a question it never asked.
+    """
+    dispatcher, client, sessions = _dispatcher({"u1"}, _log())
+    old_tag = session_provenance_tag(dispatcher.current_session_key("u1"))
+
+    await dispatcher.handle_message(_message("!new"))
+    assert dispatcher.current_session_key("u1") != ""
+    sessions.last_key = ""
+
+    await dispatcher.on_interaction(_interaction(f"opt:0:{old_tag}", "m-opts", label="Choice A"))
+
+    assert any("moved away" in t for t, _ in client.sent)
+    assert sessions.last_key == ""
+
+
+@pytest.mark.asyncio
+async def test_stale_press_against_busy_target_is_refused_not_queued() -> None:
+    """The provenance gate precedes the busy check — pinned as ordering.
+
+    A stale press must be refused BEFORE ``is_busy`` runs: the busy path either
+    queues (native) or posts the busy refusal (resumed), and a queued stale
+    press would be drained and replayed WITHOUT its tag, executing unchecked
+    later. It also must not leak whether the current target is mid-turn.
+    """
+    dispatcher, client, sessions = _dispatcher({"u1"}, _log())
+    old_tag = session_provenance_tag(dispatcher.current_session_key("u1"))
+    await dispatcher.handle_message(_message("!new"))
+    sessions.last_key = ""
+    sessions.is_busy = lambda key: True  # type: ignore[method-assign]
+    enqueued: list = []
+    sessions.enqueue = lambda *a, **k: enqueued.append(a)  # type: ignore[attr-defined]
+
+    await dispatcher.on_interaction(_interaction(f"opt:0:{old_tag}", "m-opts", label="Choice A"))
+
+    assert any("moved away" in t for t, _ in client.sent)
+    assert not any("busy" in t for t, _ in client.sent)
+    assert enqueued == []
+    assert sessions.last_key == ""
+
+
+@pytest.mark.asyncio
+async def test_valid_tagged_press_against_busy_target_is_refused_not_queued_or_steered() -> None:
+    """A VALID press whose target is mid-turn refuses — it never enters the queue.
+
+    ``_handle_busy`` enqueues bare text (or steers it mid-turn), and the drain
+    replays queued text WITHOUT the provenance tag — so a ``!new`` or idle
+    rotation between enqueue and drain would execute the model-authored choice
+    in a conversation the tag never named (server review round 2, span
+    405abadda748). The busy path is therefore unreachable for any tagged press.
+    """
+    dispatcher, client, sessions = _dispatcher({"u1"}, _log())
+    tag = session_provenance_tag(dispatcher.current_session_key("u1"))
+    sessions.is_busy = lambda key: True  # type: ignore[method-assign]
+    enqueued: list = []
+    sessions.enqueue = lambda *a, **k: enqueued.append(a)  # type: ignore[attr-defined]
+    steered: list = []
+    sessions.steer = lambda *a, **k: steered.append(a)  # type: ignore[attr-defined]
+
+    await dispatcher.on_interaction(_interaction(f"opt:0:{tag}", "m-opts", label="Choice A"))
+
+    assert any("busy" in t and "NOT applied" in t for t, _ in client.sent)
+    assert enqueued == [] and steered == []
+    assert sessions.last_key == ""  # no turn ran anywhere
+
+
+@pytest.mark.asyncio
+async def test_option_press_after_binding_destroyed_is_refused_not_native() -> None:
+    """A press whose binding died mid-flight gets the Detached refusal.
+
+    The refusal is the honest outcome routing already produces for a typed
+    message; the press must not fall back to a silent native turn, which is the
+    exact misroute the routing gate exists to stop.
+    """
+    log = _log()
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    await _bind_to_chat1(dispatcher, client, log)
+    stale_tag = session_provenance_tag("dashboard:chat-1")
+    # The binding dies out from under the DM (a housekeeping clear, not !unlink).
+    sessions.clear_mirror_link("dashboard:chat-1")
+
+    await dispatcher.on_interaction(
+        _interaction(f"opt:0:{stale_tag}", "m-opts", label="Ship option (a)")
+    )
+
+    assert any("Detached" in t for t, _ in client.sent)
+    assert sessions.last_key == ""  # no turn ran anywhere
+
+
+@pytest.mark.asyncio
+async def test_synthetic_dispatch_without_origin_tag_keeps_native_affinity() -> None:
+    """Untagged synthetic turns keep the legacy skip: native session, no routing.
+
+    Queue drains replay messages the native session accepted while busy, and
+    AutoNudge fires target the native key their loop rotation-checked — routing
+    either into a binding created later would run them in a session that never
+    queued or armed them. This pins that ``interpret_commands=False`` with no
+    ``origin_tag`` still means "skip routing" for those callers.
+    """
+    log = _log()
+    dispatcher, client, sessions = _dispatcher({"u1"}, log)
+    await _bind_to_chat1(dispatcher, client, log)
+
+    await dispatcher.handle_message(_message("nudge cycle text"), interpret_commands=False)
+
+    assert sessions.last_key != "dashboard:chat-1"
+    assert sessions.last_key.startswith("discord")
+
+
 @pytest.mark.asyncio
 async def test_stale_picker_fails_closed(monkeypatch) -> None:
     dispatcher, client, sessions = _dispatcher({"u1"}, _log())
@@ -1242,7 +1593,7 @@ async def test_choice_refusal_for_outbound_mirror_names_unlink() -> None:
     # And the instruction is followable: the sweep frees the location, after
     # which the conflict check no longer refuses.
     sessions.clear_mirror_links_at(ChannelLink(channel_type="discord", channel_id="c1"))
-    conflict = dispatcher._session_resume._binding_conflict(
+    conflict = dispatcher._session_resume._binder.binding_conflict(
         "dashboard:chat-1",
         "chat one",
         ChannelLink(channel_type="discord", channel_id="c1"),

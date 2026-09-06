@@ -50,10 +50,11 @@ class _FakeStore:
         self.texts.add(text)
         return True
 
-    def backfill_missing_embeddings(self) -> int:
+    def backfill_missing_embeddings(self, *, pace: bool = True) -> int:
         if self._fail_backfill:
             raise RuntimeError("model unavailable")
         self.backfill_calls += 1
+        self.backfill_paced = pace
         return len(self.texts)
 
     def search_episodic(self, **kw: Any) -> list[dict]:
@@ -106,6 +107,11 @@ class TestIncrementalImport(_Env):
         first = ledger_index.import_pending(store)
         self.assertEqual(first["written"], 20)
         self.assertEqual(store.backfill_calls, 1, "one batched sweep, not 20")
+        self.assertTrue(
+            store.backfill_paced,
+            "the only caller is the ledger-hygiene cron, which blocks but is "
+            "unattended, so the whole-corpus sweep must stay paced",
+        )
 
         second = ledger_index.import_pending(store)
         self.assertEqual(second["written"], 0, "an unchanged ledger must re-embed nothing")
@@ -428,12 +434,13 @@ class TestLedgerMutationsAreLocked(_Env):
 
     def test_hygiene_does_not_erase_an_append_that_races_its_read(self):
         """Drive the exact interleaving deterministically: a new entry is appended DURING
-        hygiene's `read_entries`, in the window `_write_all` would otherwise clobber.
+        hygiene's read, in the window `_write_all` would otherwise clobber.
 
-        A real thread race would be flaky; patching `read_entries` to append-then-return
-        reproduces it every run. The lock does not prevent the interleaving here (same
-        process, re-entrant open) — the assertion is that the appended entry SURVIVES, which
-        it cannot if hygiene rewrites from a snapshot taken before it."""
+        A real thread race would be flaky; patching `read_entries_for_update` (the
+        mutation-path read hygiene starts from) to append-then-return reproduces it every
+        run. The lock does not prevent the interleaving here (same process, re-entrant
+        open) — the assertion is that the appended entry SURVIVES, which it cannot if
+        hygiene rewrites from a snapshot taken before it."""
         from unittest import mock
 
         from kiro_crew.apps.builtins.ops_mission_control.backend import ledger
@@ -441,7 +448,7 @@ class TestLedgerMutationsAreLocked(_Env):
         ledger.upsert(LedgerEntry.create(pattern="original", fix="f"))
         latecomer = LedgerEntry.create(pattern="arrived during hygiene", fix="f2")
 
-        real_read = ledger.read_entries
+        real_read = ledger.read_entries_for_update
         fired = {"done": False}
 
         def read_then_append():
@@ -451,7 +458,7 @@ class TestLedgerMutationsAreLocked(_Env):
                 ledger._append(latecomer)  # the concurrent POST
             return rows
 
-        with mock.patch.object(ledger, "read_entries", read_then_append):
+        with mock.patch.object(ledger, "read_entries_for_update", read_then_append):
             ledger.hygiene()
 
         patterns = {e.pattern for e in ledger.read_entries()}

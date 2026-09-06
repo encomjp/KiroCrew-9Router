@@ -362,7 +362,9 @@ class TestStartDashboardWiring:
         The ``Host`` barrier must run OUTSIDE the audit middleware: aiohttp runs
         middlewares outermost-first, and a rebinding attempt refused inside the
         audit layer would 403 without ever being recorded (which is why
-        ``_audit_denied`` exists at all).
+        ``_audit_denied`` exists at all). The deny-audit boundary must in turn
+        run outside the ``Host`` barrier: that is what makes the recording
+        positional rather than dependent on every deny site calling the helper.
         """
         async with _dashboard(tmp_path, monkeypatch) as (runner, _state, _spies):
             names = [getattr(mw, "__name__", type(mw).__name__) for mw in runner.app.middlewares]
@@ -370,6 +372,8 @@ class TestStartDashboardWiring:
         assert "host_validation_middleware" in names
         assert "sel_audit_middleware" in names
         assert names.index("host_validation_middleware") < names.index("sel_audit_middleware")
+        assert "deny_audit_middleware" in names, "the pre-audit deny boundary is not installed"
+        assert names.index("deny_audit_middleware") < names.index("host_validation_middleware")
 
     @pytest.mark.asyncio
     async def test_a_disallowed_host_is_refused_by_the_real_chain(
@@ -427,6 +431,7 @@ class TestStartDashboardWiring:
 
         later_hooks = (
             "_instances_shutdown",
+            "_connections_warm_shutdown",
             "_prevent_sleep_shutdown",
             "_status_sink_shutdown",
             "_contrib_shutdown",
@@ -439,8 +444,16 @@ class TestStartDashboardWiring:
         tunnel_at = cleanup.index("_tunnel_shutdown")
         for name in later_hooks:
             assert tunnel_at < cleanup.index(name), f"{name} would starve the tunnel teardown"
-        for name in ("_instances_startup", "_contrib_startup", "_hooks_startup"):
+        for name in (
+            "_instances_startup",
+            "_contrib_startup",
+            "_hooks_startup",
+        ):
             assert name in startup, f"missing on_startup hook: {name}"
+        # The warm scavenge is deliberately ABSENT from on_startup: those hooks run
+        # inside runner.setup(), before the listener binds, so the scavenge is kicked
+        # explicitly after _start_site instead (no-new-work-on-gateway-boot-path).
+        assert "_connections_warm_startup" not in startup
 
     @pytest.mark.asyncio
     async def test_a_cross_origin_post_is_refused(self, tmp_path, monkeypatch) -> None:
@@ -574,4 +587,26 @@ class TestStartDashboardWiring:
             spy.assert_awaited_once()
         finally:
             await runner.cleanup()
+            await _cancel_stray_tasks()
+
+
+class TestGatewayShutdownIsGuaranteed:
+    """GPT round-8 [BLOCKING] F4 (server.py:3357): a hung/raising reconciler
+    stop must not skip on_gateway_shutdown() -- that sweep tears down app
+    backends, so skipping it strands spawned processes past gateway exit."""
+
+    @pytest.mark.asyncio
+    async def test_on_gateway_shutdown_runs_even_if_stopping_the_poller_raises(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        async def _boom() -> None:
+            raise RuntimeError("reconciler stop blew up")
+
+        monkeypatch.setattr(srv, "stop_hook_reconciler", _boom)
+        runner, _state, spies = await _start_dashboard(tmp_path, monkeypatch)
+        try:
+            # cleanup dispatches _hooks_shutdown; the finally must still sweep.
+            await runner.cleanup()
+            spies["on_gateway_shutdown"].assert_awaited_once()
+        finally:
             await _cancel_stray_tasks()

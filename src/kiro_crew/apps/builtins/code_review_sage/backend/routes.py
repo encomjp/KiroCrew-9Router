@@ -457,12 +457,24 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
             # the subprocess (and its memory) lives exactly as long as the batch. The
             # holder is reference-counted, so overlapping runs share one runtime and the
             # last one out tears it down.
-            await pool.begin_batch()
+            #
+            # Runtime preflight, read ONCE and reused: when the host cannot spawn a
+            # reviewer (no kiro-cli, ACP runtime unimportable) the batch is never
+            # opened — begin_batch would raise inside the spawn with a generic
+            # message — and the same verdict is handed to run_review, which fails
+            # every change fast with a reason naming the missing runtime. One
+            # reading keeps the bracket and the driver's verdict consistent.
+            # Offloaded: the executable resolution stats candidates across every
+            # PATH entry, and one stale network mount there would stall the loop.
+            runtime_error = await asyncio.to_thread(review_pool.runtime_preflight)
+            if not runtime_error:
+                await pool.begin_batch()
             try:
                 summary = await asyncio.to_thread(
                     review_driver.run_review, changes,  # type: ignore[attr-defined]
                     dispatch=dispatch, progress=_make_progress(run),
                     run_id=run_id, cancelled=lambda: run_id in _CANCELLED,
+                    preflight=lambda: runtime_error,
                     # One reviewer at a time. Workers share the staging directory and
                     # each has shell and file tools, so two running at once means one
                     # can write another change's record between that change's slot
@@ -474,7 +486,8 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                     concurrency=1,
                 )
             finally:
-                await pool.end_batch()
+                if not runtime_error:
+                    await pool.end_batch()
             run["summary"] = summary
             _collect_delivered(run, summary)
             run["report_slug"] = summary.get("report_slug") or run.get("report_slug")
@@ -508,6 +521,21 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
                 # repo-review skips it until its head changes. Only repo-review runs
                 # carry head_shas; pasted-link runs skip this (no-op).
                 await asyncio.to_thread(_record_reviewed, run)
+            if run["status"] == "error":
+                # The cause as a TOKEN, beside the sentence rather than instead of
+                # it. `_first_change_failure` collapses the token into English for
+                # `error`, so without this the payload names the cause nowhere and
+                # the dashboard's translator has to recognize causes by their
+                # wording -- which silently reverts a card to untranslated
+                # pass-through the next time a message is reworded, with no test
+                # going red. Set for BOTH error branches above: the summary-level
+                # `error` sentence and the per-change one describe the same
+                # `per_change` records, so the token is derived from those either
+                # way. Absent (never empty-string) when no record carried one, so a
+                # reader cannot mistake "no token" for a token.
+                reason = _first_change_failure(summary)[1]
+                if reason:
+                    run["reason"] = reason
     except Exception as exc:  # pragma: no cover - defensive
         run["status"] = "error"
         run["error"] = str(exc)
@@ -524,18 +552,45 @@ async def _run_review_bg(run: dict, changes: list[str]) -> None:
         await _notify_finished(run)
 
 
-def _first_change_error(summary: dict) -> str:
-    """The most useful per-change failure reason, for a run-level error message."""
+def _first_change_failure(summary: dict) -> tuple[str, str]:
+    """The most useful per-change failure, as ``(sentence, reason_token)``.
+
+    Both halves come from the SAME record in one pass, which is the whole reason
+    this is not two functions. The sentence is often built from ``deep_error`` --
+    prose from the spawn -- while the token lives in that record's
+    ``skipped_reason``; a second independent scan for the token would happily
+    return a LATER record's token and pair it with this record's sentence,
+    labelling a failure with an unrelated cause.
+
+    The token half is ``""`` when the chosen record kept no ``skipped_reason``.
+    """
     for rec in summary.get("per_change") or []:
         for key in ("deep_error", "gate_error", "skipped_reason"):
             val = str(rec.get(key) or "").strip()
             if val:
-                return {
+                sentence = {
                     "no_review_recorded": "the reviewer finished but wrote no "
                                           "findings record",
+                    "review_record_incomplete": "the reviewer wrote a findings "
+                                                "record but never completed the "
+                                                "review",
+                    # Reason-level fallback only: a preflight-failed record
+                    # carries the specific runtime message in its error fields,
+                    # which the key order above prefers, and the run-level error
+                    # for that case comes from the summary's own error. Kept so
+                    # the reason itself always renders as a cause, never as a
+                    # bare enum value.
+                    "runtime_unavailable": "the reviewer never ran: its agent "
+                                           "runtime is unavailable on this host",
                     "review_failed": "the review turn failed",
                 }.get(val, val)
-    return ""
+                return sentence, str(rec.get("skipped_reason") or "").strip()
+    return "", ""
+
+
+def _first_change_error(summary: dict) -> str:
+    """The most useful per-change failure reason, for a run-level error message."""
+    return _first_change_failure(summary)[0]
 
 
 def _run_headline(run: dict) -> str:

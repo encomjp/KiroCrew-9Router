@@ -7,6 +7,9 @@ import { CommentsSidebar } from './CommentsSidebar'
 import { InlineCommentOverlay } from './InlineCommentOverlay'
 import { CommentThreadPopover } from './CommentThreadPopover'
 import { CommentPopover } from './CommentOverlay'
+import ErrorNotice from './ErrorNotice'
+import { errMessage } from '../utils/thunkError'
+import { i18nT } from '../i18n/t'
 
 /**
  * Durable artifact-comment layer for a NON-iframe (markdown / text) body,
@@ -77,7 +80,15 @@ export function useFileArtifactComments({
     enabled: !!slug,
     staleTime: 30_000,
   })
-  const durableComments = slug ? (commentsQuery.data?.comments ?? []) : []
+  // Memoized because it is the dep of rootIdOf / unreadRootIds / markThreadRead:
+  // the `[]` fallback (no slug, or the query not yet resolved) is a fresh array
+  // each render, which would rebuild all three — and every consumer memo keyed
+  // on them — on every render. React Query keeps `data` referentially stable
+  // between refetches that resolve deep-equal, so this changes only on real data.
+  const durableComments = useMemo(
+    () => (slug ? (commentsQuery.data?.comments ?? []) : []),
+    [slug, commentsQuery.data?.comments],
+  )
   const remoteSyncError = commentsQuery.data?.remote_sync_error ?? null
   const invalidate = useCallback(() => {
     if (slug) qc.invalidateQueries({ queryKey: ['artifact-comments', slug] })
@@ -176,7 +187,18 @@ export function useFileArtifactComments({
   // Writes go through useMutation so errors aren't silently swallowed and cache
   // invalidation is centralized (use-react-query guideline). The mutations are
   // only reachable when slug is non-null (the returned nodes are null otherwise).
-  const onMutErr = useCallback(() => invalidate(), [invalidate])
+  // A rejected write is ALSO kept as a message: invalidating alone re-reads the
+  // list, which silently drops the user's text with no explanation. The
+  // sidebar renders it beside the composer (no hand-off there — see the sidebar).
+  const [mutationError, setMutationError] = useState<string | null>(null)
+  const onMutErr = useCallback((e: unknown) => {
+    setMutationError(errMessage(e) || i18nT('components.commentsSidebar.comment_change_failed'))
+    invalidate()
+  }, [invalidate])
+  const clearMutationError = useCallback(() => setMutationError(null), [])
+  const loadError = commentsQuery.isError
+    ? (errMessage(commentsQuery.error) || i18nT('components.commentsSidebar.comments_load_failed'))
+    : null
   const postMut = useMutation({
     mutationFn: (vars: { text: string; scope?: string; anchor?: object }) =>
       api.postArtifactComment(slug as string, vars),
@@ -236,6 +258,26 @@ export function useFileArtifactComments({
 
   const popovers: ReactNode = slug ? (
     <>
+      {/* Writes also originate from the popovers (anchored add, thread reply /
+          resolve), which stay reachable while the sidebar is CLOSED — so a
+          rejected write, and equally a rejected comments READ (the overlay then
+          shows zero comments), must not wait for a sidebar that is not mounted.
+          When the sidebar is open it owns both notices (beside the composer);
+          when it is closed they land here, in the node the host always mounts.
+          No hand-off: the popover reply / comment textarea draft is unsaved. */}
+      {!sidebarOpen && (loadError || mutationError) && (
+        <div className="fixed bottom-safe-offset-4 right-safe-offset-4 z-[60] max-w-[420px] flex flex-col gap-2">
+          <ErrorNotice
+            testId="artifact-comments-load-error"
+            message={loadError}
+          />
+          <ErrorNotice
+            testId="artifact-comments-mutation-error"
+            message={mutationError}
+            onDismiss={clearMutationError}
+          />
+        </div>
+      )}
       {popover && (
         <CommentPopover
           x={popover.x}
@@ -266,6 +308,9 @@ export function useFileArtifactComments({
       comments={durableComments}
       loading={commentsQuery.isFetching}
       remoteSyncError={remoteSyncError}
+      loadError={loadError}
+      mutationError={mutationError}
+      onDismissMutationError={clearMutationError}
       onAdd={addDoc}
       onReply={reply}
       onResolve={resolve}

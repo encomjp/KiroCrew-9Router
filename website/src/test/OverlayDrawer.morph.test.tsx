@@ -23,13 +23,24 @@ import OverlayDrawer from '../components/OverlayDrawer'
 
 let reduceMotion = false
 
+/** The framer-motion props this mock READS; every other prop lands in `rest` and
+ *  is forwarded to the plain DOM element, which is what the index signature is for. */
+interface MotionMockProps {
+  [prop: string]: unknown
+  children?: React.ReactNode
+  initial?: { clipPath?: string }
+  animate?: { clipPath?: string }
+  exit?: { clipPath?: string }
+  transition?: unknown
+}
+
 // Capture what framer-motion is ASKED to animate. The real library cannot run
 // projection in jsdom, so the props are the observable surface.
 vi.mock('framer-motion', async () => {
   const React = await import('react')
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const { children, initial, animate, exit, transition, ...rest } = props
+    React.forwardRef((props: MotionMockProps, ref: React.Ref<unknown>) => {
+      const { children, initial, animate, exit, transition: _transition, ...rest } = props
       return React.createElement(tag, {
         ...rest,
         ref,
@@ -40,7 +51,7 @@ vi.mock('framer-motion', async () => {
     })
   return {
     motion: new Proxy({}, { get: (_t, tag: string) => make(tag) }),
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
     useReducedMotion: () => reduceMotion,
   }
 })
@@ -135,5 +146,56 @@ describe('OverlayDrawer morph clip', () => {
       view.unmount()
     }
     reduceMotion = false
+  })
+})
+
+describe('OverlayDrawer slide mode', () => {
+  // The framer-motion mock forwards every prop it does not read (`style`,
+  // `x`, `width`) straight onto the DOM element, so the merged style object is
+  // observable there. `x` is a MotionValue in production; here it is passed as a
+  // plain value purely to assert it survives the merge and is not overridden by
+  // `slideStyle`.
+  const X = 'X-MOTION-VALUE' as unknown as import('framer-motion').MotionValue<number>
+
+  const slidePanel = (over: Partial<React.ComponentProps<typeof OverlayDrawer>> = {}) => {
+    const { container } = render(
+      <OverlayDrawer open width={320} slideX={X} {...over}>
+        <div data-testid="panel">panel</div>
+      </OverlayDrawer>,
+    )
+    return container.querySelector('.overflow-hidden') as HTMLElement
+  }
+
+  it('merges the caller vertical inset and keeps x/width unoverridden', () => {
+    reduceMotion = false
+    const panel = slidePanel({ slideStyle: { marginTop: 58, marginBottom: 400 } })
+    const style = panel.getAttribute('style') ?? ''
+    // The caller's vertical inset lands as BLOCK-AXIS MARGINS, so the panel's own
+    // `top`/`bottom` CSS edges (which carry `env()` safe insets no script can
+    // read) keep owning where the box starts and ends.
+    expect(style).toContain('margin-top: 58px')
+    expect(style).toContain('margin-bottom: 400px')
+    // …the width the caller passed survives the merge…
+    expect(style).toContain('width: 320px')
+    // …and `x` (the transform channel, a MotionValue in production) is still
+    // applied — slideStyle was spread first, so it cannot displace it. A
+    // competing vertical transform would be a bug; the inset is margin-only.
+    expect(style).toContain('x: X-MOTION-VALUE')
+    expect(style).not.toContain('translateY')
+    // The inset must not restate an edge either: `top` belongs to the className.
+    // Anchored to a declaration boundary so `margin-top:` does not satisfy it.
+    expect(style).not.toMatch(/(?:^|;\s*)top:/)
+    expect(panel.querySelector('[data-testid="panel"]')).toBeTruthy()
+  })
+
+  it('is a no-op when no vertical inset is supplied (the desktop-free slide branch)', () => {
+    reduceMotion = false
+    const panel = slidePanel()
+    const style = panel.getAttribute('style') ?? ''
+    // Nothing forces a margin when the caller passes no slideStyle; x/width remain.
+    expect(style).not.toContain('margin')
+    expect(style).toContain('width: 320px')
+    expect(style).toContain('x: X-MOTION-VALUE')
+    expect(panel.querySelector('[data-testid="panel"]')).toBeTruthy()
   })
 })

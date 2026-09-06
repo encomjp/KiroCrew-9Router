@@ -472,6 +472,21 @@ export function isUnsupportedForge(err: unknown): boolean {
   return (err as ApiError | null)?.code === 'repo_provider_unsupported'
 }
 
+/** Whether a failure is the backend refusing because the dispatch queue has not
+ * been sharded per repository on this install yet.
+ *
+ * RECOGNITION, not a second rule: the refusal and its authored message live in
+ * `pipeline_fold._read_queue` (raised as `QueueMigrationPending`, answered 503 with
+ * this code by `_handle_step` / `_handle_item_sessions`). This only reads the code,
+ * so the two cannot disagree. Unlike an unsupported forge, this is not a standing
+ * fact about the repository -- re-running the pipeline installer clears it -- so a
+ * view that recognises it should still offer a retry, just not imply retrying alone
+ * is the fix.
+ */
+export function isQueueMigrationPending(err: unknown): boolean {
+  return (err as ApiError | null)?.code === 'queue_migration_pending'
+}
+
 function coerceOverviewStep(v: unknown): OverviewStep | null {
   const o = asObject(v)
   if (!o) return null

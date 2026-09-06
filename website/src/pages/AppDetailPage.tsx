@@ -6,30 +6,35 @@
  * Shows full description, features, screenshots, tags, and action buttons.
  */
 import { useEffect, useState, useCallback, useRef } from 'react'
+import { useReducedMotion } from 'framer-motion'
 import { useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   ArrowLeft, Download, Check, Loader2, Power, PowerOff,
   Trash2, RefreshCw, Bot, Zap, ArrowUp,
   Clock, ChevronLeft, ChevronRight, X, Monitor, Copy, Terminal,
-  Sparkles, Target, Settings2,
+  Target, Settings2, Star,
 } from 'lucide-react'
 import { needsDesktopApp } from '../lib/electron'
 import { api } from '../api/client'
+import { isNotFoundError } from '../api/apiError'
 import { PageHeader, Card, CardTitle, Badge, Btn } from '../components/ui'
 import AppIcon from '../components/AppIcon'
 import TrustAppModal, { APP_EXECUTION_DENIED, isTrustDeniedError, useTrustGate } from '../components/appstore/TrustAppModal'
-import { isRegistrySourced } from '../components/appstore/types'
+import { isRegistrySourced, sanitizeStargazersCount } from '../components/appstore/types'
 import { recordEvent } from '../rum'
 import { useTheme } from '../hooks/useTheme'
-import AskAgentButton from '../components/AskAgentButton'
+import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM, usePinchZoom } from '../hooks/usePinchZoom'
+import ErrorNotice from '../components/ErrorNotice'
+import { findReport, recordError } from '../utils/errorReport'
 
 import { i18nT } from '../i18n/t'
+import type { AppContributor } from '../types'
 import {
   appDisplayName, appDescription, appHighlights, appUseCases, appConfiguration,
 } from '../components/appstore/appManifest'
 import { isBuiltinServerRow, mergeBuiltinRow } from '../components/appstore/mergeBuiltinRow'
 import { classifyManifestArt, installedArt, installedArtList, installedArtListAligned, installedIcon } from '../components/appstore/useHeroArt'
-import { fmtDateNumeric } from '../i18n/format'
+import { fmtDateNumeric, fmtCompact, fmtNumber } from '../i18n/format'
 type AppInfo = {
   name: string
   displayName: string
@@ -67,6 +72,12 @@ type AppInfo = {
   repo?: string
   trustRepository?: string
   branch?: string
+  /**
+   * GitHub star count baked into git-type third-party rows by the publisher.
+   * Display-only and server-sanitized; built-ins never carry it, so presence
+   * is the display gate.
+   */
+  stargazersCount?: number
   // Installed state
   installed: boolean
   installedVersion?: string
@@ -154,9 +165,50 @@ interface AppManifest {
   minKiroCrewVersion?: string
 }
 
+type ScreenshotFailureState = {
+  screensKey: string
+  fallbacksKey: string
+  primary: ReadonlySet<number>
+  fallback: ReadonlySet<number>
+}
+
+const NO_SCREENSHOT_FAILURES: ReadonlySet<number> = new Set()
+
+function recordScreenshotFailure(
+  previous: ScreenshotFailureState,
+  screensKey: string,
+  fallbacksKey: string,
+  index: number,
+  tier: 'primary' | 'fallback',
+): ScreenshotFailureState {
+  // A failure belongs to the generation that rendered the image. The URL lists
+  // are re-armed during render (below), so a handler still holding an older
+  // generation's keys is by definition superseded: drop it rather than let it
+  // resurrect a set the current generation already cleared.
+  if (previous.screensKey !== screensKey || previous.fallbacksKey !== fallbacksKey) {
+    return previous
+  }
+  const primary = new Set<number>(previous.primary)
+  const fallback = new Set<number>(previous.fallback)
+  if (tier === 'primary') primary.add(index)
+  else fallback.add(index)
+  return { screensKey, fallbacksKey, primary, fallback }
+}
+
 // Exported for tests: the per-index latch guards (self-match, '' placeholder
 // skip) are not all reachable through the page once the call site gates the
 // fallback list on a registry-supplied primary.
+
+/** Screenshot zoom bounds. `1` is fit-to-viewport. The ceiling matches the
+ *  image viewer's (5), not the diagram viewer's (8): a screenshot is raster
+ *  pixels, and 8x would only blur it, while a vector diagram's labels need the
+ *  deeper zoom to become readable. */
+const SCREENSHOT_ZOOM_MIN = 1
+const SCREENSHOT_ZOOM_MAX = 5
+/** Travel a one-finger drag must cover before it counts as a pan rather than a
+ *  tap — below it the double-tap path is left alone. */
+const DRAG_SLOP = 6
+
 export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: string[]; fallbacks?: string[] }) {
   const [selected, setSelected] = useState<number | null>(null)
   // Both lists are TYPED string[] but can arrive as arbitrary JSON at
@@ -168,27 +220,155 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
   // #6886; the `screenshots` case pre-existed as a `.map` crash).
   const screenList: string[] = Array.isArray(screenshots) ? screenshots : []
   const fallbackList: string[] = Array.isArray(fallbacks) ? fallbacks : []
-  // Per-thumbnail failure latches, mirroring AppIcon's two-latch shape
-  // (#6804): a thumbnail whose primary errored swaps to ITS OWN fallback; one
+  // Per-thumbnail failure latches: a thumbnail whose primary errored swaps to
+  // ITS OWN fallback; one
   // whose fallback errored too is hidden — the pre-#6864 terminal state.
   // Per-index state, not one flag for the strip: one unreachable asset must
   // not blank its neighbours. `fallbacks` is optional so untouched callers
   // stay default-inert (the contract #6865 locked for AppIcon).
-  const [primaryFailed, setPrimaryFailed] = useState<ReadonlySet<number>>(new Set())
-  const [fallbackFailed, setFallbackFailed] = useState<ReadonlySet<number>>(new Set())
-  // Per-URL reset discipline (AppIcon's, list-shaped), keyed on the joined
-  // URLs rather than array identity because the caller builds these props
-  // inline, so identity changes every render. A changed primary list (theme
-  // flip, refetch) clears BOTH latch sets; a changed fallback list alone (an
-  // install completing under a mounted page) re-arms only the fallback
-  // latches. '\n' cannot appear in a URL, so the join is unambiguous.
   const screensKey = screenList.join('\n')
   const fallbacksKey = fallbackList.join('\n')
-  useEffect(() => {
-    setPrimaryFailed(new Set())
-    setFallbackFailed(new Set())
-  }, [screensKey])
-  useEffect(() => { setFallbackFailed(new Set()) }, [fallbacksKey])
+  // Re-arm the latches during render rather than in a passive effect. An image
+  // rendered for a new generation can fail BEFORE an effect would run, and the
+  // effect's reset would then erase that real failure and re-show the dead URL.
+  // Adjusting state while rendering re-arms before the new <img> is committed,
+  // and — unlike binding failures to the URL text alone — it clears on EVERY
+  // transition, so returning to an earlier list (theme flip back, refetch)
+  // retries instead of restoring a stale failure. A primary-list change re-arms
+  // both latch sets; a fallback-only change re-arms only the fallback latches.
+  const [failures, setFailures] = useState<ScreenshotFailureState>(() => ({
+    screensKey,
+    fallbacksKey,
+    primary: NO_SCREENSHOT_FAILURES,
+    fallback: NO_SCREENSHOT_FAILURES,
+  }))
+  if (failures.screensKey !== screensKey) {
+    setFailures({
+      screensKey,
+      fallbacksKey,
+      primary: NO_SCREENSHOT_FAILURES,
+      fallback: NO_SCREENSHOT_FAILURES,
+    })
+  } else if (failures.fallbacksKey !== fallbacksKey) {
+    setFailures({
+      screensKey,
+      fallbacksKey,
+      primary: failures.primary,
+      fallback: NO_SCREENSHOT_FAILURES,
+    })
+  }
+  const primaryFailed = failures.screensKey === screensKey
+    ? failures.primary
+    : NO_SCREENSHOT_FAILURES
+  const fallbackFailed = failures.screensKey === screensKey
+    && failures.fallbacksKey === fallbacksKey
+    ? failures.fallback
+    : NO_SCREENSHOT_FAILURES
+
+  // ── screenshot magnification (issue #6162) ────────────────────────────────
+  // This lightbox is the third full-viewport magnify overlay, bound by the same
+  // own-your-zoom rule as the image viewer and DiagramLightbox (narrow-viewport.md):
+  // page zoom is off on touch shell-wide, so a phone user has no other way to
+  // inspect a fit-scaled screenshot. Unlike those two, the surface also owns
+  // prev/next navigation and click-to-dismiss, so the shared hook supplies only
+  // the gesture math while the page keeps those interactions.
+  const dialogRef = useRef<HTMLDivElement | null>(null)
+  const imgRef = useRef<HTMLImageElement | null>(null)
+  const reduceMotion = useReducedMotion()
+  // A finished pinch or double-tap synthesises a click; without suppression it
+  // reaches the backdrop handler and closes the viewer the user just zoomed
+  // into (mirrors DiagramLightbox's `suppressClickRef`).
+  const suppressClickRef = useRef(false)
+  const lastTapRef = useRef({ t: 0, x: 0, y: 0 })
+  const [dragging, setDragging] = useState(false)
+  const dragRef = useRef({ id: -1, startX: 0, startY: 0, baseX: 0, baseY: 0, active: false })
+  const open = selected !== null
+  const {
+    zoom, setZoom, pan, setPan, pinching, clampPan,
+    trackPointerDown, trackPointerMove, trackPointerUp, reset,
+  } = usePinchZoom({
+    targetRef: imgRef,
+    // Claim a trackpad gesture anywhere in the overlay, not just over the
+    // image: around a small or portrait screenshot most of the backdrop is
+    // visually part of the viewer (mirrors DiagramLightbox).
+    containRef: dialogRef,
+    // Only while the lightbox is open. It unmounts its viewers by returning
+    // null elsewhere, but the component itself stays mounted and a non-passive
+    // `wheel` listener would otherwise sit on `window` for the page's lifetime.
+    enabled: open,
+    min: SCREENSHOT_ZOOM_MIN,
+    max: SCREENSHOT_ZOOM_MAX,
+    onPinchEnd: () => { suppressClickRef.current = true },
+  })
+
+  // Reset to fit whenever the selected screenshot changes, so a zoom applied to
+  // one screenshot is never inherited by the next (mirrors DiagramLightbox's
+  // reset on `svg` change).
+  useEffect(() => { reset() }, [selected, reset])
+
+  // Re-clamp the pan after a zoom change: the pannable box is a function of the
+  // zoom, so shrinking back toward fit must pull an out-of-range pan back in.
+  useEffect(() => { setPan(p => (zoom <= SCREENSHOT_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan, setPan])
+
+  /** Double-tap toggles fit <-> DOUBLE_TAP, anchored where the user tapped so
+   *  the detail they aimed at is what they get. */
+  const onTap = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
+    if (e.pointerType === 'mouse') return
+    const now = Date.now()
+    const last = lastTapRef.current
+    const isDouble = now - last.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - last.x, e.clientY - last.y) < DOUBLE_TAP_SLOP
+    lastTapRef.current = { t: now, x: e.clientX, y: e.clientY }
+    if (!isDouble) return
+    lastTapRef.current = { t: 0, x: 0, y: 0 }
+    suppressClickRef.current = true
+    if (zoom > SCREENSHOT_ZOOM_MIN) { setZoom(SCREENSHOT_ZOOM_MIN); setPan({ x: 0, y: 0 }); return }
+    const cx = window.innerWidth / 2
+    const cy = window.innerHeight / 2
+    const z = DOUBLE_TAP_ZOOM
+    setZoom(z)
+    setPan(clampPan((e.clientX - cx) * (1 - z), (e.clientY - cy) * (1 - z), z))
+  }, [zoom, setZoom, setPan, clampPan])
+
+  const onImgPointerDown = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
+    // Clear here (not on the wrapper) because the <img> stops propagation, so
+    // a wrapper-level clear would never run for an image click.
+    suppressClickRef.current = false
+    // A pinch owns the gesture when it seats; neither the tap nor the pan path
+    // must also run. The first contact already ran through `onTap` and left a
+    // tap candidate, so clear it.
+    if (trackPointerDown(e)) {
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
+      dragRef.current.active = false
+      setDragging(false)
+      return
+    }
+    onTap(e)
+    if (zoom <= SCREENSHOT_ZOOM_MIN) return
+    dragRef.current = { id: e.pointerId, startX: e.clientX, startY: e.clientY, baseX: pan.x, baseY: pan.y, active: true }
+  }, [trackPointerDown, onTap, zoom, pan])
+
+  const onImgPointerMove = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
+    if (trackPointerMove(e)) return
+    const d = dragRef.current
+    if (!d.active || e.pointerId !== d.id) return
+    const dx = e.clientX - d.startX
+    const dy = e.clientY - d.startY
+    // Below the slop the gesture is still a candidate tap; committing to a drag
+    // early would eat the double-tap.
+    if (!dragging && Math.hypot(dx, dy) < DRAG_SLOP) return
+    if (!dragging) {
+      setDragging(true)
+      lastTapRef.current = { t: 0, x: 0, y: 0 }
+    }
+    suppressClickRef.current = true
+    setPan(clampPan(d.baseX + dx, d.baseY + dy))
+  }, [trackPointerMove, dragging, clampPan, setPan])
+
+  const onImgPointerUp = useCallback((e: React.PointerEvent<HTMLImageElement>) => {
+    trackPointerUp(e)
+    const d = dragRef.current
+    if (d.active && e.pointerId === d.id) { d.active = false; if (dragging) setDragging(false) }
+  }, [trackPointerUp, dragging])
 
   // The effective (post-swap) src for one index — '' when the index is
   // terminal (primary failed and no usable fallback: absent, an '' alignment
@@ -245,8 +425,10 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
                   alt={i18nT('pages.appDetailPage.screenshot', { n: i + 1 })}
                   className="h-40 rounded-lg border border-border hover:border-accent/40 hover:shadow-md transition-all object-cover"
                   onError={() => {
-                    if (!primaryFailed.has(i)) setPrimaryFailed(prev => new Set(prev).add(i))
-                    else setFallbackFailed(prev => new Set(prev).add(i))
+                    const tier = primaryFailed.has(i) ? 'fallback' : 'primary'
+                    setFailures(previous => recordScreenshotFailure(
+                      previous, screensKey, fallbacksKey, i, tier,
+                    ))
                   }}
                 />
               </button>
@@ -270,20 +452,45 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
           // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions
           <div
             className="fixed inset-0 z-[9999] flex items-center justify-center bg-bg/80 backdrop-blur-sm"
-            onClick={() => setSelected(null)}
+            onClick={() => {
+              // A pinch, drag or double-tap just finished — that click is gesture
+              // residue and must not dismiss the viewer the user just zoomed into.
+              if (suppressClickRef.current) { suppressClickRef.current = false; return }
+              setSelected(null)
+            }}
             onKeyDown={e => {
               if (e.key === 'Escape') setSelected(null)
               if (e.key === 'ArrowRight' && nextVisible !== undefined) setSelected(nextVisible)
               if (e.key === 'ArrowLeft' && prevVisible !== undefined) setSelected(prevVisible)
             }}
             tabIndex={-1}
-            ref={el => el?.focus()}
+            ref={el => {
+              dialogRef.current = el
+              el?.focus()
+            }}
             role="dialog"
             aria-modal="true"
           >
             {/* Presentational wrapper: stops backdrop-dismiss when clicking the image. */}
             <div role="presentation" className="relative max-w-4xl max-h-[80vh] mx-4" onClick={e => e.stopPropagation()}>
-              <img src={resolvedAt(selected)} alt="" className="max-w-full max-h-[80vh] rounded-xl shadow-2xl" />
+              <img
+                src={resolvedAt(selected)}
+                alt=""
+                ref={imgRef}
+                className="max-w-full max-h-[80vh] rounded-xl shadow-2xl touch-none"
+                style={{
+                  transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+                  // No transition during a gesture: a pinch already produces a frame
+                  // per move, and easing between them lags the fingers. Nor for a user
+                  // who opted out of motion — a double-tap animates a 2.5x scale.
+                  transition: pinching || dragging || reduceMotion ? 'none' : 'transform 150ms ease-out',
+                  cursor: zoom > SCREENSHOT_ZOOM_MIN ? (dragging ? 'grabbing' : 'grab') : undefined,
+                }}
+                onPointerDown={onImgPointerDown}
+                onPointerMove={onImgPointerMove}
+                onPointerUp={onImgPointerUp}
+                onPointerCancel={onImgPointerUp}
+              />
               <button className="absolute top-2 right-2 bg-bg/80 rounded-full p-1.5 text-muted hover:text-text" onClick={() => setSelected(null)} aria-label={i18nT('pages.appDetailPage.close')}><X size={18} /></button>
               {prevVisible !== undefined && (
                 <button className="absolute left-2 top-1/2 -translate-y-1/2 bg-bg/80 rounded-full p-2 text-muted hover:text-text" onClick={e => { e.stopPropagation(); setSelected(prevVisible) }} aria-label={i18nT('pages.appDetailPage.previous')}><ChevronLeft size={20} /></button>
@@ -314,26 +521,36 @@ export function ScreenshotGallery({ screenshots, fallbacks }: { screenshots: str
  */
 // Exported for tests (direct latch-discipline coverage).
 export function HeroBanner({ src, fallbackSrc, isDetail }: { src: string; fallbackSrc?: string; isDetail: boolean }) {
-  const [primaryFailed, setPrimaryFailed] = useState(false)
-  const [fallbackFailed, setFallbackFailed] = useState(false)
-  // A changed primary clears BOTH latches: a theme flip changes `src` without
-  // any prop the parent re-keys on, and an app update rewrites the local file
-  // in place, so a stale fallback latch would be a sticky failure.
-  useEffect(() => {
-    setPrimaryFailed(false)
-    setFallbackFailed(false)
-  }, [src])
-  // The same per-URL reset for the fallback latch alone: the fallback
-  // candidate moves independently of the primary (a theme flip where only the
-  // fallback pair has a dark variant, an install completing under a mounted
-  // page) and must never inherit a stale failure.
-  useEffect(() => { setFallbackFailed(false) }, [fallbackSrc])
   // Same-origin gate on the fallback, mirroring resolvedAt in the gallery:
   // the registry-only raw-row spread can deliver attacker-chosen fallback
   // keys, and an absolute URL honoured on error would leak the viewer's
   // address to a third-party host. installedArt only emits same-origin
   // routes, so real installed-app fallbacks always pass (GPT finding, #6886).
   const safeFallback = fallbackSrc && classifyManifestArt(fallbackSrc) === 'same-origin' ? fallbackSrc : ''
+  // Re-arm the latches during render rather than in a passive effect. The image
+  // for a new URL can fail BEFORE an effect would run, and the effect's reset
+  // would then erase that real failure and re-show the dead URL. Adjusting
+  // state while rendering re-arms before the new <img> is committed, and —
+  // unlike binding the failure to the URL text alone — it clears on EVERY
+  // transition, so a theme flip back to a previously failed URL retries instead
+  // of restoring a stale failure. A changed primary re-arms both latches; a
+  // fallback that moves on its own (an install completing under a mounted page)
+  // re-arms only the fallback latch.
+  const [latch, setLatch] = useState<{
+    src: string
+    fallback: string
+    primaryFailed: boolean
+    fallbackFailed: boolean
+  }>(() => ({ src, fallback: safeFallback, primaryFailed: false, fallbackFailed: false }))
+  if (latch.src !== src) {
+    setLatch({ src, fallback: safeFallback, primaryFailed: false, fallbackFailed: false })
+  } else if (latch.fallback !== safeFallback) {
+    setLatch({ src, fallback: safeFallback, primaryFailed: latch.primaryFailed, fallbackFailed: false })
+  }
+  const primaryFailed = latch.src === src && latch.primaryFailed
+  const fallbackFailed = latch.src === src
+    && latch.fallback === safeFallback
+    && latch.fallbackFailed
   const useFallback = primaryFailed && !!safeFallback && safeFallback !== src && !fallbackFailed
   if (!src || (primaryFailed && !useFallback)) return null
   return (
@@ -345,8 +562,14 @@ export function HeroBanner({ src, fallbackSrc, isDetail }: { src: string; fallba
         alt=""
         className="w-full h-full object-cover"
         onError={() => {
-          if (!primaryFailed) setPrimaryFailed(true)
-          else setFallbackFailed(true)
+          setLatch(previous => {
+            // Superseded generation: the current render already re-armed these
+            // tokens, so this error is about a URL no longer on screen.
+            if (previous.src !== src || previous.fallback !== safeFallback) return previous
+            return previous.primaryFailed
+              ? { ...previous, fallbackFailed: true }
+              : { ...previous, primaryFailed: true }
+          })
         }}
       />
     </div>
@@ -384,11 +607,52 @@ export default function AppDetailPage() {
   const [showUninstallConfirm, setShowUninstallConfirm] = useState(false)
   const [keepData, setKeepData] = useState(true)
 
-  // Helper: open chat with a pre-filled message (same mechanism as useChatLauncher from app-sdk)
-  const openChatWithMessage = useCallback((message: string) => {
-    ;(window as Window & { __mc_chat_launch?: { message: string; ts: number } }).__mc_chat_launch = { message, ts: Date.now() }
-    navigate('/chat')
-  }, [navigate])
+  // Contributors row (Details panel). Resolved GitHub repo URL for the app's
+  // source, its top contributors, and the fetch's loading state. The row hides
+  // entirely unless a GitHub repo URL resolves and the fetch yields entries.
+  const [repoUrl, setRepoUrl] = useState('')
+  const [contributors, setContributors] = useState<AppContributor[]>([])
+  const [contribLoading, setContribLoading] = useState(false)
+  /** A rejected contributors fetch, kept apart from `[]` so a transport failure
+   *  does not read as "no contributors". */
+  const [contribError, setContribError] = useState('')
+
+  useEffect(() => {
+    // Prefer the registry/manifest repo, then the git URL the app was trusted
+    // from, then its source. GitHub-only in v1; a non-GitHub value leaves the
+    // row hidden (the backend also returns [] for one).
+    const candidates = [app?.repo, app?.manifest?.repo, app?.trustRepository, app?.source]
+    const url = candidates.find(
+      (v): v is string => typeof v === 'string' && /^https:\/\/github\.com\//i.test(v),
+    ) || ''
+    setRepoUrl(url)
+    setContribError('')
+    if (!url) { setContributors([]); setContribLoading(false); return }
+    let cancelled = false
+    setContribLoading(true)
+    api.appContributors(url)
+      .then(res => { if (!cancelled) setContributors(res.contributors || []) })
+      .catch((e: unknown) => { if (!cancelled) { setContributors([]); setContribError(e instanceof Error ? e.message : String(e)) } })
+      .finally(() => { if (!cancelled) setContribLoading(false) })
+    return () => { cancelled = true }
+  }, [app])
+
+  /** Journal an install failure WITH the tail of its log, then show it.
+   *
+   *  The streaming install bypasses the `api.*` journal hook, so without this the
+   *  agent hand-off on the failure notice would carry only the one-line message.
+   *  The log is read from the rendered <pre> (the accumulated state, not a stale
+   *  closure); `recordError` redacts and caps it. The message string is the
+   *  journal key, so it must be exactly what `setError` shows. */
+  const reportInstallFailure = useCallback((message: string, source: 'api' | 'system') => {
+    recordError({
+      source,
+      message,
+      endpoint: '/api/apps/registry/install-stream',
+      detail: installLogRef.current?.textContent || undefined,
+    })
+    setError(message)
+  }, [])
 
   // Abort in-flight streaming install on unmount
   useEffect(() => () => { installAbortRef.current?.abort() }, [])
@@ -396,17 +660,41 @@ export default function AppDetailPage() {
   const load = useCallback(async () => {
     if (!name) return
     setLoading(true)
+    // Drop the previous record before resolving the new name: a genuine miss
+    // sets nothing below, and without this an in-session navigation from a
+    // loaded app to a non-existent one would keep rendering the old app under
+    // the new URL instead of the not-found page.
+    setApp(null)
     clearError()
     try {
-      // Try installed app first
-      const installed = await api.getApp(name).catch(() => null)
-      // Also check registry for richer metadata (screenshots, highlights)
-      const registryData = await api.listRegistry().catch(() => ({ apps: [], serverPlatform: { os: '', arch: '' } }))
-      const registryList = (registryData.apps || []) as RegistryEntry[]
+      // Try installed app first. Only a 404 means "not installed"; any other
+      // rejection is a load failure and must not be shown as "not found".
+      let installed: Awaited<ReturnType<typeof api.getApp>> | null = null
+      try {
+        installed = await api.getApp(name)
+      } catch (e: unknown) {
+        if (!isNotFoundError(e)) throw e
+      }
+      // Also check registry for richer metadata (screenshots, highlights). A
+      // failure here is held rather than swallowed: an INSTALLED app can still
+      // render from its manifest, but the reader is told the catalog was not
+      // reachable; an app that is not installed cannot be resolved without it.
+      let registryList: RegistryEntry[] = []
+      let sideFailure: unknown = null
+      try {
+        const registryData = await api.listRegistry()
+        registryList = (registryData.apps || []) as RegistryEntry[]
+      } catch (e: unknown) {
+        sideFailure = e
+      }
 
       // Fetch server hostname for client install template variables
-      const sysInfo = await api.system().catch(() => ({ hostname: '' }))
-      if (sysInfo.hostname) setServerHostname(sysInfo.hostname)
+      try {
+        const sysInfo = await api.system()
+        if (sysInfo.hostname) setServerHostname(sysInfo.hostname)
+      } catch (e: unknown) {
+        sideFailure ??= e
+      }
       const registryEntry = registryList.find((r) => r.name === name)
 
       if (installed) {
@@ -432,6 +720,10 @@ export default function AppDetailPage() {
             resources: installed.resources,
             lifecycle: installed.lifecycle,
             updateAvailable: registryEntry.updateAvailable || false,
+            // Built-ins never carry a star count (they have no repository of
+            // their own) — enforce the invariant here rather than trusting the
+            // spread above, since mergeBuiltinRow copies the raw server row.
+            stargazersCount: undefined,
             manifest: m,
           })
         } else {
@@ -537,6 +829,7 @@ export default function AppDetailPage() {
             // fallback identifier is a separate decision from resolving art.
             repo: registryEntry?.repo || '',
             trustRepository: installed.trustRepository,
+            stargazersCount: sanitizeStargazersCount(registryEntry?.stargazersCount),
             installed: true,
             installedVersion: installed.version,
             enabled: installed.enabled,
@@ -560,13 +853,23 @@ export default function AppDetailPage() {
           description: registryEntry.description || '',
           version: registryEntry.version || '0.0.0',
           author: registryEntry.author || '',
+          // The spread above copies the RAW listRegistry payload, which never
+          // went through normalizeRegistryApp — sanitize the display-only star
+          // count explicitly so a hostile/older gateway cannot render NaN/-1
+          // or a layout-breaking 1e308 here (the list path is already covered).
+          stargazersCount: sanitizeStargazersCount(registryEntry.stargazersCount),
           // Preserve install status from registry (set by detectInstalled)
           installed: registryEntry.installed ?? false,
           platform: registryEntry.platform,
         })
-      } else {
-        setError(i18nT('pages.appDetailPage.app_not_found_2', { name }))
+      } else if (sideFailure) {
+        // Neither installed nor in the catalog — but the catalog read FAILED, so
+        // this is a load failure, not a missing app.
+        throw sideFailure
       }
+      // Otherwise a real not-found: `app` stays null with no error, and the
+      // render below shows the "doesn't exist" page for exactly that pair.
+      if (sideFailure) setError(sideFailure instanceof Error ? sideFailure.message : String(sideFailure))
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.failed_to_load_app'))
     } finally {
@@ -676,7 +979,7 @@ export default function AppDetailPage() {
         await load()
         window.dispatchEvent(new Event('mc:apps-changed'))
       } else {
-        setError(result.error || i18nT('pages.appDetailPage.install_failed'))
+        reportInstallFailure(result.error || i18nT('pages.appDetailPage.install_failed'), 'system')
         return 'failed'
       }
     } catch (e: unknown) {
@@ -696,7 +999,7 @@ export default function AppDetailPage() {
         return 'trust-required'
       }
       setInstallDone(true)
-      setError(e instanceof Error ? e.message : i18nT('pages.appDetailPage.install_failed'))
+      reportInstallFailure(e instanceof Error ? e.message : i18nT('pages.appDetailPage.install_failed'), 'api')
       return 'failed'
     } finally {
       // Only clear loading if this is still the active install —
@@ -833,11 +1136,23 @@ export default function AppDetailPage() {
   }
 
   if (!app) {
+    // Two different pages share this branch: `error` set means the load FAILED
+    // (transport, 5xx), so the header must not announce "not found" and the
+    // failure gets the shared surface plus a retry; no error means the name
+    // genuinely resolves to nothing.
     return (
       <>
-        <PageHeader title={i18nT('pages.appDetailPage.app_not_found')} subtitle={error || i18nT('pages.appDetailPage.doesnt_exist', { name })} />
-        <div className="flex-1 flex items-center justify-center p-8">
-          <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('pages.appDetailPage.back_to_apps')}</Btn>
+        <PageHeader
+          title={error ? i18nT('pages.appDetailPage.apps') : i18nT('pages.appDetailPage.app_not_found')}
+          subtitle={error ? i18nT('pages.appDetailPage.failed_to_load_app') : i18nT('pages.appDetailPage.doesnt_exist', { name })}
+        />
+        <div className="flex-1 flex flex-col items-center justify-center gap-4 p-8">
+          {/* Nothing on this page is editable, so the hand-off loses nothing. */}
+          <ErrorNotice message={error} askAgent />
+          <div className="flex items-center gap-2">
+            {error && <Btn onClick={() => { void load() }}>{i18nT('pages.appDetailPage.retry')}</Btn>}
+            <Btn onClick={() => navigate('/apps')}><ArrowLeft size={14} /> {i18nT('pages.appDetailPage.back_to_apps')}</Btn>
+          </div>
         </div>
       </>
     )
@@ -918,26 +1233,16 @@ export default function AppDetailPage() {
           </div>
         )}
 
-        {/* Error */}
-        {error && (
-          <div className="mb-4 bg-danger/10 border border-danger/20 rounded-lg p-3 flex items-start gap-3 animate-rise">
-            <div className="flex-1 min-w-0">
-              {/* No special execution-policy branch here any more: an untrusted
-                  third-party app is refused with `app_execution_denied`, and that
-                  refusal is now resolved INLINE by the consent modal (granting
-                  this one app) rather than by sending the user off to flip a
-                  blanket switch. Everything that still reaches this box is an
-                  unrecognized backend failure, so it renders the prose — better
-                  than swallowing it — plus a hand-off to the agent, since raw
-                  backend prose is otherwise a dead end. */}
-              <span className="text-danger text-sm block">{error}</span>
-              <div className="mt-2">
-                <AskAgentButton message={error} />
-              </div>
-            </div>
-            <button aria-label={i18nT('pages.appDetailPage.dismiss_error')} className="text-danger/60 hover:text-danger text-sm shrink-0" onClick={clearError}><X className="lucide-inline" /></button>
-          </div>
-        )}
+        {/* Error. No special execution-policy branch here any more: an untrusted
+            third-party app is refused with `app_execution_denied`, and that
+            refusal is now resolved INLINE by the consent modal (granting this
+            one app) rather than by sending the user off to flip a blanket
+            switch. Everything that still reaches this box is an unrecognized
+            backend failure, so it renders the prose — better than swallowing
+            it — plus the agent hand-off, since raw backend prose is otherwise
+            a dead end. The page holds no draft (every action commits on
+            click), so the hand-off is safe. */}
+        <ErrorNotice message={error} askAgent onDismiss={clearError} className="mb-4 animate-rise" />
 
         {/* Third-party execution-trust consent. Opened when an enable OR a
             registry install is refused with code `app_execution_denied`, instead
@@ -996,8 +1301,13 @@ export default function AppDetailPage() {
 
         {/* Hero */}
         <div className="flex items-start gap-5 mb-6">
-          <div className="w-24 h-24 rounded-2xl bg-accent/10 flex items-center justify-center shrink-0 overflow-hidden">
-            <AppIcon icon={app.icon} iconUrl={app.iconUrl} iconUrlDark={app.iconUrlDark} iconUrlFallback={app.iconUrlFallback} iconUrlFallbackDark={app.iconUrlFallbackDark} size={64} />
+          {/* `relative` is load-bearing, not decoration: `rasterFill` absolutely
+              insets the image, so without a positioned plate the icon resolves
+              against the nearest positioned ancestor — there is none above this
+              hero row, so it would escape to a page-level box. `overflow-hidden`
+              is what makes the bled image take this plate's `rounded-2xl`. */}
+          <div className="w-24 h-24 rounded-2xl bg-accent/10 flex items-center justify-center shrink-0 overflow-hidden relative">
+            <AppIcon icon={app.icon} iconUrl={app.iconUrl} iconUrlDark={app.iconUrlDark} iconUrlFallback={app.iconUrlFallback} iconUrlFallbackDark={app.iconUrlFallbackDark} size={64} rasterFill />
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-3 mb-1 flex-wrap">
@@ -1007,7 +1317,15 @@ export default function AppDetailPage() {
               {app.installed && isSelfManaged && !isBuiltin && <Badge variant="ok">{i18nT('pages.appDetailPage.self_managed')}</Badge>}
               {app.installed && !isSelfManaged && !isBuiltin && <Badge variant={app.enabled ? 'ok' : 'warn'}>{app.enabled ? i18nT('pages.appDetailPage.enabled') : i18nT('pages.appDetailPage.disabled')}</Badge>}
             </div>
-            <div className="text-[13px] text-muted mb-3">{app.author} {i18nT('pages.appDetailPage.v_2')}{app.version}</div>
+            <div className="text-[13px] text-muted mb-3 flex items-center gap-1 flex-wrap">
+              <span>{app.author} {i18nT('pages.appDetailPage.v_2')}{app.version}</span>
+              {typeof app.stargazersCount === 'number' && (
+                <span className="inline-flex items-center gap-0.5">
+                  · <Star size={13} className="shrink-0" role="img" aria-label={i18nT('pages.appDetailPage.github_stars')} />
+                  {fmtCompact(app.stargazersCount)}
+                </span>
+              )}
+            </div>
 
             {/* Actions */}
             <div className="flex items-center gap-2 flex-wrap">
@@ -1098,30 +1416,26 @@ export default function AppDetailPage() {
               <div className="flex items-center gap-2">
                 {!installDone && <Loader2 size={14} className="animate-spin text-accent" />}
                 {installDone && !error && <Check size={14} className="text-ok" />}
-                {installDone && error && <X size={14} className="text-danger" />}
-                <CardTitle>
-                  {!installDone ? i18nT('pages.appDetailPage.installing') : error ? i18nT('pages.appDetailPage.install_failed') : i18nT('pages.appDetailPage.install_complete')}
-                </CardTitle>
+                {installDone && error ? (
+                  /* The failure headline is the shared surface, not a bespoke
+                     "Fix with AI" button. The hand-off resolves the journal entry
+                     `reportInstallFailure` wrote for this exact message, so it
+                     carries the log tail the old button pasted by hand. The
+                     message itself already shows in the page banner above; this
+                     row states the outcome. */
+                  <ErrorNotice
+                    variant="inline"
+                    message={i18nT('pages.appDetailPage.install_failed')}
+                    report={findReport(error)}
+                    askAgent
+                  />
+                ) : (
+                  <CardTitle>
+                    {!installDone ? i18nT('pages.appDetailPage.installing') : i18nT('pages.appDetailPage.install_complete')}
+                  </CardTitle>
+                )}
               </div>
               <div className="flex items-center gap-2">
-                {installDone && error && (
-                  <Btn onClick={() => {
-                    const appSourcePath = `~/.kiro/crew/app-sources/${app?.name || name}/`
-                    const msg = [
-                      `App "${app?.displayName || name}" installation failed. Error log:`,
-                      '',
-                      '```',
-                      installLog.slice(-2000),
-                      '```',
-                      '',
-                      `The app source is at: ${appSourcePath}`,
-                      `Read the README.md and any setup instructions in that directory, then fix the environment and complete the installation.`,
-                    ].join('\n')
-                    openChatWithMessage(msg)
-                  }}>
-                    <Sparkles size={14} /> {i18nT('pages.appDetailPage.fix_with_ai')}
-                  </Btn>
-                )}
                 {installDone && (
                   <button className="text-muted hover:text-text transition-colors p-1" onClick={() => setShowInstallLog(false)} aria-label={i18nT('pages.appDetailPage.close')}>
                     <X size={14} />
@@ -1376,7 +1690,62 @@ export default function AppDetailPage() {
             <CardTitle>{i18nT('pages.appDetailPage.details')}</CardTitle>
             <div className="grid gap-1.5 mt-2 text-[13px] text-muted">
               {app.repo && <div>{i18nT('pages.appDetailPage.repository')} {app.repo}</div>}
+              {typeof app.stargazersCount === 'number' && <div>{i18nT('pages.appDetailPage.github_stars_2', { value: fmtNumber(app.stargazersCount) })}</div>}
               {app.author && <div>{i18nT('pages.appDetailPage.author')} {app.author}</div>}
+              {repoUrl && (contribLoading || contributors.length > 0 || contribError) && (
+                <div className="flex items-start gap-2 flex-wrap">
+                  <span className="shrink-0">{i18nT('pages.appDetailPage.contributors')}</span>
+                  {contribLoading ? (
+                    <div className="flex gap-1.5">
+                      {[0, 1, 2].map(i => (
+                        <span
+                          key={i}
+                          className="inline-block h-[22px] w-16 rounded-full animate-pulse"
+                          style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)' }}
+                        />
+                      ))}
+                    </div>
+                  ) : contribError ? (
+                    /* Read-only details row: the hand-off has nothing to lose. */
+                    <ErrorNotice message={contribError} variant="inline" askAgent />
+                  ) : (
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {contributors.slice(0, 6).map(c => (
+                        <span
+                          key={c.login}
+                          title={c.name}
+                          className="inline-flex items-center gap-1.5 rounded-full pl-0.5 pr-2 py-0.5"
+                          style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--text)' }}
+                        >
+                          <span
+                            className="relative inline-flex h-[18px] w-[18px] items-center justify-center overflow-hidden rounded-full text-[10px]"
+                            style={{ background: 'var(--accent-subtle)', color: 'var(--accent)' }}
+                          >
+                            <span>{(c.name || c.login).slice(0, 1).toUpperCase()}</span>
+                            {c.avatarUrl && /^https:\/\/[^"')(\s]+$/.test(c.avatarUrl) && (
+                              <span
+                                aria-hidden="true"
+                                className="absolute inset-0 rounded-full"
+                                style={{ backgroundImage: `url("${c.avatarUrl}")`, backgroundSize: 'cover', backgroundPosition: 'center' }}
+                              />
+                            )}
+                          </span>
+                          <span className="text-[12px]">{c.name}</span>
+                        </span>
+                      ))}
+                      <a
+                        href={`${repoUrl.replace(/\.git$/, '').replace(/\/$/, '')}/graphs/contributors`}
+                        target="_blank"
+                        rel="noreferrer noopener"
+                        className="inline-flex items-center rounded-full px-2 py-0.5 text-[12px] no-underline"
+                        style={{ background: 'var(--bg-elevated)', border: '1px solid var(--border)', color: 'var(--muted)' }}
+                      >
+                        {i18nT('pages.appDetailPage.all_contributors')}
+                      </a>
+                    </div>
+                  )}
+                </div>
+              )}
               {app.installedAt && <div>{i18nT('pages.appDetailPage.installed')} {fmtDateNumeric(app.installedAt)}</div>}
               {app.origin && <div>{i18nT('pages.appDetailPage.origin')} {app.origin} {i18nT('pages.appDetailPage.resources_2')} {app.resources || 'gateway'} {i18nT('pages.appDetailPage.lifecycle')} {app.lifecycle || 'gateway'}</div>}
               {app.manifest?.minKiroCrewVersion && <div>{i18nT('pages.appDetailPage.min_kirocrew_v')}{app.manifest.minKiroCrewVersion}</div>}

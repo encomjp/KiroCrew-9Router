@@ -52,6 +52,11 @@ vi.mock('../api/client', () => ({
     setSlotFolder: vi.fn().mockResolvedValue({ ok: true }),
     dashboardConfig: vi.fn().mockResolvedValue({ quick_send: false }),
     planAction: vi.fn().mockResolvedValue({ ok: true }),
+    // The sidebar's folder and board-column reads now report a failure through
+    // an ErrorNotice (with a Retry button); an absent mock reads as a failure,
+    // so answer them so the notice does not compete with the assertions below.
+    chatFolders: vi.fn().mockResolvedValue([]),
+    tagColumns: vi.fn().mockResolvedValue([]),
   },
   SEARCH_MIN_CHARS: 2,
 }))
@@ -302,5 +307,23 @@ describe('ChatPage plan follow-ups (issue #5893 parity)', () => {
     await act(async () => { clickOption('Approve it') })
     expect(composer().value).toBe('Approve it')
     expect(api.planAction).not.toHaveBeenCalled()
+  })
+
+  it('double-click on a plan chip dispatches the plan action, never sendChat (issue #6240)', async () => {
+    await renderPage(ASSISTANT_WITH_PLAN, 'orchestrator', 'Go', 'chat-plan-dbl')
+    fireEvent.doubleClick(chip('Go'))
+    await waitFor(() => expect(api.planAction).toHaveBeenCalledTimes(1))
+    expect(api.planAction).toHaveBeenCalledWith('chat-plan-dbl', 'Go')
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
+  })
+
+  it('Send now on a plan chip dispatches the plan action, never sendChat (issue #6240)', async () => {
+    await renderPage(ASSISTANT_WITH_PLAN, 'orchestrator', 'Go', 'chat-plan-sendnow')
+    fireEvent.click(screen.getByRole('button', { name: 'Send now: Go All' }))
+    await waitFor(() => expect(api.planAction).toHaveBeenCalledTimes(1))
+    expect(api.planAction).toHaveBeenCalledWith('chat-plan-sendnow', 'Go All')
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
   })
 })

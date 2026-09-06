@@ -77,6 +77,7 @@ from kiro_crew.apps.builtins.pptx_maker.backend import (
 )
 from kiro_crew.apps.manager import is_app_enabled
 from kiro_crew.atomic_write import atomic_write
+from kiro_crew.credential_patterns import AWS_KEY_ID
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.hooks import FileTooLargeError
 from kiro_crew.messaging.raster import SNIFF_BYTES, sniff_raster_mime
@@ -202,9 +203,9 @@ _BITMAP_FTYP_MAGIC = b"ftyp"
 # body (see `_BITMAP_URI_TERMINATORS`), which covers every separator rather than an
 # enumerated few.
 #
-# Case-sensitive on purpose: `[A-Z0-9]{16}` over a lowercased body would match ordinary
-# mixed-case base64 constantly.
-_ENCODED_CREDENTIAL_RE = re.compile(r"(?:AKIA|ASIA)[A-Z0-9]{16}")
+# Case-sensitive on purpose: the shared spelling's uppercase-only body over a
+# lowercased body would match ordinary mixed-case base64 constantly.
+_ENCODED_CREDENTIAL_RE = re.compile(AWS_KEY_ID)
 
 
 # Characters that legitimately END a `data:` URI in the artifact formats the engine
@@ -478,10 +479,25 @@ async def _read_body(request: web.Request) -> bytes | None:
 
 
 async def _json_body(request: web.Request) -> tuple[dict | None, web.Response | None]:
-    """Parse a JSON object body, or return the 400 to send back."""
+    """Parse a JSON object body, or return the 400 to send back.
+
+    Same 400-for-non-object / (body, None)-tuple contract as
+    ``dashboard/handlers/_shared.read_bounded_json``; the deliberate divergence is
+    the app-specific ``code`` values (``body_not_json`` / ``body_not_object``)
+    that the dashboard switches on. Unlike ``read_bounded_json`` this helper does
+    not cap the body — the size-bounded reader ``_read_body`` guards the raw-body
+    ``styles/import`` endpoint instead, not this JSON path.
+
+    The catch spans the client-input failure set: ``LookupError`` (an unknown
+    ``charset=`` codec) previously escaped as a 500 and is now a 400, and
+    ``RecursionError`` (a deeply nested body) is caught for the same reason.
+    ``UnicodeDecodeError`` is a ``ValueError`` subclass, so ``ValueError`` alone
+    already covers undecodable bytes; it is dropped from the tuple as redundant.
+    A mid-read transport error still propagates as itself.
+    """
     try:
         body = await request.json()
-    except (ValueError, UnicodeDecodeError):
+    except (LookupError, RecursionError, ValueError):
         return None, web.json_response(
             {"error": "request body must be JSON", "code": "body_not_json"}, status=400
         )

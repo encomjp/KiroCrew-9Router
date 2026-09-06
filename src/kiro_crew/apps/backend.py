@@ -27,6 +27,7 @@ from kiro_crew import platform_compat
 from kiro_crew.apps.admission import app_admission_denied
 from kiro_crew.apps.execution import (
     app_execution_denied,
+    is_builtin_app,
     shipped_builtin_app_root,
     shipped_builtin_module_path,
 )
@@ -39,6 +40,8 @@ from kiro_crew.loopback_http import loopback_urlopen
 from kiro_crew.sandbox import (
     RLIMIT_PROFILE_BUILD,
     RLIMIT_PROFILE_TOOL,
+    app_backend_visible_targets,
+    carveout_shadowed_by_foreign_mask,
     cgroup_scope_argv,
     popen_limited,
     run_limited,
@@ -1133,11 +1136,35 @@ def _start_app_backend_body(app_name: str, manifest) -> AppProcess | None:
     # control available. What still bounds a forged cache there is provenance rather than
     # permissions: with ``require_policy_signature`` set in the admission policy, a document
     # nobody trusted is refused however it got onto disk.
+    # The app's OWN hidden state leaves (e.g. md-notebook's vault registry, PAT, and
+    # sync settings) are unmasked for exactly this spawn: the mask fences agent
+    # subprocesses, but this backend is each leaf's only legitimate reader/writer, and
+    # leaving the mask on breaks the app outright (#8762). Unlike the governance cache
+    # these are the app's own read-write state, so the blanket "visible" meaning is the
+    # correct one. Empty for every app without declared owned leaves.
+    #
+    # Gated on IMMUTABLE PACKAGE PROVENANCE of the code this spawn executes, not on the
+    # app name alone: a trusted third-party app that claimed the name could otherwise
+    # spawn with the builtin's credential leaves (the Notes PAT) unmasked. The same
+    # ``execution_path`` the admission gate above vetted is what the provenance check
+    # binds to, so a file-entry install under the builtin's name gets no exemption.
+    _cache_visible = bool(_platform_extra.get(POLICY_CACHE_ONLY_ENV))
     _visible: tuple[str, ...] = ()
-    if _platform_extra.get(POLICY_CACHE_ONLY_ENV):
-        _visible = (str(policy_cache_dir()),)
+    if is_builtin_app(app_root=execution_path, app_name=app_name):
+        _visible = app_backend_visible_targets(app_name)
+    if _cache_visible:
+        # SECURITY (#8795): refuse rather than carve when the cache sits beneath an
+        # independently masked directory (a data home relocated under a credential
+        # tree). ``extra_visible_dirs`` cancels any hidden mask entry that CONTAINS
+        # a visible path, so carving the cache out would unmask that whole foreign
+        # tree for this spawn. With the mask kept, the cache-only child fails
+        # closed on the unreadable cache — strictly safer — and the guard's log
+        # line names the offending ancestor so the misconfiguration is actionable.
+        _cache_target = str(policy_cache_dir())
+        if not carveout_shadowed_by_foreign_mask(_cache_target):
+            _visible = _visible + (_cache_target,)
     sandboxed_cmd, cleanup_path = wrap_argv(cmd, mode="standard", extra_visible_dirs=_visible)
-    if _visible and list(sandboxed_cmd) == list(cmd):
+    if _cache_visible and list(sandboxed_cmd) == list(cmd):
         # The wrap was a no-op, so this host has no OS confinement at all: no sandbox backend,
         # or agent.sandbox='off' with the sandbox_allow_no_isolation opt-in. Said once,
         # because the combination is worth naming — a centrally governed host running app code
@@ -1485,6 +1512,26 @@ def list_app_processes() -> list[dict[str, Any]]:
     """List all running app backend processes."""
     with _lock:
         return [ap.to_dict() for ap in _processes.values()]
+
+
+def spawned_backend_names() -> list[str]:
+    """App names whose backend THIS gateway process spawned (``proc`` set).
+
+    The gateway-shutdown sweep stops exactly these. Adopted records
+    (``proc is None``) are deliberately excluded: an adopted backend is an
+    externally managed instance whose contract is to SURVIVE gateway exit and
+    be re-probed and re-adopted on the next start (see the adoption comment in
+    ``_start_app_backend_body``) — signalling it from shutdown would take down
+    an independent service. Deriving the sweep from this tracking table rather
+    than from persisted ``enabled`` metadata also keeps it honest in both
+    directions: a child whose app was disabled cross-process (metadata-only)
+    is still stopped, and an app with nothing running is never passed to
+    :func:`stop_app_backend`, whose ``_forget_app_pid`` would otherwise erase
+    the pidfile record that lets ``_reap_stale_app_backends`` recover a
+    prior-generation orphan.
+    """
+    with _lock:
+        return sorted(name for name, ap in _processes.items() if ap.proc is not None)
 
 
 def get_app_backend_port(app_name: str) -> int | None:

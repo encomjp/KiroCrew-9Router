@@ -43,15 +43,20 @@ deliberately NOT used: it walks ``/proc`` ancestors over
 ``session_pid_<pid>.txt``, which ``mcp_core`` itself documents as
 "agent-writable and therefore forgeable".
 
-**An unresolved key is NOT a refusal.** It is forwarded empty and the call proceeds.
+**An unresolved key is NOT a refusal.** The call proceeds, carrying the
+per-process ``UNRESOLVED_SESSION_PREFIX`` placeholder rather than a guessed
+identity — and rather than the empty string, which would alias every unresolved
+session onto one ``SnapshotIndex`` slot (see that constant for the aliasing bug).
 Neither accepted source exists for a GUI-launched kiro-cli on macOS —
-``KIROCREW_SESSION_KEY`` is injected only by the ACP spawn path
-(``acp/client.py``) and ``KIROCREW_HOST_PID`` only by the Linux sandbox launcher
-(``sandbox.py``) — so gating on identity made the feature unusable on its only
-supported platform. The unattended-surface rule was removed by product decision;
-"we cannot name the session" must not become "you may not drive the desktop". What
-is lost is audit ATTRIBUTION, not a control: the trail records an empty key, which
-is honest, where the lenient walk would have recorded a forgeable one.
+``KIROCREW_SESSION_KEY`` reaches a child only from a launcher that already knows
+which session it spawns for (the ACP spawn path in ``acp/client.py``, the
+script-cron launcher in ``cron_script.py``) and ``KIROCREW_HOST_PID`` only from the
+Linux sandbox launcher (``sandbox.py``), and a GUI launch has neither above it — so
+gating on identity made the feature unusable on its only supported platform. The
+unattended-surface rule was removed by product decision; "we cannot name the
+session" must not become "you may not drive the desktop". What is lost is audit
+ATTRIBUTION, not a control: the trail records that the session could not be named,
+which is honest, where the lenient walk would have recorded a forgeable name.
 
 Tool visibility follows the keystone primary enable: ``tools/list`` returns ``[]``
 while computer use is off, so a disabled feature is invisible to the model rather
@@ -111,13 +116,14 @@ from kiro_crew.computer_use.types import (
     TOOL_TYPE_TEXT,
 )
 from kiro_crew.loopback_http import loopback_urlopen
+from kiro_crew.mcp_caller import current_tenant_nonce
 from kiro_crew.mcp_core import (
     _http_error_body,
     _internal_secret,
     _replay_target,
     _resolve_api_target,
-    _resolve_session_key_strict,
     _session_key_header_error,
+    require_strict_session_key,
 )
 from kiro_crew.mcp_shared import call_tool_with_logging, run_mcp_stdio_loop
 from kiro_crew.validation import MCP_COMPUTER_SCHEMAS, ValidationError, validate_tool_args
@@ -141,7 +147,7 @@ INVOKE_TIMEOUT_SECS = 90.0
 
 # Refusals this shim produces on its own. Everything else is the gateway's text.
 # NOTE: there is deliberately NO identity refusal here — an unresolvable session
-# key proceeds with an empty identity. See the strict-resolver comment in
+# key proceeds under the placeholder below. See the strict-resolver comment in
 # ``_call_tool_inner``.
 ERR_GATEWAY_UNREACHABLE = (
     "the KiroCrew gateway is not reachable, so computer use cannot run "
@@ -149,9 +155,8 @@ ERR_GATEWAY_UNREACHABLE = (
 )
 
 # Identity used when neither accepted source resolves — which is the NORMAL case on
-# macOS, the only platform with a driver (``KIROCREW_SESSION_KEY`` is injected only
-# by the ACP spawn path and ``KIROCREW_HOST_PID`` only by the Linux sandbox
-# launcher).
+# macOS, the only platform with a driver. Which launchers supply each source, and why
+# a GUI launch has neither, is stated once in the module docstring.
 #
 # Why this exists rather than an empty string: ``SnapshotIndex`` namespaces its
 # entries by
@@ -166,33 +171,56 @@ ERR_GATEWAY_UNREACHABLE = (
 # per session, so in the 1:1 shim topology the pid separates the namespaces exactly
 # as far as the sessions are actually separate — and it does so without reinstating
 # the unattended-surface refusal that was removed by product decision. On a POOLED
-# backend one process serves many sessions, so the pid separates only what the
+# backend one process serves many sessions, so the pid alone separates only what the
 # injected caller block does not already name: co-tenants gatewayd can name get real
-# per-session keys, and the residual — unnamed co-tenants sharing one
-# ``unresolved:<pid>`` namespace — is tracked as #5322. It is
+# per-session keys, and the unnamed ones USED to collapse onto one
+# ``unresolved:<pid>`` namespace (#5322). They no longer do — gatewayd injects a
+# per-CONNECTION nonce on every forwarded call, which is appended here, so two
+# unnamed co-tenants of one pooled process hold separate namespaces. It is
 # deliberately NOT presented as trustworthy attribution: the prefix names it as
-# unresolved so an audit reader cannot mistake a pid for a session identity.
+# unresolved so an audit reader cannot mistake a pid (or a nonce) for a session
+# identity.
 UNRESOLVED_SESSION_PREFIX = "unresolved:"
+
+#: Separates the process half from the connection half of an unresolved key.
+#: Not ``:``, which already separates the prefix from the pid — a distinct
+#: character keeps the two halves legible in an audit line.
+UNRESOLVED_TENANT_SEPARATOR = "#"
 
 
 def _unresolved_session_key() -> str:
-    """A per-PROCESS session identity for a session we could not name.
+    """A per-CONNECTION session identity for a session we could not name.
 
-    ``unresolved:<pid>`` of THIS shim process. kiro-cli spawns one shim per session,
-    so the pid separates two unresolved sessions exactly as far as they really are
-    separate — which is what keeps ``SnapshotIndex``'s ``(session_key, window_key)``
-    namespace from aliasing them onto one entry and letting one session's action
-    resolve against another's element indices.
+    ``unresolved:<pid>`` of THIS shim process, plus ``#<nonce>`` of the calling
+    CONNECTION when the gateway supplied one. Together they separate two
+    unresolved sessions exactly as far as they really are separate, in both
+    topologies:
 
-    Read at CALL time rather than captured at import: a ``fork``ed child would
-    otherwise inherit the parent's string and re-alias with it, which is the exact
-    failure this is here to prevent.
+    * 1:1 shim (no gateway, no nonce) — kiro-cli spawns one shim per session, so
+      the pid is already the separator and the key is unchanged.
+    * Pooled backend — one process serves N connections, so the pid separates
+      nothing; the gateway-minted per-connection nonce does (#5322).
+
+    Without the nonce half, two unnamed co-tenants of a pooled backend shared one
+    key, which is what let ``SnapshotIndex``'s ``(session_key, window_key)``
+    namespace alias them onto one entry and let one session's action resolve
+    against another's element indices — while each session's own fingerprint
+    check still passed, because both trees describe the same window.
+
+    Both halves are read at CALL time rather than captured at import: a ``fork``ed
+    child would otherwise inherit the parent's pid string and re-alias with it,
+    and the nonce belongs to the call in flight, not to the process.
 
     Never presented as trustworthy attribution — the prefix says so. This is a
     namespace separator, not an authenticated identity; a genuine identity still
-    comes only from the two sources ``_resolve_session_key_strict`` accepts.
+    comes only from the two sources ``_resolve_session_key_strict`` accepts, and
+    the nonce is not one of them (it names a connection, not a principal).
     """
-    return f"{UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
+    key = f"{UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
+    nonce = current_tenant_nonce()
+    if nonce:
+        return f"{key}{UNRESOLVED_TENANT_SEPARATOR}{nonce}"
+    return key
 
 
 def _list_tools() -> list[dict[str, Any]]:
@@ -669,19 +697,21 @@ def _call_tool_inner(name: str, args: dict[str, Any]) -> str:
         logger.debug("computer-use enable-state probe failed; refusing", exc_info=True)
         return f"{ERROR_PREFIX}{REFUSAL_DISABLED}"
 
-    # STRICT identity, but NOT a gate. An unresolvable key is passed through as
-    # empty rather than refused: the unattended-surface rule was removed by product
-    # decision, so "we could not name the session" must not become "you may not
-    # drive the desktop". On macOS neither accepted source is even available to a
-    # GUI-launched kiro-cli (``KIROCREW_SESSION_KEY`` is injected only by the ACP
-    # spawn path, and ``KIROCREW_HOST_PID`` only by the Linux sandbox launcher), so
-    # refusing here made the whole feature unusable on its only supported platform.
+    # STRICT identity, but NOT a gate. An unresolvable key proceeds under the
+    # per-process placeholder rather than being refused: the unattended-surface rule
+    # was removed by product decision, so "we could not name the session" must not
+    # become "you may not drive the desktop". On macOS neither accepted source is even
+    # available to a GUI-launched kiro-cli — the module docstring names which launcher
+    # supplies each one — so refusing here made the whole feature unusable on its only
+    # supported platform.
     #
     # Still the STRICT resolver, and deliberately: the lenient one walks a file
     # ``mcp_core`` itself documents as "agent-writable and therefore forgeable", and
-    # an empty audit identity is honest where a forged one is a lie. What the audit
+    # an unnamed audit identity is honest where a forged one is a lie. What the audit
     # loses is attribution, which is worth less than the feature working.
-    session_key = _resolve_session_key_strict() or _unresolved_session_key()
+    session_key = require_strict_session_key("computer-use attribution")[0] or (
+        _unresolved_session_key()
+    )
     header_err = _session_key_header_error(session_key)
     if header_err:
         return f"{ERROR_PREFIX}{header_err}"

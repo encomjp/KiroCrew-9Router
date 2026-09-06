@@ -15,7 +15,9 @@ from typing import Any
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK
 from kiro_crew.messaging.driver import APPROVAL_AUTO
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.whatsapp.commands import (
+    COMPACT_AUTO_MANAGED_TEXT,
     COMPACT_AUTO_TEXT,
     COMPACT_BUSY_TEXT,
     COMPACT_FAILED_TEXT,
@@ -92,6 +94,10 @@ class FakeSessions:
         persisted_generations: dict[str, int] | None = None,
     ) -> None:
         self.provider = provider or FakeProvider()
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
         #: What ``max_generation`` reports per durable bucket, standing in for the
         #: session map on disk. Empty means a machine that has never run this
         #: channel, which is the only case an unseeded counter gets right.
@@ -131,6 +137,12 @@ class FakeSessions:
 
     async def get_or_create(self, key, agent=None, channel_id=None):
         return self.provider, True, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, channel_id):
         self.channels[key] = channel_id
@@ -316,6 +328,49 @@ def test_compact_command_compacts_in_place_without_a_turn():
     assert sessions.released == 1, "the turn semaphore must always be handed back"
 
 
+def test_compact_command_declined_on_auto_managed_backend():
+    # A backend that cannot serve /compact gets the informational reply and
+    # compact() is NEVER dispatched (#8156).
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = "kas"
+    d, _client, sessions, transport = _make(provider=provider)
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert (provider.compacts, provider.waits) == (0, 0)
+    assert [t for _, t in transport.sent] == [COMPACT_AUTO_MANAGED_TEXT]
+    assert sessions.released == 1, "the turn semaphore must always be handed back"
+
+
+def test_compact_none_capability_preserves_dispatch():
+    # The ABC's None (supported) default keeps the existing dispatch.
+    provider = FakeProvider()
+    provider.manual_compact_unsupported_backend = None
+    d, _client, _sessions, transport = _make(provider=provider)
+    asyncio.run(d.handle_message(_msg("/compact")))
+    assert (provider.compacts, provider.waits) == (1, 1)
+    assert [t for _, t in transport.sent] == [COMPACTED_TEXT]
+
+
+def test_the_hard_threshold_declines_silently_on_auto_managed_backend():
+    # No /compact to dispatch and no notice: the backend compacts on its own
+    # as context fills (#8156).
+    provider = FakeProvider("answered")
+    provider.manual_compact_unsupported_backend = "kas"
+    d, _client, _sessions, transport = _make(provider=provider, context_pct=96.0)
+    asyncio.run(d.handle_message(_msg("a long conversation")))
+    assert (provider.compacts, provider.waits) == (0, 0)
+    assert [t for _, t in transport.sent] == ["answered"]
+
+
+def test_the_soft_nudge_is_suppressed_on_auto_managed_backend():
+    # The nudge advises /compact, which this backend refuses — it compacts on
+    # its own, so there is nothing for the user to act on (#8156).
+    provider = FakeProvider("answered")
+    provider.manual_compact_unsupported_backend = "kas"
+    d, _client, _sessions, transport = _make(provider=provider, context_pct=85.0)
+    asyncio.run(d.handle_message(_msg("first")))
+    assert [t for _, t in transport.sent] == ["answered"]
+
+
 # ── dispatcher: busy / steering ─────────────────────────────────────────────
 def test_busy_session_without_steer_asks_to_resend():
     provider = FakeProvider()
@@ -415,7 +470,7 @@ def test_persist_turn_writes_user_and_assistant_rows():
             self.rows: list[tuple[str, str]] = []
             self.title = ""
 
-        def append(self, key, role, text):
+        def append(self, key, role, text, mid=None):
             self.rows.append((role, text))
 
         def set_title(self, key, title):

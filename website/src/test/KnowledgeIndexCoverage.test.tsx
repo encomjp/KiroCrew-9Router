@@ -195,7 +195,12 @@ describe('KnowledgePage — help dialog', () => {
   it('closes the help dialog when the backdrop itself is clicked', async () => {
     render(<KnowledgePage />, { wrapper: Wrapper })
     await userEvent.click(await screen.findByRole('button', { name: /Help/ }))
-    const backdrop = (await screen.findByRole('dialog')).parentElement as HTMLElement
+    await screen.findByRole('dialog')
+    // Modal portals its own backdrop next to the panel wrapper, so the backdrop
+    // is no longer the dialog's parent: it is the sibling that owns the
+    // dismissal click.
+    const backdrop = document.querySelector('.fixed.inset-0.bg-bg\\/60') as HTMLElement
+    expect(backdrop).toBeTruthy()
     // Only a click on the backdrop element closes it — a click that bubbles up
     // from the panel must not, or every interaction inside would dismiss it.
     fireEvent.click(screen.getByRole('dialog'))
@@ -204,12 +209,43 @@ describe('KnowledgePage — help dialog', () => {
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
   })
 
+  it('renders through the shared Modal: no hand-rolled bg-black/50 backdrop, and the page scroll is locked', async () => {
+    render(<KnowledgePage />, { wrapper: Wrapper })
+    await userEvent.click(await screen.findByRole('button', { name: /Help/ }))
+    await screen.findByRole('dialog')
+    // The overlay used to be a raw `fixed inset-0 bg-black/50` div with a
+    // hand-rolled header; Modal renders its own backdrop, close button and
+    // scroll lock instead.
+    expect(document.querySelector('.bg-black\\/50')).toBeNull()
+    expect(document.body.style.overflow).toBe('hidden')
+    // Named by its own rendered title, as it was by the removed <h3>.
+    expect(screen.getByRole('dialog', { name: 'Welcome to the Knowledge Library' })).toBeInTheDocument()
+    // Initial focus lands inside the dialog — the shared focus trap, which the
+    // hand-rolled overlay never had.
+    expect(screen.getByRole('dialog').contains(document.activeElement)).toBe(true)
+  })
+
   it('Escape closes the help dialog before it clears anything else', async () => {
     render(<KnowledgePage />, { wrapper: Wrapper })
     await userEvent.click(await screen.findByRole('button', { name: /Help/ }))
     await screen.findByRole('dialog')
     fireEvent.keyDown(document.body, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+  })
+
+  it('Escape that dismisses the help does not also clear the selection underneath it', async () => {
+    // The page's Escape chain yields to the dialog while it is open. Modal owns
+    // the dismissal now, so the page branch must decline rather than close the
+    // dialog itself - otherwise one keystroke would spend both steps.
+    render(<KnowledgePage />, { wrapper: Wrapper })
+    await searchFor('ledger')
+    await userEvent.click(await screen.findByLabelText('Select Quarterly ledger notes'))
+    expect(await screen.findByText('1 selected')).toBeInTheDocument()
+    await userEvent.click(await screen.findByRole('button', { name: /Help/ }))
+    await screen.findByRole('dialog')
+    fireEvent.keyDown(document.body, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
   })
 })
 

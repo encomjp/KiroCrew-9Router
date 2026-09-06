@@ -13,7 +13,8 @@
  *   discover.png           spotlight + feature duo + category rail + rows
  *   discover-category.png  category-filtered view (editorial layer collapses)
  *   sources.png            Sources popover (registries + install from path)
- *   library.png            Library page with the updates hint row
+ *   library.png            Library launchpad grid (pin badges + updates hint row)
+ *   library-hover.png      a pinned tile hovered so its action bar is visible
  *   updates.png            Discover Updates sub-tab with a pending update row
  *   updates-empty.png      Updates sub-tab everything-up-to-date state
  *
@@ -121,6 +122,12 @@ const installedApps = [
       description: 'Messaging channel configuration.', tags: ['channels'], hidden: true,
     },
   }),
+  // One UNPINNED tile (its nav id is seeded into mc-app-nav-hidden below) so
+  // the Library shot proves the hollow-plus badge + "Not in sidebar" caption.
+  I('oncall-radar', 'Oncall Radar', 'registry', { manifest: { ...I('oncall-radar', 'Oncall Radar', 'registry').manifest, ui: { pages: [{ route: '/oncall', label: 'Oncall', icon: 'Bell' }] } } }),
+  // One DISABLED tile so the shot proves the greyscale dimming, the
+  // "Disabled" caption, and the suppressed pin badge.
+  I('issue-radar', 'Issue Radar', 'registry', { enabled: false, manifest: { ...I('issue-radar', 'Issue Radar', 'registry').manifest, ui: { pages: [{ route: '/issues', label: 'Issues', icon: 'Radar' }] } } }),
 ]
 
 // Apps that ship hero art (the rest exercise the gradient fallback).
@@ -140,6 +147,7 @@ for (const name of Object.keys(HERO)) {
 const browser = await chromium.launch()
 const context = await browser.newContext({ viewport: { width: 1520, height: 1000 }, deviceScaleFactor: 2 })
 const page = await context.newPage()
+await page.addInitScript(() => localStorage.setItem('mc-app-nav-hidden', JSON.stringify(['app-oncall-radar'])))
 
 let wsServer = null
 await page.routeWebSocket(/\/api\/ws/, ws => { wsServer = ws })
@@ -210,10 +218,26 @@ await page.screenshot({ path: `${OUT}/sources.png` })
 await page.keyboard.press('Escape')
 await settle(600)
 
-// ---- Library (standalone page after the split; updates hint row)
+// ---- Library (standalone page after the split; launchpad grid, PR3)
 await page.goto(`http://127.0.0.1:${PORT}/apps/library`, { waitUntil: 'domcontentloaded' })
 await settle(1400)
 await page.screenshot({ path: `${OUT}/library.png` })
+
+// ---- Library hover: a real pointer hover over a PINNED tile reveals its
+// in-flow action row (Open + the overflow menu). Research Lab is a pinnable
+// builtin with a UI page, so its pin badge renders filled on the icon corner.
+// Open the overflow menu too so the shot documents the full verb set
+// (Details / Unpin / Disable / Uninstall) behind the two-button row.
+const hoverTile = page.getByTestId('launchpad-tile-auto-research')
+await hoverTile.hover()
+await hoverTile.getByRole('toolbar').getByRole('button', { name: /Open/ }).waitFor({ state: 'visible' })
+await page.waitForTimeout(400) // opacity transition
+await hoverTile.getByRole('toolbar').getByRole('button', { name: /More actions/ }).click()
+await page.getByRole('menuitem', { name: /Details/ }).waitFor({ state: 'visible' })
+await page.waitForTimeout(250) // menu open transition
+await page.screenshot({ path: `${OUT}/library-hover.png` })
+await page.keyboard.press('Escape') // close the menu so later captures start clean
+await page.mouse.move(0, 0) // park the pointer so later captures have no stray hover state
 
 // ---- Updates sub-tab (deep link; secretary fixture has 1.0.0 -> 1.1.0 pending)
 await page.goto(`http://127.0.0.1:${PORT}/apps/-/updates`, { waitUntil: 'domcontentloaded' })

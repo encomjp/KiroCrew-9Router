@@ -213,6 +213,84 @@ def test_frontend_escape_patterns_are_detected(selector, tmp_path) -> None:
     assert selector._is_cross_surface(inside, selector._FRONTEND_FOREIGN) is False
 
 
+def test_backend_owned_config_references_are_cross_surface(selector, tmp_path) -> None:
+    """A spec naming a backend-owned config file must stay in the must-run set.
+
+    pyproject.toml, setup.cfg and the other TOML/CFG/YAML configs are all
+    backend-owned (the one exception, website/AUTOSDE.yaml, only makes the
+    match over-broad, which costs CI time), and a spec reaches them through
+    a pre-computed root constant -- no ``../../../`` escape and no
+    ``kiro_crew`` marker on the referencing line:
+
+        const version = readFileSync(join(REPO_ROOT, 'pyproject.toml'), ...)
+
+    With only directory/name/`.py` markers in the pattern, such a spec was
+    classified single-surface and SKIPPED on a backend-only diff -- the
+    exact silent-drop this selector exists to prevent. Measured live guards
+    that this closes: ``releaseVersion.test.ts`` (pins release.yml's version
+    mapping) and ``frontendBlobReconcile.wireFormat.test.ts`` (pins the
+    reconcile script ci.yml runs).
+    """
+    toml = tmp_path / "a.test.ts"
+    toml.write_text(
+        "const REPO_ROOT = resolve(__dirname, '..', '..', '..')\n"
+        "const version = readFileSync(join(REPO_ROOT, 'pyproject.toml'), 'utf-8')\n"
+    )
+    assert selector._is_cross_surface(toml, selector._FRONTEND_FOREIGN) is True
+
+    cfg = tmp_path / "b.test.ts"
+    cfg.write_text("const defaults = readFileSync(join(REPO_ROOT, 'setup.cfg'), 'utf-8')\n")
+    assert selector._is_cross_surface(cfg, selector._FRONTEND_FOREIGN) is True
+
+    yaml = tmp_path / "c.test.ts"
+    yaml.write_text("// parity: release.yml maps v0.6.0-rc.2 to the wheel version 0.6.0rc2\n")
+    assert selector._is_cross_surface(yaml, selector._FRONTEND_FOREIGN) is True
+
+
+def test_frontend_owned_config_reference_is_cross_surface(selector, tmp_path) -> None:
+    """The mirror: a backend guard naming the frontend's config file by bare name.
+
+    ``tsconfig.json`` lives inside website/, so a realistic reference carries
+    ``website`` in its path -- but a guard that quotes the filename alone
+    (a joined path built from constants, a fixture table of config names)
+    had no marker at all. Bare extensions cannot close this direction the
+    way they close the mirror: the backend owns .toml/.cfg/.yaml/.json
+    configs of its own, so only frontend-owned config NAMES are added here.
+    """
+    guard = tmp_path / "test_tsconfig_parity.py"
+    guard.write_text(
+        "# parity: the shipped tsconfig.json must not gain references\n"
+        'TS_CONFIG = REPO / "tsconfig.json"\n'
+    )
+    assert selector._is_cross_surface(guard, selector._BACKEND_FOREIGN) is True
+
+
+def test_own_surface_config_references_stay_single_surface(selector, tmp_path) -> None:
+    """The asymmetry is the point: each surface's OWN configs must not trip it.
+
+    A backend test reading pyproject.toml or setup.cfg is reading its own
+    surface, and a frontend spec reading package.json or tsconfig.json is
+    doing the same -- neither is a parity guard. This pins that the new
+    terms went in per-direction, not as bare extensions on both patterns
+    (which would have flooded the must-run set: 51 backend files reference
+    a .yaml of their own).
+    """
+    backend_own = tmp_path / "test_own_cfg.py"
+    backend_own.write_text(
+        'VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]\n'
+        "PARSER = configparser.ConfigParser()\n"
+        'PARSER.read(ROOT / "setup.cfg")\n'
+    )
+    assert selector._is_cross_surface(backend_own, selector._BACKEND_FOREIGN) is False
+
+    frontend_own = tmp_path / "own-configs.test.ts"
+    frontend_own.write_text(
+        "const pkg = JSON.parse(readFileSync('package.json', 'utf-8'))\n"
+        "const ts = readFileSync('tsconfig.json', 'utf-8')\n"
+    )
+    assert selector._is_cross_surface(frontend_own, selector._FRONTEND_FOREIGN) is False
+
+
 # ---------------------------------------------------------------------------
 # Windows: the reduced scope must not name a suite Windows cannot collect
 # ---------------------------------------------------------------------------
@@ -277,6 +355,7 @@ def test_ignore_list_matches_the_names_conftest_previously_inlined() -> None:
         "test_webapp_preview.py",
         "test_file_raw.py",
         "test_file_download.py",
+        "test_file_office_preview.py",
         "test_dashboard_file_io.py",
         "test_dev_fleet_app.py",
     }
@@ -373,4 +452,57 @@ def test_explicit_cli_target_bypasses_collect_ignore(tmp_path) -> None:
     assert run(str(suite / "test_boom.py")) != 0, (
         "explicit argument now honours collect_ignore -- the selector-side "
         "filter may no longer be required"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The Windows filter must be scoped the way conftest's own exclusion is
+# ---------------------------------------------------------------------------
+
+
+def _seed(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def test_windows_filter_is_scoped_to_the_test_root(tmp_path, monkeypatch) -> None:
+    """The ignore list governs ``test/`` only, so the filter must too.
+
+    The list holds BARE filenames and ``test/conftest.py`` resolves its
+    ``collect_ignore`` entries relative to its own directory -- so the exclusion
+    covers ``test/<name>`` and nothing else. Matching the emitted paths on their
+    basename instead also drops a same-named suite under ``transfer/`` or the
+    apps-builtins tree, which no conftest excludes and Windows collects fine.
+    That is a silently skipped cross-surface guard, which is the one outcome
+    this selector's deny-by-default contract forbids: a heuristic mistake is
+    supposed to cost CI time, never coverage.
+
+    Loads its own selector instance rather than taking the module-scoped
+    ``selector`` fixture, whose ``collect`` memo is keyed only on
+    ``(surface, _is_windows())`` and would otherwise be shared with -- and
+    poisoned by -- this synthetic repo root.
+    """
+    selector = _load_selector()
+    monkeypatch.setattr(selector, "_repo_root", lambda: tmp_path)
+    monkeypatch.setattr(selector, "_is_windows", lambda: True)
+
+    _seed(
+        tmp_path / "test" / "windows-collect-ignore.txt",
+        "test_snapshot.py    # POSIX-only replace-while-open semantics\n",
+    )
+    # Both name the frontend tree, so both are cross-surface and would other-
+    # wise be must-run: the only difference between them is where they live.
+    guard = "assert Path('website/src/utils/sanitize.ts').is_file()\n"
+    _seed(tmp_path / "test" / "test_snapshot.py", guard)
+    app_suite = "src/kiro_crew/apps/builtins/demo/tests/test_snapshot.py"
+    _seed(tmp_path / app_suite, guard)
+
+    selected = selector.collect("backend")
+
+    assert (
+        "test/test_snapshot.py" not in selected
+    ), "the POSIX-only suite conftest names must still be filtered out"
+    assert app_suite in selected, (
+        "a same-named suite outside test/ is not covered by conftest's "
+        f"collect_ignore and must keep running on Windows; got {selected}"
     )

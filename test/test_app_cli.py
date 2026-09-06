@@ -12,7 +12,7 @@ from kiro_crew.apps.manager import APP_MANIFEST_FILENAME, install_app
 # ---------------------------------------------------------------------------
 
 
-def _make_app_source(tmp_path, name="cli-test-app", crons=None):
+def _make_app_source(tmp_path, name="cli-test-app", crons=None, hooks=None):
     src = tmp_path / "source" / name
     src.mkdir(parents=True)
     manifest = {
@@ -26,6 +26,8 @@ def _make_app_source(tmp_path, name="cli-test-app", crons=None):
     }
     if crons is not None:
         manifest["crons"] = crons
+    if hooks is not None:
+        manifest["backend"] = {"hooks": hooks}
     (src / APP_MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2))
     (src / "agents").mkdir()
     (src / "agents" / "test-agent.json").write_text('{"name": "test-agent"}')
@@ -166,6 +168,86 @@ class TestHandleApp:
         _handle_app(ns)
         captured = capsys.readouterr()
         assert "Usage" in captured.out
+
+
+class TestEnableWarnsHooksNeedRestart:
+    """CLI `app enable` states how a backend-hook change reaches a gateway.
+
+    Hooks are Python modules imported INTO the gateway process, and only the
+    gateway loads them (``on_app_enable`` -> ``register_app_routes`` ->
+    ``load_app_module``). The CLI is a separate process, so it cannot load them
+    directly -- but the gateway's hook reconciler (``apps/hook_reconcile.py``)
+    picks up the on-disk change within a poll interval, and a stopped gateway
+    loads it on next start. Printing only "enabled <app>" reads as though the new
+    code were already live; the notice states the actual timing (issue #7880).
+    """
+
+    HOOKS = {
+        "routes": "backend.routes:register_routes",
+        "on_startup": "backend.hooks:on_startup",
+    }
+
+    def _enable(self):
+        import argparse
+
+        from kiro_crew.cli_commands import _handle_app
+
+        _handle_app(argparse.Namespace(app_action="enable", name="cli-test-app"))
+
+    def test_enable_warns_when_the_app_declares_backend_hooks(
+        self, tmp_path, app_env, capsys
+    ):
+        install_app(_make_app_source(tmp_path, hooks=self.HOOKS))
+
+        self._enable()
+
+        out = capsys.readouterr().out
+        assert "backend hooks" in out
+        # Names the declared hooks, so the operator can tell which code changed.
+        assert "routes" in out and "on_startup" in out
+        # States the actual timing: a running gateway reconciles the change
+        # automatically (issue #7880's reconciler), and a stopped one loads it on
+        # next start -- so it must NOT tell the operator a manual restart is
+        # required (that was true only before the reconciler landed).
+        assert "reloads them automatically" in out
+        assert "next start" in out
+        assert "restart" not in out
+        # The enable itself still reports success -- the notice is additive.
+        from kiro_crew.apps.manager import _read_installed
+
+        meta = _read_installed("cli-test-app")
+        assert meta is not None and meta.enabled is True
+
+    def test_enable_says_nothing_for_an_app_without_hooks(
+        self, tmp_path, app_env, capsys
+    ):
+        """No hooks means nothing in-process can be stale -- stay quiet."""
+        install_app(_make_app_source(tmp_path))
+
+        self._enable()
+
+        out = capsys.readouterr().out
+        assert "backend hooks" not in out
+        assert "restart" not in out
+
+    def test_notice_helper_tolerates_a_malformed_backend_block(
+        self, tmp_path, app_env
+    ):
+        """A hand-edited app.json must not turn the notice into a crash.
+
+        ``backend`` and ``backend.hooks`` are user-editable JSON, so either can
+        arrive as a non-dict. The helper reports "nothing to warn about" rather
+        than raising out of a successful enable.
+        """
+        from kiro_crew.cli_commands import _warn_hooks_need_restart
+
+        install_app(_make_app_source(tmp_path))
+        app_json = app_env["home"] / "apps" / "cli-test-app" / APP_MANIFEST_FILENAME
+        data = json.loads(app_json.read_text())
+        data["backend"] = {"hooks": "backend.routes:register_routes"}
+        app_json.write_text(json.dumps(data))
+
+        assert _warn_hooks_need_restart("cli-test-app") is False
 
 
 class TestEnableRegistersCrons:

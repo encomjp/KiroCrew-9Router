@@ -111,8 +111,8 @@ describe('ChatPane hydrate is bounded', () => {
   })
 
   it('hydrates a slot that is already mid-turn unbounded, so the tail is not all it shows', async () => {
-    // A background slot's stream state reads idle until an SSE frame arrives, so
-    // the bound cut raw chunk rows and the pane showed only the response tail.
+    // Stream state reads idle until an SSE frame arrives, so the slot record is the
+    // signal. Unbounded is deliberate: the handler collapses chunk runs before slicing.
     renderPane('pane-running-1', { running: true })
     await waitFor(() => expect(api.chatSlotDetail).toHaveBeenCalled())
     const [slot, limit] = (api.chatSlotDetail as ReturnType<typeof vi.fn>).mock.calls[0]
@@ -231,8 +231,8 @@ describe('ChatPane hydrate is bounded', () => {
 })
 
 /* A pane can mount against an IDLE slot and have the user start a turn before the
- * bounded fetch is served. The server slices RAW rows, so that page would be the tail
- * of the in-flight response -- the limit must still be upgradable at that point. */
+ * bounded fetch is served, so the limit must still be upgradable at that point. The
+ * handler collapses chunk runs before slicing, so a bound is not a raw-row hazard. */
 describe('a turn that starts while the bounded fetch is in flight upgrades the limit', () => {
   it('refetches unbounded when an idle slot starts running mid-hydrate', async () => {
     // Never resolves: pins the pane in the window where the bounded fetch is in flight.

@@ -240,20 +240,34 @@ function scanUnguardedEnterBlurCommits(lines: string[]): number[] {
  * it declines, so a claim past the move (or a sibling branch's claim beyond
  * it) does not clear this one. A Tab branch that acts through STATE
  * (accepting a suggestion, indenting a list item) has no focus call to
- * anchor on and is out of this rule's scope by design: fail open rather
- * than mis-flag, consistent with the rest of this file. A `.focus(` further
- * than the window is likewise not this structure.
+ * anchor on and is out of THIS rule's scope by design: fail open rather
+ * than mis-flag, consistent with the rest of this file. The rule below
+ * covers that shape, anchored on the act instead of the move. A `.focus(`
+ * further than the window is likewise not this structure.
  */
 const TAB_BRANCH = /key === 'Tab'|key !== 'Tab'/
 const FOCUS_MOVE = /\.focus\(/
-const TAB_CLAIM = /\bclaimKey\(/
+// Either flavour of the claim clears the rule: `claimKey` for a native
+// document/window listener, `claimSyntheticKey` for a React handler that also
+// needs React's own propagation flag stopped. What the rule is about is that a
+// claim RUNS before the move, not which event world the branch lives in.
+const TAB_CLAIM = /\bclaim(?:Synthetic)?Key\(/
 const TRAP_WINDOW = 25
 
-function scanUnguardedTabFocusTraps(lines: string[]): number[] {
-  const code = lines.map(l => {
+/**
+ * Blank out comment lines so a rule cannot be laundered by mentioning its own
+ * remedy in prose — and so the prose that DOCUMENTS a defect shape (this file,
+ * the hook, the tests that pin the seam) is not itself an offender.
+ */
+function codeLines(lines: string[]): string[] {
+  return lines.map(l => {
     const t = l.trim()
     return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*') ? '' : l
   })
+}
+
+function scanUnguardedTabFocusTraps(lines: string[]): number[] {
+  const code = codeLines(lines)
   const hits: number[] = []
   code.forEach((line, i) => {
     if (!TAB_BRANCH.test(line)) return
@@ -267,6 +281,148 @@ function scanUnguardedTabFocusTraps(lines: string[]): number[] {
     // and the move: one guarded branch must not clear an unguarded sibling.
     const span = code.slice(i, i + focusAt + 1)
     if (!span.some(l => TAB_CLAIM.test(l))) hits.push(i + 1)
+  })
+  return hits
+}
+
+/**
+ * The synthetic half of a claim, hand-spelled.
+ *
+ * `claimKey` takes a NATIVE event, so a React `onKeyDown` that claims through
+ * it has to reach into `.nativeEvent` — and then remember the second half
+ * itself, because the native `stopPropagation()` does not set React's own
+ * propagation flag and React walks that flag when dispatching to component
+ * ancestors. So the spelling is a PAIR, and a pair is exactly what the rest of
+ * this file exists to stop: four sites carried it (two fullscreen panels, a
+ * sidebar column popover, and Modal's key isolation), and any one of them
+ * could lose a half in a later edit with nothing to catch it.
+ *
+ * `claimSyntheticKey(e)` owns both halves, so the pair has one place to live.
+ * The rule is the reach itself — a `claimKey(` whose argument is a
+ * `.nativeEvent` — which is structural rather than a list of pardoned files:
+ * a NATIVE listener passes its event straight through and is out of scope by
+ * construction. The one sanctioned `.nativeEvent` claim is the implementation
+ * of `claimSyntheticKey` inside the hook, which the tree scan skips the same
+ * way the raw-flag rule above skips it.
+ */
+const HAND_SPELLED_SYNTHETIC_CLAIM = /\bclaimKey\([^)]*\.nativeEvent/
+
+function scanHandSpelledSyntheticClaims(lines: string[]): number[] {
+  const hits: number[] = []
+  codeLines(lines).forEach((line, i) => {
+    if (HAND_SPELLED_SYNTHETIC_CLAIM.test(line)) hits.push(i + 1)
+  })
+  return hits
+}
+
+/**
+ * A Tab branch that takes the key from the browser and then ACTS ON THE FIELD,
+ * with no composition signal anywhere.
+ *
+ * The state-setter twin of the rule above, for the half of the boundary-Tab
+ * shape a focus anchor structurally cannot see. Four sites carried it: a path
+ * bar accepting the highlighted suggestion into the draft, two markdown
+ * editors re-indenting a list item by rewriting the whole textarea value, and
+ * a composer accepting slash-command autocomplete. The hazard is the one the
+ * focus rule pins — IMEs use Tab to cycle the candidate list, and on WebKit
+ * the keydown that commits a candidate arrives after `compositionend` with
+ * `isComposing` already false — but the damage lands in the field's own text
+ * instead of in the focus ring, which is the worse half: the composing draft
+ * is replaced, so the user loses what they were typing rather than where they
+ * were.
+ *
+ * The anchor is `preventDefault()` FOLLOWED BY AN ACT, inside the branch and
+ * with no focus move in it — the two anchors partition the shape between them
+ * rather than double-reporting it. Consuming the key on its own is
+ * deliberately NOT enough: a surface that swallows Tab to hold still
+ * (`useListKeyboardNav`'s empty-list branch, whose host composer carries its
+ * own guard) writes nothing an IME could corrupt, and flagging it would buy a
+ * noisy rule an exemption list to quiet it. What makes an unclaimed Tab a
+ * corruption is the act that follows the consumption, so that is what puts a
+ * branch in scope.
+ *
+ * The claim clears the branch from either position that actually guards the
+ * code path: on the branch before the consumption it owns, or as a
+ * decline-and-return ABOVE the branch at no deeper nesting — an early
+ * `if (!latch.claimKey(e)) return` covering every branch below it, which is
+ * how `useListKeyboardNav` guards its own choose dispatch. A claim nested
+ * inside a SIBLING branch is not on this branch's path and does not count,
+ * the same asymmetry the rule above states. Indentation is the nesting proxy,
+ * as it is for the element-bracketing rules below; unrecognized formatting
+ * fails open.
+ */
+const TAB_CONSUME = /\.preventDefault\(/
+/** A decline-and-return, in both spellings the tree uses. */
+const TAB_DECLINE = /!\s*[\w.!?]*\bclaimKey\(/
+/** Where a keydown handler opens — the ceiling for the decline search. */
+const KEY_HANDLER = /\bonKeyDown\b|\bonKey\b|['"]keydown['"]/
+/** Consuming the key and leaving the branch is plumbing, not an act. */
+const BRANCH_PLUMBING =
+  /^[{}();,\s]*$|^[\w.?!]*\.(?:preventDefault|stopPropagation|stopImmediatePropagation)\(\)[\s;)}]*$|^return(?:\s+(?:true|false))?[\s;)}]*$/
+const HANDLER_WINDOW = 60
+
+/** The branch's own lines, to the first dedent that closes it (this tree's formatting). */
+function tabBranchSpan(code: string[], i: number): string[] {
+  const indent = code[i].search(/\S/)
+  const out = [code[i]]
+  for (let j = i + 1; j < code.length && j <= i + TRAP_WINDOW; j++) {
+    if (code[j].trim() === '') continue
+    if (code[j].search(/\S/) <= indent && /^\s*[})]/.test(code[j])) break
+    out.push(code[j])
+  }
+  return out
+}
+
+/** True when the branch does something after consuming the key. */
+function actsAfterConsuming(branch: string[], at: number): boolean {
+  // The one-line spelling puts the act on the consume line itself:
+  // `{ e.preventDefault(); setDraft(suggestion) }`.
+  const consume = branch[at]
+  const tail = consume
+    .slice(consume.search(TAB_CONSUME))
+    .replace(/^\.preventDefault\(\)\s*;?/, '')
+  return [tail, ...branch.slice(at + 1)].some(
+    l => l.trim() !== '' && !BRANCH_PLUMBING.test(l.trim()),
+  )
+}
+
+/** True when an early decline-and-return above the branch covers its path. */
+function declinedAbove(code: string[], i: number): boolean {
+  const indent = code[i].search(/\S/)
+  for (let j = i - 1; j >= 0 && i - j <= HANDLER_WINDOW; j--) {
+    const line = code[j]
+    if (line.trim() === '') continue
+    // Above the handler's own opening there is no shared path left to guard.
+    if (KEY_HANDLER.test(line)) return false
+    // Deeper than this branch means it sits inside a sibling one.
+    if (line.search(/\S/) > indent) continue
+    if (!TAB_DECLINE.test(line)) continue
+    // The decline has to RETURN — on its own line, or the two-line spelling.
+    if (/\breturn\b/.test(line)) return true
+    for (let k = j + 1; k <= j + 2 && k < code.length; k++) {
+      if (/\breturn\b/.test(code[k])) return true
+    }
+  }
+  return false
+}
+
+function scanUnguardedTabStateWrites(lines: string[]): number[] {
+  const code = lines.map(l => {
+    const t = l.trim()
+    return t.startsWith('//') || t.startsWith('*') || t.startsWith('/*') ? '' : l
+  })
+  const hits: number[] = []
+  code.forEach((line, i) => {
+    if (!TAB_BRANCH.test(line)) return
+    const branch = tabBranchSpan(code, i)
+    // A branch that re-aims focus is the rule above's shape, not this one.
+    if (branch.some(l => FOCUS_MOVE.test(l))) return
+    const at = branch.findIndex(l => TAB_CONSUME.test(l))
+    if (at === -1) return
+    if (!actsAfterConsuming(branch, at)) return
+    if (branch.slice(0, at + 1).some(l => TAB_CLAIM.test(l))) return
+    if (declinedAbove(code, i)) return
+    hits.push(i + 1)
   })
   return hits
 }
@@ -357,8 +513,29 @@ describe('IME Enter claim ratchet', () => {
     }
     // An entry here re-aims a Tab it never checked. Route the branch through
     // the shared latch: `useDocumentImeLatch(...).claimKey(e)` for native
-    // document/window listeners, `useImeGuard().claimKey(e)` for synthetic
-    // handlers — the claim runs BEFORE the preventDefault() and focus move.
+    // document/window listeners, `.claimSyntheticKey(e)` (or
+    // `useImeGuard().claimKey(e)`) for React handlers — the claim runs BEFORE
+    // the preventDefault() and focus move.
+    expect(offenders).toEqual([])
+  })
+
+  it('never rewrites the field on a Tab the branch did not claim', () => {
+    // The other half of the boundary-Tab shape: the rule above anchors on a
+    // focus move, so the four branches that acted through STATE instead were
+    // invisible to every rule in this file — a path bar accepting a suggestion
+    // into the draft, two markdown editors re-indenting a list item, a
+    // composer accepting slash-command autocomplete. Each replaced the text an
+    // IME was still composing, and each sat one line away from the guard its
+    // own Enter branch already used.
+    const offenders: string[] = []
+    for (const rel of sourceFiles()) {
+      if (rel === 'hooks/useImeGuard.ts') continue
+      const lines = readFileSync(join(SRC, rel), 'utf8').split('\n')
+      for (const n of scanUnguardedTabStateWrites(lines)) offenders.push(`${rel}:${n}`)
+    }
+    // An entry here acts on a Tab it never checked. Claim the key first
+    // (`if (!ime.claimKey(e)) return`) and keep the composition tracked with
+    // the `bindComposition` spread the claim reads.
     expect(offenders).toEqual([])
   })
 
@@ -432,6 +609,25 @@ describe('IME Enter claim ratchet', () => {
     }
     // Read the flag through `ime.isComposing(e)` instead: the hook layers the tracked
     // latch over it, which is the half of the guard a raw read cannot have.
+    expect(offenders).toEqual([])
+  })
+
+  it('never hand-spells the synthetic half of a claim', () => {
+    // A React handler that claims through the native `claimKey` has to reach
+    // into `.nativeEvent` and then stop React's own propagation flag itself —
+    // two halves, one call site, the drift this file exists to prevent. Four
+    // sites carried the pair before `claimSyntheticKey` owned it (#5542).
+    const offenders: string[] = []
+    for (const rel of sourceFiles()) {
+      // The hook is where the pair legitimately lives: `claimSyntheticKey` IS
+      // the one `.nativeEvent` claim, the same exemption the raw-flag rule
+      // above takes for the same reason.
+      if (rel === 'hooks/useImeGuard.ts') continue
+      const hits = scanHandSpelledSyntheticClaims(readFileSync(join(SRC, rel), 'utf8').split('\n'))
+      offenders.push(...hits.map(n => `${rel}:${n}`))
+    }
+    // Claim with `latch.claimSyntheticKey(e)` instead — it consumes the native
+    // event AND stops the synthetic flag, so neither half can be forgotten.
     expect(offenders).toEqual([])
   })
 
@@ -716,9 +912,20 @@ describe('ratchet rule fixtures', () => {
           e.preventDefault(); onOpenChange(false); btnRef?.current?.focus()
         }
       }}`))).toHaveLength(0)
+    // A React handler on the dialog panel claims the same key through the
+    // latch's synthetic twin, which also stops React's propagation flag. Both
+    // spellings clear the rule — the point is a claim before the move.
+    expect(scanUnguardedTabFocusTraps(jsx(`
+      onKeyDown={e => {
+        if (e.key !== 'Tab') return
+        if (!wrapsBackward && !wrapsForward) return
+        if (!fsImeLatch.claimSyntheticKey(e)) return
+        e.preventDefault()
+        ;(wrapsBackward ? last : first).focus()
+      }}`))).toHaveLength(0)
     // Scoped to a FOCUS MOVE: a Tab branch that acts through state (accepting
     // a suggestion, indenting a list item) has no focus call to anchor on and
-    // is out of scope by design — fail open rather than mis-flag.
+    // is out of THIS rule's scope — the state-write rule below owns it.
     expect(scanUnguardedTabFocusTraps(jsx(`
       onKeyDown={e => {
         if (e.key === 'Tab' && open && suggestions.length > 0) { e.preventDefault(); setDraft(suggestions[0].path) }
@@ -739,5 +946,156 @@ describe('ratchet rule fixtures', () => {
           confirmRef.current?.focus()
         }
       }`))).toHaveLength(1)
+  })
+
+  it('flags a hand-spelled synthetic claim but not a native one or the unified call', () => {
+    // The exact pair the four sites shipped: a native claim reached through
+    // `.nativeEvent`, with the synthetic half remembered by the caller.
+    expect(scanHandSpelledSyntheticClaims(jsx(
+      '          if (!fsImeLatch.claimKey(e.nativeEvent)) { e.stopPropagation(); return }',
+    ))).toHaveLength(1)
+    // Dropping the caller-side half is the drift the rule is really about, and
+    // it must flag too — otherwise the rule would only catch the CORRECT
+    // spelling of a shape it wants gone.
+    expect(scanHandSpelledSyntheticClaims(jsx(
+      '      if (!imeLatch.claimKey(e.nativeEvent)) return',
+    ))).toHaveLength(1)
+    // Modal's shape: the pair split across a condition with no early return.
+    expect(scanHandSpelledSyntheticClaims(jsx(
+      '      if (!imeLatch.claimKey(e.nativeEvent)) e.stopPropagation()',
+    ))).toHaveLength(1)
+    // The remedy.
+    expect(scanHandSpelledSyntheticClaims(jsx(
+      '          if (!fsImeLatch.claimSyntheticKey(e)) return',
+    ))).toHaveLength(0)
+    // A NATIVE listener passes its own event straight through — the other
+    // flavour of the same latch, and out of scope by construction.
+    expect(scanHandSpelledSyntheticClaims(jsx(
+      '        if (!imeLatch.claimKey(e)) return',
+    ))).toHaveLength(0)
+    // Prose describing the defect is not the defect.
+    expect(scanHandSpelledSyntheticClaims(jsx(
+      '  // sites used to spell claimKey(e.nativeEvent) plus a caller-side stop',
+    ))).toHaveLength(0)
+  })
+
+  it('flags a Tab branch that acts on the field without claiming the key', () => {
+    // The one-line accept-the-suggestion shape the path bar carried: consume
+    // the key, replace the draft, no composition signal anywhere.
+    expect(scanUnguardedTabStateWrites(jsx(`
+      onKeyDown={e => {
+        if (e.key === 'Tab' && open && suggestions.length > 0) { e.preventDefault(); setDraft(suggestions[0].path) }
+      }}`))).toHaveLength(1)
+    // Its sanctioned form: the claim runs before the consumption it owns.
+    expect(scanUnguardedTabStateWrites(jsx(`
+      onKeyDown={e => {
+        if (e.key === 'Tab' && open && suggestions.length > 0) { if (!ime.claimKey(e)) return; e.preventDefault(); setDraft(suggestions[0].path) }
+      }}`))).toHaveLength(0)
+    // The guard-clause spelling both markdown editors used: the early
+    // `!== 'Tab'` return scopes the rest of the handler, and the rewrite sits
+    // several lines below its own bail-outs.
+    expect(scanUnguardedTabStateWrites(jsx(`
+      onKeyDown={e => {
+        if (e.key !== 'Tab') return
+        const ta = e.currentTarget
+        const next = shiftListItem(content, ta.selectionStart, e.shiftKey)
+        if (!next) return
+        e.preventDefault()
+        ta.value = next.text
+        edit(next.text)
+      }}`))).toHaveLength(1)
+    expect(scanUnguardedTabStateWrites(jsx(`
+      onKeyDown={e => {
+        if (e.key !== 'Tab') return
+        const ta = e.currentTarget
+        const next = shiftListItem(content, ta.selectionStart, e.shiftKey)
+        if (!next) return
+        if (!ime.claimKey(e)) return
+        e.preventDefault()
+        ta.value = next.text
+        edit(next.text)
+      }}`))).toHaveLength(0)
+    // A claim that runs AFTER the consumption does not guard it: by then the
+    // browser has already been told the site owns the key.
+    expect(scanUnguardedTabStateWrites(jsx(`
+      onKeyDown={e => {
+        if (e.key === 'Tab') {
+          e.preventDefault()
+          if (!ime.claimKey(e)) return
+          setInput(filtered[cmdIdx].cmd)
+        }
+      }}`))).toHaveLength(1)
+    // Consuming the key to hold a surface STILL is not an act: the empty-list
+    // branch swallows Tab so the picker stays put and writes nothing an IME
+    // could corrupt. Flagging it would need an exemption list to quiet it.
+    expect(scanUnguardedTabStateWrites(jsx(`
+      const onKey = (e: KeyboardEvent) => {
+        if (n === 0) {
+          if (e.key === 'Enter' || e.key === 'Tab') {
+            if (releaseKeysWhenEmpty) {
+              onClose()
+              return
+            }
+            e.preventDefault()
+            e.stopPropagation()
+          }
+          return
+        }
+      }`))).toHaveLength(0)
+    // An early decline-and-return at no deeper nesting covers every branch
+    // below it — the shape `useListKeyboardNav` guards its choose dispatch
+    // with, in both the one-line and the wrapped spelling.
+    expect(scanUnguardedTabStateWrites(jsx(`
+      const onKey = (e: KeyboardEvent) => {
+        if ((e.key === 'Enter' || e.key === 'Tab') && !latch.claimKey(e)) {
+          return
+        }
+        if (e.key === 'Enter') {
+          e.preventDefault()
+          onChoose(selected)
+        } else if (e.key === 'Tab') {
+          e.preventDefault()
+          onChoose(selected)
+        }
+      }`))).toHaveLength(0)
+    // …but a claim nested inside a SIBLING branch is not on this branch's
+    // path, so it does not clear it (the asymmetry the focus rule states).
+    expect(scanUnguardedTabStateWrites(jsx(`
+      const onKey = (e: KeyboardEvent) => {
+        if (e.key === 'Escape') {
+          if (!latch.claimKey(e)) return
+          e.preventDefault()
+          onClose()
+          return
+        }
+        if (e.key === 'Tab') {
+          e.preventDefault()
+          onChoose(selected)
+        }
+      }`))).toHaveLength(1)
+    // A decline that never returns is not a guard: the branch runs on anyway.
+    expect(scanUnguardedTabStateWrites(jsx(`
+      const onKey = (e: KeyboardEvent) => {
+        const declined = !latch.claimKey(e)
+        if (e.key === 'Tab') {
+          e.preventDefault()
+          onChoose(selected)
+        }
+      }`))).toHaveLength(1)
+    // A branch that never takes the key from the browser is a different
+    // structure: nothing was re-aimed, so there is nothing to have claimed.
+    expect(scanUnguardedTabStateWrites(jsx(`
+      onKeyDown={e => {
+        if (e.key === 'Tab') setHint(null)
+      }}`))).toHaveLength(0)
+    // A claim mentioned only in a comment does not launder the site.
+    expect(scanUnguardedTabStateWrites(jsx(`
+      onKeyDown={e => {
+        if (e.key === 'Tab') {
+          // ime.claimKey( is handled upstream, honestly
+          e.preventDefault()
+          setInput(filtered[cmdIdx].cmd)
+        }
+      }}`))).toHaveLength(1)
   })
 })

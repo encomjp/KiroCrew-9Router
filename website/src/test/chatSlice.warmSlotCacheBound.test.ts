@@ -52,15 +52,18 @@ describe('warmSlotCache hydrate bound', () => {
   // Control: a refresh replaces the active transcript in place, so a bound
   // would shrink history the user already paged in. switchSlot resets the
   // pane's cursor, so IT pages: one bounded first page, older pages on demand.
-  it('leaves the in-place refresh unbounded while the slot open pages', async () => {
+  it('bounds the in-place refresh to the open page while the slot open pages', async () => {
     const store = makeStore('active-slot')
     await store.dispatch(switchSlot('active-slot') as never)
     expect(api.chatSlotDetail).toHaveBeenLastCalledWith('active-slot', OLDER_PAGE_LIMIT)
     // The PANE bound must not reach the active slot: distinct constants, so a
     // future edit collapsing them cannot pass this file unnoticed.
     expect(OLDER_PAGE_LIMIT).not.toBe(PANE_HYDRATE_LIMIT)
+    // refreshSlot is COUNT-MATCHED (see chatSlice.refreshSlotBound.test.ts,
+    // upstream #6947): a view whose rows the thunk cannot identify declines
+    // the bound, which fetchSlotDetail spells as the one-arg call.
     await store.dispatch(refreshSlot('active-slot') as never)
-    expect(api.chatSlotDetail).toHaveBeenLastCalledWith('active-slot')
+    expect((api.chatSlotDetail as unknown as { mock: { calls: unknown[][] } }).mock.calls.at(-1)?.[0]).toBe('active-slot')
   })
 
   // The pane's query is staleTime:Infinity, so a pane that mounted under the bound
@@ -142,8 +145,8 @@ describe('warmSlotCache hydrate bound', () => {
     expect(store.getState().chat.slotPaneHasMore['bg-slot']).toBe(false)
   })
 
-  // A streaming response lives as many raw chunk rows that only collapse after the
-  // server slices, so bounding a running slot would hydrate just its tail.
+  // Unbounded while streaming is deliberate, not a raw-row guard: the handler
+  // collapses chunk runs BEFORE computing total and slicing, even mid-stream.
   it('warms a streaming slot unbounded', async () => {
     ;(api.chatSlotDetail as ReturnType<typeof vi.fn>).mockResolvedValue(detail)
     const store = makeStore('active-slot', { slotRun: { 'bg-slot': { state: 'streaming' } } })
@@ -730,8 +733,8 @@ describe('switching away from a pane whose own fetch has not landed', () => {
   })
 
   // A count taken while the turn is RUNNING is not comparable with a settled
-  // one: the server counts raw rows, so a streaming response is inflated by rows
-  // that collapse when the turn ends. Retaining it makes the next warm read that
+  // one: an unbounded read counts raw rows, so a streaming response is inflated by
+  // rows that collapse at turn end. Retaining it makes the next warm read that
   // normal collapse as a truncation, and the suppression then DROPS a live row --
   // the opposite direction to the re-append this baseline exists to prevent.
   it('does not retain a count from a running response, so a later collapse is not read as a rewind', async () => {

@@ -17,6 +17,7 @@ unaffected (they don't go through events.py Slack dispatch).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -37,6 +38,7 @@ from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn
 from kiro_crew.messaging.link import canonical_key
 from kiro_crew.platform import current_context
 from kiro_crew.sel import sel
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.slack.handler import (
     _get_default_agent,
     _hydrate_conv_flags,
@@ -54,7 +56,7 @@ from kiro_crew.slack.handler import (
     maybe_route_linked_thread,
     track_background_task,
 )
-from kiro_crew.slack.renderer import SlackApprovalDecider, SlackRenderer
+from kiro_crew.slack.renderer import PARTIAL_TURN_MARKER, SlackApprovalDecider, SlackRenderer
 from kiro_crew.stats import Stats
 
 if TYPE_CHECKING:
@@ -357,6 +359,13 @@ async def handle_message_transport(
     client: LLMProvider | None = None
     _acquired = False
     renderer: SlackRenderer | None = None
+    # Hoisted above the try deliberately: the failure path reads both to decide
+    # whether partial assistant output still needs rescuing, and the turn can
+    # die anywhere inside the try — including before the points that used to
+    # initialize these — which would make the except branch raise NameError
+    # while handling the original error.
+    _logged_user_turn = False
+    _stamped_turn = False
 
     try:
         # ── Fire the ack reaction + working status IMMEDIATELY, before the
@@ -490,7 +499,6 @@ async def handle_message_transport(
         # `!incognito` that lands mid-turn used to suppress the whole turn
         # (both rows were still unwritten), and can now only suppress the
         # reply -- the question is already durable.
-        _logged_user_turn = False
         if conversation_log and not _is_slack_restricted(session_key):
             try:
                 # Off the loop deliberately. ``ConversationLog.append`` takes a
@@ -590,8 +598,10 @@ async def handle_message_transport(
             decider=decider,
             # Preserve native handle_message's auto_approve_subagent_spawn hook:
             # auto-approve spawn_run when the context builder's hook is enabled,
-            # regardless of the interactive ladder.
-            auto_approve_tool=lambda title: _should_auto_approve_spawn(context_builder, title),
+            # regardless of the interactive ladder. The predicate takes the
+            # permission EVENT so identity comes from event.tool_name/is_shell,
+            # never the model-authored title.
+            auto_approve_tool=lambda event: _should_auto_approve_spawn(context_builder, event),
             # Per-session Trust (set via the Trust button) auto-approves all
             # subsequent tools for THIS session, mirroring native. Checked per
             # permission request so a mid-turn Trust click takes effect for the
@@ -611,6 +621,7 @@ async def handle_message_transport(
             ),
             audit_session_key=session_key,
             audit_agent=_agent or "kirocrew",
+            closing_gate=lambda: sessions.begin_turn(session_key),
         )
         # The thread's owner as of the moment the turn starts producing output.
         # A dashboard link landing during the run moves the conversation to a
@@ -623,7 +634,6 @@ async def handle_message_transport(
         # from inside the run below. Only the renderer knows the final text; only
         # we know the conversation and its transcript, so we pass in the operation
         # rather than the state.
-        _stamped_turn = False
 
         async def _persist_and_stamp(final_text: str) -> str | None:
             nonlocal _stamped_turn
@@ -847,11 +857,110 @@ async def handle_message_transport(
                 exc_info=True,
             )
 
+    except SessionClosingError:
+        # Shutdown began between the claim and the dispatch, so no turn opened.
+        # Mirrors the native handler's own gate: clear the thread status and
+        # return quietly. Deliberately NOT the generic branch below -- a restart
+        # is not a session fault (record_failure counts toward tripping the
+        # circuit breaker on a session that never misbehaved), is not a failed
+        # message, and does not warrant an error posted into the thread.
+        logger.info("Aborting Slack dispatch for %s — gateway is shutting down", session_key)
+        with contextlib.suppress(Exception):
+            await slack.set_thread_status(channel, reply_ts, "")
     except Exception:
         logger.exception("transport_dispatch: error handling message")
         Stats().inc_message_failed()
         if client and _acquired:
             await sessions.record_failure(session_key)
+        # ── Rescue partial progress ──
+        # A transient backend fault (the "died before streaming started" class,
+        # a dropped stream) leaves the user row on disk and everything the model
+        # already produced in memory only. Nothing persisted it, so each retry
+        # re-read a transcript that ended at the question and started over: a
+        # 28-minute outage on 2026-09-02 burned five identical attempts that each
+        # re-derived the same ticket ids before dying again.
+        #
+        # Persisting the partial reply makes the next attempt resume — it reads
+        # what was already established instead of rediscovering it. Guarded so
+        # this can never make the failure worse:
+        #   * ``_stamped_turn`` — the reply already landed via the OPTIONS stamp,
+        #     so writing again would duplicate the turn.
+        #   * ``renderer.turn_finalized`` — the turn already ENDED normally. A
+        #     fault raised after the stream finished (a footer post that fails,
+        #     say) unwinds through this same branch, and stamping that complete
+        #     reply as cut off would tell the next turn to resume finished work.
+        #     Safe to read here: ``close()`` also sets the flag, but from the
+        #     ``finally`` below, which runs after this decision is made.
+        #   * ``_logged_user_turn`` — the rescue runs ONLY when the user row is
+        #     confirmed on disk. When the receipt append raised, whether the row
+        #     landed is unknowable from here: ``ConversationLog.append`` writes
+        #     the row and only then invalidates caches and calls
+        #     ``_maybe_rotate``, whose own guard covers just the ``stat`` — so a
+        #     rotation fault on an oversized transcript raises with the row
+        #     already durable, while a lock timeout raises with nothing written.
+        #     Writing both rows there would duplicate the question; writing the
+        #     assistant row alone would orphan the answer. Neither is honest, so
+        #     the rescue no-ops and the retry starts from the question, exactly
+        #     as it did before this change. Same rule the delivery ledger applies
+        #     to an unacknowledged send: when an outcome is unconfirmable, record
+        #     nothing.
+        #   * ``_is_slack_restricted`` — incognito/temporary sessions persist
+        #     nothing, same as both success-path writes.
+        #   * off-loop ``to_thread``, because ``append`` takes a cross-process
+        #     flock and ON the loop it single-shots and drops the row.
+        #   * its own try/except: a disk failure here must not replace the real
+        #     exception in the log with a bookkeeping one.
+        # Persist only what Slack CONFIRMED it showed. ``SlackRenderer`` batches on
+        # an edit throttle, so the text the model has produced runs routinely ahead
+        # of the text the user has seen; a rescue that persisted the former would
+        # record unseen output as established fact, and the retry would build on
+        # something that was never on screen. ``delivered_text`` is the renderer's
+        # delivery ledger — advanced only where Slack acknowledged the append — so
+        # it is the honest source here.
+        #
+        # This is the only rescue in the codebase, on purpose — and the reason is
+        # confirmable delivery, not an absence of mid-turn sending. Renderers on
+        # the shared ``messaging/dispatch.drive_turn`` path DO emit during a turn
+        # (``telegram`` live-edits per chunk, ``wecom`` pushes stream frames,
+        # ``webex`` rides the buffer tail on a status frame), but none of them can
+        # say afterwards which bytes the user actually retained: those frames are
+        # throttled, replaced wholesale, or truncated. Slack is the one renderer
+        # that keeps a per-append record of what the API acknowledged, so it is
+        # the one place a rescue can persist shown text rather than produced text.
+        _shown = renderer.delivered_text if renderer is not None else ""
+        # ``strip`` decides EMPTINESS only. What gets persisted is ``_shown``
+        # verbatim: leading indentation is content in a transcript — a fenced block
+        # or a nested list loses its structure if the margin is trimmed — and the
+        # success-path write does not trim it either.
+        if (
+            _shown.strip()
+            and _logged_user_turn
+            and not _stamped_turn
+            and renderer is not None
+            and not renderer.turn_finalized
+            and conversation_log
+            and not _is_slack_restricted(session_key)
+        ):
+            try:
+                await asyncio.to_thread(
+                    conversation_log.append,
+                    session_key,
+                    "assistant",
+                    _shown + PARTIAL_TURN_MARKER,
+                    source_thread=session_key,
+                    source_user=user_id,
+                )
+                logger.info(
+                    "transport_dispatch: rescued %d chars of partial reply session=%s",
+                    len(_shown),
+                    session_key,
+                )
+            except Exception:
+                logger.warning(
+                    "transport_dispatch: partial-reply rescue failed session=%s",
+                    session_key,
+                    exc_info=True,
+                )
         # Post error to Slack so user knows something went wrong. The error
         # MESSAGE is suppressed for trusted-bot messages: in a mutual-mesh
         # setup (A trusts B, B trusts A) an error reply is itself a

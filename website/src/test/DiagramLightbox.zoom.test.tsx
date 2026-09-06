@@ -356,7 +356,7 @@ describe('the magnify-surface rule is enforced by count, not by example', () => 
      *  An entry here is a visible debt with an owner; deleting the entry is part
      *  of that issue's work. Do NOT add one to make a red sweep green — the
      *  point of the sweep is that a NEW overlay cannot ship without the hook. */
-    const deferred = new Map([['pages/AppDetailPage.tsx', '#6162']])
+    const deferred = new Map<string, string>()
     const offenders: string[] = []
     const magnifySurfaces: string[] = []
     let seen = 0

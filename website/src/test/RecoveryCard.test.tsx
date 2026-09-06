@@ -18,6 +18,7 @@ const BUSY = '[Session busy — automatic recovery]'
 const HOOK = '[Hook continuation — automatic]'
 const HALT = '[Stop-hook nudge cap reached]'
 const PROMISE_ONLY = '[Unfinished action — automatic recovery]'
+const COMPACTION = '[Context compacted — automatic recovery]'
 
 /** A refusal body shaped the way build_refusal_recovery_prompt() emits it. */
 function refusalBody(items: string[]): string {
@@ -211,6 +212,30 @@ describe('parseRecoveryMessage', () => {
     expect(promise?.chip).toBe('')
     expect(promise?.body.startsWith('[')).toBe(false)
   })
+
+  it('labels a post-compaction continuation without blaming a backend fault', () => {
+    // Verbatim opener from chat_utils._COMPACTION_CONTINUE_MSG.
+    const compaction = parseRecoveryMessage(
+      `${COMPACTION}\nThe conversation above was summarized mid-turn because the context window filled up.`,
+    )
+    expect(compaction?.kind).toBe('compaction')
+    expect(compaction?.title).toBe('Context compacted')
+    // Its own copy rather than the posttoken pair: nothing errored and nothing
+    // was lost, so a "backend error" detail would send the reader hunting a
+    // fault that does not exist.
+    expect(compaction?.detail).toBe('summarized mid-turn · continuation sent automatically')
+    expect(compaction?.detail).not.toContain('error')
+    expect(compaction?.chip).toBe('')
+    expect(compaction?.body.startsWith('[')).toBe(false)
+  })
+
+  it('does not claim an ordinary mention of compacting', () => {
+    // The ACP layer matches the adapter's notice on an exact literal for the
+    // same reason: model prose about compaction is not a control frame.
+    expect(parseRecoveryMessage('The context was compacted, so here is a summary.')).toBeNull()
+    // Hyphen instead of em dash — not the wire value.
+    expect(parseRecoveryMessage('[Context compacted - automatic recovery]\nbody')).toBeNull()
+  })
 })
 
 describe('RecoveryCard', () => {
@@ -314,25 +339,35 @@ describe('ChatPage – recovery card wiring', () => {
   const src = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../pages/ChatPage.tsx'), 'utf8')
 
   it('imports the card and its shared resolver', () => {
-    expect(src).toMatch(
-      /import\s+RecoveryCard\s*,\s*\{\s*resolveInjectCard\s*\}\s*from\s*['"][^'"]*RecoveryCard['"]/,
-    )
+    // Since chat-core P5-b the recovery row is a shared dashboard entry
+    // (pages/chat/transcriptRenderers.tsx) that ChatPage spreads into its host
+    // list, so the imports live in the factory and the page imports the factory.
+    const factory = readFileSync(resolve(__dirname, '../pages/chat/transcriptRenderers.tsx'), 'utf8')
+    expect(factory).toMatch(/import\s+RecoveryCard\s*,\s*\{\s*resolveInjectCard\s*\}\s*from\s*['"]\.\/RecoveryCard['"]/)
+    expect(src).toMatch(/import \{ createTranscriptRenderers \} from '\.\/chat\/transcriptRenderers'/)
   })
 
   it('routes inject rows through the shared resolver to the card', () => {
-    expect(src).toMatch(/resolveInjectCard\s*\(\s*m\s*\)/)
-    expect(src).toMatch(/<RecoveryCard\s/)
+    const factory = readFileSync(resolve(__dirname, '../pages/chat/transcriptRenderers.tsx'), 'utf8')
+    expect(factory).toMatch(/resolveInjectCard\s*\(\s*m\s*\)/)
+    expect(factory).toMatch(/<RecoveryCard\s/)
   })
 
   it('checks for a card BEFORE the generic inject bubble renders', () => {
-    // The generic `isInject` branch paints any injected text as a full-width
-    // warning bubble. If the resolver check lands after it, the card is dead
-    // code and the raw prompt reappears.
-    const card = src.indexOf('resolveInjectCard(m)')
-    const generic = src.indexOf("const isInject = m.role === 'inject'")
-    expect(card).toBeGreaterThanOrEqual(0)
-    expect(generic).toBeGreaterThanOrEqual(0)
-    expect(card).toBeLessThan(generic)
+    // Since chat-core P5-b the page spreads the dashboard's shared row set
+    // (pages/chat/transcriptRenderers.tsx) into its host list, and precedence
+    // is list order. The generic bubble entry (which paints any injected text
+    // as a full-width warning bubble) is the LAST entry; the shared set --
+    // which carries the `recovery_inject` shape entry -- must be spread before
+    // it, or the card is dead code and the raw prompt reappears.
+    const list = src.indexOf('const renderers = mergeRenderers([')
+    const shared = src.indexOf('...shared,', list)
+    const generic = src.indexOf('\n      bubble,\n    ])', list)
+    expect(list).toBeGreaterThanOrEqual(0)
+    expect(shared).toBeGreaterThan(list)
+    expect(generic).toBeGreaterThan(shared)
+    const factory = readFileSync(resolve(__dirname, '../pages/chat/transcriptRenderers.tsx'), 'utf8')
+    expect(factory).toMatch(/id: 'recovery_inject',\s*\n\s*roles: \['inject'\],\s*\n\s*match: m => resolveInjectCard\(m\) !== null/)
   })
 })
 

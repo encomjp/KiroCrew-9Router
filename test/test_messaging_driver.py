@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from kiro_crew.acp.types import (
     EVENT_COMPACTION_STATUS,
     EVENT_COMPLETE,
@@ -18,6 +20,7 @@ from kiro_crew.acp.types import (
     EVENT_TEXT_CHUNK,
     EVENT_TOOL_CALL,
     AcpEvent,
+    TurnUsage,
 )
 from kiro_crew.messaging import (
     APPROVAL_AUTO,
@@ -26,6 +29,8 @@ from kiro_crew.messaging import (
     TurnDriver,
 )
 from kiro_crew.messaging.renderer import Renderer
+from kiro_crew.monitoring.completion import MonitorCompletionHook
+from kiro_crew.monitoring.models import MonitorActionCompletion, MonitorActionDisposition
 
 
 class _RecordingRenderer(Renderer):
@@ -92,6 +97,242 @@ class TestTurnDriverTranslation:
         out = _run(p, r)
         assert out == "Hello world"
         assert [e[0] for e in r.events] == ["text_chunk", "text_chunk", "done"]
+
+    def test_safe_complete_reports_monitor_action_once(self):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="max_tokens",
+                    usage=TurnUsage(input_tokens=20, output_tokens=5),
+                )
+            ]
+        )
+        completions: list[MonitorActionCompletion] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        hook = MonitorCompletionHook("monitor1", "failure-a", _capture)
+        _run(p, r, monitor_completion=hook)
+
+        assert len(completions) == 1
+        assert completions[0].disposition is MonitorActionDisposition.FAILURE
+        assert completions[0].input_tokens == 20
+        assert completions[0].output_tokens == 5
+
+    @pytest.mark.parametrize(
+        "stop_reason",
+        [
+            "",
+            "timeout",
+            "stale_recover",
+            "error: cancel unacked",
+            "error: tool stall",
+            "error: compaction failed",
+        ],
+    )
+    def test_synthetic_complete_does_not_report_monitor_action(self, stop_reason):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason=stop_reason,
+                    usage=TurnUsage(input_tokens=20, output_tokens=5),
+                )
+            ]
+        )
+        completions: list[MonitorActionCompletion] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        hook = MonitorCompletionHook("monitor1", "failure-a", _capture)
+        _run(p, r, monitor_completion=hook)
+
+        assert completions == []
+
+    def test_real_end_turn_reports_monitor_success(self):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="end_turn",
+                    usage=TurnUsage(input_tokens=20, output_tokens=5),
+                )
+            ]
+        )
+        completions: list[MonitorActionCompletion] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        _run(p, r, monitor_completion=MonitorCompletionHook("monitor1", "failure-a", _capture))
+
+        assert len(completions) == 1
+        assert completions[0].disposition is MonitorActionDisposition.SUCCESS
+
+    def test_synthesized_end_turn_does_not_report_monitor_action(self):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="end_turn",
+                    synthetic_completion=True,
+                    usage=TurnUsage(input_tokens=20, output_tokens=5),
+                )
+            ]
+        )
+        completions: list[MonitorActionCompletion] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        _run(p, r, monitor_completion=MonitorCompletionHook("monitor1", "failure-a", _capture))
+
+        assert completions == []
+
+    def test_monitor_authorization_is_rechecked_before_provider_stream(self):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider([AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")])
+        completions: list[MonitorActionCompletion] = []
+        authorizations: list[tuple[str, str]] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        async def _authorize(monitor_id: str, fingerprint: str) -> bool:
+            authorizations.append((monitor_id, fingerprint))
+            return False
+
+        hook = MonitorCompletionHook(
+            "monitor1",
+            "failure-a",
+            _capture,
+            authorization_callback=_authorize,
+        )
+        out = _run(p, r, monitor_completion=hook)
+
+        assert out == ""
+        assert authorizations == [("monitor1", "failure-a")]
+        assert not hook.accepted
+        assert completions == []
+        assert r.events == []
+
+    def test_monitor_closing_gate_runs_before_acceptance_and_provider_stream(self):
+        r = _RecordingRenderer()
+        order: list[str] = []
+
+        class _OrderedProvider(_ScriptedProvider):
+            async def stream(self, message):
+                order.append("stream")
+                for event in self._events:
+                    yield event
+
+        p = _OrderedProvider([AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")])
+
+        async def _capture(_completion: MonitorActionCompletion) -> None:
+            return None
+
+        async def _authorize(_monitor_id: str, _fingerprint: str) -> bool:
+            order.append("authorize")
+            return True
+
+        hook = MonitorCompletionHook(
+            "monitor1",
+            "failure-a",
+            _capture,
+            authorization_callback=_authorize,
+        )
+
+        def _guard() -> None:
+            order.append("guard")
+            assert not hook.accepted
+
+        _run(p, r, monitor_completion=hook, closing_gate=_guard)
+
+        assert order == ["authorize", "guard", "stream"]
+        assert hook.accepted
+
+    def test_monitor_closing_gate_refusal_never_accepts_or_streams(self):
+        r = _RecordingRenderer()
+        p = _ScriptedProvider([AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn")])
+
+        async def _capture(_completion: MonitorActionCompletion) -> None:
+            return None
+
+        hook = MonitorCompletionHook("monitor1", "failure-a", _capture)
+
+        def _guard() -> None:
+            raise RuntimeError("gateway closing")
+
+        with pytest.raises(RuntimeError, match="gateway closing"):
+            _run(p, r, monitor_completion=hook, closing_gate=_guard)
+
+        assert not hook.accepted
+        assert r.events == []
+
+    def test_safe_complete_reports_monitor_action_before_renderer_finalization(self):
+        class _CancellingDoneRenderer(_RecordingRenderer):
+            async def on_done(self, stop_reason=""):
+                await super().on_done(stop_reason)
+                raise asyncio.CancelledError
+
+        r = _CancellingDoneRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="max_tokens",
+                    usage=TurnUsage(input_tokens=20, output_tokens=5),
+                )
+            ]
+        )
+        completions: list[MonitorActionCompletion] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        hook = MonitorCompletionHook("monitor1", "failure-a", _capture)
+        with pytest.raises(asyncio.CancelledError):
+            _run(p, r, monitor_completion=hook)
+
+        assert len(completions) == 1
+        assert completions[0].input_tokens == 20
+        assert completions[0].output_tokens == 5
+
+    def test_safe_complete_reports_monitor_action_before_buffered_rendering(self):
+        class _FailingTextRenderer(_RecordingRenderer):
+            async def on_text_chunk(self, text):
+                raise RuntimeError("transport unavailable")
+
+        r = _FailingTextRenderer()
+        p = _ScriptedProvider(
+            [
+                AcpEvent(kind=EVENT_TEXT_CHUNK, text="✅ Conversation comp"),
+                AcpEvent(
+                    kind=EVENT_COMPLETE,
+                    stop_reason="max_tokens",
+                    usage=TurnUsage(input_tokens=20, output_tokens=5),
+                ),
+            ]
+        )
+        completions: list[MonitorActionCompletion] = []
+
+        async def _capture(completion: MonitorActionCompletion) -> None:
+            completions.append(completion)
+
+        hook = MonitorCompletionHook("monitor1", "failure-a", _capture)
+        with pytest.raises(RuntimeError, match="transport unavailable"):
+            _run(p, r, monitor_completion=hook)
+
+        assert len(completions) == 1
+        assert completions[0].input_tokens == 20
+        assert completions[0].output_tokens == 5
 
     def test_tool_calls_emit_uniform_tool_call(self):
         r = _RecordingRenderer()
@@ -248,18 +489,33 @@ class TestApprovalLadder:
 
 class TestAutoApproveTool:
     """The injected auto_approve_tool predicate (e.g. auto_approve_subagent_spawn
-    for spawn_run) takes precedence over the interactive ladder."""
+    for spawn_run) takes precedence over the interactive ladder.
 
-    def _perm_script(self, title):
+    The predicate receives the PERMISSION EVENT (not the title): the title is
+    model-authored, so the production predicate keys on canonical identity
+    (``tool_name``/``is_shell``). Both directions are pinned below through the
+    real ``build_auto_approve`` builder; flipping any consumer back to a
+    title-only check must fail the forged-shell direction.
+    """
+
+    def _perm_script(self, title, **event_fields):
         return [
             AcpEvent(
                 kind=EVENT_PERMISSION_REQUEST,
                 request_id="rq1",
                 title=title,
                 options=[{"id": "approve"}],
+                **event_fields,
             ),
             AcpEvent(kind=EVENT_COMPLETE, stop_reason="end_turn"),
         ]
+
+    @staticmethod
+    def _spawn_hook_builder(enabled=True):
+        """A ctx_builder double with only the spawn hook flag set."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(hooks=SimpleNamespace(auto_approve_subagent_spawn=enabled))
 
     def test_predicate_auto_approves_matching_tool(self):
         r = _RecordingRenderer()
@@ -275,7 +531,7 @@ class TestAutoApproveTool:
             r,
             approval_mode=APPROVAL_INTERACTIVE,
             decider=decider,
-            auto_approve_tool=lambda title: title == "spawn_run",
+            auto_approve_tool=lambda event: (getattr(event, "title", "") or "") == "spawn_run",
         )
         assert p.approved == ["rq1"]
         assert p.rejected == []
@@ -289,10 +545,73 @@ class TestAutoApproveTool:
             p,
             r,
             approval_mode=APPROVAL_INTERACTIVE,
-            auto_approve_tool=lambda title: title == "spawn_run",
+            auto_approve_tool=lambda event: (getattr(event, "title", "") or "") == "spawn_run",
         )
         assert p.rejected == ["rq1"]
         assert p.approved == []
+
+    def test_genuine_spawn_run_mcp_event_still_auto_approves(self):
+        # Direction 1: a genuine spawn_run MCP call (canonical identity from
+        # ``_meta.kiro``, provenance-flagged, served by the crew's own MCP
+        # server) keeps unattended fan-out unblocked.
+        from kiro_crew.messaging.dispatch import build_auto_approve
+
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            self._perm_script(
+                "spawn_run",
+                tool_name="spawn_run",
+                mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
+            )
+        )
+        _run(
+            p,
+            r,
+            approval_mode=APPROVAL_INTERACTIVE,
+            auto_approve_tool=build_auto_approve(self._spawn_hook_builder()),
+        )
+        assert p.approved == ["rq1"]
+        assert p.rejected == []
+
+    def test_shell_event_with_forged_spawn_title_is_not_auto_approved(self):
+        # Direction 2 (the issue's attack): a SHELL event whose model-authored
+        # title says spawn_run must fall to the ladder, not ride the rung.
+        from kiro_crew.messaging.dispatch import build_auto_approve
+
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(self._perm_script("spawn_run", is_shell=True, shell_classified=True))
+        _run(
+            p,
+            r,
+            approval_mode=APPROVAL_INTERACTIVE,
+            auto_approve_tool=build_auto_approve(self._spawn_hook_builder()),
+        )
+        assert p.approved == []
+        assert p.rejected == ["rq1"]
+
+    def test_canonical_name_mismatch_with_forged_title_is_not_auto_approved(self):
+        # A non-shell tool whose canonical _meta.kiro name is NOT spawn_run
+        # cannot borrow the rung by re-titling itself.
+        from kiro_crew.messaging.dispatch import build_auto_approve
+
+        r = _RecordingRenderer()
+        p = _ScriptedProvider(
+            self._perm_script(
+                "spawn_run",
+                tool_name="artifact_delete",
+                mcp_server_name="kirocrew-core",
+                mcp_identity_trusted=True,
+            )
+        )
+        _run(
+            p,
+            r,
+            approval_mode=APPROVAL_INTERACTIVE,
+            auto_approve_tool=build_auto_approve(self._spawn_hook_builder()),
+        )
+        assert p.approved == []
+        assert p.rejected == ["rq1"]
 
     def test_session_trust_auto_approves_without_buttons(self):
         r = _RecordingRenderer()
@@ -458,7 +777,7 @@ class TestToolGateEnforcement:
             p,
             r,
             approval_mode=APPROVAL_INTERACTIVE,
-            auto_approve_tool=lambda title: True,
+            auto_approve_tool=lambda event: True,
             tool_gate=lambda ev: "deny",
         )
         assert p.rejected == ["rq1"]
@@ -528,7 +847,7 @@ class TestDenyAllTools:
             p,
             r,
             approval_mode=APPROVAL_INTERACTIVE,
-            auto_approve_tool=lambda title: True,
+            auto_approve_tool=lambda event: True,
             deny_all_tools=True,
         )
         assert p.rejected == ["rq1"] and p.approved == []

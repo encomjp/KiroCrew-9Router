@@ -30,8 +30,10 @@ from kiro_crew.providers.base import (
     EVENT_TOOL_CALL,
     LLMEvent,
     LLMProvider,
+    resolve_billing_stats,
 )
 from kiro_crew.security import (
+    MAX_SCANNABLE_COMMAND_CHARS,
     is_denied,
     is_sensitive_bash_command,
     is_sensitive_path,
@@ -885,6 +887,120 @@ def _extract_tool_input_strings(tool_input: str) -> list[str]:
     return results
 
 
+# Longest single string the tool_input scan will attempt.
+#
+# The scan runs on a worker thread, but CPython's ``re`` HOLDS the GIL for the
+# whole of one match call (measured: a 5-8 s ``search`` on a worker left the
+# main thread exactly one tick on 3.10 and 3.12), so the hop yields between
+# strings, never within one. The ceiling is therefore the liveness bound for a
+# single string as well as the WORKER's: an unbounded string parks the loop and
+# the thread for as long as the scan takes, and the permission request behind
+# it -- the turn -- waits with it.
+#
+# The anchor rewrite in this change cut the constant but NOT the growth -- the
+# scan is still superlinear in the length of one line. Measured on one dev box:
+#
+#     4 KiB 0.16s | 8 KiB 0.31s | 16 KiB 1.14s | 20 KiB 1.52s | 32 KiB 3.79s
+#
+# 16->32 KiB is 3.3x for 2x the input (~n^1.7), so extrapolation is the wrong
+# instinct here and a ceiling has to be set from the measured curve. A CI runner
+# under parallel load came in roughly an order of magnitude slower than this box,
+# which is what sets the margin: 20 KiB is ~1.5s here and ~15s there, under the
+# 25s loop watchdog on both.
+#
+# Exceeding it is FAIL-CLOSED: the call is denied, never skipped. A skip would
+# convert a liveness bug into a security hole by letting unscanned input through
+# the deny surface; a denial only refuses input we cannot prove safe, and is
+# strictly better than the alternative it replaces, which was crashing the
+# gateway and losing the whole turn.
+#
+# Known cost of that trade: a permission-gated write of a benign file larger
+# than this lands its whole content in ``tool_input`` and is refused. The durable
+# fix is to stop running the SHELL-COMMAND matcher over fields that never carry a
+# command. Tracked in https://github.com/kirodotdev/KiroCrew/issues/8053.
+#
+# One number for both tiers: the shell gate refuses a command above
+# ``security.MAX_SCANNABLE_COMMAND_CHARS`` on its own (every caller, not only
+# this one), so aliasing it here is what keeps "too long for the tool_input
+# scan" and "too long for the command gate" the same size.
+_MAX_SCANNABLE_TOOL_INPUT_CHARS = MAX_SCANNABLE_COMMAND_CHARS
+
+
+def _title_denial(
+    title: str,
+    denied_regexes: list[str] | None,
+) -> tuple[str, str] | None:
+    """Return the always-enforced denial for the tool *title*, or ``None``.
+
+    The title is the request's primary subject -- for a shell tool it IS the
+    command -- and it goes through the same three predicates as every
+    tool_input string. Pure and synchronous like :func:`_first_tool_input_denial`,
+    and run on the same worker hop: the field crash this exists for was the
+    sensitive-path gate scanning a ~9 KB TITLE for 25 s on the event loop, so
+    a hop that offloaded only the tool_input strings left the crash path in
+    place. The tuple is ``(kind, reason)`` with *kind* ``"path"`` / ``"bash"`` /
+    ``"regex"``; the reasons are the exact strings the on-loop checks produced.
+    """
+    if is_sensitive_path(title):
+        return ("path", f"Blocked: sensitive path: {title}")
+    bash_reason = is_sensitive_bash_command(title)
+    if bash_reason:
+        return ("bash", bash_reason)
+    deny_reason = is_denied(title, denied_regexes=denied_regexes)
+    if deny_reason:
+        return ("regex", deny_reason)
+    return None
+
+
+def _first_tool_input_denial(
+    strings: list[str],
+    denied_regexes: list[str] | None,
+) -> tuple[str, str, str] | None:
+    """Return the first tool_input denial among *strings*, or ``None``.
+
+    Pure, synchronous, and blocking: the three predicates are regex-heavy and
+    ``_extract_tool_input_strings`` hands over EVERY string in the payload, so a
+    single long document body can occupy the calling thread for seconds. It
+    therefore runs on a worker thread (one hop for the whole loop, not one per
+    string). CPython's ``re`` HOLDS the GIL for the whole of one match call
+    (measured: a 5-8 s ``search`` on a worker left the main thread a single
+    tick on 3.10 and 3.12), so the hop keeps the loop live BETWEEN strings,
+    not within one; within one string the only liveness guarantees are the
+    linear patterns and the length check against
+    :data:`_MAX_SCANNABLE_TOOL_INPUT_CHARS`, which also bounds the worker's
+    own wall clock -- a denied oversized string is recoverable, a worker parked
+    for minutes on a pathological payload is not -- and an oversized one is
+    denied rather than scanned or skipped.
+
+    The tuple is ``(kind, reason, matched_string)`` where *kind* is
+    ``"path"`` / ``"bash"`` / ``"regex"`` / ``"oversize"``. Mechanism
+    classification stays with the caller on the event loop, because it consults
+    the HookManager.
+    """
+    for s in strings:
+        if len(s) > _MAX_SCANNABLE_TOOL_INPUT_CHARS:
+            # Fail closed: too long to scan inside the loop's liveness budget,
+            # so it cannot be shown safe and is refused.
+            return (
+                "oversize",
+                (
+                    "Blocked: a tool_input string is too large to security-scan "
+                    f"({len(s)} chars > {_MAX_SCANNABLE_TOOL_INPUT_CHARS} limit); "
+                    "refused rather than left unscanned"
+                ),
+                s[:64],
+            )
+        if is_sensitive_path(s):
+            return ("path", f"Blocked: sensitive path in tool_input: {s}", s)
+        _input_bash = is_sensitive_bash_command(s)
+        if _input_bash:
+            return ("bash", _input_bash, s)
+        _input_deny = is_denied(s, denied_regexes=denied_regexes)
+        if _input_deny:
+            return ("regex", _input_deny, s)
+    return None
+
+
 # ── Tool Approval Policies ──
 
 
@@ -894,10 +1010,6 @@ class ToolApprovalPolicy(Enum):
     AUTO_APPROVE = "auto_approve"
     REJECT_ALL = "reject_all"
     HOOK_BASED = "hook_based"
-
-
-# Callback type for custom tool approval logic
-OnPermissionCallback = Callable[[LLMEvent], Awaitable[bool]]
 
 
 # ── Stream and Collect ──
@@ -1113,14 +1225,28 @@ def _billing_stats(provider: Any) -> Any:
     Returned as the object rather than a value so callers can compare identity:
     the runner installs a FRESH stats object as it begins a turn, which is what
     tells a completed turn apart from one that never started.
+
+    Each holder is read through :func:`resolve_billing_stats`, the one spelling
+    the wrappers use too: a provider's declared
+    :meth:`LLMProvider.billing_stats` wins, and the ``last_prompt_stats``
+    fallback keeps every holder that was found before the capability existed --
+    the raw ``AcpClient``, and the doubles that stand in for a runner. One
+    holder's broken read is skipped rather than abandoning the walk, so a faulty
+    wrapper cannot lose a turn whose billing a later node still carries.
     """
     try:
-        for node in _billing_stat_holders(provider):
-            stats = getattr(node, "last_prompt_stats", None)
-            if stats is not None:
-                return stats
+        holders = _billing_stat_holders(provider)
     except Exception:
-        logger.debug("billing stats lookup failed", exc_info=True)
+        logger.debug("billing stats holder walk failed", exc_info=True)
+        return None
+    for node in holders:
+        try:
+            stats = resolve_billing_stats(node)
+        except Exception:
+            logger.debug("billing stats read failed for one holder", exc_info=True)
+            continue
+        if stats is not None:
+            return stats
     return None
 
 
@@ -1261,13 +1387,18 @@ def provider_last_turn_usage(provider: Any, *, since: Any = _NO_PRIOR_STATS) -> 
 def _billing_stat_holders(provider: Any) -> "list[Any]":
     """Objects that may carry ``last_prompt_stats``, nearest wrapper first.
 
-    The turn-runner sits behind a different attribute per seam: the acp provider
-    keeps it on ``_client``, the session provider on ``_handle``, and the shared
-    background session hands non-kiro callers a thin adapter whose only link to
-    the runner is ``_sess.provider``. Walking all of them keeps a background turn
-    on the claude_code / bedrock seam from reporting 0 credits for a turn that
-    was billed. Bounded and identity-deduped so a self-referential wrapper chain
-    cannot loop.
+    The compatibility path behind :func:`_billing_stats`, and the lookup
+    :func:`_provider_label` still needs: the turn-runner sits behind a different
+    attribute per seam: the acp provider keeps it on ``_client``, the session
+    provider on ``_handle``, and the shared background session hands non-kiro
+    callers a thin adapter whose only link to the runner is ``_sess.provider``.
+    Walking all of them keeps a background turn on the claude_code / bedrock seam
+    from reporting 0 credits for a turn that was billed. Bounded and
+    identity-deduped so a self-referential wrapper chain cannot loop.
+
+    A name absent from this tuple is exactly how a new seam's spend went
+    unreported, which is why the billing read now prefers the provider's declared
+    :meth:`LLMProvider.billing_stats` and only falls back here.
     """
     out: list[Any] = []
     seen: set[int] = set()
@@ -1435,6 +1566,7 @@ async def stream_and_collect(
     on_chunk: Callable[[str], None] | None = None,
     on_tool_approval: Callable[[LLMEvent], Awaitable[bool]] | None = None,
     on_steer_consumed: Callable[[str], None] | None = None,
+    on_complete: Callable[[LLMEvent], None] | None = None,
     on_tool_gate: Callable[[str, bool, bool], None] | None = None,
     retry_transient: bool = True,
     max_turns: int | None = None,
@@ -1461,6 +1593,10 @@ async def stream_and_collect(
             fire-and-forget write, so this echo is the ONLY authoritative signal
             that the backend injected it; a caller that steers must observe this
             to know which of its steers to requeue when the turn ends.
+        on_complete: Optional callback invoked with the provider's raw
+            ``EVENT_COMPLETE``. It is not invoked when the stream exhausts or
+            the caller cancels before that event. Raising from the callback is
+            swallowed so observation cannot fail the completed turn.
         on_tool_gate: Optional callback invoked once per tool permission
             decision with ``(tool_title, approved, security_blocked)``. Lets a
             caller tell "the model did work" apart from "every tool the model
@@ -1631,6 +1767,11 @@ async def stream_and_collect(
                 elif event.kind == EVENT_STEER_CONSUMED:
                     consumed_this_attempt.append(event.text or "")
                 elif event.kind == EVENT_COMPLETE:
+                    if on_complete:
+                        try:
+                            on_complete(event)
+                        except Exception:
+                            logger.debug("on_complete callback failed", exc_info=True)
                     break
             return result_text
         except AcpError as exc:
@@ -1955,19 +2096,6 @@ async def _resolve_permission(
         await provider.reject_tool(event.request_id)
         _log("denied", error="Blocked: missing tool title", metadata={"mechanism": "always_deny"})
         return False
-    if is_sensitive_path(normalized):
-        await provider.reject_tool(event.request_id)
-        _log(
-            "denied",
-            error=f"Blocked: sensitive path: {normalized}",
-            metadata={"mechanism": "always_deny"},
-        )
-        return False
-    _bash_reason = is_sensitive_bash_command(normalized)
-    if _bash_reason:
-        await provider.reject_tool(event.request_id)
-        _log("denied", error=_bash_reason, metadata={"mechanism": "always_deny"})
-        return False
     # Honor the user's Settings>Security opt-out + governance pins on this
     # surface too (cron / Slack / workflow / heartbeat). Without threading the
     # effective set, is_denied() fails closed to ALL built-ins here, which would
@@ -2002,47 +2130,46 @@ async def _resolve_permission(
             return unconditional
         return unconditional if is_denied(probe, denied_regexes=_unpinned) else "policy_deny"
 
-    _deny_reason = is_denied(normalized, denied_regexes=_denied_regexes)
-    if _deny_reason:
+    # Defense-in-depth: the title AND every string in event.tool_input go through
+    # the same three predicates. The title usually carries the full path/command
+    # (kiro-cli convention), but tool_input may contain additional arguments or
+    # the actual path when the title is a generic tool name (e.g. "Read", "Bash").
+    _tool_input = event.tool_input or ""
+    _input_strings = _extract_tool_input_strings(_tool_input) if _tool_input else []
+
+    def _scan_off_loop() -> tuple[str, str, str, str] | None:
+        # One worker hop for the title and the whole tool_input loop. Both are
+        # regex-heavy over agent-supplied text; on the event loop a ~9 KB shell
+        # title held the loop past the 25 s stall watchdog and took the gateway
+        # down (the title tier used to run inline here while only the tool_input
+        # tier was offloaded, so that crash path survived the first offload).
+        # ``re`` HOLDS the GIL for one match call, so the hop does not keep the
+        # loop live inside a single scan -- the linear patterns and the size
+        # ceiling do that; what the hop buys is the realpath I/O inside
+        # ``is_sensitive_path`` (which does release the GIL) and yields between
+        # the strings. Title first, so a request denied on its title
+        # reports the title-tier reason and mechanism exactly as before.
+        title_hit = _title_denial(normalized, _denied_regexes)
+        if title_hit is not None:
+            return (title_hit[0], title_hit[1], normalized, "always_deny")
+        if _input_strings:
+            input_hit = _first_tool_input_denial(_input_strings, _denied_regexes)
+            if input_hit is not None:
+                return (*input_hit, "always_deny_input")
+        return None
+
+    _hit = await asyncio.to_thread(_scan_off_loop)
+    if _hit is not None:
+        _kind, _reason, _matched, _tier = _hit
         await provider.reject_tool(event.request_id)
         _log(
             "denied",
-            error=_deny_reason,
-            metadata={"mechanism": _regex_deny_mechanism(normalized, "always_deny")},
+            error=_reason,
+            metadata={
+                "mechanism": (_regex_deny_mechanism(_matched, _tier) if _kind == "regex" else _tier)
+            },
         )
         return False
-
-    # Defense-in-depth: also inspect event.tool_input for sensitive paths/commands.
-    # The title usually carries the full path/command (kiro-cli convention), but
-    # tool_input may contain additional arguments or the actual path when the
-    # title is a generic tool name (e.g. "Read", "Bash").
-    _tool_input = event.tool_input or ""
-    if _tool_input:
-        # Extract string values from JSON tool_input for path/command checking.
-        _input_strings = _extract_tool_input_strings(_tool_input)
-        for s in _input_strings:
-            if is_sensitive_path(s):
-                await provider.reject_tool(event.request_id)
-                _log(
-                    "denied",
-                    error=f"Blocked: sensitive path in tool_input: {s}",
-                    metadata={"mechanism": "always_deny_input"},
-                )
-                return False
-            _input_bash = is_sensitive_bash_command(s)
-            if _input_bash:
-                await provider.reject_tool(event.request_id)
-                _log("denied", error=_input_bash, metadata={"mechanism": "always_deny_input"})
-                return False
-            _input_deny = is_denied(s, denied_regexes=_denied_regexes)
-            if _input_deny:
-                await provider.reject_tool(event.request_id)
-                _log(
-                    "denied",
-                    error=_input_deny,
-                    metadata={"mechanism": _regex_deny_mechanism(s, "always_deny_input")},
-                )
-                return False
 
     if policy == ToolApprovalPolicy.HOOK_BASED and hooks:
         tool_result = hooks.on_tool_call(

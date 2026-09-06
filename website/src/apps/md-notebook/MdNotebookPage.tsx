@@ -6,6 +6,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useIsMobile } from '../../hooks/useIsMobile'
+import { useImeGuard } from '../../hooks/useImeGuard'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { motion } from 'framer-motion'
 import type { CSSProperties } from 'react'
@@ -23,6 +24,7 @@ import {
 import { PanelLeftLight, PanelLeftSolid } from '../../components/icons/panels'
 import { Trans } from 'react-i18next'
 import { i18nT } from '../../i18n/t'
+import ErrorNotice from '../../components/ErrorNotice'
 import {
   ACCENT,
   AUTO_COMMIT_MINS,
@@ -193,6 +195,9 @@ export default function MdNotebookPage() {
   )
   const [panelOpen, setPanelOpen] = useState(() => loadPref<boolean>(LS.panelOpen, true))
   const isMobile = useIsMobile()
+  // Composition state for the raw-markdown textarea, whose Tab re-indents a list
+  // item by rewriting the whole value — see the keydown handler below.
+  const ime = useImeGuard()
   // The panel is a fixed 260px `flexShrink: 0` column, so at 390px it left the
   // editor 130px. `panelOpen` already exists but is a stored DESKTOP preference,
   // so it arrives open on a phone. While narrow the panel is a drawer that starts
@@ -2059,6 +2064,7 @@ export default function MdNotebookPage() {
           </div>
 
           {/* Note list. Dropping on the background files a note at the root. */}
+          {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions -- drag-drop only: this is the list's scroll background, which has no activation of its own, so a role and tab stop would add a focus stop that does nothing */}
           <div
             style={{ flex: 1, overflowY: 'auto', padding: '8px' }}
             onDragOver={e => {
@@ -2423,19 +2429,11 @@ export default function MdNotebookPage() {
             </button>
           </div>
         )}
+        {/* No hand-off: the open note's editor buffer below is unsaved local
+            state — a failed save is exactly when it holds text nowhere else. */}
         {error && (
-          <div
-            role="alert"
-            style={{
-              margin: `8px ${COLUMN_PAD_X}px 0`,
-              padding: '8px 10px',
-              borderRadius: '8px',
-              background: 'var(--danger-subtle)',
-              color: 'var(--danger)',
-              fontSize: '11px',
-            }}
-          >
-            {error}
+          <div style={{ margin: `8px ${COLUMN_PAD_X}px 0` }}>
+            <ErrorNotice message={error} />
           </div>
         )}
 
@@ -2462,11 +2460,18 @@ export default function MdNotebookPage() {
               spellCheck={false}
               aria-label={i18nT('apps.mdNotebook.header.view_raw')}
               onChange={e => edit(e.target.value)}
+              {...ime.bindComposition<HTMLTextAreaElement>()}
               onKeyDown={e => {
                 if (e.key !== 'Tab') return
                 const ta = e.currentTarget
                 const next = shiftListItem(content, ta.selectionStart, e.shiftKey)
                 if (!next) return
+                // Claim BEFORE the rewrite: IMEs use Tab to cycle the candidate
+                // list, and on WebKit the keydown that commits a candidate
+                // arrives after `compositionend` with `isComposing` already
+                // false — so an unclaimed Tab would re-indent the list item and
+                // overwrite the text still being composed.
+                if (!ime.claimKey(e)) return
                 e.preventDefault()
                 ta.value = next.text
                 ta.setSelectionRange(next.pos, next.pos)

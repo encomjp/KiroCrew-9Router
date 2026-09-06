@@ -120,6 +120,13 @@ class TestMetricDirectionIsPlumbed:
 class TestPushRetriesOnRace:
     """3 of 6 gate survivors were lost to a branch that moved mid-run."""
 
+    @pytest.fixture(autouse=True)
+    def _safe_repository(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+
+        monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+        monkeypatch.setattr(clone_setup, "_push_disabled", lambda _clone: True)
+
     @staticmethod
     def _driver(clone: Path, log, *, reverify: bool = True, raises: bool = False):
         """A Driver stub whose build gate reports ``reverify`` (or explodes).
@@ -166,6 +173,7 @@ class TestPushRetriesOnRace:
 
         d = self._driver(tmp_path, logging.getLogger("t"))
         out = D.Driver._push_with_rebase(d, "https://x/y.git", "b", "tgt")
+        assert out is not None
         assert out.returncode == 0
         assert len(pushes) == 2, "should push, rebase, push again"
         assert ["fetch", "https://x/y.git", "b"] in gits
@@ -190,6 +198,7 @@ class TestPushRetriesOnRace:
 
         d = self._driver(tmp_path, logging.getLogger("t"))
         out = D.Driver._push_with_rebase(d, "https://x/y.git", "b", "tgt")
+        assert out is not None
         assert out.returncode == 1
         assert len(pushes) == 1, "a non-race failure must not be retried"
 
@@ -218,6 +227,7 @@ class TestPushRetriesOnRace:
 
         d = self._driver(tmp_path, logging.getLogger("t"))
         out = D.Driver._push_with_rebase(d, "https://x/y.git", "b", "tgt")
+        assert out is not None
         assert out.returncode == 1
         assert ["rebase", "--abort"] in gits, "a conflicted rebase must be aborted"
         assert len(pushes) == 1, "must not push a half-merged tree"
@@ -236,6 +246,13 @@ class TestARebasedTreeIsReVerifiedBeforePublishing:
 
     Raised by the GPT review of this branch.
     """
+
+    @pytest.fixture(autouse=True)
+    def _safe_repository(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+
+        monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+        monkeypatch.setattr(clone_setup, "_push_disabled", lambda _clone: True)
 
     def test_the_replayed_tree_is_re_verified_before_the_second_push(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -269,11 +286,98 @@ class TestARebasedTreeIsReVerifiedBeforePublishing:
         d.profile.build_gate.build_and_test = _counting_gate  # type: ignore[attr-defined]
 
         out = D.Driver._push_with_rebase(d, "https://x/y.git", "b", "tgt")
+        assert out is not None
         assert out.returncode == 0
         assert verified == ["gate"], "the rebased tree must be re-verified exactly once"
         # Ordering is the whole point: the tree is verified AFTER the rebase replays it and
         # BEFORE the retry push, so what gets published is what was measured.
         assert order.index("rebase") < order.index("verify") < order.index("push", 1)
+
+    def test_post_rebase_safety_failure_retires_without_further_git(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+        from kiro_crew.apps.builtins.auto_improvement.spine import driver as D
+
+        states = iter((True, False))
+        monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: next(states))
+        retired: list[Path] = []
+        retired_path = tmp_path / ".clone.unsafe-test"
+
+        def _retire(clone: Path) -> Path:
+            retired.append(Path(clone))
+            return retired_path
+
+        monkeypatch.setattr(clone_setup, "_retire_unsafe_clone", _retire)
+        pushes: list[list[str]] = []
+
+        def _fake_run(argv, **_kw):
+            pushes.append(argv)
+            return subprocess.CompletedProcess(
+                args=argv, returncode=1, stdout="", stderr="(fetch first)"
+            )
+
+        gits: list[list[str]] = []
+
+        def _fake_git(args, _cwd):
+            gits.append(args)
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(D.subprocess, "run", _fake_run)
+        monkeypatch.setattr(D, "_git", _fake_git)
+        d = TestPushRetriesOnRace._driver(tmp_path / "clone", logging.getLogger("t"))
+        d._stop = False
+        d._repository_retired = False
+        d._progress = lambda **_event: None
+
+        out = D.Driver._push_with_rebase(d, "https://x/y.git", "b", "tgt")
+
+        assert out is None
+        assert retired == [tmp_path / "clone"]
+        assert d._repository_retired is True and d._stop is True
+        assert len(pushes) == 1, "unsafe rebased tree must not reach the retry push"
+        assert not any(args[:1] == ["reset"] for args in gits)
+
+    @pytest.mark.parametrize("reverify,raises", [(False, False), (True, True)])
+    def test_failed_reverify_still_retires_before_failure_handling(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        reverify: bool,
+        raises: bool,
+    ) -> None:
+        from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+        from kiro_crew.apps.builtins.auto_improvement.spine import driver as D
+
+        states = iter((True, False))
+        monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: next(states))
+        monkeypatch.setattr(
+            clone_setup, "_retire_unsafe_clone", lambda _clone: tmp_path / ".unsafe"
+        )
+        pushes: list[list[str]] = []
+
+        def _failed_push(argv, **_kw):  # noqa: ANN001
+            pushes.append(argv)
+            return subprocess.CompletedProcess(argv, 1, "", "(fetch first)")
+
+        monkeypatch.setattr(D.subprocess, "run", _failed_push)
+        monkeypatch.setattr(
+            D,
+            "_git",
+            lambda args, _cwd: subprocess.CompletedProcess(args, 0, "", ""),
+        )
+        d = TestPushRetriesOnRace._driver(
+            tmp_path / "clone", logging.getLogger("t"), reverify=reverify, raises=raises
+        )
+        d._stop = False
+        d._repository_retired = False
+        d._progress = lambda **_event: None
+
+        out = D.Driver._push_with_rebase(d, "https://x/y.git", "b", "tgt")
+
+        assert out is None
+        assert d._repository_retired is True
+        assert len(pushes) == 1
 
     def test_a_rebased_tree_that_fails_re_verification_is_not_pushed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -297,6 +401,7 @@ class TestARebasedTreeIsReVerifiedBeforePublishing:
 
         d = TestPushRetriesOnRace._driver(tmp_path, logging.getLogger("t"), reverify=False)
         out = D.Driver._push_with_rebase(d, "https://x/y.git", "b", "tgt")
+        assert out is not None
         assert out.returncode == 1, "the original rejection is returned"
         assert len(pushes) == 1, "an unverified rebased tree must never be pushed"
 
@@ -323,6 +428,7 @@ class TestARebasedTreeIsReVerifiedBeforePublishing:
 
         d = TestPushRetriesOnRace._driver(tmp_path, logging.getLogger("t"), raises=True)
         out = D.Driver._push_with_rebase(d, "https://x/y.git", "b", "tgt")
+        assert out is not None
         assert out.returncode == 1
         assert len(pushes) == 1, "a gate that raised must not be read as a pass"
 
@@ -344,6 +450,104 @@ class TestARebasedTreeIsReVerifiedBeforePublishing:
         body = inspect.getsource(Driver)
         for site in ("direct-pushed to {self.branch}", "direct-pushed bug fix to {self.branch}"):
             assert f'f"{site} ({{landed}})"' in body, f"{site} must record the landed sha"
+
+
+class TestPostAgentRepositorySafety:
+    def test_proposer_exception_retires_before_reraise(self) -> None:
+        from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
+
+        d = object.__new__(Driver)
+        d.proposer = SimpleNamespace(  # type: ignore[assignment]
+            fan_out=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("capture failed"))
+        )
+        d.profile = SimpleNamespace()  # type: ignore[assignment]
+        d._stop = False
+        retired: list[str] = []
+
+        def _retire(stage: str) -> bool:
+            retired.append(stage)
+            return True
+
+        d._retire_if_unsafe = _retire  # type: ignore[method-assign]
+
+        result = Driver._fan_out_checked(d, fresh_candidates=[], base_sha="abc", cycle=1)
+
+        assert result is None
+        assert retired == ["proposal"]
+
+    def test_candidate_exception_retires_before_ledger_bookkeeping(self) -> None:
+        from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver, Stats
+
+        d = object.__new__(Driver)
+
+        def _raise(*_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+            raise RuntimeError("gate failed")
+
+        def _retire(stage: str) -> bool:
+            del stage
+            return True
+
+        def _fail_record(*_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+            pytest.fail("ledger bookkeeping ran")
+
+        d._work_one_proposal = _raise  # type: ignore[method-assign]
+        d._retire_if_unsafe = _retire  # type: ignore[method-assign]
+        d._record = _fail_record  # type: ignore[method-assign]
+        d.log = logging.getLogger("t")
+        d.stats = Stats()
+        prop = SimpleNamespace(cand_id="candidate")
+
+        result = Driver._work_one_proposal_checked(
+            d,
+            prop,  # type: ignore[arg-type]
+            base_sha="abc",
+            cycle=1,
+            proposals=[],
+            perf_survivors=[],
+            bug_winners=[],
+            gated_sha={},
+        )
+
+        assert result is False
+        assert d.stats.errors == 0
+
+    def test_each_agent_boundary_precedes_the_next_host_git_phase(self) -> None:
+        import inspect
+
+        from kiro_crew.apps.builtins.auto_improvement.spine.driver import Driver
+
+        cycle = inspect.getsource(Driver.run_cycle)
+        assert cycle.index("self.profile.discover(") < cycle.index(
+            'self._retire_if_unsafe("discovery")'
+        ) < cycle.index("self._fan_out_checked(")
+
+        fan_out = inspect.getsource(Driver._fan_out_checked)
+        assert fan_out.index("self.proposer.fan_out(") < fan_out.index(
+            'self._retire_if_unsafe("proposal")'
+        ) < fan_out.index("if error is not None:")
+
+        candidate = inspect.getsource(Driver._work_one_proposal_checked)
+        assert candidate.index("self._work_one_proposal(") < candidate.index(
+            'self._retire_if_unsafe("candidate gate/measure")'
+        ) < candidate.index("if error is not None:")
+        assert candidate.index('self._retire_if_unsafe("candidate gate/measure")') < candidate.index(
+            "self._record(prop, L.STATUS_ERROR"
+        )
+
+        push = inspect.getsource(Driver._direct_push)
+        assert push.index("self._prepush_review_clean(") < push.index(
+            'self._retire_if_unsafe("pre-push review")'
+        ) < push.index('if not sha or sha == "-"')
+        assert "elif pushed is False" in inspect.getsource(Driver._apply_verdict)
+        assert "elif pushed is False" in inspect.getsource(Driver._apply_bug_winner)
+
+        from kiro_crew.apps.builtins.auto_improvement.spine.pr_pipeline import CrPipeline
+
+        reproduce = inspect.getsource(CrPipeline.emit_perf)
+        assert reproduce.count('self._retire_if_unsafe("reproduce")') == 2
+        assert reproduce.index('self._retire_if_unsafe("reproduce")') < reproduce.index(
+            "if not self._reproduces(verify, reproduce):"
+        )
 
 
 class TestFanOutIsDisjoint:
@@ -426,7 +630,7 @@ class TestNestedTargetJoinsItsEvidence:
 
 
 class TestRetargetClearsRepoScopedConfig:
-    """Found by executing docs/system-specs/modules/auto-improvement-test-plan.md against a SECOND repository.
+    """Found by executing docs/system-specs/modules/auto-improvement.md against a SECOND repository.
 
     ``setup-clone`` rewrote ``clone``/``target_url``/``target_display`` but left
     ``branch`` untouched, so after retargeting from Kiro Crew to chess_test the config
@@ -464,7 +668,7 @@ class TestRetargetClearsRepoScopedConfig:
 
 
 class TestReproTestDirIsRepoAware:
-    """Found by executing docs/system-specs/modules/auto-improvement-test-plan.md against a SECOND repo (Zedmor/chess_test).
+    """Found by executing docs/system-specs/modules/auto-improvement.md against a SECOND repo (Zedmor/chess_test).
 
     The authoring prompt and the candidate's declared repro path both hard-coded
     ``test/test_bug_*.py``. chess_test keeps its suite in ``tests/`` (plural), so the
@@ -613,6 +817,13 @@ class TestUnattendedApprovalIsAudited:
         assert calls == ["reject:r2"], "an unauditable approval must be refused"
 
 
+@pytest.fixture
+def synthetic_clone_is_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+    monkeypatch.setattr(clone_setup, "_push_disabled", lambda _clone: True)
+
+
+@pytest.mark.usefixtures("synthetic_clone_is_safe")
 class TestCheckoutPrecedesProfileBuild:
     """The profile resolves ``scopeDiffBase`` in its CONSTRUCTOR, so the clone must
     already be on the configured branch when it is built.
@@ -3558,6 +3769,21 @@ class TestOneClickCommitWorksInAPushDisabledClone:
         draft_src = inspect.getsource(routes._handle_draft_pr)
         assert "clone_lock()" in draft_src, "the draft route can still race a commit"
 
+    def test_one_click_safety_gate_precedes_every_git_mutation(self) -> None:
+        """A failed safety check cannot be followed by Git rollback over that unsafe repo.
+
+        The production route holds `clone_lock` and proves the runner idle. Validate once
+        before materialization; a second post-commit check creates an impossible branch:
+        trusting Git to reset is unsafe, while not resetting leaks the rejected commit.
+        """
+        import inspect
+
+        src = inspect.getsource(commit_mod._commit_finding_locked)
+        gate = src.index("if not _repository_is_isolated(clone):")
+        assert gate < src.index("materialize_queued_diff(")
+        assert gate < src.index('"commit", "-m", message')
+        assert src.count("_repository_is_isolated(clone)") == 1
+
     def test_a_failed_push_leaves_no_commit_behind(self, tmp_path, monkeypatch) -> None:
         """One-click commit's LAST two exits returned with the commit still on the branch.
 
@@ -3950,6 +4176,7 @@ class TestAnUnprovenRulerHaltsThePerfTrack:
         )
 
 
+@pytest.mark.usefixtures("synthetic_clone_is_safe")
 class TestRunStartupSharesTheCloneLock:
     """`POST /run` mutated the shared clone without holding the clone lock.
 
@@ -4083,6 +4310,7 @@ class TestTheProfileImportStaysLazy:
         )
 
 
+@pytest.mark.usefixtures("synthetic_clone_is_safe")
 class TestRetargetIsAtomicWithRunStartup:
     """`POST /setup-clone` checked "is a run live?", then cloned (slow: network + git), then
     persisted the new `clone`/`target_url`. `POST /run` reads config independently. So a
@@ -4670,6 +4898,26 @@ class TestRepoControlledGitHooksDoNotExecuteHostSide:
         pin = (repo / ".git" / "info" / "attributes").read_text(encoding="utf-8")
         assert "-filter" in pin and " diff" in pin, "the pin content is not the driver-unbinding line"
 
+    def test_the_pin_atomically_replaces_a_hardlink(self, tmp_path) -> None:
+        from kiro_crew.apps.builtins.auto_improvement.spine import git_safety as gs
+
+        repo = tmp_path / "repo"
+        info = repo / ".git" / "info"
+        info.mkdir(parents=True)
+        external = tmp_path / "external"
+        external.write_text("PRECIOUS\n", encoding="utf-8")
+        pin = info / "attributes"
+        os.link(external, pin)
+        external_inode = external.stat().st_ino
+
+        gs.require_pinned(repo)
+
+        assert external.read_text(encoding="utf-8") == "PRECIOUS\n"
+        assert external.stat().st_ino == external_inode
+        assert pin.read_text(encoding="utf-8") == gs._ATTRIBUTES_PIN
+        assert pin.stat().st_ino != external_inode
+        assert pin.stat().st_nlink == 1
+
     def test_every_host_side_git_helper_injects_the_safe_config(self) -> None:
         """Structural: each helper that runs git over the agent-writable tree must carry the
         hook/fsmonitor overrides, so a new call site cannot quietly omit them."""
@@ -4728,6 +4976,17 @@ class TestRepoControlledGitHooksDoNotExecuteHostSide:
             cfg = " ".join(mod._GIT_SAFE_CONFIG)
             assert "core.hooksPath=" in cfg, f"{mod.__name__} does not neutralize core.hooksPath"
             assert "core.fsmonitor=false" in cfg, f"{mod.__name__} does not disable fsmonitor"
+            assert "core.attributesFile=/dev/null" in cfg, (
+                f"{mod.__name__} permits an external attributes path"
+            )
+            assert "core.excludesFile=/dev/null" in cfg, (
+                f"{mod.__name__} permits an external excludes path"
+            )
+            assert "push.recurseSubmodules=no" in cfg, (
+                f"{mod.__name__} permits recursive submodule pushes — the egress guard only "
+                f"validates the superproject origin, so a recursive push could ship unscanned "
+                f"submodule objects to an attacker-controlled submodule remote"
+            )
 
         # ONE shared definition, not a per-module copy: this finding class recurred six times
         # because each new host-side git surface re-declared its own constant and a later one
@@ -4834,7 +5093,7 @@ class TestRepoControlledGitHooksDoNotExecuteHostSide:
             "the COMMON gitdir, so the in-tree `.gitattributes` binding was never unbound"
         )
 
-    def test_clone_setup_checkout_pins_the_attributes(self, tmp_path) -> None:
+    def test_clone_setup_checkout_pins_the_attributes(self, tmp_path, monkeypatch) -> None:
         """`clone_setup.checkout_branch` runs `checkout -B <bare>` host-side over the clone, and
         `checkout` runs the SMUDGE filter as it writes the working tree — so a repo-planted
         `filter.<n>.smudge` bound by an in-tree `.gitattributes` would execute outside the
@@ -4851,6 +5110,7 @@ class TestRepoControlledGitHooksDoNotExecuteHostSide:
 
         from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup as clone_mod
 
+        monkeypatch.setattr(clone_mod, "_push_disabled", lambda _clone: True)
         clone = tmp_path / "clone"
         clone.mkdir()
         sp.run(["git", "init", "-q", "-b", "main", "."], cwd=clone, check=True)
@@ -6259,9 +6519,11 @@ class TestOnlyTheBugTrackMayAddTests:
 
 
 class TestCommitErrorsReachTheBrowserRedacted:
-    """The commit route returned `str(result.get("error"))` verbatim, and `commit.py` builds
-    that value from `(proc.stderr or '')[:160]` — RAW GIT STDERR, which quotes the ref, the
-    path, and whatever a repository's own hooks printed.
+    """The commit route returned `str(result.get("error"))` verbatim, and `commit.py` built
+    that value from a raw fixed-bound slice of git stderr — which quotes the ref, the
+    path, and whatever a repository's own hooks printed. (`commit.py` now scrubs its
+    stderr at the source with `redact_via_context`; this route-level pass stays as the
+    output-boundary backstop.)
 
     This was latent while nothing rendered it. D-97 (surfacing a refused commit at the finding
     row, so the operator learns WHY) turned it into a live egress path: a failing pre-commit

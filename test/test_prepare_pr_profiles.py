@@ -7,9 +7,7 @@ Covers:
     positional-argument stripping that makes it work.
 
 The scripts live under the packaged builtin skill and are NOT importable as a
-package, so we load them by path with importlib. Everything here is stdlib and
-runs on the full CI matrix (3.10 + 3.12); the TOML path is version-guarded
-because tomllib is 3.11+.
+package, so we load them by path with importlib. Everything here is stdlib.
 """
 import json
 import os
@@ -33,20 +31,6 @@ def _load(module_name, filename):
 
 resolve_profile = _load("_pp_resolve_profile", "resolve_profile.py")
 pr_status = _load("_pp_pr_status", "pr_status.py")
-
-
-def _toml_available():
-    try:
-        import tomllib  # noqa: F401
-
-        return True
-    except ImportError:
-        try:
-            import tomli  # noqa: F401
-
-            return True
-        except ImportError:
-            return False
 
 
 # --------------------------------------------------------------------------
@@ -299,17 +283,28 @@ def test_charter_budgets_match_the_ci_workflows():
 
 
 def _ci_workflow_run_text() -> str:
-    """ci.yml with comment-only lines removed.
+    """Every blocking CI workflow, with comment-only lines removed.
 
     Every scan here matches a COMMAND, never a comment. ci.yml explains in
     prose why the Type check step uses `tsc -b` and not `npm run typecheck`,
     so a naive grep for `npm run <script>` finds a script CI deliberately does
     NOT run -- the same trap as reading a ratchet number out of a comment.
+
+    Both blocking workflows are read, not just ci.yml. The cheap lint gates now
+    live in fast-gate.yml and ci.yml blocks on it through `await-fast-gate`, so a
+    gate in either one is a gate CI enforces and the floor must mirror. Reading
+    ci.yml alone silently dropped eleven jobs' worth of gates out of this scan's
+    view, which is the exact rot this test exists to catch.
     """
-    text = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    return "\n".join(
-        line for line in text.splitlines() if not line.lstrip().startswith("#")
-    )
+    parts = []
+    for name in ("ci.yml", "fast-gate.yml"):
+        text = (REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        parts.append(
+            "\n".join(
+                line for line in text.splitlines() if not line.lstrip().startswith("#")
+            )
+        )
+    return "\n".join(parts)
 
 
 def test_every_floor_command_names_a_real_target():
@@ -371,9 +366,28 @@ def test_ci_blocking_scans_are_covered_by_the_floor():
     }
 
     invoked = set(re.findall(r"\bscripts/[A-Za-z0-9_.-]+\.(?:py|sh)", run_text))
+    # The scan must actually see the gates that live in fast-gate.yml. If a
+    # rename or a further workflow split drops them out of `run_text`, every
+    # assertion below passes by measuring nothing -- green because it looked at
+    # an empty set, which is indistinguishable from green because the floor is
+    # complete. Name a few of the moved gates outright so that silence fails.
+    moved_to_fast_gate = {
+        "scripts/scrub-lint.sh",
+        "scripts/verify_vendor_manifest.py",
+        "scripts/check_brand_name.py",
+        "scripts/docs_lint.py",
+    }
+    assert moved_to_fast_gate <= invoked, (
+        "these gates are no longer visible to this scan: "
+        f"{sorted(moved_to_fast_gate - invoked)}. They ran in ci.yml, then moved to "
+        "fast-gate.yml; if they have moved again, add that workflow to "
+        "_ci_workflow_run_text() -- otherwise this test silently stops checking the "
+        "floor against them."
+    )
+
     missing = sorted(s for s in invoked - exempt_scripts if s not in floor)
     assert not missing, (
-        "ci.yml runs these scripts but the prepare-pr floor does not: "
+        "ci.yml/fast-gate.yml run these scripts but the prepare-pr floor does not: "
         f"{missing}. Add them to profiles/kirocrew.json gates[] in their "
         "CI-exact form, or exempt them here with a reason."
     )
@@ -661,29 +675,17 @@ def test_toml_config_path(tmp_path):
         "[readiness]\n"
         'status_context = "My Readiness"\n'
     )
-    if _toml_available():
-        prof = resolve_profile.resolve(str(tmp_path))
-        assert prof["source"] == "config"
-        assert prof["base_branch"] == "trunk"
-        assert prof["setup"] == ["make bootstrap"]
-        assert prof["gates"] == ["make check"]
-        assert prof["rule_files"] == ["AGENTS.md"]
-        assert prof["reviewers"][0]["model"] == "gpt-5.6-sol"
-        assert prof["readiness"]["status_context"] == "My Readiness"
-    else:
-        # No TOML parser (Python < 3.11 without tomli): a present config is a
-        # hard error, never silently ignored.
-        try:
-            resolve_profile.resolve(str(tmp_path))
-        except RuntimeError as exc:
-            assert "TOML parser" in str(exc)
-        else:
-            raise AssertionError("expected RuntimeError when no TOML parser")
+    prof = resolve_profile.resolve(str(tmp_path))
+    assert prof["source"] == "config"
+    assert prof["base_branch"] == "trunk"
+    assert prof["setup"] == ["make bootstrap"]
+    assert prof["gates"] == ["make check"]
+    assert prof["rule_files"] == ["AGENTS.md"]
+    assert prof["reviewers"][0]["model"] == "gpt-5.6-sol"
+    assert prof["readiness"]["status_context"] == "My Readiness"
 
 
 def test_partial_toml_config_fills_gates_from_autodetect(tmp_path):
-    if not _toml_available():
-        return  # parse path only runs on 3.11+; covered on the 3.12 CI leg
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
     (tmp_path / ".prepare-pr.toml").write_text('[project]\nbase_branch = "trunk"\n')
     prof = resolve_profile.resolve(str(tmp_path))

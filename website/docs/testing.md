@@ -8,6 +8,7 @@ observe the thing you changed.
 | Unit and integration | vitest | `happy-dom`, network mocked by MSW | `integration/**/*.test.tsx`, `src/**/*.test.tsx` |
 | Browser end-to-end | Playwright | real Chromium against a real gateway | `playwright/*.spec.ts` |
 | Desktop shell | node:test | Node, no DOM | `electron/test/` |
+| Component stories | Storybook | real Chromium, no gateway, every shipped theme | `src/**/*.stories.tsx`, config in `.storybook/` |
 
 ## Commands
 
@@ -19,6 +20,8 @@ npm run test:watch        # vitest, watch mode
 npm run test:electron     # the Electron node:test suite
 npm run test:playwright   # playwright test --headed --workers=1
 npm run test:playwright:headless
+npm run storybook         # component stories on http://127.0.0.1:6006 (loopback only)
+npm run build-storybook   # static build into storybook-static/ (gitignored)
 npx tsc -b                # the real type check
 ```
 
@@ -44,6 +47,26 @@ regression in suite speed.
 
 Reach for the **Electron suite** for main-process code: window and menu wiring,
 remote-host token resolution, and the launcher.
+
+Reach for a **story** when the question is how a shared primitive LOOKS or behaves
+in isolation — a variant matrix, a controlled component driven by hand, a Framer
+Motion transition, or the same component under all shipped themes. Stories run in
+a real browser with the real `src/index.css`, so they show what `happy-dom` cannot
+(layout, animation, token resolution); the `theme` toolbar entry paints
+`data-theme` + `data-mode` exactly as `applyTheme` in `useTheme.tsx` does, one
+entry per theme × mode. They are not a test layer on their own yet: nothing in CI
+renders them, so a story is a review surface and a place to reproduce a visual
+bug, not proof of anything. A story file is development-only — it is excluded from
+coverage, jscpd, and the hardcoded-string gate the same way a test file is, and
+the production bundle never imports it.
+
+Stories live in `src/stories/` (one file per component, `title:
+'Primitives/<Name>'`) rather than beside `ui.tsx`, because that file is a barrel of
+two dozen primitives and one story file per barrel would collide on title. Seven
+primitives have a story; the rest do not, and nothing requires one yet. Whether
+every shared primitive must carry a story is decided by the change that makes CI
+render them — a requirement the tree does not meet has no gate behind it, so it is
+not stated here until it can be enforced.
 
 ## MSW mocking
 
@@ -115,26 +138,21 @@ file count first.
 
 ## Playwright: how it actually runs
 
-The config is `playwright.config.ts`, and several of its choices surprise people:
+The config is `playwright.config.ts`. The full table of its choices — including
+`locale: 'en-US'`, which is a real dependency (most specs assert English prose,
+the harness storage state carries no `mc-lang`, so a `zh-*` runner renders the
+zh-CN catalog and fails them) — is in
+[../../docs/ci/e2e-gate.md](../../docs/ci/e2e-gate.md#the-gateway-must-already-be-running-webserver-is-not-configured).
 
-- `testDir` is `./playwright`, and specs are `*.spec.ts` there.
-- `baseURL` defaults to `http://localhost:5476`, overridable with
-  `PLAYWRIGHT_BASE_URL`.
-- **`webServer` is `undefined`.** Playwright starts nothing. A gateway must already
-  be listening, or every spec fails on connection refused.
-- Authentication is a setup project: it exchanges `PLAYWRIGHT_TOKEN` for a session
-  cookie and saves it to `playwright/.auth/state.json`, which the other projects
-  reuse as `storageState`.
-- Specs that need a live model are tagged and **excluded by default** via
-  `grepInvert`; set `PLAYWRIGHT_RUN_AGENT_SPECS=1` to include them. This keeps the
-  default run credential-free and deterministic.
-- CI pins `workers: 1`; local runs parallelize.
+The one thing to know locally: **Playwright starts nothing.** `webServer` is
+`undefined`, so a gateway must already be listening on `baseURL`
+(`http://localhost:5476` unless `PLAYWRIGHT_BASE_URL` overrides it), or every spec
+fails on connection refused.
 
 **In CI these specs run through the backend gate, not through npm.**
 `python setup.py test_e2e` boots a real gateway wired to a packaged fake ACP
 backend and shells this suite against it, entirely offline. That is the harness to
-match when you are debugging a CI-only failure: see
-[../../docs/ci/e2e-gate.md](../../docs/ci/e2e-gate.md).
+match when you are debugging a CI-only failure.
 
 ## CI gates
 

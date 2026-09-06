@@ -32,16 +32,37 @@ export const FOCUSABLE =
  * Escape before the outer dialog observes it, while this hook still owns focus
  * entry, restoration, and Tab trapping.
  *
+ * `restoreFocus` gates ONLY the return half: focus still moves into the dialog
+ * on mount, but nothing is captured or restored on unmount. Pass `false` from a
+ * trigger-anchored popover whose host already moves focus back itself, for two
+ * reasons this hook cannot decide from the inside:
+ *
+ *   - The capture is `document.activeElement` at mount, and on Safari a clicked
+ *     button is not focused — so for a popover opened by a click the capture
+ *     lands on `<body>`, and the unmount-ordered restore then runs AFTER the
+ *     host's own `trigger.focus()` and blurs the trigger it just focused.
+ *   - The restore is unconditional, and a trigger-anchored popover's is
+ *     deliberately not: dismissal by an outside click leaves focus where the
+ *     click put it (#2533) instead of yanking it back to the trigger.
+ *
+ * A dialog with no single trigger (the Modal family) has neither problem and
+ * keeps the default.
+ *
  * The keydown listener is CAPTURE phase on purpose: dialogs stop keydown
  * propagation so the page's own shortcuts don't fire while the user types
  * inside them, and a bubble-phase listener would then never see Escape or Tab
  * from inside the dialog — breaking both dismissal and the trap.
  */
+export interface DialogFocusTrapOptions {
+  enabled?: boolean
+  handleEscape?: boolean
+  restoreFocus?: boolean
+}
+
 export function useDialogFocusTrap(
   containerRef: RefObject<HTMLElement | null>,
   onEscape: () => void,
-  enabled = true,
-  handleEscape = true,
+  { enabled = true, handleEscape = true, restoreFocus = true }: DialogFocusTrapOptions = {},
 ): void {
   // Move focus into the dialog on open, restore it on close, so keyboard users
   // aren't dumped at the top of the document afterwards.
@@ -52,11 +73,11 @@ export function useDialogFocusTrap(
   // BEHIND it and the workspace visibly twitches as the animation settles; on
   // close the same happens to whatever regains focus.
   useEffect(() => {
-    const restoreTo = document.activeElement as HTMLElement | null
+    const restoreTo = restoreFocus ? (document.activeElement as HTMLElement | null) : null
     const first = containerRef.current?.querySelector<HTMLElement>(FOCUSABLE)
     ;(first ?? containerRef.current)?.focus({ preventScroll: true })
     return () => restoreTo?.focus?.({ preventScroll: true })
-  }, [containerRef])
+  }, [containerRef, restoreFocus])
 
   // IME guard for the Tab-cycles-focus path. This listener receives NATIVE
   // KeyboardEvents (window capture), which `useImeGuard`'s synthetic-only

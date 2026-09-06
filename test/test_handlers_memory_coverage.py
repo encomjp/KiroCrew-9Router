@@ -76,6 +76,7 @@ def _make_request(
     query: dict[str, str] | None = None,
     match_info: dict[str, str] | None = None,
     session_key: str = "",
+    body_present: bool | None = None,
 ) -> Any:
     req = MagicMock()
     req.app = {"state": state}
@@ -83,8 +84,16 @@ def _make_request(
     req.query = query or {}
     req.match_info = match_info or {}
     req.headers = {"X-Session-Key": session_key} if session_key else {}
+    # ``can_read_body`` is what ``_shared.read_bounded_json`` consults for its
+    # allow_absent endpoints. It defaults to "a body was supplied", which makes
+    # ``json_body=None`` an ABSENT body -- the common case for the GET tests.
+    # Pass ``body_present=True`` alongside ``json_body=None`` for the other
+    # meaning: a body that is present and whose content is the JSON literal
+    # ``null``, which is a non-object and must be refused, not defaulted.
+    req.can_read_body = json_body is not None if body_present is None else body_present
     if isinstance(json_body, _BadJSON):
         req.json = AsyncMock(side_effect=ValueError("not json"))
+        req.can_read_body = True
     else:
         req.json = AsyncMock(return_value=json_body)
     return req
@@ -167,7 +176,7 @@ class TestPreferencesProjectsHistory:
         req = _make_request(state, method="PUT", json_body=_BadJSON())
         resp = await mem_mod.api_memory_preferences(req)
         assert resp.status == 400
-        assert _body(resp) == {"error": "invalid JSON"}
+        assert _body(resp) == {"error": "invalid JSON", "code": "invalid_json"}
         mem.write_preferences.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1079,12 +1088,40 @@ class TestContextPreviewAndObservability:
 
 class TestPromote:
     @pytest.mark.asyncio
-    async def test_invalid_json_body_uses_defaults(self) -> None:
+    async def test_absent_body_uses_defaults(self) -> None:
+        # Every field has a default, so a bodyless POST is legitimate and must
+        # still run the default promotion -- that is what allow_absent buys.
+        store = _store(promote_episodic_patterns=MagicMock(return_value=2))
+        state = _make_state(vector_store=store)
+        req = _make_request(state, method="POST")
+        assert _body(await mem_mod.api_memory_promote(req)) == {"ok": True, "promoted": 2}
+        store.promote_episodic_patterns.assert_called_once_with(5, 0.75)
+
+    @pytest.mark.asyncio
+    async def test_malformed_body_is_400_not_silent_defaults(self) -> None:
+        # A body that is PRESENT but unparseable is a client mistake, not an
+        # absent body: answering 200-with-defaults ran a different promotion
+        # than the caller asked for and told them nothing (issue #5587).
         store = _store(promote_episodic_patterns=MagicMock(return_value=2))
         state = _make_state(vector_store=store)
         req = _make_request(state, method="POST", json_body=_BadJSON())
-        assert _body(await mem_mod.api_memory_promote(req)) == {"ok": True, "promoted": 2}
-        store.promote_episodic_patterns.assert_called_once_with(5, 0.75)
+        resp = await mem_mod.api_memory_promote(req)
+        assert resp.status == 400
+        assert _body(resp)["code"] == "invalid_json"
+        store.promote_episodic_patterns.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_object_body_is_400(self) -> None:
+        # `[]` / `"str"` / `5` are valid JSON but not objects; the .get() calls
+        # below would raise AttributeError into a 500 without the shape guard.
+        store = _store(promote_episodic_patterns=MagicMock(return_value=2))
+        state = _make_state(vector_store=store)
+        for payload in ([], "str", 5):
+            req = _make_request(state, method="POST", json_body=payload)
+            resp = await mem_mod.api_memory_promote(req)
+            assert resp.status == 400, payload
+            assert _body(resp)["code"] == "body_not_object", payload
+        store.promote_episodic_patterns.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_explicit_thresholds_are_forwarded(self) -> None:
@@ -1215,7 +1252,9 @@ class TestEmbeddingModelEndpoint:
             req = _make_request(state, method="POST", json_body=payload)
             resp = await mem_mod.api_memory_embedding_model(req)
             assert resp.status == 400
-            assert _body(resp)["code"] == "invalid_json"
+            # The shared guard distinguishes "unparseable" from "parsed, wrong
+            # shape"; this handler used to answer invalid_json for both.
+            assert _body(resp)["code"] == "body_not_object"
 
     @pytest.mark.asyncio
     async def test_validation_error_is_400_with_code(self) -> None:
@@ -2122,3 +2161,55 @@ class TestConfigWritesRunOffTheEventLoop:
         assert json.loads(cfg.read_text(encoding="utf-8")) == {"memory": []}, (
             "the malformed section was rewritten"
         )
+
+
+class TestNonObjectBodiesAcrossConvertedHandlers:
+    """Every converted handler answers 400, never 5xx, on a non-object body.
+
+    ``[]`` / ``"s"`` / ``5`` / ``true`` / ``null`` are all VALID JSON, so
+    ``request.json()`` returns them and the ``.get()`` each handler performs
+    next raised ``AttributeError`` from OUTSIDE the parse ``try`` -- a 500 for
+    what is really malformed client input (issue #5587). Enumerated rather than
+    written one test per handler so a handler that loses the guard fails by
+    construction; the agents.py half of the same invariant lives in
+    ``test_json_object_body_guard.py``.
+    """
+
+    _HANDLERS = [
+        ("api_memory_preferences", "PUT"),
+        ("api_memory_projects", "PUT"),
+        ("api_memory_history", "PUT"),
+        ("api_memory_settings", "PUT"),
+        ("api_memory_semantic_write", "PUT"),
+        ("api_memory_import", "POST"),
+        ("api_memory_consolidate", "POST"),
+        ("api_memory_promote", "POST"),
+        ("api_memory_embedding_model", "POST"),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", [[], "a string", 5, 1.5, True, None], ids=repr)
+    @pytest.mark.parametrize("handler_name,method", _HANDLERS, ids=str)
+    async def test_non_object_body_is_400_not_500(
+        self, handler_name: str, method: str, payload: Any
+    ) -> None:
+        state = _make_state(
+            vector_store=_store(),
+            memory=MagicMock(),
+            consolidator=MagicMock(),
+        )
+        req = _make_request(
+            state,
+            method=method,
+            json_body=payload,
+            session_key="dashboard:ui",
+            # A body IS present in every row -- including the ``null`` one,
+            # which must be refused as a non-object rather than read as an
+            # absent body by the allow_absent endpoints.
+            body_present=True,
+        )
+        handler = getattr(mem_mod, handler_name)
+        with patch(f"{_MOD}.KiroCrewConfig.load", return_value=_cfg()):
+            resp = await handler(req)
+        assert resp.status == 400, f"{handler_name} on {payload!r}: expected 400"
+        assert _body(resp)["code"] == "body_not_object", handler_name

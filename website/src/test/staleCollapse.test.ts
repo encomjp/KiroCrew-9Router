@@ -48,9 +48,11 @@ describe('splitStaleSlots', () => {
     expect(stale.map(r => r.key)).toEqual(['plain-old'])
   })
 
-  it('presets include off (0) and the default (2 days), ascending', () => {
+  it('presets include off (0), the default (7 days) and a 14-day option, ascending', () => {
     expect(STALE_COLLAPSE_PRESETS_MS[0]).toBe(0)
     expect(STALE_COLLAPSE_PRESETS_MS).toContain(DEFAULT_STALE_COLLAPSE_MS)
+    expect(DEFAULT_STALE_COLLAPSE_MS).toBe(7 * DAY)
+    expect(STALE_COLLAPSE_PRESETS_MS).toContain(14 * DAY)
     expect([...STALE_COLLAPSE_PRESETS_MS]).toEqual([...STALE_COLLAPSE_PRESETS_MS].sort((a, b) => a - b))
   })
 })

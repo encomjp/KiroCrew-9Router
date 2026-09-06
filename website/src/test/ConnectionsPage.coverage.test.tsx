@@ -20,6 +20,7 @@
 // broadcasts. Interactions use `fireEvent` (no fake timers anywhere, so no
 // clock to keep in sync) and every assertion waits on rendered output.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { StrictMode } from 'react'
 import { screen, fireEvent, waitFor, within } from '@testing-library/react'
 
 import type { ChatMessage, McpServer, RootState } from '../types'
@@ -33,11 +34,27 @@ const mcpCustomUpdate = vi.fn()
 const mcpOAuthRelay = vi.fn()
 const connectionsMint = vi.fn()
 const connectionsMintState = vi.fn()
+const connectionsPremint = vi.fn()
 const connectionsStatus = vi.fn()
 const connectionsCancel = vi.fn()
 const connectionsDisconnect = vi.fn()
+const connectionsTest = vi.fn()
 
 vi.mock('../api/client', () => ({
+  // A real-shaped class, not a stub: `testConnection`'s 409 handling narrows
+  // with `e instanceof ApiError` before it may read `.status`/`.body`, so a
+  // bare object would make every rejection fall through to the generic
+  // action_failed message and the single-flight branch would never run.
+  ApiError: class ApiError extends Error {
+    status: number
+    body: string
+    constructor(status: number, message: string, body = '') {
+      super(message)
+      this.name = 'ApiError'
+      this.status = status
+      this.body = body
+    }
+  },
   api: {
     mcpServers: (...a: unknown[]) => mcpServers(...a),
     mcpProbe: (...a: unknown[]) => mcpProbe(...a),
@@ -48,9 +65,11 @@ vi.mock('../api/client', () => ({
     mcpOAuthRelay: (...a: unknown[]) => mcpOAuthRelay(...a),
     connectionsMint: (...a: unknown[]) => connectionsMint(...a),
     connectionsMintState: (...a: unknown[]) => connectionsMintState(...a),
+    connectionsPremint: (...a: unknown[]) => connectionsPremint(...a),
     connectionsStatus: (...a: unknown[]) => connectionsStatus(...a),
     connectionsCancel: (...a: unknown[]) => connectionsCancel(...a),
     connectionsDisconnect: (...a: unknown[]) => connectionsDisconnect(...a),
+    connectionsTest: (...a: unknown[]) => connectionsTest(...a),
   },
 }))
 
@@ -64,7 +83,10 @@ vi.mock('../pages/overview/McpTab', () => ({
 
 import ConnectionsPage from '../pages/connections/ConnectionsPage'
 import { CONNECTION_PROVIDERS } from '../pages/connections/registry'
+import ProviderLogo, { PROVIDER_LOGO_SLUGS } from '../pages/connections/ProviderLogo'
+import { i18next } from '../i18n'
 import { createTestStore, renderWithProviders } from './helpers'
+import { ApiError } from '../api/client'
 
 const NOTION_URL = 'https://mcp.notion.com/mcp'
 const STRIPE_URL = 'https://mcp.stripe.com'
@@ -92,7 +114,7 @@ interface ChatSeed {
 }
 
 function mount(
-  { servicesEnabled = true, chat = {} }: { servicesEnabled?: boolean; chat?: ChatSeed } = {},
+  { servicesEnabled = true, chat = {}, strict = false }: { servicesEnabled?: boolean; chat?: ChatSeed; strict?: boolean } = {},
 ) {
   const store = createTestStore({
     chat: {
@@ -100,7 +122,8 @@ function mount(
       slotMessages: chat.slotMessages ?? {},
     } as unknown as RootState['chat'],
   })
-  return renderWithProviders(<ConnectionsPage servicesEnabled={servicesEnabled} />, { store })
+  const tree = <ConnectionsPage servicesEnabled={servicesEnabled} />
+  return renderWithProviders(strict ? <StrictMode>{tree}</StrictMode> : tree, { store })
 }
 
 /** The card for one provider, addressed the way the DOM exposes it. */
@@ -139,6 +162,7 @@ beforeEach(() => {
   connectionsMintState.mockReset().mockResolvedValue({
     slug: 'notion', state: 'minting', token: 'tok1',
   })
+  connectionsPremint.mockReset().mockResolvedValue({ ok: true, preminting: ['notion'] })
   // Authorization axis: empty by default, so the reachability-derived card states
   // these tests assert on are unchanged by the status feed.
   connectionsStatus.mockReset().mockResolvedValue({ schema_version: 1, connections: [] })
@@ -149,6 +173,13 @@ beforeEach(() => {
     grantSurviving: [],
     entryRemoved: true,
     grantSharedWith: [],
+  })
+  connectionsTest.mockReset().mockResolvedValue({
+    schema_version: 1,
+    slug: 'notion',
+    verdict: 'usable',
+    code: 'tools_available',
+    toolCount: 2,
   })
 })
 
@@ -165,6 +196,68 @@ describe('the held-back gallery', () => {
   })
 })
 
+// Warming the approval URLs ahead of any click. The engine (POST
+// /api/connections/premint) shipped with zero callers; this is the caller, and
+// what these tests pin is the shape of the call rather than its result — the
+// response is never a verdict, so nothing about the rendered gallery may depend
+// on it.
+describe('premint on mount', () => {
+  it('warms the mintable providers once, with no body, when the gallery mounts', async () => {
+    mount()
+
+    await waitFor(() => expect(connectionsPremint).toHaveBeenCalledTimes(1))
+    // Bodyless by contract: what is mintable is the server's to decide, so the
+    // caller passes nothing — no source, no provider list, no telemetry.
+    expect(connectionsPremint).toHaveBeenCalledWith()
+  })
+
+  it('warms once under StrictMode, where the mount effect is double-invoked', async () => {
+    // The real double-fire hazard: an in-flight warm is not cancellable, so a
+    // teardown flag cannot un-spawn the first activation and only a latching ref
+    // holds. Asserting "once" on a plain mount proves nothing about the guard —
+    // that render invokes the effect a single time either way.
+    mount({ strict: true })
+
+    await waitFor(() => expect(connectionsPremint).toHaveBeenCalledTimes(1))
+  })
+
+  it('does not warm while the services flag is off', async () => {
+    mount({ servicesEnabled: false })
+
+    // The gate offers no card and no Connect button, so there is nothing a warm
+    // URL could serve — and warming spawns a process.
+    expect(await screen.findByText('No services match this search.')).toBeInTheDocument()
+    expect(connectionsPremint).not.toHaveBeenCalled()
+  })
+
+  it('warms when the flag arrives after the first render, still only once', async () => {
+    // The flag rides the config query, so the page's first render is ALWAYS
+    // gated-off. A mount-only effect would either warm every install that never
+    // opted in, or never warm at all — this pins the keyed-on-the-flag shape.
+    const { rerender } = mount({ servicesEnabled: false })
+    expect(connectionsPremint).not.toHaveBeenCalled()
+
+    rerender(<ConnectionsPage servicesEnabled />)
+    await waitFor(() => expect(connectionsPremint).toHaveBeenCalledTimes(1))
+
+    rerender(<ConnectionsPage servicesEnabled />)
+    expect(connectionsPremint).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders the gallery unchanged when the warm request rejects', async () => {
+    // A non-owner session is denied by design and the gateway may be older than
+    // the endpoint; either way the cold mint on Connect is the fallback, so the
+    // rejection must reach neither the cards nor an alert.
+    connectionsPremint.mockRejectedValue(new Error('403 forbidden'))
+
+    mount()
+
+    await waitFor(() => expect(cards()).toHaveLength(CONNECTION_PROVIDERS.length))
+    expect(within(card('notion')).getByRole('button', { name: 'Connect' })).toBeEnabled()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})
+
 describe('the provider gallery', () => {
   it('renders one card per launch-gated provider and withholds the rest', async () => {
     mount()
@@ -176,6 +269,27 @@ describe('the provider gallery', () => {
     expect(screen.getByText(`${CONNECTION_PROVIDERS.length} available`)).toBeInTheDocument()
   })
 
+  it('keeps feedback slots out of the compact gallery until feedback exists', async () => {
+    mount()
+
+    await waitFor(() => expect(cards()).toHaveLength(CONNECTION_PROVIDERS.length))
+    expect(document.querySelectorAll('[data-slot="connection-feedback"]')).toHaveLength(0)
+  })
+
+  it('reserves a feedback slot on every displayed card when one card has feedback', async () => {
+    mcpServers.mockResolvedValue([server()])
+    mcpProbe.mockResolvedValue([server()])
+    mount()
+
+    await waitFor(() => expect(cards()).toHaveLength(CONNECTION_PROVIDERS.length))
+    fireEvent.click(within(card('notion')).getByRole('button', { name: 'Test' }))
+    await screen.findByText('Connection is healthy.')
+
+    const slots = document.querySelectorAll('[data-slot="connection-feedback"]')
+    expect(slots).toHaveLength(CONNECTION_PROVIDERS.length)
+    expect(Array.from(slots).filter(slot => slot.querySelector('[role="status"]'))).toHaveLength(1)
+  })
+
   it('shows an unconnected provider its docs link and a Connect button', async () => {
     mount()
 
@@ -184,6 +298,120 @@ describe('the provider gallery', () => {
     expect(within(notion).getByText('Search your Notion workspace and read pages and databases.')).toBeInTheDocument()
     expect(within(notion).getByRole('link', { name: /Documentation/ })).toHaveAttribute('target', '_blank')
     expect(within(notion).getByRole('button', { name: 'Connect' })).toBeEnabled()
+  })
+
+  it('marks only providers with a blocking prerequisite, as an icon beside Connect', async () => {
+    mount()
+
+    await waitFor(() => expect(cards()).toHaveLength(CONNECTION_PROVIDERS.length))
+    for (const provider of CONNECTION_PROVIDERS) {
+      const icon = within(card(provider.slug)).queryByRole('button', { name: `${provider.name} prerequisites` })
+      if (provider.prerequisite_copy) expect(icon).toBeInTheDocument()
+      else expect(icon).not.toBeInTheDocument()
+    }
+    // The launch set's two provider-side prerequisites: GitLab (Duo/group
+    // access, else zero tools) and Atlassian (site required, else Accept stays
+    // disabled). Pinned here so a registry edit that drops either surfaces as
+    // a failure instead of silently deleting the warning.
+    expect(within(card('gitlab')).getByRole('button', { name: 'GitLab prerequisites' })).toBeInTheDocument()
+    expect(within(card('atlassian')).getByRole('button', { name: 'Atlassian prerequisites' })).toBeInTheDocument()
+  })
+
+  it('previews the prerequisite on hover and pins it on click until an outside click', async () => {
+    mount()
+
+    const gitlab = CONNECTION_PROVIDERS.find(provider => provider.slug === 'gitlab')
+    expect(gitlab?.prerequisite_copy).toBeTruthy()
+    const icon = await waitFor(() =>
+      within(card('gitlab')).getByRole('button', { name: 'GitLab prerequisites' }),
+    )
+
+    // Hover previews the bubble (portal-rendered, so queried on the document).
+    fireEvent.mouseEnter(icon)
+    const bubble = screen.getByRole('tooltip')
+    expect(within(bubble).getByText(gitlab?.prerequisite_copy ?? '__missing_gitlab_copy__')).toBeInTheDocument()
+    expect(bubble).toHaveTextContent('GitLab Duo')
+    // All three provider-side blockers stay named — dropping any one recreates
+    // the silent zero-tools connect this warning exists to prevent.
+    expect(bubble).toHaveTextContent('beta and experimental features')
+    expect(bubble).toHaveTextContent('top-level group')
+    expect(bubble).toHaveTextContent('exposes no tools')
+
+    // Leaving without clicking dismisses the preview — after the short grace
+    // that lets the pointer travel into the bubble (WCAG 1.4.13 hoverable).
+    fireEvent.mouseLeave(icon)
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    await waitFor(() => expect(screen.queryByRole('tooltip')).not.toBeInTheDocument())
+
+    // Crossing from the icon into the bubble keeps it open, and a mousedown
+    // inside it (starting a drag-selection of the steps) does not dismiss.
+    fireEvent.mouseEnter(icon)
+    const hoverBubble = screen.getByRole('tooltip')
+    fireEvent.mouseLeave(icon)
+    fireEvent.mouseEnter(hoverBubble)
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    fireEvent.mouseDown(hoverBubble)
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    fireEvent.mouseLeave(hoverBubble)
+    await waitFor(() => expect(screen.queryByRole('tooltip')).not.toBeInTheDocument())
+
+    // Clicking pins the bubble open past mouse-leave...
+    fireEvent.click(icon)
+    fireEvent.mouseLeave(icon)
+    expect(icon).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+
+    // ...and a click anywhere else dismisses it.
+    fireEvent.mouseDown(document.body)
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+    expect(icon).toHaveAttribute('aria-expanded', 'false')
+
+    // A tip opened by hover/focus alone (never pinned) must also dismiss on
+    // Escape (WCAG 1.4.13) — regression for the pinned-only listener gate.
+    fireEvent.mouseEnter(icon)
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+
+    // The bubble is position:fixed and computed once, so a scroll anywhere
+    // dismisses it rather than letting it detach from its icon.
+    fireEvent.click(icon)
+    expect(screen.getByRole('tooltip')).toBeInTheDocument()
+    fireEvent.scroll(document)
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+  })
+
+  it('hides the prerequisite icon once the provider is connected', async () => {
+    mcpServers.mockResolvedValue([
+      server({ name: 'gitlab', url: 'https://gitlab.com/api/v4/mcp' }),
+    ])
+    mount()
+
+    const gitlab = await waitFor(() => card('gitlab'))
+    expect(gitlab).toHaveAttribute('data-state', 'connected')
+    expect(within(gitlab).queryByRole('button', { name: 'GitLab prerequisites' })).not.toBeInTheDocument()
+  })
+
+  it('keeps the prerequisite icon beside Connect when a configured provider is ungranted', async () => {
+    // A GitLab entry whose grant is confirmed absent offers the same Connect
+    // CTA as the first-connect path — same consent flow, same Duo/group wall
+    // -- so the warning must ride this button too, not only the first-connect
+    // one. The label used to read "Authorize" here while every other
+    // consent-starting button read "Connect" for the identical startMint
+    // path; both are unified on "Connect" now.
+    mcpServers.mockResolvedValue([
+      server({ name: 'gitlab', url: 'https://gitlab.com/api/v4/mcp', status: 'needs_auth' }),
+    ])
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'gitlab', status: 'not_connected', grantPresent: false }],
+    })
+    mount()
+
+    const gitlab = await waitFor(() => card('gitlab'))
+    await waitFor(() => expect(gitlab).toHaveAttribute('data-state', 'not-verified'))
+    expect(within(gitlab).getByRole('button', { name: /Connect/ })).toBeInTheDocument()
+    expect(within(gitlab).getByRole('button', { name: 'GitLab prerequisites' })).toBeInTheDocument()
   })
 
   it('renders a skeleton while the server list is in flight, then the cards', async () => {
@@ -313,32 +541,112 @@ describe('a connected provider', () => {
     expect(within(stripe).queryByText('Access is controlled by enabled tools.')).not.toBeInTheDocument()
   })
 
-  it('confirms a healthy probe as success feedback', async () => {
+  it('confirms authenticated usable tools as success feedback', async () => {
     mcpServers.mockResolvedValue(connected)
-    mcpProbe.mockResolvedValue(connected)
     mount()
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Test' })))
 
     expect(await screen.findByText('Connection is healthy.')).toBeInTheDocument()
-    expect(mcpProbe).toHaveBeenCalled()
+    expect(connectionsTest).toHaveBeenCalledWith('notion')
+    expect(mcpProbe).not.toHaveBeenCalled()
   })
 
-  it('surfaces a failing probe as an error on the card', async () => {
+  it('shows connected but zero exposed tools as an honest warning', async () => {
     mcpServers.mockResolvedValue(connected)
-    mcpProbe.mockResolvedValue([server({ status: 'error' })])
+    connectionsTest.mockResolvedValue({
+      schema_version: 1,
+      slug: 'notion',
+      verdict: 'no_tools',
+      code: 'no_tools_exposed',
+      toolCount: 0,
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Test' })))
+
+    const warning = await screen.findByRole('alert')
+    expect(warning).toHaveTextContent('Offered no tools to inspect')
+    // A no_tools verdict is NOT a failed request -- the call succeeded and
+    // returned a verdict -- so it keeps this page's plain feedback line (a
+    // <div>) rather than being dressed as an error through ErrorNotice.
+    expect(warning.tagName).toBe('DIV')
+    expect(card('notion')).toHaveAttribute('data-state', 'connected')
+    expect(screen.queryByText('Connection is healthy.')).toBeNull()
+  })
+
+  it('links GitLab zero-tools guidance to its separately maintained prerequisites', async () => {
+    mcpServers.mockResolvedValue([
+      server({ name: 'gitlab', url: 'https://gitlab.com/api/v4/mcp' }),
+    ])
+    connectionsTest.mockResolvedValue({
+      schema_version: 1,
+      slug: 'gitlab',
+      verdict: 'no_tools',
+      code: 'no_tools_exposed',
+      toolCount: 0,
+    })
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [{ slug: 'gitlab', status: 'connected', grantPresent: true }],
+    })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('gitlab')).getByRole('button', { name: 'Test' })))
+
+    const warning = await screen.findByRole('alert')
+    // The connected-but-toolless user gets the exact provider-side steps, not
+    // just a generic reason and a link. The steps render localized via the
+    // slug-keyed catalog entry, whose English value must stay in lockstep with
+    // the registry's prerequisite_copy (the drift guard below).
+    expect(warning).toHaveTextContent('beta and experimental features')
+    expect(warning).toHaveTextContent('top-level group')
+    expect(within(warning).getByText(i18next.t('pages.connectionsPage.prerequisite_gitlab_steps'))).toBeInTheDocument()
+    expect(within(warning).getByRole('link', { name: 'Documentation' }))
+      .toHaveAttribute('href', 'https://docs.gitlab.com/user/model_context_protocol/mcp_server/')
+  })
+
+  it('keeps the localized prerequisite catalogs in lockstep with the registry English', () => {
+    // The registry decides WHETHER a card warns and is the English fallback;
+    // the en catalog is what actually renders in the default locale. If they
+    // drift, English users silently read different steps than the registry
+    // documents — so equality is pinned here for every provider that warns.
+    for (const provider of CONNECTION_PROVIDERS) {
+      if (!provider.prerequisite_copy) continue
+      expect(i18next.t(`pages.connectionsPage.prerequisite_${provider.slug}`)).toBe(provider.prerequisite_copy)
+    }
+  })
+
+  it('surfaces an authenticated failure as an error on the card', async () => {
+    mcpServers.mockResolvedValue(connected)
+    connectionsTest.mockResolvedValue({
+      schema_version: 1,
+      slug: 'notion',
+      verdict: 'failed',
+      code: 'mcp_server_failed',
+      toolCount: 0,
+    })
     mount()
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Test' })))
 
     const failure = await screen.findByRole('alert')
     expect(failure).toHaveTextContent('Action failed: The provider did not pass the connection test.')
+    // A generic action failure is a FAILED request, so it renders through the
+    // shared error surface (`ErrorNotice`) rather than a hand-written alert box
+    // -- its inline variant is a <span role="alert">, while this page's plain
+    // feedback line is a <div>, so the tag names which surface rendered it.
+    expect(failure.tagName).toBe('SPAN')
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    // No hand-off beside the return-address paste-back input, whose typed value
+    // survives a failed relay and would be discarded by navigating to the chat.
+    expect(within(failure).queryByRole('button', { name: /ask.*agent/i })).toBeNull()
   })
 
-  it('shows the busy label while the probe is in flight', async () => {
-    const pending = deferred<McpServer[]>()
+  it('shows the busy label while authenticated enumeration is in flight', async () => {
+    const pending = deferred<{ verdict: string }>()
     mcpServers.mockResolvedValue(connected)
-    mcpProbe.mockReturnValue(pending.promise)
+    connectionsTest.mockReturnValue(pending.promise)
     mount()
 
     fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Test' })))
@@ -347,8 +655,113 @@ describe('a connected provider', () => {
     expect(testing).toBeDisabled()
     expect(within(card('notion')).getByRole('button', { name: /Disconnect/ })).toBeDisabled()
 
-    pending.resolve(connected)
+    pending.resolve({ verdict: 'usable' })
     await waitFor(() => expect(screen.getByRole('button', { name: 'Test' })).toBeEnabled())
+  })
+
+  it('disables every OTHER card\'s Test button while one card is testing, with an explanation', async () => {
+    const pending = deferred<{ verdict: string }>()
+    mcpServers.mockResolvedValue([
+      server({ accountLabel: 'ada@example.com' }),
+      server({ name: 'stripe', url: STRIPE_URL }),
+    ])
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [
+        { slug: 'notion', status: 'connected', grantPresent: true },
+        { slug: 'stripe', status: 'connected', grantPresent: true },
+      ],
+    })
+    connectionsTest.mockImplementation((slug: string) => slug === 'notion' ? pending.promise : Promise.resolve({ verdict: 'usable' }))
+    mount()
+
+    await waitFor(() => expect(card('stripe')).toHaveAttribute('data-state', 'connected'))
+    fireEvent.click(within(card('notion')).getByRole('button', { name: 'Test' }))
+
+    // The sibling's button is disabled and explains itself; it is NOT relabeled
+    // "Testing…" -- that label is reserved for the card that owns the request.
+    // aria-label overrides the visible "Test" text for the accessible name, so
+    // the disabled sibling's true accessible name IS the explanation.
+    const explanation = 'One connection test runs at a time — Notion is testing'
+    const stripeTest = await waitFor(() => within(card('stripe')).getByRole('button', { name: explanation }))
+    expect(stripeTest).toBeDisabled()
+    expect(stripeTest).toHaveTextContent('Test')
+    expect(stripeTest).toHaveAttribute('title', 'One connection test runs at a time — Notion is testing')
+    // Every OTHER action on the sibling card stays enabled -- only Test is blocked.
+    expect(within(card('stripe')).getByRole('button', { name: /Disconnect/ })).toBeEnabled()
+    // The testing card's own label is still the busy spinner label, not the
+    // sibling-disable text -- the two must never collide on one card.
+    expect(within(card('notion')).getByRole('button', { name: 'Testing…' })).toBeInTheDocument()
+
+    pending.resolve({ verdict: 'usable' })
+    await waitFor(() => expect(within(card('stripe')).getByRole('button', { name: 'Test' })).toBeEnabled())
+  })
+
+  it('never disables a testing card\'s OWN button against its own name', async () => {
+    const pending = deferred<{ verdict: string }>()
+    mcpServers.mockResolvedValue(connected)
+    connectionsTest.mockReturnValue(pending.promise)
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Test' })))
+
+    // The busy spinner label covers this card's own in-flight state; it must
+    // never ALSO carry the sibling-disable title naming itself.
+    const testing = within(card('notion')).getByRole('button', { name: 'Testing…' })
+    expect(testing).not.toHaveAttribute('title')
+
+    pending.resolve({ verdict: 'usable' })
+  })
+
+  it('renders a 409 test_in_flight refusal as a named warning, never an opaque error', async () => {
+    mcpServers.mockResolvedValue([
+      server({ accountLabel: 'ada@example.com' }),
+      server({ name: 'stripe', url: STRIPE_URL }),
+    ])
+    connectionsStatus.mockResolvedValue({
+      schema_version: 1,
+      connections: [
+        { slug: 'notion', status: 'connected', grantPresent: true },
+        { slug: 'stripe', status: 'connected', grantPresent: true },
+      ],
+    })
+    // The server is the ground truth for the refusal: the client's own busy
+    // state disables the sibling button, but this proves the CARD reacts
+    // correctly to a 409 arriving regardless of what disabled it client-side --
+    // a stale disabled state, a second tab, or a race all reach this path.
+    connectionsTest.mockRejectedValue(
+      new ApiError(409, 'a connection test for notion is already running', JSON.stringify({
+        error: 'a connection test for notion is already running',
+        code: 'test_in_flight',
+        slug: 'notion',
+      })),
+    )
+    mount()
+
+    await waitFor(() => expect(card('stripe')).toHaveAttribute('data-state', 'connected'))
+    // Directly invoking the click handler bypasses the client-side `disabled`
+    // attribute, isolating the response-handling path from the button-state path.
+    fireEvent.click(within(card('stripe')).getByRole('button', { name: 'Test' }))
+
+    const warning = await screen.findByRole('alert')
+    expect(warning).toHaveTextContent('A connection test for Notion is already running')
+    expect(warning).not.toHaveTextContent('Unknown error')
+    expect(warning).not.toHaveTextContent('Action failed')
+    // A rejected request renders through the SHARED error surface, so the
+    // structured context (endpoint, status, backend `code`) is recoverable
+    // rather than thrown away by a hand-written line. ErrorNotice's inline
+    // variant owns the role="alert", so exactly one alert exists -- a nested
+    // pair would announce twice.
+    expect(screen.getAllByRole('alert')).toHaveLength(1)
+    // ErrorNotice's inline variant is a <span role="alert">, while this page's
+    // plain feedback line is a <div> -- so the tag proves WHICH surface rendered
+    // it without reaching into the component's internals.
+    expect(warning.tagName).toBe('SPAN')
+    // No hand-off beside the return-address paste-back field: the button
+    // navigates to the chat and unmounts this gallery.
+    expect(within(warning).queryByRole('button', { name: /ask.*agent/i })).toBeNull()
+    // The card stays connected -- a single-flight refusal is not a test failure.
+    expect(card('stripe')).toHaveAttribute('data-state', 'connected')
   })
 
   it('uninstalls the entry on Disconnect and keeps pointing at the provider revoke page', async () => {
@@ -386,7 +799,14 @@ describe('a connected provider', () => {
     expect(alert).toHaveTextContent(
       'Part of the stored grant could not be removed. Revoke access at the provider.',
     )
-    expect(within(alert).getByRole('link', { name: /Revoke at Notion/ })).toBeInTheDocument()
+    // The error TEXT is owned by ErrorNotice (which carries the role), so the
+    // revoke affordance is its sibling in the feedback slot rather than inside
+    // the announced region -- supplemental guidance, not part of the error
+    // string. The message itself already says to revoke at the provider.
+    expect(alert.tagName).toBe('SPAN')
+    const slot = alert.closest('[data-slot="connection-feedback"]')
+    expect(slot).not.toBeNull()
+    expect(within(slot as HTMLElement).getByRole('link', { name: /Revoke at Notion/ })).toBeInTheDocument()
   })
 
   it('says the grant was kept when another entry shares the endpoint', async () => {
@@ -476,7 +896,7 @@ describe('a connected provider', () => {
     // the same dishonesty class this slice exists to remove.
     const note = await screen.findByRole('status')
     expect(note).toHaveTextContent(
-      'The stored grant was removed. Your server configuration was left unchanged.',
+      'The stored grant was removed. Your server configuration was left unchanged. You can manage this entry from the MCP Servers tab.',
     )
   })
 
@@ -662,7 +1082,13 @@ describe('connecting a new provider', () => {
     await waitFor(() => expect(mcpCustomAdd).toHaveBeenCalledWith({ notion: { url: NOTION_URL } }, true))
     expect(mcpProbe).toHaveBeenCalled()
     await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
-    expect(screen.getByText('Finish approving in your browser…')).toBeInTheDocument()
+    // jsdom grants no window, so `window.open` returns null and this click lands
+    // on the refused-tab path -- where the neutral heading is the correct copy,
+    // because there is no browser page to finish approving in. Asserted as an
+    // absence: the neutral wording shares its text with the state badge, so a
+    // positive match cannot tell the two apart. The granted-tab wording is
+    // asserted in `the approval tab` below, against a stubbed open.
+    expect(screen.queryByText('Finish approving in your browser…')).toBeNull()
   })
 
   it('asks for the approval URL instead of waiting for one', async () => {
@@ -724,6 +1150,61 @@ describe('connecting a new provider', () => {
       () => expect(card('notion')).not.toHaveAttribute('data-state', 'waiting-for-approval'),
       { timeout: 8000 },
     )
+  }, 15000)
+
+  it.each([
+    {
+      reason: 'mint_timeouterror',
+      state: 'failed',
+      expected: 'Action failed: Authorization setup timed out before an approval address was ready. Try connecting again.',
+    },
+    {
+      reason: 'mint_process_gone',
+      state: 'expired',
+      expected: 'Action failed: The authorization process stopped before approval finished. Try connecting again.',
+    },
+    {
+      reason: 'mint_server_absent',
+      state: 'failed',
+      expected: 'Action failed: The MCP server entry disappeared before authorization could start. Try connecting again.',
+    },
+    {
+      reason: 'mint_url_rejected',
+      state: 'failed',
+      expected: 'Action failed: The provider returned an approval address containing credential-like data, so it was not displayed.',
+    },
+    {
+      reason: 'mint_future_reason',
+      state: 'failed',
+      expected: 'Action failed: Authorization setup failed before an approval address was ready. Try connecting again.',
+    },
+  ])('explains $state mint reason $reason', async ({ reason, state, expected }) => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state, reason, token: 'tok1' })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+
+    await waitFor(() => {
+      expect(within(card('notion')).getByRole('alert')).toHaveTextContent(expected)
+    })
+  })
+
+  it("does not surface another tab's expired mint reason", async () => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting', token: 'tok1' })
+    mount()
+
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+    await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+    connectionsMintState.mockResolvedValue({
+      slug: 'notion', state: 'expired', reason: 'mint_process_gone', token: 'tok2',
+    })
+
+    await waitFor(
+      () => expect(card('notion')).not.toHaveAttribute('data-state', 'waiting-for-approval'),
+      { timeout: 8000 },
+    )
+    expect(within(card('notion')).queryByRole('alert')).toBeNull()
   }, 15000)
 
   it('probes for fresh status when the mint reports granted', async () => {
@@ -1263,4 +1744,318 @@ describe('the authorization status feed', () => {
     expect(within(card('notion')).getByText(/cannot see the authorization/)).toBeInTheDocument()
     expect(within(card('notion')).queryByText(/is not authorized/)).toBeNull()
   })
+})
+
+// Provider brand marks. The art inventory and the card roster are maintained
+// separately, so a provider CAN ship without a mark -- `superhuman` is in the
+// registry today with no `.svg` file at all, while every provider the launch
+// gate lets through onto the visible gallery now ships one (github is also
+// launch-gated off, but the inventory already covers it, so it cannot stand
+// in for the gap case). That gap case must degrade to the lettered tile
+// rather than to an empty gap, and it did not: the card built
+// `<ProviderLogo …/>` unconditionally, which is a truthy element even for a
+// slug with no mark, so the `??` fallback beside it was unreachable.
+// Exercised directly against `ProviderLogo` / `PROVIDER_LOGO_SLUGS` below
+// rather than through a real gallery card, because no visible card is
+// currently gapped to hang that assertion on.
+describe('the card brand mark', () => {
+  it('ships no mark for a provider the launch gate holds back (superhuman)', () => {
+    // The card's own fallback logic (`PROVIDER_LOGO_SLUGS.includes(slug) ? <ProviderLogo .../> : null`)
+    // reads this list; asserting on it directly pins the gap the lettered
+    // tile exists to cover, independent of which providers are launch-gated.
+    // `superhuman` is in the registry (launch_gate_passed: false) with no
+    // `.svg` file in `logos/` at all -- unlike github, which the launch gate
+    // also holds back but which the inventory already covers.
+    expect(PROVIDER_LOGO_SLUGS).not.toContain('superhuman')
+    expect(ProviderLogo({ slug: 'superhuman' })).toBeNull()
+  })
+
+  it('renders the mark, and no letter, for a provider that ships one', async () => {
+    mount()
+
+    await waitFor(() => expect(card('notion')).toBeInTheDocument())
+    const slot = card('notion').querySelector('header [role="img"]')
+    if (!slot) throw new Error('no brand-mark slot on the notion card')
+    expect(slot.querySelector('[data-testid="provider-logo-notion"]')).not.toBeNull()
+    // The tile must not double up with the mark.
+    expect(slot.textContent).toBe('')
+  })
+
+  it('renders the full-colour gitlab mark, and no letter', async () => {
+    mount()
+
+    await waitFor(() => expect(card('gitlab')).toBeInTheDocument())
+    const slot = card('gitlab').querySelector('header [role="img"]')
+    if (!slot) throw new Error('no brand-mark slot on the gitlab card')
+    expect(slot.querySelector('[data-testid="provider-logo-gitlab"]')).not.toBeNull()
+    expect(slot.textContent).toBe('')
+  })
+})
+
+// sizes to its own copy makes the row it sits in ragged. jsdom runs no layout
+// engine, so the reserved box IS the observable here: asserting the floor/clamp
+// pair on the description is what a browser's equal-height rows reduce to, and it
+// is what a later "tidy up the classes" edit would break.
+describe('the card description box', () => {
+  it('reserves two lines for every description and allows a third', async () => {
+    mount()
+
+    await waitFor(() => expect(card('notion')).toBeInTheDocument())
+    // GitLab's copy wraps to two lines where Notion's takes one: both cards must
+    // still reserve the same vertical space.
+    for (const slug of ['notion', 'gitlab']) {
+      const description = card(slug).querySelector('p')
+      if (!description) throw new Error(`no description paragraph on the ${slug} card`)
+      // A FLOOR, not a fixed height: a locale whose copy needs a third line grows
+      // rather than clipping a write-scope disclosure behind a hover-only title.
+      expect(description).toHaveClass('min-h-[34px]')
+      expect(description).not.toHaveClass('h-[34px]')
+      expect(description).toHaveClass('line-clamp-3')
+      // An explicit line-height is what makes the reserved height hold whole
+      // lines instead of cutting one mid-glyph.
+      expect(description).toHaveClass('leading-[17px]')
+    }
+  })
+})
+
+// jsdom runs no layout engine, so the CLASS is the observable here: an
+// `items-start` override on the grid is what let one row's cards take their
+// own heights instead of stretching to a shared bottom edge, which is what
+// "nothing is flush" reported. This supersedes an earlier deliberate choice
+// ("a taller card must not stretch its siblings") -- the user has since
+// overridden that with an explicit flush-rows request, and every card is
+// already `flex flex-col` with its action region on `mt-auto`, so a stretched
+// row aligns buttons on a shared edge rather than clipping content.
+describe('the gallery grid', () => {
+  it('stretches row cards to equal height instead of sizing each to its own content', async () => {
+    mount()
+
+    await waitFor(() => expect(card('notion')).toBeInTheDocument())
+    const grid = card('notion').parentElement
+    if (!grid) throw new Error('no grid parent above the notion card')
+    expect(grid).not.toHaveClass('items-start')
+    expect(grid).toHaveClass('grid')
+  })
+})
+
+// Connect opens the approval tab. The requirement is that one click lands the
+// user on the provider's consent page; the "Re-open approval" link is the
+// recovery path for a tab the browser refused, not the primary route. What makes
+// it delicate is the ordering: POST /api/connections/mint answers BEFORE the URL
+// exists, so the tab has to be opened by the click -- while the user activation
+// is still current -- and filled when the poll produces a URL.
+//
+// `window.open` is swapped by hand rather than with vi.spyOn so the restore is
+// guaranteed by try/finally even when an assertion throws: a leaked stub would
+// silently change every test that ran after it.
+describe('the approval tab', () => {
+  type FakeTab = { closed: boolean; location: { href: string }; close: () => void }
+
+  const fakeTab = () => {
+    const body = { style: '', text: '', setAttribute: (_: string, v: string) => { body.style = v } }
+    const tab = {
+      closed: false,
+      location: { href: '' },
+      closeCalls: 0,
+      // Only the surface the card touches: a body it can style and fill, and a
+      // title. Deliberately not a real DOM -- the assertion is that the card
+      // writes TEXT rather than markup, which a string field states plainly.
+      document: {
+        title: '',
+        get body() {
+          return {
+            setAttribute: body.setAttribute,
+            set textContent(v: string) { body.text = v },
+            get textContent() { return body.text },
+          }
+        },
+      },
+      body,
+      close() {
+        tab.closeCalls += 1
+        tab.closed = true
+      },
+    }
+    return tab
+  }
+
+  const withOpen = async (
+    tab: FakeTab | ReturnType<typeof fakeTab> | null,
+    body: (calls: unknown[][]) => Promise<void>,
+  ): Promise<void> => {
+    const original = window.open
+    const calls: unknown[][] = []
+    window.open = ((...args: unknown[]) => {
+      calls.push(args)
+      return tab as unknown as Window
+    }) as typeof window.open
+    try {
+      await body(calls)
+    } finally {
+      window.open = original
+    }
+  }
+
+  const clickConnect = async () => {
+    fireEvent.click(await waitFor(() => within(card('notion')).getByRole('button', { name: 'Connect' })))
+  }
+
+  it('opens the tab on the click, before any URL exists', async () => {
+    // The mint stays in `minting`, so no URL is available at any point here: the
+    // tab must still have been opened, which is the whole popup-blocker fix.
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    await withOpen(fakeTab(), async calls => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(connectionsMint).toHaveBeenCalledWith('notion'))
+      expect(calls).toEqual([['', '_blank']])
+    })
+  })
+
+  it('sends the approval URL to the tab the click opened', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=minted'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(tab.location.href).toBe(minted))
+      // ...and the heading may now say the browser page exists, because it does.
+      expect(within(card('notion')).getByText(/Finish approving in your browser/)).toBeInTheDocument()
+    })
+  })
+
+  it('leaves the link as the way in when the browser refuses the tab', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=blocked'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    // A blocked popup is a null handle, not a throw.
+    await withOpen(null, async () => {
+      mount()
+      await clickConnect()
+
+      const link = await waitFor(() =>
+        within(card('notion')).getByRole('link', { name: /Re-open approval/ }),
+      )
+      expect(link).toHaveAttribute('href', minted)
+      // No tab was granted, so the heading must NOT claim a browser page is open.
+      // Asserted as an absence on purpose: the neutral heading shares its wording
+      // with the state badge, so a positive match would not tell them apart.
+      expect(within(card('notion')).queryByText(/Finish approving in your browser/)).toBeNull()
+    })
+  })
+
+  it('reclaims the blank tab when the attempt fails', async () => {
+    connectionsMint.mockRejectedValue(new Error('mint refused'))
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+
+      // The mint never starts, so no URL will ever arrive: leaving the blank tab
+      // open would make the user close it by hand.
+      await waitFor(() => expect(screen.getByText(/mint refused/)).toBeInTheDocument())
+      await waitFor(() => expect(tab.closeCalls).toBe(1))
+    })
+  })
+
+  it('drops a tab the user closed instead of reopening it', async () => {
+    const minted = 'https://mcp.notion.com/authorize?state=closed'
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'waiting', oauth_url: minted })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+      // Simulate the user closing the placeholder before the URL landed. Racing
+      // the poll would make this flaky, so close it and assert on the end state:
+      // whatever the ordering, the card must never resurrect a closed window.
+      tab.closed = true
+
+      const link = await waitFor(() =>
+        within(card('notion')).getByRole('link', { name: /Re-open approval/ }),
+      )
+      expect(link).toHaveAttribute('href', minted)
+    })
+  })
+
+  it('tells the user what the blank tab is for while the mint polls', async () => {
+    // The mint stays in `minting`, which is the whole poll window: a tab left on a
+    // bare about:blank for those seconds reads as a failure of the click.
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(tab.body.text).toBe('Connecting…'))
+      expect(tab.document.title).toBe('Connecting…')
+      // Written as text, never markup, so a translated string cannot become nodes.
+      expect(tab.body.text).not.toMatch(/[<>]/)
+      // And laid out without hardcoded colours, so it cannot clash with the theme.
+      expect(tab.body.style).toContain('color-scheme:light dark')
+    })
+  })
+
+  it('never claims an open browser page while the tab stands refused', async () => {
+    // The refused-tab case during the POLL is the gap a boolean gated on
+    // `oauth.minted` could not express: minted is still false here, so the card
+    // used to tell a blocked-popup user to finish in a browser page they never
+    // got -- the same false claim this change set out to remove.
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    await withOpen(null, async () => {
+      mount()
+      await clickConnect()
+
+      await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+      expect(within(card('notion')).queryByText(/Finish approving in your browser/)).toBeNull()
+    })
+  })
+
+  it('takes the blank tab back when the user cancels mid-mint', async () => {
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    const tab = fakeTab()
+    await withOpen(tab, async () => {
+      mount()
+      await clickConnect()
+      await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'waiting-for-approval'))
+
+      fireEvent.click(within(card('notion')).getByRole('button', { name: /Cancel/ }))
+
+      // Cancel ends the attempt, so no URL is ever coming. Leaving the tab open
+      // also left the ref stale, and the NEXT Connect click then overwrote it and
+      // orphaned this tab for good -- so the ref being cleared is the half that
+      // matters beyond tidiness.
+      await waitFor(() => expect(tab.closeCalls).toBe(1))
+    })
+  })
+
+  it('opens the tab for Reconnect too, not just Connect', async () => {
+    // Reconnect and Authorize run the IDENTICAL mint-and-poll path through
+    // `onReconnect`. Wiring the tab to the Connect button alone left two of the
+    // card's three mint-starting buttons opening nothing at all.
+    mcpServers.mockResolvedValue([server({ status: 'error', error: 'invalid_grant' })])
+    connectionsMintState.mockResolvedValue({ slug: 'notion', state: 'minting' })
+    await withOpen(fakeTab(), async calls => {
+      mount()
+      await waitFor(() => expect(card('notion')).toHaveAttribute('data-state', 'needs-attention'))
+
+      fireEvent.click(within(card('notion')).getByRole('button', { name: /Reconnect/ }))
+
+      await waitFor(() => expect(connectionsMint).toHaveBeenCalledWith('notion'))
+      expect(calls).toEqual([['', '_blank']])
+    })
+  })
+
+  // NOT pinned here, deliberately, and stated rather than faked: the stale-outcome
+  // path (a granted tab whose attempt ended, leaving `clickTab` at `open` so a
+  // LATER mint re-made the browser-page claim) is only observable when the card
+  // re-enters `waiting-for-approval` WITHOUT a click, because a second click sets
+  // the outcome explicitly and masks it. This harness could not produce that
+  // second entry in the same mount: once a URL is published the card holds the
+  // waiting state through `expired`, and a fresh mount resets the state under
+  // test. Driving it would need a seeded gateway-published banner arriving after a
+  // completed click attempt. The fix itself is a two-line reordering -- the reset
+  // moved above the ref guard, since delivery nulls the ref -- reviewed against
+  // the trace that found it.
 })

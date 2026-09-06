@@ -19,27 +19,53 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
-from kiro_crew import mcp_core, platform_compat, session_directive
+from kiro_crew import autonudge, mcp_core, platform_compat, session_directive
 from kiro_crew.mcp_shared import ToolCancelled, is_tool_cancelled
 from kiro_crew.mcp_tools._limits import _MONITOR_DEFAULT_MAX_CYCLES
-from kiro_crew.security import redact_credentials, redact_exfiltration_urls
+from kiro_crew.monitoring.github_pull_request import parse_github_pull_request_target
+from kiro_crew.monitoring.models import (
+    DEFAULT_MONITOR_AGENT_TURNS,
+    DEFAULT_MONITOR_CADENCE_SECS,
+    DEFAULT_MONITOR_PROVIDER_ERRORS,
+    DEFAULT_MONITOR_RUNTIME_SECS,
+    DEFAULT_MONITOR_TOKENS,
+    MAX_MONITOR_AGENT_TURNS,
+    MAX_MONITOR_CADENCE_SECS,
+    MAX_MONITOR_CHECK_NAMES,
+    MAX_MONITOR_PROVIDER_ERRORS,
+    MAX_MONITOR_RUNTIME_SECS,
+    MAX_MONITOR_TOKENS,
+    MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
+    MIN_MONITOR_CADENCE_SECS,
+)
+from kiro_crew.security import (
+    redact_and_truncate,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.session_surface import has_dashboard_surface
 from kiro_crew.validation import (
     ASK_QUESTION_SCHEMA,
     AUTONUDGE_STOP_SCHEMA,
+    MONITOR_INSPECT_SCHEMA,
     MONITOR_START_SCHEMA,
+    MONITOR_STOP_SCHEMA,
     MONITOR_UPDATE_SCHEMA,
+    MONITOR_WATCH_SCHEMA,
     REGISTER_HOOK_SCHEMA,
+    RESET_CONVERSATION_SCHEMA,
     SELECT_CREW_SCHEMA,
     SET_PROJECT_SCHEMA,
     SUGGEST_FOLLOWUP_SCHEMA,
     TASK_RUN_SCHEMA,
     WAIT_SCHEMA,
+    ValidationError,
     validate_ask_user_question,
     validate_tool_args,
 )
@@ -188,9 +214,7 @@ def schemas() -> list[dict[str, Any]]:
                 "properties": {
                     "questions": {
                         "type": "array",
-                        "description": (
-                            "1-4 questions to show in one card, each with 1-6 options"
-                        ),
+                        "description": ("1-4 questions to show in one card, each with 1-6 options"),
                         "items": {
                             "type": "object",
                             "properties": {
@@ -243,6 +267,72 @@ def schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "monitor_watch",
+            "description": (
+                "Watch a GitHub pull request with cheap provider probes. The owning session "
+                "is woken only when a new revision needs action; unchanged, pending, retry, "
+                "and terminal probes use no agent turn. One structured monitor per session."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["github_pull_request"]},
+                    "target": {"type": "string", "description": "Public GitHub PR URL"},
+                    "objective": {"type": "string", "enum": ["review_ready"]},
+                    "interval_secs": {
+                        "type": "integer",
+                        "minimum": MIN_MONITOR_CADENCE_SECS,
+                        "maximum": MAX_MONITOR_CADENCE_SECS,
+                    },
+                    "max_runtime_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_MONITOR_RUNTIME_SECS,
+                    },
+                    "max_agent_turns": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_MONITOR_AGENT_TURNS,
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_MONITOR_TOKENS,
+                    },
+                    "max_provider_errors": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_MONITOR_PROVIDER_ERRORS,
+                    },
+                    "wake_instructions": {
+                        "type": "string",
+                        "maxLength": MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
+                        "description": "Compact instructions used only on an actionable wake",
+                    },
+                },
+                "required": ["kind", "target", "objective"],
+            },
+        },
+        {
+            "name": "monitor_inspect",
+            "description": (
+                "Inspect the structured monitor bound to your authenticated current session. "
+                "Takes no session key or monitor id."
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+        },
+        {
+            "name": "monitor_stop",
+            "description": (
+                "Durably stop the structured monitor on your current session while retaining "
+                "its terminal outcome for inspection."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {"reason": {"type": "string"}},
+            },
+        },
+        {
             "name": "monitor_start",
             "description": (
                 "Start a monitoring loop on YOUR CURRENT session: every "
@@ -259,11 +349,28 @@ def schemas() -> list[dict[str, Any]]:
                 "interval. When the exit condition is met (or the user says "
                 "stop), call autonudge_stop — reaching max_cycles is a runaway "
                 "backstop, NOT a successful finish. Use monitor_update to "
-                "revise the instruction if what you are watching changes. One "
-                "loop per session; starting a new one replaces the old. "
+                "revise or re-arm the instruction if what you are watching "
+                "changes. One automation may occupy a session; monitor_start "
+                "is create-only and refuses while an ACTIVE one exists (a "
+                "system-stopped or expired automation — an approval stall, a "
+                "spent cap or budget, a finished subject — is replaced by the "
+                "new arm; manual pauses, user stops and retained tombstones "
+                "are preserved). "
                 "Survives gateway restarts. Every cycle appends a full turn to "
                 "this same session, so keep per-cycle output small and report "
-                "only real signals."
+                "only real signals. "
+                "COST: naming exactly ONE GitHub pull request BY ITS FULL URL "
+                "(https://github.com/<owner>/<repo>/pull/<N>) makes the loop "
+                "observe it each interval and re-inject your message only when "
+                "it actually changed, so a cycle where nothing changed costs no "
+                "model turn and max_cycles then counts the turns actually "
+                "DELIVERED to you -- wakes, plus the periodic delivery that "
+                "breaks a long quiet streak and any tick that could not observe "
+                "the subject -- rather than intervals elapsed. If your loop must "
+                "run every "
+                "interval regardless -- it acts while the subject is quiet, e.g. "
+                "refreshing a heartbeat -- do not name a single pull request, or "
+                "pass gate=false."
             ),
             "inputSchema": {
                 "type": "object",
@@ -285,6 +392,23 @@ def schemas() -> list[dict[str, Any]]:
                             "cycle whose own work runs long still pushes the "
                             "next deadline out, so real cadence is at least "
                             "interval_secs + turn time (15-86400, default 300)"
+                        ),
+                    },
+                    "gate": {
+                        "type": "boolean",
+                        "description": (
+                            "Default true. Pass false to opt this loop OUT of "
+                            "observation-gating, so it is re-injected every "
+                            "interval even when the pull request it names has "
+                            "not changed. Use it for a loop whose duty is to act "
+                            "WHILE the subject is quiet -- refresh a heartbeat "
+                            "file, chase a reviewer who still has not replied, "
+                            "keep a branch rebased on a moving base -- since the "
+                            "observation watches the pull request and continued "
+                            "silence is invisible to it. A gated loop is never "
+                            "starved (it is delivered anyway after enough quiet "
+                            "intervals) so reach for this only when every "
+                            "interval genuinely has work"
                         ),
                     },
                     "max_cycles": {
@@ -311,6 +435,24 @@ def schemas() -> list[dict[str, Any]]:
                             "most one turn (itself bounded by the per-turn "
                             "transport timeout). When the budget is spent the "
                             "loop deactivates and the user is notified"
+                        ),
+                    },
+                    "banner": {
+                        "type": "string",
+                        "description": (
+                            "Optional SHORT line shown in the transcript row "
+                            "instead of the full message (max 500 chars). The "
+                            "model still receives `message` whole every cycle — "
+                            "this changes only what is stored and displayed. Set "
+                            "it whenever `message` is long: a multi-KB "
+                            "instruction is otherwise re-stored and re-broadcast "
+                            "as a transcript row on every single cycle, which "
+                            "measured 51.8% of one long-running session's file. "
+                            'Something like "watching PR #123 for CI" is '
+                            "enough. Omit it for a short message, and omit it on "
+                            "a channel-bound loop (`slack:`/`discord:`/`webex:`) "
+                            "— a banner there is refused with a 400, since only "
+                            "the dashboard transcript renders it"
                         ),
                     },
                 },
@@ -363,6 +505,42 @@ def schemas() -> list[dict[str, Any]]:
                             "604800 = 7 days). Omit to leave unchanged"
                         ),
                     },
+                    "target": {
+                        "type": "string",
+                        "description": "New GitHub PR URL for a structured monitor",
+                    },
+                    "objective": {"type": "string", "enum": ["review_ready"]},
+                    "max_agent_turns": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_MONITOR_AGENT_TURNS,
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_MONITOR_TOKENS,
+                    },
+                    "max_provider_errors": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_MONITOR_PROVIDER_ERRORS,
+                    },
+                    "wake_instructions": {
+                        "type": "string",
+                        "maxLength": MAX_MONITOR_WAKE_INSTRUCTIONS_CHARS,
+                        "description": "Replacement actionable-wake instructions",
+                    },
+                    "banner": {
+                        "type": "string",
+                        "description": (
+                            "Replacement SHORT transcript row for future cycles "
+                            "(max 500 chars); the model still receives `message` "
+                            'whole. Pass "" to CLEAR it and go back to showing '
+                            "the full message. Omit to leave it unchanged. A "
+                            "non-blank banner on a channel-bound loop "
+                            "(`slack:`/`discord:`/`webex:`) is refused with a 400"
+                        ),
+                    },
                 },
             },
         },
@@ -406,6 +584,43 @@ def schemas() -> list[dict[str, Any]]:
                     },
                 },
                 "required": ["path"],
+            },
+        },
+        {
+            "name": "reset_conversation",
+            "description": (
+                "Give the calling chat session a clean context: the next message "
+                "starts a fresh conversation with no memory of this one. The tab "
+                "stays open and the TRANSCRIPT IS NOT TOUCHED — earlier messages "
+                "remain visible and on disk, so this drops the model's memory, not "
+                "the user's record."
+                "\n\n"
+                "Use when a session walks a list of independent items one at a time "
+                "(reviewing a queue, triaging tickets) and carrying item N's context "
+                "into item N+1 buys nothing but tokens. Also use when a long-lived "
+                "conversation has drifted off the thing it was about."
+                "\n\n"
+                "Do NOT use to escape a context you still need: anything not written "
+                "down somewhere durable — a file, a ticket, a memory — is gone from "
+                "the model's view after the reset, even though the user can still "
+                "read it in the tab. Record what carries forward BEFORE calling this."
+                "\n\n"
+                "Restrictions: headless callers (cron jobs, subagents, task runners) "
+                "are rejected — a cron turn can run on a user's dashboard slot and a "
+                "subagent shares its parent's slot, so neither may wipe it."
+                "\n\n"
+                "The reset lands at a turn BOUNDARY, not inline, so this tool returns "
+                "cleanly without tearing down its own caller mid-write. Normally that "
+                "is the end of this turn, so the next message starts fresh. It waits, "
+                "however, for anything whose work the teardown would destroy: a turn "
+                "still in flight on the session, or sub-agents running, queued, or "
+                "delivering a result. So it can land a turn or more later than the "
+                "next message, and the rest of the current turn always still sees the "
+                "full conversation."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
             },
         },
         {
@@ -500,8 +715,14 @@ def task_run(name: str, args: dict[str, Any]) -> str:
     if d.get("error"):
         return f"Error: {d['error']}"
 
-    safe_label, _ = redact_exfiltration_urls(task_name or spec[:80])
-    safe_label, _ = redact_credentials(safe_label)
+    # ``task_name`` is used whole; only the ``spec`` fallback is bounded, so
+    # only that branch needs the redact-then-bound composition — bounding first
+    # can cut a credential into fragments no redaction regex matches.
+    if task_name:
+        safe_label, _ = redact_exfiltration_urls(task_name)
+        safe_label, _ = redact_credentials(safe_label)
+    else:
+        safe_label = redact_and_truncate(spec, 80)
     return f"Task runner started: {safe_label}"
 
 
@@ -546,15 +767,15 @@ def wait(name: str, args: dict[str, Any]) -> str:
     # SUBAGENT's wait. No frontend guard can catch that: with only one wait_id
     # pinging there is no collision to detect.
     #
-    # `_resolve_session_key_strict()` is the existing primitive for exactly
-    # this class of session-mutating tool (monitor_start, autonudge_stop,
-    # set_project) -- it drops the walk and accepts only gateway-injected
-    # caller context, KIROCREW_SESSION_KEY, or a HMAC-verified pid sidecar.
+    # `require_strict_session_key` is the shared gate for exactly this class
+    # of session-mutating tool (monitor_start, autonudge_stop, set_project)
+    # -- it drops the walk and accepts only gateway-injected caller context,
+    # KIROCREW_SESSION_KEY, or a HMAC-verified pid sidecar.
     # When it comes back empty the identity is a guess, so the ping degrades
     # to the original `{}` touch: the session still cannot be reaped
     # mid-sleep, and the countdown simply never appears. Tracked in #2347,
     # which is the work that lets this gate go away.
-    _identified = bool(mcp_core._resolve_session_key_strict())
+    _identified = bool(mcp_core.require_strict_session_key("the wait keepalive ping")[0])
     # The 5s cadence exists ONLY to bound how long the button appears to do
     # nothing. An unidentified sleep publishes nothing and honours no
     # end_wait, so it has no button and would be paying a 12x request
@@ -573,19 +794,21 @@ def wait(name: str, args: dict[str, Any]) -> str:
             try:
                 reply = mcp_core._post(
                     "/api/session-keepalive",
-                    {
-                        "wait_id": wait_id,
-                        "seconds": seconds,
-                        "remaining": max(0, int(remaining)),
-                        # Lets the dashboard derive a liveness window for
-                        # this sleep without importing this module's
-                        # constant -- see _service_wait_ping's collision
-                        # guard, which needs to know how stale a ping has to
-                        # be before the sleep behind it is presumed gone.
-                        "interval": _ping_secs,
-                    }
-                    if _identified
-                    else {},
+                    (
+                        {
+                            "wait_id": wait_id,
+                            "seconds": seconds,
+                            "remaining": max(0, int(remaining)),
+                            # Lets the dashboard derive a liveness window for
+                            # this sleep without importing this module's
+                            # constant -- see _service_wait_ping's collision
+                            # guard, which needs to know how stale a ping has to
+                            # be before the sleep behind it is presumed gone.
+                            "interval": _ping_secs,
+                        }
+                        if _identified
+                        else {}
+                    ),
                 )
             except Exception:
                 reply = {}  # keepalive is best-effort
@@ -595,11 +818,7 @@ def wait(name: str, args: dict[str, Any]) -> str:
             # `_identified` too: an unidentified sleep sends no wait_id, so a
             # matching reply could only mean the backend is answering about
             # somebody else's wait.
-            if (
-                _identified
-                and isinstance(reply, dict)
-                and reply.get("end_wait") == wait_id
-            ):
+            if _identified and isinstance(reply, dict) and reply.get("end_wait") == wait_id:
                 ended_early = True
                 break
             _next_ping = now + _ping_secs
@@ -720,15 +939,55 @@ def register_hook(name: str, args: dict[str, Any]) -> str:
     )
 
 
+def _emit_directive(kind: str, args: dict[str, Any], human: str) -> str:
+    """Encode a validated directive AND publish it out of band; return the text.
+
+    Two delivery paths, one each way round:
+
+    * The MARKER in the returned text is the original path. A consumer that can
+      verify the call's ``_meta.kiro`` identity (kiro-cli) decodes and applies it
+      from there, exactly as before — this function changes nothing for that
+      backend.
+    * The out-of-band POST is the provider-neutral path. ``_post`` already carries
+      ``X-Session-Key`` (and the gateway kernel-verifies that claim on the unix
+      socket), so the gateway parks the payload for the RIGHT session without the
+      model's tool result being trusted for anything. A backend that emits no
+      ``_meta.kiro`` identity has no other way to reach its own control plane.
+
+    Order matters: encode FIRST. ``encode`` refuses an oversized payload by
+    returning a marker-less error string, and a refused directive must NOT be
+    published — otherwise the model is told "nothing was applied" while a record
+    sits waiting to apply it.
+
+    Fail-soft on the POST, and SILENT by design. An older gateway with no such
+    route, or one that is simply down, must not turn a working tool call into an
+    error: the marker is already in hand and the kiro-cli path still works. There
+    is no log line because this module runs as a stdio MCP server, where the
+    process's own streams are the protocol channel — and because the failure that
+    matters is reported at the CONSUMER, which is the side that knows whether a
+    directive actually landed.
+    """
+    out = session_directive.encode(kind, args, human)
+    if session_directive.is_refusal(out):
+        return out
+    try:
+        mcp_core._post("/api/session-directive", {"kind": kind, "args": args})
+    except Exception:
+        pass
+    return out
+
+
 def autonudge_stop(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, AUTONUDGE_STOP_SCHEMA)
 
     # Resolve the current session's binding key and stop any loop on it.
-    # STRICT resolution (env-var only, no PID walk): this tool mutates
-    # another process's persistent loop state, and a subagent lives under
-    # the parent slot's process tree — a PID-walk would let it silently
-    # stop the PARENT session's loop (matches set_project's rule).
-    sk = mcp_core._resolve_session_key_strict()
+    # STRICT resolution via the shared gate (env-var only, no PID walk): this
+    # tool mutates another process's persistent loop state, and a subagent
+    # lives under the parent slot's process tree — a PID-walk would let it
+    # silently stop the PARENT session's loop (matches set_project's rule).
+    # Resolve-half only: an empty key deliberately does NOT refuse here — it
+    # falls through to the directive, whose consumer resolves its own session.
+    sk, _ = mcp_core.require_strict_session_key("autonudge_stop")
     # Stateless: emit a directive; the session-aware consumer
     # (chat_runner) resolves the loop by ITS OWN session and stops it. The
     # tool carries no session identity — sk is used only to short-circuit a
@@ -739,7 +998,7 @@ def autonudge_stop(name: str, args: dict[str, Any]) -> str:
             "a dashboard, Slack, or Discord session "
             f"(current session_key={sk!r})."
         )
-    return session_directive.encode(
+    return _emit_directive(
         "autonudge_stop",
         {"reason": args.get("reason", "").strip()},
         # NOT a confirmation, and worded so a model cannot read it as one: this
@@ -765,7 +1024,9 @@ def ask_question(name: str, args: dict[str, Any]) -> str:
     # the session started — a channel-born session with its tab open can
     # render it. Surfaces without a tab still get the [OPTIONS:] hint;
     # an empty (default-install) key falls through to the directive.
-    sk = mcp_core._resolve_session_key_strict()
+    # Resolve-half of the shared strict gate only: ask_question gates on the
+    # dashboard surface, not on identity, so an empty key is not a refusal.
+    sk, _ = mcp_core.require_strict_session_key("ask_question")
     if sk and not has_dashboard_surface(sk):
         return (
             "ask_question only works from a dashboard chat session "
@@ -773,13 +1034,22 @@ def ask_question(name: str, args: dict[str, Any]) -> str:
             "turn with an [OPTIONS: a | b | c] tag instead — it renders "
             "clickable buttons on every channel that supports them."
         )
-    return session_directive.encode(
+    # Deep per-question/option validation, AUTHORITATIVELY here rather than in
+    # the shallow schema: a malformed nested question must be rejected before the
+    # model is told a card was posted, not surface later as a card-post failure.
+    # RETURNED, not raised: an escaped exception is turned into the same
+    # ``"Error: …"`` text by the JSON-RPC layer, but it escapes this server's own
+    # return path — so it is neither audited with the call's args nor tagged as a
+    # refusal, and the consumer reads a decline as a LOST DIRECTIVE MARKER
+    # (#8635). Returning keeps the model-facing text identical and keeps the
+    # "marker or refusal, nothing in between" invariant total.
+    try:
+        questions = validate_ask_user_question(args)
+    except ValidationError as exc:
+        return f"Error: {exc}"
+    return _emit_directive(
         "ask_question",
-        # Encode the AUTHORITATIVELY-validated + normalized questions (deep
-        # per-question/option checks), not the shallow-schema args: a
-        # malformed nested question must be rejected HERE, not surface as a
-        # card-post failure after the model was told it posted.
-        {"questions": validate_ask_user_question(args)},
+        {"questions": questions},
         "Question card requested for this session. End your turn now — if it "
         "renders, the user's answer arrives as your next message (do NOT "
         "re-ask or guess in the meantime). If no dashboard client is "
@@ -789,12 +1059,14 @@ def ask_question(name: str, args: dict[str, Any]) -> str:
 
 def monitor_start(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, MONITOR_START_SCHEMA)
-    # STRICT resolution (env-var only, no PID walk): monitor_start creates
-    # a persistent unattended loop that repeatedly runs tools in the bound
-    # session. A subagent under the parent's process tree must NOT be able
-    # to PID-walk into the parent's identity and mint a loop the parent
-    # user never asked for (crosses the session authorization boundary).
-    sk = mcp_core._resolve_session_key_strict()
+    # STRICT resolution via the shared gate (env-var only, no PID walk):
+    # monitor_start creates a persistent unattended loop that repeatedly runs
+    # tools in the bound session. A subagent under the parent's process tree
+    # must NOT be able to PID-walk into the parent's identity and mint a loop
+    # the parent user never asked for (crosses the session authorization
+    # boundary). Resolve-half only: the short-circuit below is on context,
+    # not identity, so an empty key falls through to the directive.
+    sk, _ = mcp_core.require_strict_session_key("monitor_start")
     # Stateless: only short-circuit contexts where a directive can
     # never be applied (cron/hook/subagent). The session-aware consumer
     # (chat_runner) supplies the binding key and arms the loop.
@@ -819,28 +1091,64 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     # the runaway backstop; the runtime budget is for callers that need a
     # hard TIME bound (e.g. "babysit this for at most 2 hours").
     max_runtime_secs = int(args.get("max_runtime_secs") or 0)
-    return session_directive.encode(
+    # The one escape from gating, and deliberately an opt-OUT. An opt-IN is what
+    # this change exists to stop shipping: five consecutive opt-in mechanisms
+    # measured zero adoption, because the default never moved. An opt-out does
+    # not share that failure -- the default gates everything, and this only
+    # releases the minority of loops whose duty is to act WHILE the subject is
+    # quiet (refresh a heartbeat, chase a silent reviewer, rebase onto a moving
+    # base). Those loops previously had no control but the wording of their own
+    # instruction, which is a fragile thing to key a cadence on.
+    gate = args.get("gate")
+    gate = True if gate is None else bool(gate)
+    # Infer from the message AS IT WILL BE STORED. The authorizer redacts
+    # exfiltration URLs and credentials at its own chokepoint before persisting,
+    # so a subject named by a URL the redactor rewrites survives here but not
+    # there -- and the ack would then promise gating for a loop that is armed
+    # ungated. Applying the same transform first makes the disclosure describe
+    # the loop that will actually exist.
+    stored_message, _ = redact_exfiltration_urls(message)
+    stored_message, _ = redact_credentials(stored_message)
+    gated = autonudge.infer_monitor(stored_message, time.time()) if gate else None
+    # ``banner`` is CONDITIONAL, unlike the fields above: a caller that sets no
+    # banner must see the payload shape it saw before, because the tool's
+    # contract test asserts this dict by EXACT equality. The applier reads it
+    # with ``.get``, so absent and empty mean the same thing there.
+    banner = str(args.get("banner") or "").strip()
+    payload: dict[str, Any] = {
+        "message": message,
+        "idle_secs": interval_secs,
+        "max_cycles": max_cycles,
+        "max_runtime_secs": max_runtime_secs,
+        "gate": gate,
+    }
+    if banner:
+        payload["banner"] = banner
+    # Say whether this loop will be GATED, in the ack, at the surface that armed
+    # it. This calls the SCHEDULER'S OWN decision function rather than
+    # re-deriving the answer from the target: a subject can infer cleanly and
+    # still fail to form a valid monitor, so a second evaluation could claim a
+    # gate the loop never got -- and a disclosure that can be wrong is worse than
+    # none. Without any disclosure the ack promises a plain re-injection "every
+    # {interval}s", which for a gated loop is untrue, and this whole change
+    # exists because a cadence change nobody could see had no effect.
+    return _emit_directive(
         "monitor_start",
-        {
-            "message": message,
-            "idle_secs": interval_secs,
-            "max_cycles": max_cycles,
-            "max_runtime_secs": max_runtime_secs,
-        },
+        payload,
         (
-            "Monitor loop requested on this session: the message will "
-            f"re-inject every {interval_secs}s (user messages defer a due "
+            "Monitor loop requested on this session: "
+            + (
+                f"observing {gated.target} every {interval_secs}s and "
+                "re-injecting the message only when it changes, so quiet cycles "
+                "cost no turn"
+                + (f" and the {max_cycles} cap counts delivered turns" if max_cycles else "")
+                if gated is not None
+                else f"the message will re-inject every {interval_secs}s"
+            )
+            + " (user messages defer a due "
             "fire to their turn's end without restarting the countdown)"
-            + (
-                f", stopping after {max_cycles} cycles"
-                if max_cycles
-                else ", with NO cycle cap"
-            )
-            + (
-                f", wall-clock budget {max_runtime_secs}s"
-                if max_runtime_secs
-                else ""
-            )
+            + (f", stopping after {max_cycles} cycles" if max_cycles else ", with NO cycle cap")
+            + (f", wall-clock budget {max_runtime_secs}s" if max_runtime_secs else "")
             + ". End your turn now; once the loop is armed it wakes you on "
             "that interval — but arming happens when this turn's result is "
             "processed, and only a live dashboard/Slack/Discord session can "
@@ -851,19 +1159,210 @@ def monitor_start(name: str, args: dict[str, Any]) -> str:
     )
 
 
+def _monitor_context_refusal(tool_name: str, session_key: str, message: str) -> str:
+    """Return a failed tool result and retain the security-relevant refusal."""
+    mcp_core.sel().log_tool_invocation(
+        session_key=session_key or "mcp_core",
+        source="mcp",
+        tool_name=tool_name,
+        outcome="denied",
+        error="unsupported_session_binding",
+    )
+    return f"Error: {message}"
+
+
+def _parsed_pull_request_target(raw: Any) -> tuple[str, str]:
+    """Return ``(url, "")`` for a valid PR target, or ``("", "Error: …")``.
+
+    ONE guarded parse for BOTH callers (``monitor_watch`` and ``monitor_update``)
+    rather than a ``try`` at each site. `parse_github_pull_request_target` raises,
+    and a raise from a directive tool escapes this server's own return path: the
+    JSON-RPC layer turns it into the same ``"Error: …"`` text, but past the point
+    that tags a decline as a refusal, so the consumer reads it as a LOST directive
+    marker and fires the WARNING reserved for a transport regression. Guarding the
+    two sites separately is what let the second one ship unguarded (#8635); a
+    single seam is what makes the next caller correct by construction.
+    """
+    try:
+        return parse_github_pull_request_target(str(raw)).url, ""
+    except ValueError as exc:
+        return "", f"Error: {exc}"
+
+
+def monitor_watch(name: str, args: dict[str, Any]) -> str:
+    """Validate and emit a session-bound structured monitor directive."""
+    args = validate_tool_args(args, MONITOR_WATCH_SCHEMA)
+    sk, strict_err = mcp_core.require_strict_session_key(
+        "monitor_watch requires an authenticated strict session binding. "
+        "No process-ancestor fallback is used."
+    )
+    if not sk:
+        return _monitor_context_refusal("monitor_watch", sk, strict_err)
+    if mcp_core._structured_monitor_binding_key(sk) is None:
+        return _monitor_context_refusal(
+            "monitor_watch",
+            sk,
+            "monitor_watch only works from within a dashboard, Slack, or "
+            f"Discord session (current session_key={sk!r}).",
+        )
+    target, target_error = _parsed_pull_request_target(args["target"])
+    if target_error:
+        return target_error
+    payload = {
+        "kind": args["kind"],
+        "target": target,
+        "objective": args["objective"],
+        "cadence_secs": int(args.get("interval_secs") or DEFAULT_MONITOR_CADENCE_SECS),
+        "max_runtime_secs": int(args.get("max_runtime_secs") or DEFAULT_MONITOR_RUNTIME_SECS),
+        "max_agent_turns": int(args.get("max_agent_turns") or DEFAULT_MONITOR_AGENT_TURNS),
+        "max_tokens": int(args.get("max_tokens") or DEFAULT_MONITOR_TOKENS),
+        "max_provider_errors": int(
+            args.get("max_provider_errors") or DEFAULT_MONITOR_PROVIDER_ERRORS
+        ),
+        "wake_instructions": str(args.get("wake_instructions") or "").strip(),
+    }
+    return _emit_directive(
+        "monitor_watch",
+        payload,
+        "Structured monitor requested for this session. End your turn; inspect the monitor "
+        "to confirm the authoritative consumer armed it.",
+    )
+
+
+def monitor_inspect(name: str, args: dict[str, Any]) -> str:
+    """Read only the monitor bound to a verified strict session identity."""
+    validate_tool_args(args, MONITOR_INSPECT_SCHEMA)
+    sk, strict_err = mcp_core.require_strict_session_key(
+        "Monitor inspection unavailable without an authenticated strict session binding. "
+        "No process-ancestor fallback is used."
+    )
+    if not sk:
+        return _monitor_context_refusal("monitor_inspect", sk, strict_err)
+    if mcp_core._structured_monitor_binding_key(sk) is None:
+        return _monitor_context_refusal(
+            "monitor_inspect",
+            sk,
+            f"monitor_inspect is unavailable for this session type ({sk!r}).",
+        )
+    result = mcp_core._get("/api/autonudge/session-monitor", session_key=sk)
+    if result.get("error"):
+        return f"Error: Monitor inspection failed: {result['error']}"
+    return json.dumps(
+        _compact_monitor_inspection(result),
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _compact_monitor_inspection(result: dict[str, Any]) -> dict[str, Any]:
+    """Project the browser record into a bounded, agent-oriented status."""
+    compact = {key: result.get(key) for key in ("enabled", "active", "monitor_id") if key in result}
+    raw = result.get("monitor")
+    if not isinstance(raw, dict):
+        compact["monitor"] = None
+        return compact
+    fields = (
+        "kind",
+        "target",
+        "objective",
+        "budgets",
+        "cadence_secs",
+        "last_fingerprint",
+        "last_wake_fingerprint",
+        "wake_in_flight",
+        "wake_count",
+        "agent_turns",
+        "input_tokens",
+        "output_tokens",
+        "probe_count",
+        "provider_error_count",
+        "consecutive_provider_errors",
+        "last_probe_at",
+        "created_ts",
+        "last_decision",
+        "last_wake_reason_code",
+        "last_provider_error",
+        "next_probe_at",
+        "outcome",
+        "stopped_reason",
+        "user_stop_reason",
+        "stopped_at",
+    )
+    monitor = {key: raw.get(key) for key in fields}
+    observation = raw.get("last_observation")
+    if isinstance(observation, dict):
+        observation_fields = (
+            "state",
+            "draft",
+            "head_revision",
+            "mergeability",
+            "review_decision",
+            "blocking_review",
+            "unresolved_review_threads",
+            "review_threads_complete",
+        )
+        summary = {key: observation.get(key) for key in observation_fields}
+        checks = observation.get("checks")
+        if isinstance(checks, dict):
+            check_summary: dict[str, Any] = {}
+            for status in ("failed", "pending", "unknown"):
+                values = checks.get(status)
+                if isinstance(values, list):
+                    check_summary[status] = values[:MAX_MONITOR_CHECK_NAMES]
+                    check_summary[f"{status}_count"] = len(values)
+            passed = checks.get("passed")
+            if isinstance(passed, list):
+                check_summary["passed_count"] = len(passed)
+            summary["checks"] = check_summary
+        monitor["observation"] = summary
+    compact["monitor"] = monitor
+    return compact
+
+
+def monitor_stop(name: str, args: dict[str, Any]) -> str:
+    """Emit a durable structured-stop directive without caller identity."""
+    args = validate_tool_args(args, MONITOR_STOP_SCHEMA)
+    sk, strict_err = mcp_core.require_strict_session_key(
+        "monitor_stop requires an authenticated strict session binding. "
+        "No process-ancestor fallback is used."
+    )
+    if not sk:
+        return _monitor_context_refusal("monitor_stop", sk, strict_err)
+    if mcp_core._structured_monitor_binding_key(sk) is None:
+        return _monitor_context_refusal(
+            "monitor_stop",
+            sk,
+            "monitor_stop only works from within a dashboard, Slack, or "
+            f"Discord session (current session_key={sk!r}).",
+        )
+    return _emit_directive(
+        "monitor_stop",
+        {"reason": str(args.get("reason") or "").strip()},
+        "Structured monitor stop requested for this session.",
+    )
+
+
 def monitor_update(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, MONITOR_UPDATE_SCHEMA)
-    # STRICT resolution, same rationale as monitor_start/autonudge_stop:
-    # this mutates persistent loop state that drives unattended turns, so a
-    # subagent must not PID-walk into the parent's identity and rewrite the
-    # parent session's instruction.
-    sk = mcp_core._resolve_session_key_strict()
+    # STRICT resolution via the shared gate, same rationale as
+    # monitor_start/autonudge_stop: this mutates persistent loop state that
+    # drives unattended turns, so a subagent must not PID-walk into the
+    # parent's identity and rewrite the parent session's instruction.
+    sk, strict_err = mcp_core.require_strict_session_key(
+        "monitor_update requires an authenticated strict session binding. "
+        "No process-ancestor fallback is used."
+    )
     # Stateless: short-circuit only un-appliable contexts; the
     # consumer resolves the loop by its own session and patches it.
-    if mcp_core._autonudge_binding_key(sk) is None and sk:
-        return (
+    if not sk:
+        return _monitor_context_refusal("monitor_update", sk, strict_err)
+    if mcp_core._structured_monitor_binding_key(sk) is None:
+        return _monitor_context_refusal(
+            "monitor_update",
+            sk,
             "monitor_update only works from within a dashboard, Slack, or "
-            f"Discord session (current session_key={sk!r})."
+            f"Discord session (current session_key={sk!r}).",
         )
     patch: dict[str, Any] = {}
     if args.get("message") is not None:
@@ -877,6 +1376,24 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
         patch["max_cycles"] = int(args["max_cycles"])
     if args.get("max_runtime_secs") is not None:
         patch["max_runtime_secs"] = int(args["max_runtime_secs"])
+    if args.get("target") is not None:
+        patch["target"], target_error = _parsed_pull_request_target(args["target"])
+        if target_error:
+            return target_error
+    if args.get("objective") is not None:
+        patch["objective"] = str(args["objective"])
+    for field in ("max_agent_turns", "max_tokens", "max_provider_errors"):
+        if args.get(field) is not None:
+            patch[field] = int(args[field])
+    if args.get("wake_instructions") is not None:
+        patch["wake_instructions"] = str(args["wake_instructions"]).strip()
+    # Blank is KEPT here, unlike ``message`` above which rejects it: a loop with
+    # no instruction cannot fire, but a loop with no banner is the default state,
+    # so "" has to round-trip as a request to CLEAR. Dropping it as "unchanged"
+    # would make a banner set once impossible to remove without tearing the loop
+    # down and losing its cycle count.
+    if args.get("banner") is not None:
+        patch["banner"] = str(args["banner"]).strip()
     if not patch:
         mcp_core.sel().log_tool_invocation(
             session_key=sk, source="mcp", tool_name="monitor_update", outcome="noop"
@@ -885,7 +1402,7 @@ def monitor_update(name: str, args: dict[str, Any]) -> str:
             "monitor_update: nothing to change — pass at least one of "
             "message, interval_secs, max_cycles, max_runtime_secs."
         )
-    return session_directive.encode(
+    return _emit_directive(
         "monitor_update",
         {"patch": patch},
         f"Monitor-loop update requested for this session "
@@ -898,13 +1415,30 @@ def set_project(name: str, args: dict[str, Any]) -> str:
     args = validate_tool_args(args, SET_PROJECT_SCHEMA)
     # Stateless: the session-aware consumer (chat_runner) applies the
     # project change to ITS OWN slot — no session identity resolved here.
-    return session_directive.encode(
+    return _emit_directive(
         "set_project",
         {"project": args.get("path", ""), "clear": bool(args.get("clear"))},
         "Project change requested for this session; if the path is valid "
         "and permitted it takes effect on the next message (cold-start with "
         "the new CWD and project steering). An invalid or sensitive path is "
         "rejected when this turn's result is processed.",
+    )
+
+
+def reset_conversation(name: str, args: dict[str, Any]) -> str:
+    validate_tool_args(args, RESET_CONVERSATION_SCHEMA)
+    # Stateless: the session-aware consumer (chat_runner) queues the discard
+    # against ITS OWN slot — no session identity resolved here. The payload is
+    # empty because there is nothing to choose: a caller asking for a clean
+    # context always wants a clean one, and the HTTP route carries a replay flag
+    # for the rare caller that does not.
+    return _emit_directive(
+        "reset_conversation",
+        {},
+        "Conversation reset requested for this session; if this turn is "
+        "user-facing it takes effect at a turn boundary, and the next message "
+        "starts with no memory of this conversation. The transcript is not "
+        "deleted — write down anything that must carry forward.",
     )
 
 
@@ -915,7 +1449,7 @@ def suggest_followup(name: str, args: dict[str, Any]) -> str:
     # the card to ITS OWN slot; no session identity resolved here. The card
     # is broadcast-only (dropped if no client attached), so the confirmation
     # stays cautious — restate the follow-ups in reply text if they matter.
-    return session_directive.encode(
+    return _emit_directive(
         "suggest_followup",
         {"items": items},
         "Follow-up card requested for this session. It is delivered to a "
@@ -933,7 +1467,11 @@ HANDLERS: dict[str, Callable[[str, dict[str, Any]], str]] = {
     "autonudge_stop": autonudge_stop,
     "ask_question": ask_question,
     "monitor_start": monitor_start,
+    "monitor_watch": monitor_watch,
+    "monitor_inspect": monitor_inspect,
+    "monitor_stop": monitor_stop,
     "monitor_update": monitor_update,
     "set_project": set_project,
+    "reset_conversation": reset_conversation,
     "suggest_followup": suggest_followup,
 }

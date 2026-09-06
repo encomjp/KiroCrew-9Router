@@ -48,7 +48,9 @@ jobs:
   # only_backend / only_frontend are computed here ONCE. `backend` is a
   # catch-all, so every changed file is exactly one of frontend / meta /
   # backend: a diff that touches two buckets (or meta) leaves BOTH flags false
-  # and the full matrix runs.
+  # and the full matrix runs. One exception: temp-screenshots/** evidence
+  # media counts toward NO bucket, so a screenshots-only diff also leaves both
+  # flags false and runs the full matrix (fails safe).
   changes:
     name: Detect changed surface
     runs-on: ubuntu-latest
@@ -63,9 +65,15 @@ jobs:
       only_backend: ${{ steps.decide.outputs.only_backend }}
       only_frontend: ${{ steps.decide.outputs.only_frontend }}
       linux_packaging: ${{ steps.filter.outputs.linux_packaging }}
+      leaf_tests: ${{ steps.leaf.outputs.leaf_tests }}
+      leaf_targets: ${{ steps.leaf.outputs.leaf_targets }}
+      leaf_gates: ${{ steps.leaf.outputs.leaf_gates }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # The leaf-test selector diffs against the PR base, so the base commit
+          # must be present. Paid once here rather than on every shard job.
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -73,12 +81,14 @@ jobs:
         with:
           # 'some-with-excludes': a file matches a filter when it matches at
           # least one pattern AND none of the negated ones. That lets `backend`
-          # be a true CATCH-ALL ("every changed file that is not frontend and not
-          # meta") instead of an allowlist that would have to be complete to be
-          # safe. Every changed file therefore lands in exactly one bucket, which
-          # is what makes "only_X means only X changed" literally true -- an
-          # unrecognised path (docs/**, *.md, a new root file) counts as backend
-          # rather than silently riding along under a narrowed suite.
+          # be a true CATCH-ALL ("every changed file that is not frontend, not
+          # meta, and not ignored evidence media") instead of an allowlist that
+          # would have to be complete to be safe. Every changed file therefore
+          # lands in exactly one bucket -- or none, for temp-screenshots/**
+          # evidence -- which is what keeps "only_X means only X changed" true
+          # for real files: an unrecognised path (docs/**, *.md, a new root
+          # file) counts as backend rather than silently riding along under a
+          # narrowed suite.
           # NOTE: this quantifier requires >= v4.0.3 (added upstream in PR #322);
           # v4.0.2 rejects the input and throws, so do not lower the pin.
           predicate-quantifier: 'some-with-excludes'
@@ -93,6 +103,15 @@ jobs:
               - '!website/**'
               - '!.github/**'
               - '!scripts/**'
+              # temp-screenshots/** is never-packaged, never-imported evidence
+              # media (cleanup-temp-screenshots.yml already treats it as
+              # ephemeral), so it must not drag a frontend-only PR into the
+              # full backend matrix (#8027). Excluding it keeps the catch-all
+              # safety property: any unrecognised REAL file still lands in
+              # backend, a screenshots+frontend diff stays only_frontend=true,
+              # and a screenshots-ONLY diff matches no bucket so both flags
+              # stay false and the FULL matrix runs (fails safe).
+              - '!temp-screenshots/**'
             # Independent of the three buckets above: it answers a different
             # question ("could this diff change what a Linux package installs?")
             # and so may overlap them freely.
@@ -128,6 +147,61 @@ jobs:
           echo "only_frontend=$only_frontend" >> "$GITHUB_OUTPUT"
           echo "backend=$BACKEND frontend=$FRONTEND meta=$META full_run=$FULL_RUN -> only_backend=$only_backend only_frontend=$only_frontend"
 
+      # A diff that touches ONLY leaf test modules cannot change a production code
+      # path, and cannot change another test file's outcome either -- the selector
+      # escalates on conftest, shared helpers, fixture trees, and any test module
+      # some other file imports. So the sharded suite is replaced by the changed
+      # files plus the gates that read the test/ tree as data, run several times.
+      #
+      # This exists because a one-line flaky-test fix used to wait ~30 minutes for
+      # the full matrix, which is what makes a flake block every open PR. Repeats
+      # matter more than breadth here: a flaky test run once in isolation passes.
+      #
+      # Every failure path below yields the FULL suite. `ci-full-run` still forces
+      # the whole matrix when a fix depends on suite-wide interleaving.
+      - name: Decide leaf-test scope
+        id: leaf
+        env:
+          FULL_RUN: ${{ contains(github.event.pull_request.labels.*.name, 'ci-full-run') }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -uo pipefail
+          leaf_tests=false
+          # BOTH must be pre-initialized: the heredoc below expands each one
+          # unconditionally, while they are assigned only in the `else` branch. A
+          # push build (no PR base) and a `ci-full-run` PR both take the `if`
+          # branch, so an uninitialized variable there dies on `set -u` and takes
+          # the whole `changes` job -- and every job that needs it -- with it,
+          # breaking the very full-matrix escape hatch this branch exists to serve.
+          targets=""
+          gates=""
+          if [ "$FULL_RUN" = "true" ] || [ -z "${BASE_SHA:-}" ]; then
+            echo "Full suite: ci-full-run label set, or no PR base (push build)."
+          else
+            rc=0
+            targets="$(SCOPED_TESTS_BASE_REF="$BASE_SHA" \
+              python3 scripts/leaf_test_scope.py --targets)" || rc=$?
+            gates="$(SCOPED_TESTS_BASE_REF="$BASE_SHA" \
+              python3 scripts/leaf_test_scope.py --gates)" || true
+            if [ "$rc" = "0" ] && [ -n "$targets" ]; then
+              leaf_tests=true
+              echo "Leaf-test diff: $(printf '%s\n' "$targets" | grep -c .) target file(s)."
+              printf '%s\n' "$targets" | sed 's/^/  - /'
+            else
+              echo "Full suite: not a leaf-test-only diff (selector rc=$rc)."
+              gates=""
+            fi
+          fi
+          echo "leaf_tests=$leaf_tests" >> "$GITHUB_OUTPUT"
+          {
+            echo "leaf_targets<<LEAF_EOF"
+            printf '%s\n' "$targets"
+            echo "LEAF_EOF"
+            echo "leaf_gates<<GATE_EOF"
+            printf '%s\n' "$gates"
+            echo "GATE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
   # Build the Linux desktop packages and install them for real, but ONLY when the
   # diff could change what a package installs. The check is expensive (a PBS
   # interpreter, a full pip closure, then electron-builder three times), and it
@@ -139,7 +213,7 @@ jobs:
   # exists to prevent: a package that builds green and refuses to install.
   linux-packaging:
     name: Linux Packaging (build + smoke-install)
-    needs: changes
+    needs: [changes, await-fast-gate]
     if: ${{ needs.changes.outputs.linux_packaging == 'true' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 45
@@ -171,260 +245,136 @@ jobs:
       - name: Install the packages in their target distros
         run: ./scripts/smoke-linux-packages.sh website/electron/dist
 
-  scrub-lint:
-    name: De-Amazon Scrub Lint
+  # ── Fast gate barrier (see .github/workflows/fast-gate.yml) ──────────
+  # The eleven cheap gates live in their own workflow so the fork reviewers can
+  # key on them, which means ci.yml cannot reach them with `needs:` -- a needs
+  # edge cannot cross a workflow file. This job is that edge: it reads the Fast
+  # Gate run for this exact commit and fails closed, and every heavy job needs
+  # it. One extra ~1-minute job buys the whole matrix the right to not start.
+  #
+  # Fails closed on purpose, in all three ways it can go wrong: a Fast Gate run
+  # that never appears, one that never completes inside the budget, and one that
+  # completes non-success all exit non-zero. A barrier that passed when it could
+  # not read its subject would be worse than no barrier, because the matrix would
+  # run anyway and the log would claim it was cleared to.
+  await-fast-gate:
+    name: Await Fast Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    permissions:
+      # actions:read is what lets this read another workflow's runs. Job-level
+      # permissions REPLACE the top-level grant, so contents:read is restated.
+      actions: read
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        # Full history is fetched lazily by the script only for the (skipped)
-        # history scan; the working-tree gate needs just the checkout.
-        with:
-          persist-credentials: false
-      - name: Scan working tree for internal markers
-        # Blocking gate: fails the build on any Amazon-internal marker in the
-        # public tree (internal domains/hosts, ticket ids, aliases, credential
-        # shapes) outside the intentional allowlist, so a sync cannot reintroduce
-        # a coupling. --no-history: git-history rewrite is a separate task.
-        run: ./scripts/scrub-lint.sh --no-history
-
-  vendor-manifest:
-    name: Vendored Tree Integrity
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # Deliberately NOT gated behind the `changes` job's surface outputs:
-    # everything under src/kiro_crew/_vendor is excluded from semgrep and the
-    # AI reviewers' diff, so this checksum gate is the only content review the
-    # vendored tree gets. Hashing the ~26MB tree takes seconds, and an
-    # always-on job cannot be dodged by a path-filter edge case.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Verify _vendor tree against the committed sha256 manifest
-        # Blocking gate: fails on any modified, missing, or added file under
-        # src/kiro_crew/_vendor relative to scripts/vendor_manifest.sha256.
-        # Legitimate vendored bumps regenerate the manifest with --write (see
-        # src/kiro_crew/_vendor/README.md) so the change lands as a reviewable
-        # manifest diff. No setup-python step: ubuntu-latest ships Python 3,
-        # same as the other stdlib-only lint jobs in this file.
-        run: python3 scripts/verify_vendor_manifest.py
-
-  brand-lint:
-    name: Brand Name Gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      # persist-credentials retained: brand-lint/Check the product name on the lines this change adds runs `git fetch origin`
-      # against the same remote, through the shared diff-base resolver script.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Check the product name on the lines this change adds
-        # Diff-scoped on purpose. The tree still carries thousands of prose lines
-        # that join the two words, from before the convention, so a whole-tree
-        # gate would fail every PR until one enormous rename lands and charge the
-        # break to whoever pushed next. Added lines are complete for regression —
-        # a line only reaches main through a diff that added it — and the
-        # whole-tree number is still printed as a non-failing report.
+      - name: Wait for the Fast Gate verdict on this commit
         env:
-          # `base.sha`, not `origin/<base>`: the merge ref this run checks out was
-          # computed against that exact commit, so the diff cannot pick up main
-          # moves that landed after the run started. Same reasoning as the
-          # i18n gates below; see the longer note at their first use.
-          BRAND_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # The head sha, not github.sha: on a pull_request event github.sha is
+          # the ephemeral merge commit, and Fast Gate's own run is keyed to the
+          # same head the PR reports. Matching on `event` too keeps a push run on
+          # the same commit from answering for a pull_request run.
+          SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+          # A head SHA is NOT a unique key for a run. Two pull requests can carry
+          # the same head commit -- a shared branch, a cherry-pick, a fork whose
+          # branch was pushed to a second PR -- and each one gets its own Fast Gate
+          # run on that commit. Keyed on the SHA alone, this job could read the
+          # OTHER PR's verdict and release its own matrix on a gate that never ran
+          # against this PR's base. The head branch plus the head repository is
+          # what makes the triple unique, so both are matched below and then
+          # re-verified on the run that is selected.
+          BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
+          HEAD_REPO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
         run: |
-          BRAND_BASE_REF="$(bash "$GITHUB_WORKSPACE/.github/scripts/resolve-i18n-base.sh" \
-            "$BRAND_BASE_REF" 'the brand-name gate')" || exit 1
-          export BRAND_BASE_REF
-          # Self-test first: it plants one probe per rule family, so a typo that
-          # silently disables an exemption fails here instead of shipping green.
-          python3 scripts/check_brand_name.py --test
-          python3 scripts/check_brand_name.py
+          set -euo pipefail
 
-  focus-cue-lint:
-    name: Focus Cue Gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      # persist-credentials retained: focus-cue-lint/Check the focus cues on the elements this change touches runs `git fetch origin`
-      # against the same remote, through the shared diff-base resolver script.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+          # Both workflows start from the same webhook, so Fast Gate's run may not
+          # be visible for the first few seconds. APPEAR_BUDGET covers that race;
+          # after it, a missing run is a real misconfiguration and fails.
+          APPEAR_BUDGET=180
+          TOTAL_BUDGET=720
+          started="$(date +%s)"
+          seen=false
 
-      - name: Check the focus cues on the elements this change touches
-        # Diff-scoped on purpose, same reasoning as the brand gate above: the tree
-        # still carries elements that opted out of the focus outline before the
-        # global ring existed, so a whole-tree gate would charge that backlog to
-        # whoever pushed next. Elements a change touched are complete for
-        # regression — a hole only reaches main through a diff that wrote its
-        # className — and the whole-tree number is still printed as a non-failing
-        # report.
-        env:
-          FOCUS_CUE_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          FOCUS_CUE_BASE_REF="$(bash "$GITHUB_WORKSPACE/.github/scripts/resolve-i18n-base.sh" \
-            "$FOCUS_CUE_BASE_REF" 'the focus-cue gate')" || exit 1
-          export FOCUS_CUE_BASE_REF
-          # Self-test first: it plants one probe per rule family, so a change that
-          # silently promotes a suppressor to a cue — or disables an exemption —
-          # fails here instead of shipping a gate that passes everything.
-          python3 scripts/check_focus_cue.py --test
-          python3 scripts/check_focus_cue.py
+          while :; do
+            elapsed=$(( $(date +%s) - started ))
 
-  changelog-history:
-    name: Changelog History Gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      # persist-credentials retained: changelog-history/Check that shipped changelog sections survived this change runs `git fetch origin`
-      # against the same remote, through the shared diff-base resolver script.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            runs="$(gh api --method GET \
+              "repos/$REPO/actions/workflows/fast-gate.yml/runs" \
+              -f "head_sha=$SHA" -f "event=$EVENT" -f "branch=$BRANCH" \
+              -f per_page=100 2>/dev/null || true)"
 
-      - name: Check that shipped changelog sections survived this change
-        # CHANGELOG.md is append-only history: every section already in it
-        # describes software a user has installed, so a line deleted from one is
-        # unrecoverable from that user's artifact. This has already happened
-        # once — a commit titled "docs: add 0.3.0-insider.9 changelog" REPLACED
-        # the file instead of prepending to it (53 insertions, 322 deletions),
-        # taking [0.2.0], [0.1.3] and [0.1.2] with it. It read as plausible in
-        # review because the insertions are what a reader looks at, and the
-        # deletions sat in the same hunk. Nothing failed; a user noticed the
-        # Releases page had gone nearly empty.
-        #
-        # So the judgment half of the rule (commit dumps, prerelease headings,
-        # whether this PR should touch the file at all) stays in AUTOSDE.yaml
-        # where a reviewer applies it, and the mechanical half runs here, where
-        # nobody has to notice anything. release.yml's stable gate is the
-        # complement: it checks the NEW section exists, not that the old ones
-        # survived — which is the half that actually failed.
-        env:
-          # base.sha, not origin/<base>: the merge ref this run checks out was
-          # computed against that exact commit, so the comparison cannot pick up
-          # base moves that landed after the run started. Same reasoning as the
-          # brand-name and i18n gates above.
-          CHANGELOG_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          CHANGELOG_BASE_REF="$(bash "$GITHUB_WORKSPACE/.github/scripts/resolve-i18n-base.sh" \
-            "$CHANGELOG_BASE_REF" 'the changelog-history gate')" || exit 1
-          export CHANGELOG_BASE_REF
-          # Self-test first: one probe per rule family, so a weakened rule fails
-          # here instead of shipping green and letting a deletion through.
-          python3 scripts/check_changelog_history.py --test
-          python3 scripts/check_changelog_history.py
+            # `branch=` is passed to the API as a narrowing hint, but the match is
+            # re-asserted here: a filter the server silently ignores would hand
+            # back another PR's run, and selecting max_by(.id) out of an unfiltered
+            # list would pick the NEWEST such run -- the most likely one to be a
+            # different PR's. Filter first, collapse second.
+            latest="$(printf '%s' "$runs" \
+              | jq -c --arg branch "$BRANCH" --arg repo "$HEAD_REPO" \
+                  '[(.workflow_runs // [])[]
+                    | select(.head_branch == $branch)
+                    | select(.head_repository.full_name == $repo)]
+                   | if length == 0 then null else max_by(.id) end' \
+                  2>/dev/null || echo null)"
 
-  loop-bound-locks:
-    name: Loop-Bound Locks Gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+            if [ "$latest" = "null" ] || [ -z "$latest" ]; then
+              if [ "$elapsed" -ge "$APPEAR_BUDGET" ]; then
+                echo "::error::No Fast Gate run found for $SHA on $HEAD_REPO@$BRANCH" \
+                     "($EVENT) after ${elapsed}s. The gates cannot be confirmed, so the" \
+                     "matrix is not cleared to run."
+                exit 1
+              fi
+              sleep 10
+              continue
+            fi
 
-      - name: Check for bare module-global asyncio primitives
-        # An asyncio.Lock/Event/Queue created at module scope binds to the
-        # import-time (or first-use) event loop and raises RuntimeError when
-        # acquired from another loop (Python 3.10+). #4800 converted every
-        # module-global lock to kiro_crew.loop_lock.LoopBoundLock; this gate
-        # keeps the declaration form of the class extinct (the registry form
-        # — dicts holding lazily-created locks — is a review concern; see the
-        # script docstring). Whole-tree, not diff-scoped: the backlog is zero
-        # after the conversion, so there is nothing to charge to whoever
-        # pushes next.
-        run: |
-          # Self-test first: it plants one probe per rule family, so a rule
-          # that silently stops matching fails here instead of shipping green.
-          python3 scripts/check_loop_bound_locks.py --test
-          python3 scripts/check_loop_bound_locks.py
+            status="$(printf '%s' "$latest" | jq -r '.status')"
+            conclusion="$(printf '%s' "$latest" | jq -r '.conclusion // ""')"
+            url="$(printf '%s' "$latest" | jq -r '.html_url')"
 
-  testpaths-coverage:
-    name: Testpaths Coverage Gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            if [ "$seen" = false ]; then
+              echo "Fast Gate run: $url"
+              seen=true
+            fi
 
-      - name: Check that every pytest test file sits under a collected root
-        # setup.cfg pins `testpaths`, so a test_*.py file created outside those
-        # roots is silently never run — green by omission — and rots against
-        # the code it claims to cover (#6577: twelve files sat uncollected in a
-        # root-level tests/ dir). Whole-tree, not diff-scoped: the backlog is
-        # zero after #6577's move, so there is nothing to charge to whoever
-        # pushes next. Nested distributions with their own pyproject/setup.cfg
-        # and marker-exempted manual scripts are excluded; see the script
-        # docstring.
-        run: |
-          # Self-test first: it plants one probe per rule family, so a rule
-          # that silently stops matching fails here instead of shipping green.
-          python3 scripts/check_testpaths_coverage.py --test
-          python3 scripts/check_testpaths_coverage.py
+            if [ "$status" = "completed" ]; then
+              case "$conclusion" in
+                success)
+                  echo "Fast Gate passed. Releasing the heavy jobs."
+                  exit 0
+                  ;;
+                *)
+                  echo "::error::Fast Gate concluded '$conclusion' ($url)." \
+                       "Fix the gate it reports; the heavy jobs are skipped on purpose."
+                  exit 1
+                  ;;
+              esac
+            fi
 
-  harness-parity:
-    name: Harness Parity Gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      # persist-credentials retained: harness-parity/Check harness identity tests on the lines this change adds runs `git fetch origin`
-      # against the same remote, through the shared diff-base resolver script.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+            if [ "$elapsed" -ge "$TOTAL_BUDGET" ]; then
+              echo "::error::Fast Gate still '$status' after ${elapsed}s ($url)." \
+                   "Failing closed rather than starting the matrix unverified."
+              exit 1
+            fi
 
-      - name: Check harness identity tests on the lines this change adds
-        # Kiro Crew drives one first-class harness (kiro-cli) and adapts the
-        # others. The defect class is a call site that spells "this is kiro" as
-        # the ABSENCE of another harness: correct with two backends, and then it
-        # hands the third a capability or a sandbox waiver nobody granted it.
-        # It fails toward the permissive answer, so nothing else goes red.
-        #
-        # Diff-scoped for the same reason as the brand gate above: the tree
-        # carries pre-existing negative tests in the dormant claude seam, and
-        # converting them is a separate change with its own review. Added lines
-        # are complete for regression, and the whole-tree count is still printed
-        # as a non-failing report. Invariants:
-        # docs/system-specs/modules/harness-parity.md
-        env:
-          # `base.sha` for the same reason as the brand gate: the merge ref this
-          # run checks out was computed against that exact commit.
-          HARNESS_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          HARNESS_BASE_REF="$(bash "$GITHUB_WORKSPACE/.github/scripts/resolve-i18n-base.sh" \
-            "$HARNESS_BASE_REF" 'the harness-parity gate')" || exit 1
-          export HARNESS_BASE_REF
-          # Self-test first: it plants one probe per rule, so a regex typo that
-          # silently disables a rule fails here instead of shipping green.
-          python3 scripts/check_harness_parity.py --test
-          python3 scripts/check_harness_parity.py
-
-  docs-lint:
-    name: Docs Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Verify the linter's own checks still fire
-        # Self-test first: a gate that has silently stopped detecting anything is
-        # worse than no gate, because it reads as a green signal. Each check is
-        # exercised against a planted defect in a throwaway tree.
-        run: python3 scripts/docs_lint.py --test
-
-      - name: Lint documentation trees
-        # Blocking gate: every internal link resolves, every doc is reachable from
-        # its directory index, every directory holding docs has one, no code comment
-        # cites a doc that does not exist, and no doc whose filename is hardcoded in
-        # code has been renamed out from under its consumer.
-        # No setup-python step: ubuntu-latest ships Python 3 and the script is
-        # stdlib-only.
-        run: ./scripts/docs-lint.sh
+            sleep 10
+          done
 
   backend-lint:
     name: Backend Lint & Type Check
+    needs: [changes, await-fast-gate]
+    # black/flake8/isort/mypy read no file under website/, so a frontend-only
+    # diff cannot change this verdict. Gated on only_frontend (not on a
+    # positive "python changed" allowlist) so that anything the selector could
+    # not classify as frontend -- docs, a new root file, meta -- still runs it.
+    if: needs.changes.outputs.only_frontend != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.12"]
     steps:
       # Full history so the black gate can compute THIS change's own diff. A
       # shallow clone truncates parent info and leaves no base ref, and the gate
@@ -479,6 +429,33 @@ jobs:
           python3 scripts/check_subprocess_encoding.py --test
           python3 scripts/check_subprocess_encoding.py
 
+      # Application code must reach the agent backend through kiro_crew.agent_sdk,
+      # not by importing kiro_crew.acp (or kiro_crew.providers, which re-exports
+      # the same ACP shapes and would otherwise be a laundering channel). Today's
+      # edges are carried in the baseline as pre-existing and it is shrink-only. Design
+      # record: docs/request-for-change/rfc-crew-agent-sdk-boundary.md.
+      # Self-test first, same reason as the gate above.
+      - name: Check agent-SDK import boundary (gate, baselined)
+        run: |
+          python3 scripts/check_agent_sdk_boundary.py --test
+          python3 scripts/check_agent_sdk_boundary.py
+
+      # Blocking IO inside an `async def` stalls every session's turn, and a
+      # stall past dashboard.loop_stall_exit_after_secs (25s) makes the watchdog
+      # kill the gateway — the user sees a restart for no apparent reason and
+      # loses every in-flight turn (#1572). #3057's audit found the sites
+      # cluster where nothing was watching: ~70 on-loop store.db.execute() calls
+      # in dashboard/handlers/knowledge.py against zero in handlers/memory.py
+      # next door. Baselined for the same reason as the gates above — the
+      # known set is recorded as legacy so it can only shrink, while a NEW call
+      # (or one on a line this change adds) fails here.
+      - name: Check for blocking IO inside async def (gate, baselined)
+        run: |
+          # Self-test first: it plants one probe per rule family, so a rule that
+          # silently stops matching fails here instead of shipping green.
+          python3 scripts/check_sync_io_in_async.py --test
+          python3 scripts/check_sync_io_in_async.py
+
       # A secret-bearing file must be locked down BEFORE any content reaches it:
       # a post-publish lockdown leaves the payload at its final path under the
       # inherited DACL, which on Windows is not covered by atomic_write's POSIX
@@ -507,16 +484,19 @@ jobs:
 
   backend-test:
     name: Backend Tests
-    needs: [changes]
+    needs: [changes, await-fast-gate]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The slowest 3.12 shard runs ~29 minutes, so a 30-minute cap kills the
+    # job at the coverage step with every test green and Coverage Gate then
+    # reds on the missing shard artifact. Same budget as backend-test-windows.
+    timeout-minutes: 40
     strategy:
       # Don't cancel sibling shards when one fails -- we want the full failure
       # picture across the suite, not just the first shard to break.
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
-        # Duration-balanced shards (pytest-split). 4 groups x 2 Python = 8
+        python-version: ["3.12"]
+        # Duration-balanced shards (pytest-split). 4 groups x 1 Python = 4
         # parallel jobs, each on its own runner (4 cores via -n auto). To add
         # shards, extend this list AND bump SHARD_COUNT to match -- mind the
         # ~20 concurrent-job ceiling for public repos.
@@ -550,6 +530,8 @@ jobs:
         id: scope
         env:
           ONLY_FRONTEND: ${{ needs.changes.outputs.only_frontend }}
+          LEAF_TESTS: ${{ needs.changes.outputs.leaf_tests }}
+          LEAF_TARGETS: ${{ needs.changes.outputs.leaf_targets }}
           TARGETS_FILE: ${{ runner.temp }}/backend-targets.txt
         # A frontend-only diff cannot affect a backend test that never touches
         # the frontend surface, so we run only the files the selector could NOT
@@ -557,6 +539,20 @@ jobs:
         # Every failure path here falls back to the FULL suite on purpose --
         # never trade a missed test for a faster run.
         run: |
+          # Leaf-test verdict wins: it is the narrower and more specific reduction,
+          # and it is computed once in the `changes` job. `reduced=true` rides along
+          # so every existing coverage guard keyed on it keeps working unchanged --
+          # a subset's coverage is not comparable to the repo floor either way.
+          if [ "$LEAF_TESTS" = "true" ] && [ -n "${LEAF_TARGETS//[[:space:]]/}" ]; then
+            printf '%s\n' "$LEAF_TARGETS" | grep . > "$TARGETS_FILE" || true
+            if [ -s "$TARGETS_FILE" ]; then
+              echo "reduced=true" >> "$GITHUB_OUTPUT"
+              echo "leaf=true" >> "$GITHUB_OUTPUT"
+              echo "Leaf-test scope: $(wc -l < "$TARGETS_FILE") file(s), repeated."
+              exit 0
+            fi
+            echo "::warning::leaf targets arrived empty -- running the FULL backend suite."
+          fi
           if [ "$ONLY_FRONTEND" != "true" ]; then
             echo "reduced=false" >> "$GITHUB_OUTPUT"
             echo "Full backend suite (diff is not frontend-only)."
@@ -580,21 +576,77 @@ jobs:
         # by test count. -n auto still parallelizes within each shard across the
         # runner's cores -- sharding scales across runners, -n auto across cores.
         #
-        # Coverage runs only on 3.12 (fast sys.monitoring path); each shard emits
-        # a partial data file merged later by the coverage-combine job. 3.10
-        # passes --no-cov (overriding setup.cfg's forced --cov) for a trace-free,
-        # faster run.
+        # Coverage runs on every shard: since the floor moved to >= 3.12 the
+        # matrix has a single Python, so there is no --no-cov lane left. Each
+        # shard emits a partial data file merged later by the coverage-combine
+        # job.
         env:
           REDUCED: ${{ steps.scope.outputs.reduced }}
+          LEAF: ${{ steps.scope.outputs.leaf }}
+          LEAF_REPEAT: "3"
+          LEAF_GATES: ${{ needs.changes.outputs.leaf_gates }}
           TARGETS_FILE: ${{ runner.temp }}/backend-targets.txt
         run: |
+          # Take the `python` problem matcher registered by actions/setup-python
+          # out of scope before pytest writes a line. Its pattern is a traceback
+          # frame followed by `raise SomeError('msg')`, matched anywhere in the
+          # log -- including inside pytest's warnings summary. MEASURED on the six
+          # jobs in #7296: it matched a warning traceback every time and a pytest
+          # failure not once, so every red was annotated `Event loop is closed`
+          # at asyncio/base_events.py's line 545 while the tests that actually
+          # failed were named in no annotation at all, and four unrelated PRs
+          # were misdiagnosed as an event-loop teardown flake. conftest.py's
+          # `pytest_terminal_summary` now emits the annotations from pytest's own
+          # report objects; this keeps a louder wrong answer off the check run.
+          # Not `add-problem-matchers: false`: that input does not exist on this
+          # action pin, and passing it only adds an "Unexpected input(s)" warning.
+          echo "::remove-matcher owner=python::"
           # Reduced scope (frontend-only diff): run just the cross-surface
           # files, still sharded, with coverage off -- a subset's coverage is
           # not comparable to the repo floor, so Coverage Combine/Gate skip the
           # backend lane for this run (see coverage-gate).
+          TARGETS=()
           if [ "$REDUCED" = "true" ]; then
-            TARGETS=()
             while IFS= read -r line; do line=${line%$'\r'}; if [ -n "$line" ]; then TARGETS+=("$line"); fi; done < "$TARGETS_FILE"
+          fi
+          # Leaf-test scope: run the whole narrow set on every matrix job, NOT
+          # split across shards -- 14 files do not shard usefully, and the point
+          # is repeats. Each shard job is then an independent roll on its own
+          # runner, which is what a flake fix actually needs. Measured
+          # on this checkout: one pass over the narrow set is ~38s (910 tests)
+          # against ~29 minutes for the slowest full shard.
+          if [ "$LEAF" = "true" ]; then
+            # The corpus gates run ONCE: they are deterministic content assertions,
+            # so repeating them buys nothing and -- at ~3 minutes a pass over ~158
+            # files -- would dominate the run and undo the reduction. Only the
+            # CHANGED files repeat, because that is where a flake lives.
+            GATES=()
+            while IFS= read -r line; do line=${line%$'\r'}; if [ -n "$line" ]; then GATES+=("$line"); fi; done <<< "$LEAF_GATES"
+            CHANGED=()
+            for target in "${TARGETS[@]}"; do
+              keep=1
+              for gate in "${GATES[@]}"; do
+                if [ "$target" = "$gate" ]; then keep=0; break; fi
+              done
+              if [ "$keep" = "1" ]; then CHANGED+=("$target"); fi
+            done
+            if [ "${#CHANGED[@]}" -eq 0 ]; then
+              echo "::error::leaf run resolved no changed files -- refusing to report green."
+              exit 1
+            fi
+            if [ "${#GATES[@]}" -gt 0 ]; then
+              echo "::group::leaf corpus gates (${#GATES[@]} file(s), once)"
+              pytest -q -n auto --timeout=120 --no-cov "${GATES[@]}"
+              echo "::endgroup::"
+            fi
+            for pass in $(seq 1 "$LEAF_REPEAT"); do
+              echo "::group::leaf changed files, pass $pass/$LEAF_REPEAT"
+              pytest -q -n auto --timeout=120 --no-cov "${CHANGED[@]}"
+              echo "::endgroup::"
+            done
+            exit 0
+          fi
+          if [ "$REDUCED" = "true" ]; then
             pytest -q -n auto --timeout=120 \
               --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
               --no-cov \
@@ -603,7 +655,7 @@ jobs:
           fi
           pytest -q -n auto --timeout=120 \
             --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
-            ${{ matrix.python-version == '3.12' && '--cov=kiro_crew --cov=sage_lib' || '--no-cov' }}
+            --cov=kiro_crew --cov=sage_lib
         # Nothing is deselected. The eleven files that used to be -- the two sandbox
         # suites, the two ops git/gh suites, and the seven auto_improvement suites --
         # each carry `skipif(not userns_available())` on the tests that need a namespace
@@ -611,7 +663,7 @@ jobs:
         # named reason and the other ~523 run. See the note above the `jobs:` key.
 
       - name: Stage shard coverage data
-        if: matrix.python-version == '3.12' && steps.scope.outputs.reduced != 'true'
+        if: steps.scope.outputs.reduced != 'true'
         # Fold any xdist parallel data files into a single .coverage (no-op if
         # pytest-cov already combined this shard), then name it per-shard so the
         # combine job can merge all shards with `coverage combine`.
@@ -621,7 +673,7 @@ jobs:
           mv .coverage ".coverage.${{ matrix.group }}"
 
       - name: Upload shard coverage
-        if: matrix.python-version == '3.12' && steps.scope.outputs.reduced != 'true'
+        if: steps.scope.outputs.reduced != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-shard-${{ matrix.group }}
@@ -637,13 +689,13 @@ jobs:
   # Python (3.12: the preferred Windows runtime; numpy 1.x ships no 3.13
   # Windows wheel), duration-balanced shards like the POSIX matrix,
   # trace-free (--no-cov: the coverage-combine job merges ubuntu shards
-  # only). Timeout is higher than the POSIX job: windows-latest runners
-  # run the same tests measurably slower.
+  # only).
   backend-test-windows:
     name: Backend Tests (Windows)
-    needs: [changes]
+    needs: [await-fast-gate]
     runs-on: windows-latest
-    # windows-latest runs the same shards measurably slower than POSIX.
+    # Same 40-minute budget as backend-test; windows-latest runs the same
+    # shards measurably slower, so this job has the least headroom of the two.
     timeout-minutes: 40
     strategy:
       # Full failure picture across shards, same as backend-test.
@@ -678,29 +730,14 @@ jobs:
       - name: Install dependencies
         run: uv pip install --system -e ".[voice,desktop]" --group dev
 
-      - name: Select test scope
-        id: scope
-        # bash (Git Bash on windows-latest), not pwsh -- same reason as the test
-        # step below. Mirrors the POSIX backend-test selector exactly.
-        shell: bash
-        env:
-          ONLY_FRONTEND: ${{ needs.changes.outputs.only_frontend }}
-          TARGETS_FILE: ${{ runner.temp }}/backend-targets.txt
-        run: |
-          if [ "$ONLY_FRONTEND" != "true" ]; then
-            echo "reduced=false" >> "$GITHUB_OUTPUT"
-            echo "Full backend suite (diff is not frontend-only)."
-            exit 0
-          fi
-          rc=0
-          python3 scripts/ci-surface-tests.py --surface backend --summary > "$TARGETS_FILE" || rc=$?
-          if [ "$rc" != "0" ] || [ ! -s "$TARGETS_FILE" ]; then
-            echo "::warning::surface selector unusable (rc=$rc) -- running the FULL backend suite."
-            echo "reduced=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "reduced=true" >> "$GITHUB_OUTPUT"
-          echo "Reduced scope: $(wc -l < "$TARGETS_FILE") cross-surface backend file(s)."
+      # No surface selector here, unlike the POSIX backend-test job. Narrowing
+      # this job to the cross-surface subset on a frontend-only diff was
+      # measured as a PESSIMISATION: 4 shards x ~18 min = 70 job-min for the
+      # subset, against 62-67 job-min for the whole suite (runs 33412618648 vs
+      # 33406565382). `-n auto` already saturates each runner, so a smaller
+      # file list does not shorten a shard, and the cross-surface files are not
+      # the cheap ones. Running everything is both cheaper and strictly more
+      # coverage, so there is nothing to select.
 
       - name: Run tests (Windows shard ${{ matrix.group }}/${{ env.SHARD_COUNT }})
         # bash (Git Bash on windows-latest), not pwsh: the invocation shares
@@ -731,18 +768,11 @@ jobs:
         # is red either way, and a named red in 12 minutes beats an
         # uninterpretable one at the 40-minute cap.
         shell: bash
-        env:
-          REDUCED: ${{ steps.scope.outputs.reduced }}
-          TARGETS_FILE: ${{ runner.temp }}/backend-targets.txt
         run: |
-          if [ "$REDUCED" = "true" ]; then
-            TARGETS=()
-            while IFS= read -r line; do line=${line%$'\r'}; if [ -n "$line" ]; then TARGETS+=("$line"); fi; done < "$TARGETS_FILE"
-            pytest -q -n auto --timeout=180 --no-cov --max-worker-restart=0 \
-              --splits "$SHARD_COUNT" --group ${{ matrix.group }} \
-              "${TARGETS[@]}"
-            exit 0
-          fi
+          # Same as backend-test (#7296): the `python` matcher annotates any
+          # traceback in the log, including one printed inside a warning, and
+          # never matches a pytest failure.
+          echo "::remove-matcher owner=python::"
           pytest -q -n auto --timeout=180 --no-cov --max-worker-restart=0 \
             --splits "$SHARD_COUNT" --group ${{ matrix.group }}
         # Nothing is deselected here either, and the same guards carry it: Windows has no
@@ -770,6 +800,7 @@ jobs:
   # about 4 seconds, so the job's wall time is essentially dependency install.
   backend-test-macos:
     name: Gateway Tests (macOS)
+    needs: [await-fast-gate]
     runs-on: macos-14
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -804,6 +835,10 @@ jobs:
       - name: Assert the macOS peer-identity canary runs (not skipped)
         run: |
           set -o pipefail
+          # Same as backend-test (#7296): the `python` matcher annotates any
+          # traceback in the log, including one printed inside a warning, and
+          # never matches a pytest failure.
+          echo "::remove-matcher owner=python::"
           pytest -v -n0 --no-cov --timeout=120 \
             "test/test_socketsec.py::test_macos_check_matches_a_socket_we_connected_to_ourselves" \
             | tee canary.log
@@ -849,6 +884,7 @@ jobs:
   #
   backend-test-sandbox:
     name: Backend Tests (namespace sandbox)
+    needs: [await-fast-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -886,6 +922,10 @@ jobs:
         # `coverage-combine` taught to consume it, which couples the coverage gate to a
         # job it does not depend on today. Separate change; the omit carries the pointer.
         run: |
+          # Same as backend-test (#7296): the `python` matcher annotates any
+          # traceback in the log, including one printed inside a warning, and
+          # never matches a pytest failure.
+          echo "::remove-matcher owner=python::"
           pytest -q --timeout=180 --no-cov \
             test/test_script_hooks.py \
             test/test_cron_script.py \
@@ -905,7 +945,14 @@ jobs:
     # A frontend-only diff runs the backend suite as a coverage-free subset, so
     # there are no shard artifacts to combine. Coverage Gate asserts this job is
     # exactly `skipped` in that case, and `success` otherwise.
-    if: needs.changes.outputs.only_frontend != 'true'
+    #
+    # A leaf-test diff is the SAME situation for a different reason, and it needs
+    # naming separately: it is a BACKEND diff, so `only_frontend` is false, and
+    # without this clause the job would run and fail on artifacts the leaf lane
+    # deliberately never uploaded.
+    if: >-
+      needs.changes.outputs.only_frontend != 'true'
+      && needs.changes.outputs.leaf_tests != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1048,6 +1095,7 @@ jobs:
       - name: Require upstream coverage jobs to have succeeded
         env:
           CC: ${{ needs.coverage-combine.result }}
+          LEAF_TESTS: ${{ needs.changes.outputs.leaf_tests }}
           FE: ${{ needs.frontend-test.result }}
           FCM: ${{ needs.frontend-coverage-merge.result }}
           BE: ${{ needs.backend-test.result }}
@@ -1094,7 +1142,18 @@ jobs:
           # coverage-combine is therefore skipped by design. Anything else
           # (failure, cancellation, dependency-skip, or a run that happened when
           # it shouldn't have) fails closed.
-          if [ "$ONLY_FRONTEND" = "true" ]; then
+          # A leaf-test run is coverage-free by design (the backend lane runs a
+          # subset, whose coverage is not comparable to the repo floor), so
+          # coverage-combine is skipped for it exactly as it is for a
+          # frontend-only run. Checked BEFORE the frontend branch because the two
+          # flags are independent and a leaf diff sets only this one.
+          if [ "$LEAF_TESTS" = "true" ]; then
+            if [ "$CC" != "skipped" ]; then
+              echo "::error::coverage-combine=$CC but this run was a leaf-test run (expected exactly 'skipped') -- inconsistent."
+              exit 1
+            fi
+            echo "Leaf-test run: coverage-combine skipped by design; backend coverage not asserted."
+          elif [ "$ONLY_FRONTEND" = "true" ]; then
             if [ "$CC" != "skipped" ]; then
               echo "::error::coverage-combine=$CC but this run was frontend-only (expected exactly 'skipped') -- inconsistent."
               exit 1
@@ -1215,6 +1274,11 @@ jobs:
 
   frontend-lint:
     name: Frontend Lint & Type Check
+    needs: [changes, await-fast-gate]
+    # eslint/tsc/i18n over website/** only; a backend-only diff leaves every
+    # input byte-identical. only_backend is the catch-all side of the same
+    # decision, so an unclassifiable path still runs this.
+    if: needs.changes.outputs.only_backend != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -1242,15 +1306,18 @@ jobs:
 
       - name: Lint
         working-directory: website
-        # Blocking: fails on any eslint error and on any NEW warning above the
-        # current baseline. Ratchet --max-warnings down toward 0 as the
-        # pre-existing warnings (no-explicit-any, jsx-a11y, no-console) are burned
-        # down; do not raise it.
+        # Blocking, and the tree is at ZERO: the ceiling is a hard zero rather than
+        # a stored baseline, so any warning a change introduces fails here. A hard
+        # zero is the only ceiling that needs no bookkeeping — there is no count to
+        # re-measure and no ceiling that can drift above the truth.
         #
-        # The ceiling must EQUAL the measured count, not sit above it: slack is
-        # silent admission, and a warning that lands inside it never surfaces
-        # again. Re-measure with `cd website && npx eslint src/` when burning down.
-        run: npx eslint src/ --max-warnings 659
+        # NEVER raise this number. A warning admitted into slack never surfaces
+        # again: it is indistinguishable from the pre-existing ones and nothing
+        # downstream reports it. Fix the warning, or — if the code is genuinely
+        # right — suppress that one line with
+        # `// eslint-disable-next-line <rule> -- <why the code is correct>`, which
+        # is reviewable in the diff where a raised ceiling is not.
+        run: npx eslint src/ --max-warnings 0
 
       - name: Copy/paste detection
         working-directory: website
@@ -1383,6 +1450,9 @@ jobs:
   # class, and without a job on the floor nothing would notice.
   lockfile-engines-floor:
     name: Lockfile Installs On Declared Node Floor
+    needs: [changes, await-fast-gate]
+    # Reads website/package.json + website/package-lock.json and nothing else.
+    if: needs.changes.outputs.only_backend != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1428,6 +1498,10 @@ jobs:
 
   cfn-lint:
     name: CloudFormation Lint
+    needs: [changes, await-fast-gate]
+    # The templates it lints live under src/kiro_crew/deploy/, which the
+    # paths-filter counts as backend, so a frontend-only diff cannot touch one.
+    if: needs.changes.outputs.only_frontend != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1455,8 +1529,17 @@ jobs:
   # shipped DMG. That is not hypothetical: the missing macOS microphone
   # entitlement reached users this way. This job is deliberately tiny and fast —
   # pure unit tests, no Electron binary download, no packaging.
+  # NOT diff-gated, deliberately. The obvious gate (only_backend != 'true')
+  # is wrong: test/packaging.test.js pins the macOS entitlement contract
+  # against BOTH signing lanes, and one of them is
+  # packaging/signing/Entitlements.entitlements -- outside website/, so the
+  # paths-filter counts it as backend. A packaging-only diff would therefore
+  # skip the job whose absence already shipped a broken bundle once (the
+  # missing microphone entitlement above). Same for the
+  # packaging/installer-assets/* references it pins.
   electron-test:
     name: Electron Shell Tests
+    needs: [await-fast-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -1488,7 +1571,7 @@ jobs:
 
   frontend-test:
     name: Frontend Tests
-    needs: [changes]
+    needs: [changes, await-fast-gate]
     runs-on: ubuntu-latest
     # Per-shard budget. The whole suite was ~23 min on one runner; split four
     # ways each shard is well under this, and a hung shard fails fast.
@@ -1628,7 +1711,16 @@ jobs:
     # coverage-free subset, so there is nothing to merge and the Coverage Gate
     # skips the frontend lane.) `!cancelled()` lets it still stitch a report
     # when a shard failed, so the failure surfaces in one place.
-    if: ${{ !cancelled() && needs.changes.outputs.only_backend != 'true' }}
+    #
+    # The `!= 'skipped'` clause is what keeps that `!cancelled()` honest now that
+    # the shards sit behind await-fast-gate: a red fast gate skips frontend-test,
+    # and without this the merge would still run, find no coverage artifact, and
+    # go red for a reason that has nothing to do with the gate the developer has
+    # to fix. A skipped shard set has nothing to stitch; a FAILED one still does.
+    if: >-
+      ${{ !cancelled()
+      && needs.frontend-test.result != 'skipped'
+      && needs.changes.outputs.only_backend != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -1693,7 +1785,7 @@ jobs:
 
   bundle-size:
     name: Bundle Size Gate
-    needs: [changes]
+    needs: [changes, await-fast-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     # A backend-only diff cannot change the frontend bundle, so this gate has
@@ -1734,6 +1826,7 @@ jobs:
 
   e2e:
     name: E2E (stub ACP backend, offline)
+    needs: [await-fast-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -1879,3 +1972,24 @@ jobs:
           # for discoverability). See docs/system-specs/modules/history.md.
           KIROCREW_STRICT_ON_LOOP_PERSIST: "1"
         run: python setup.py test_e2e
+
+      # The specs' own failure record. Playwright writes one directory per
+      # failed attempt under website/test-results/ -- the ARIA snapshot of the
+      # page at the failing assertion (error-context.md), the on-first-retry
+      # trace, and any screenshot -- and the html report next to it. Until this
+      # step existed none of it left the runner: #8526 was triaged for hours from
+      # a log line that named `error-context.md` and nothing else. Failure-only,
+      # because a green run has nothing in either directory worth keeping and
+      # the job already uploads coverage. `ignore` rather than `error`: a run
+      # that failed before the specs started (a browser install that stalled)
+      # has no results, and this step must not turn that into a second failure.
+      - name: Upload Playwright failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-playwright-failures
+          path: |
+            website/test-results/
+            website/playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7

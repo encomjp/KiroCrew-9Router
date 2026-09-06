@@ -97,6 +97,8 @@ describe('the generic tool row', () => {
 
 describe('the shape-matched cards', () => {
   it('draws a stop event through StopEventCard', () => {
+    // Resolved from the SDK default now that this module no longer overrides the
+    // row — the point being that the merged registry still lands on the card.
     const m = msg('assistant', { kind: 'stop_event' })
     const { el, id } = drawn(m)
     expect(id).toBe('stop_event')

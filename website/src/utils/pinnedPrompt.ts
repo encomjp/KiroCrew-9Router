@@ -1,6 +1,7 @@
 import type { DisplayItem } from '../pages/chat/types'
 import { TURN_OPENER_ROLES } from '../pages/chat/groupDisplayItems'
 import { mdImageDestToPath } from './fileTokens'
+import { type PasteBlock, expandAll } from './pasteTokens'
 
 /**
  * Geometry + selection helpers for the pinned-prompt banner (the most recent
@@ -123,9 +124,9 @@ export function findNextPromptIdx(items: DisplayItem[], afterIdx: number): numbe
  * The walk deliberately consumes MACHINE turn openers too (nudge and subagent
  * rows — `isPrompt` derives from `TURN_OPENER_ROLES`), not only consecutive
  * user rows like a steer following its prompt. The mechanism-backed case is a
- * subagent fan-out whose synthesis is still pending: `groupDisplayItems`
- * suppresses each per-completion reply under `synthesisPending`, so the
- * completions lay out as one run of consecutive opener rows. Consecutive
+ * fan-out whose completions drain back to back: each is a turn opener and none
+ * of them carries a reply of its own, so they lay out as one run of consecutive
+ * opener rows. Consecutive
  * nudge rows arise only when nudged turns persist no reply (an errored or
  * cancelled cycle — a normal cycle interposes its tool/assistant rows). In
  * both shapes each row is pinnable, and each belongs to the same contextual
@@ -352,6 +353,158 @@ export function promptImages(content: string): string[] {
     }
   }
   return out
+}
+
+/**
+ * Per-block character budget applied when a pinned prompt's `[ Paste #N · M
+ * lines ]` tokens are substituted for the text they stand for.
+ *
+ * Unbounded substitution is not an option here. The store deliberately keeps a
+ * sent prompt's content in its COLLAPSED, token-bearing form (`recollapsePastes`
+ * in pasteTokens) precisely so nothing downstream measures or lays out hundreds
+ * of KB, and this module's consumer re-derives once per animation frame of a
+ * scroll. A cap keeps both properties: enough text to fill the three-line
+ * collapsed card and the scrollable expanded strip from real content, far short
+ * of the sizes that froze the tab. The rest stays one click away — the card's
+ * body IS a jump-to-turn button, and the bubble it jumps to has the paste in
+ * full behind its own chip.
+ */
+export const PINNED_PASTE_HEAD_CHARS = 12000
+
+/**
+ * Substitute every `[ Paste #N · M lines ]` token in `content` for a head-capped
+ * copy of its block's text, optionally passing that text through `mapBlock`.
+ *
+ * Ranges come from `findTokenRanges` — the same locator the bubble, the composer
+ * highlight layer and the copy handler use — so the pinned card can never
+ * disagree with them about which token belongs to which block. The splice walks
+ * right-to-left so each write leaves the earlier ranges' offsets valid.
+ *
+ * A truncated block ends in ` …` so the card never implies the paste stopped
+ * where the cap did.
+ */
+export function expandPastesCapped(
+  content: string,
+  blocks: PasteBlock[],
+  mapBlock?: (text: string) => string,
+): string {
+  // Safe to delegate: `findTokenRanges` pairs a token to a block by `seq`, and
+  // the spread preserves it, so rewriting content cannot move a range.
+  return expandAll(content, blocks.map(b => {
+    const capped = b.content.length > PINNED_PASTE_HEAD_CHARS
+      ? b.content.slice(0, PINNED_PASTE_HEAD_CHARS) + ' …'
+      : b.content
+    return { ...b, content: mapBlock ? mapBlock(capped) : capped }
+  }))
+}
+
+/** Everything the pinned card renders, derived from one prompt in one pass. */
+export interface PinnedPromptText {
+  /** Flattened, clamp-ready preview for the COLLAPSED card. */
+  text: string
+  /** Line-preserving body for the EXPANDED card. */
+  body: string
+  /** Image sources to thumbnail. */
+  images: string[]
+}
+
+/** Collapse every whitespace run to a single space, as `promptPreview` does. */
+function flattenWhitespace(s: string): string {
+  return s.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Derive all three pinned-card values from a prompt's stored content and blocks.
+ *
+ * The store holds a sent prompt COLLAPSED, so reading `msg.content` straight
+ * gave the card the literal `[ Paste #N ]` token — the empty-card failure images
+ * already have an exemption for, and the placeholder the copy handler rejects as
+ * "worthless on the other end" (UserMessage).
+ *
+ * Substitution happens AFTER the three prose passes, never before: they rewrite
+ * markdown, and a paste is verbatim text the user is SHOWING us, so running them
+ * over it would thumbnail an image the prompt never attached and delete the
+ * pasted line that spelled it. The token holds no markdown and no newline, so it
+ * survives all three untouched and substituting into their output exempts the
+ * paste from them exactly. With no blocks this is the previous behaviour.
+ */
+export function derivePinnedPromptText(content: string, blocks: PasteBlock[]): PinnedPromptText {
+  // Computed from the ORIGINAL content on purpose: an image inside a paste is
+  // pasted text, not an attachment.
+  const images = promptImages(content)
+  if (!blocks.length) return { text: promptPreview(content), body: promptBody(content), images }
+  return {
+    text: expandPastesCapped(promptPreview(content), blocks, flattenWhitespace),
+    body: expandPastesCapped(promptBody(content), blocks),
+    images,
+  }
+}
+
+/** The pinned banner's complete state, owned by the transcript page. */
+export interface PinnedPromptState {
+  idx: number
+  ts?: string
+  text: string
+  raw: string
+  full: string
+  images: string[]
+  bodyBeyondPreview: boolean
+  push: number
+  bannerH: number
+}
+
+/** What the scroll recompute knows before any derivation is done. */
+export interface PinnedPromptInput {
+  idx: number
+  ts?: string
+  /** Stored (collapsed) prompt content — the identity the derivation keys on. */
+  raw: string
+  pastes: PasteBlock[]
+  /** Compact label a machine-authored row shows instead of its payload. */
+  machineLabel: string | null
+  /** Body such a row reveals when expanded, when it differs from `raw`. */
+  machineBody?: string
+  push: number
+  bannerH: number
+}
+
+/**
+ * Next banner state, or `prev` itself when nothing a reader can see has moved.
+ *
+ * Derivation lives HERE rather than ahead of the call because the caller runs
+ * once per animation frame of a scroll: on a frame that moved only the push
+ * geometry the second branch carries the already-derived text forward, so the
+ * three regex walks happen once per pinned message instead of once per frame.
+ * That is what the cache this replaced was for.
+ *
+ * Identity is `(idx, raw, ts)` — the message — so two prompts that collapse to
+ * the same token text cannot share a derivation the way a content-shape key let
+ * them.
+ */
+export function nextPinnedPromptState(
+  prev: PinnedPromptState | null,
+  input: PinnedPromptInput,
+): PinnedPromptState {
+  const { idx, ts, raw, pastes, machineLabel, machineBody, push, bannerH } = input
+  const sameMsg = prev !== null && prev.idx === idx && prev.raw === raw && prev.ts === ts
+  if (sameMsg && prev.push === push && prev.bannerH === bannerH) return prev
+  if (sameMsg) return { ...prev, push, bannerH }
+  const derived = machineLabel === null ? derivePinnedPromptText(raw, pastes) : null
+  const text = machineLabel ?? derived?.text ?? ''
+  const full = machineBody ?? derived?.body ?? raw
+  return {
+    idx,
+    ts,
+    text,
+    raw,
+    full,
+    images: derived?.images ?? [],
+    // By COMPARISON, not by being machine-authored: a short multiline paste never
+    // clamps, so this flag is the only thing that can reach its body.
+    bodyBeyondPreview: full !== text,
+    push,
+    bannerH,
+  }
 }
 
 /**

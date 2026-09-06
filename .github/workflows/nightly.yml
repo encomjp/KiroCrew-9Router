@@ -132,20 +132,35 @@ jobs:
           echo "Nightly (semver): ${BASE}-nightly.${STAMP_DATE}t${STAMP_TIME}"
           echo "Wheel (PEP 440):  ${WHEEL_BASE}.dev${STAMP_FULL}"
 
+  # The production dependency audit gates PUBLICATION, not the build. It reaches
+  # the npm registry, whose slow hours once failed the nightly for hours at a
+  # stretch and blocked every build behind it -- which is why it was removed
+  # from this workflow entirely. Removing it went too far: main has no
+  # dependency-audit gate of its own, so a high/critical production
+  # vulnerability that lands there shipped to nightly-channel users unaudited
+  # until the next tagged release.
+  #
+  # Hanging it off the PUBLISH jobs instead of the build jobs restores the
+  # control without restoring the outage: a slow or flaky registry now delays
+  # publication of an already-built nightly rather than failing the build, and
+  # the artifacts stay in the run for a re-run to publish once the audit
+  # answers. Deliberately NOT a `needs:` of build-wheel / build-desktop /
+  # build-windows -- that arrangement is what blocked the builds before, and
+  # test_dependency_vulnerability_gate.py pins it that way.
   dependency-vulnerability-gate:
     name: Production Dependency Vulnerability Gate
     uses: ./.github/workflows/dependency-vulnerability.yml
 
   build-wheel:
     name: Build Wheel
-    needs: [version, dependency-vulnerability-gate]
+    needs: [version]
     uses: ./.github/workflows/build-wheel.yml
     with:
       wheel_version: ${{ needs.version.outputs.wheel_version }}
 
   build-desktop:
     name: Build Desktop
-    needs: [version, dependency-vulnerability-gate]
+    needs: [version]
     uses: ./.github/workflows/build-desktop.yml
     with:
       version: ${{ needs.version.outputs.nightly_version }}
@@ -158,7 +173,7 @@ jobs:
   # sign-and-notarize via this caller's result.
   build-windows:
     name: Build Windows Desktop
-    needs: [version, dependency-vulnerability-gate]
+    needs: [version]
     permissions:
       contents: read
       id-token: write
@@ -167,7 +182,11 @@ jobs:
       version: ${{ needs.version.outputs.nightly_version }}
       soft_fail: true
       use_prod_environment: true
-    secrets: inherit
+    # Explicit passthrough, not `secrets: inherit`: the callee declares
+    # the secret it consumes, so this hands over that one and nothing
+    # else. Pinned by test_workflow_permissions.py.
+    secrets:
+      AWS_WINDOWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_WINDOWS_SIGNING_ROLE_ARN }}
 
   # ── CLI channel publish ───────────────────────────────────────────────
   # Publishes the built wheel to the nightly CLI channel (cli/ + latest-cli.json).
@@ -176,7 +195,7 @@ jobs:
   # never blocks the CLI release. See docs/build/release.md.
   publish-cli:
     name: Publish CLI (nightly channel)
-    needs: [version, build-wheel]
+    needs: [version, build-wheel, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -186,7 +205,11 @@ jobs:
       channel: nightly
       version: ${{ needs.version.outputs.nightly_version }}
       wheel_artifact: cli-wheel
-    secrets: inherit
+    # Explicit passthrough, not `secrets: inherit`: the callee declares
+    # the secret it consumes, so this hands over that one and nothing
+    # else. Pinned by test_workflow_permissions.py.
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
 
   # ── Linux desktop publish ─────────────────────────────────────────────
   # Publishes the built AppImages to the distribution CDN (versioned key +
@@ -212,7 +235,7 @@ jobs:
   # tracked in #2645 rather than reshaped here.
   publish-linux-appimage-x64:
     name: Publish Linux appimage (nightly channel · x64)
-    needs: [version, build-desktop]
+    needs: [version, build-desktop, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -230,7 +253,7 @@ jobs:
 
   publish-linux-appimage-arm64:
     name: Publish Linux appimage (nightly channel · arm64)
-    needs: [version, build-desktop]
+    needs: [version, build-desktop, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -248,7 +271,7 @@ jobs:
 
   publish-linux-deb-x64:
     name: Publish Linux deb (nightly channel · x64)
-    needs: [version, build-desktop]
+    needs: [version, build-desktop, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -266,7 +289,7 @@ jobs:
 
   publish-linux-deb-arm64:
     name: Publish Linux deb (nightly channel · arm64)
-    needs: [version, build-desktop]
+    needs: [version, build-desktop, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -284,7 +307,7 @@ jobs:
 
   publish-linux-rpm-x64:
     name: Publish Linux rpm (nightly channel · x64)
-    needs: [version, build-desktop]
+    needs: [version, build-desktop, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -302,7 +325,7 @@ jobs:
 
   publish-linux-rpm-arm64:
     name: Publish Linux rpm (nightly channel · arm64)
-    needs: [version, build-desktop]
+    needs: [version, build-desktop, dependency-vulnerability-gate]
     permissions:
       contents: read
       id-token: write
@@ -331,7 +354,7 @@ jobs:
   # soft_fail exists to protect.
   publish-windows-x64:
     name: Publish Windows Desktop (nightly channel · x64)
-    needs: [version, build-windows]
+    needs: [version, build-windows, dependency-vulnerability-gate]
     permissions:
       contents: read
       # A called workflow cannot exceed the caller job's grants, so the probe's
@@ -357,7 +380,7 @@ jobs:
   # alone (see test_workflow_permissions.py).
   publish-docker:
     name: Publish Docker Image (nightly channel)
-    needs: [version, build-wheel]
+    needs: [version, build-wheel, dependency-vulnerability-gate]
     permissions:
       contents: read
       packages: write
@@ -383,13 +406,20 @@ jobs:
   # attestation (signed + stapled bytes).
   sign-and-notarize:
     name: Sign + Notarize macOS
-    needs: [version, build-wheel, build-desktop]
+    needs: [version, build-wheel, build-desktop, dependency-vulnerability-gate]
     permissions:
       id-token: write
       contents: read
       attestations: write
     uses: ./.github/workflows/sign-and-notarize.yml
-    secrets: inherit
+    # Explicit passthrough, not `secrets: inherit`: the callee declares
+    # the secrets it consumes, so this hands over those and nothing
+    # else. Pinned by test_workflow_permissions.py.
+    secrets:
+      AWS_SIGNING_ROLE_ARN: ${{ secrets.AWS_SIGNING_ROLE_ARN }}
+      AWS_SIGNING_BUCKET: ${{ secrets.AWS_SIGNING_BUCKET }}
+      AWS_SIGNER_ACCESS_ROLE_ARN: ${{ secrets.AWS_SIGNER_ACCESS_ROLE_ARN }}
+      CDSIGNER_API_ENDPOINT: ${{ secrets.CDSIGNER_API_ENDPOINT }}
     with:
       channel: nightly
       version: ${{ needs.version.outputs.nightly_version }}

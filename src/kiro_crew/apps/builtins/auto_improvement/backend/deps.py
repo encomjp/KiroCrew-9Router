@@ -20,6 +20,7 @@ import subprocess
 import sys
 from typing import Any
 
+from kiro_crew.security import redact_and_truncate
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 logger = logging.getLogger(__name__)
@@ -111,5 +112,14 @@ def install_deps() -> dict[str, Any]:
         return {"ok": False, "installed": [], "error": f"install failed: {exc}"}
     if proc.returncode != 0:
         tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
-        return {"ok": False, "installed": [], "error": f"pip failed: {tail[0][:200]}"}
+        # pip inherits the gateway environment, so an authenticated private
+        # index echoes its request URL — token and all — to stderr on an auth
+        # failure. The dashboard route that serves this payload redacts what
+        # it sends, but its regexes need the full credential shape to match:
+        # bounding first can cut a token mid-match, leaving a fragment no
+        # downstream pass can recognise. redact_and_truncate scrubs the whole
+        # line BEFORE its bound, so a recognised credential straddling the
+        # 200-char boundary cannot leak as an unredacted partial.
+        safe_tail = redact_and_truncate(tail[0], 200)
+        return {"ok": False, "installed": [], "error": f"pip failed: {safe_tail}"}
     return {"ok": True, "installed": ["ruff"], "detail": "ruff installed"}

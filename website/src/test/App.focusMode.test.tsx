@@ -12,8 +12,12 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, fireEvent, act } from '@testing-library/react'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { renderWithProviders } from './helpers'
 import { FOCUS_INSET, focusModeEnabled, setFocusModeEnabled, __resetFocusMode } from '../hooks/useFocusMode'
+import { OVERLAY_Z_MAX, THEME_DECOR_SLOT_ID, TOPBAR_FOCUS_Z, TOPBAR_Z, useThemeDecorSlot } from '../lib/themeDecorLayer'
 
 vi.mock('../lib/embedded', () => ({ isEmbeddedPane: vi.fn(() => false) }))
 import { isEmbeddedPane } from '../lib/embedded'
@@ -63,6 +67,11 @@ import App from '../App'
 
 const setWindowWidth = (w: number) => {
   Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: w })
+}
+
+const cssSource = () => {
+  const here = dirname(fileURLToPath(import.meta.url))
+  return readFileSync(join(here, '..', 'index.css'), 'utf8')
 }
 
 describe('focus mode — shared session state', () => {
@@ -130,6 +139,44 @@ describe('focus mode — shell layout', () => {
     expect(content.style.paddingLeft).toBe('')
   })
 
+  // #7377: a theme pack's decorative overlay painted over the top bar. The shell
+  // is its own stacking context (`z-[1]`), so an overlay rendered outside it
+  // outranks the header at ANY z-index; the fix is a slot INSIDE the shell that
+  // the overlays portal into, pinned strictly below the header in both layouts.
+  it('keeps the theme decoration slot inside the shell and strictly below the header', async () => {
+    expect(OVERLAY_Z_MAX).toBeLessThan(TOPBAR_Z)
+    expect(OVERLAY_Z_MAX).toBeLessThan(TOPBAR_FOCUS_Z)
+
+    let seen: HTMLElement | null = null
+    function SlotProbe() { seen = useThemeDecorSlot(); return null }
+    renderWithProviders(<><SlotProbe /><App /></>, { route: '/chat' })
+    const toggle = await screen.findByTestId('focus-mode-toggle')
+
+    const shell = screen.getByTestId('dashboard-shell')
+    const slot = screen.getByTestId('theme-decor-slot')
+    const header = document.querySelector('header.topbar') as HTMLElement
+    expect(slot.id).toBe(THEME_DECOR_SLOT_ID)
+    // Same stacking context as the header, and published to the layer that
+    // portals into it (mounted outside the router, so it cannot take a prop).
+    expect(shell.contains(slot)).toBe(true)
+    expect(shell.contains(header)).toBe(true)
+    expect(seen).toBe(slot)
+    // Earlier in DOM order too, so even an equal z-index could not flip the win.
+    expect(slot.compareDocumentPosition(header) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // Click-through, and a stacking context whose own z-index is the ceiling.
+    expect(slot.className).toContain('pointer-events-none')
+    expect(slot.className).toContain('fixed')
+    expect(slot.style.zIndex).toBe(String(OVERLAY_Z_MAX))
+
+    // Docked header: z from the shared constant, above the slot.
+    expect(header.style.zIndex).toBe(String(TOPBAR_Z))
+    // Focus mode (the absolute-overlay path that stands in for the native
+    // fullscreen stacking change reported on macOS): still above the slot.
+    await act(async () => { fireEvent.click(toggle) })
+    expect(header.style.zIndex).toBe(String(TOPBAR_FOCUS_Z))
+    expect(Number(header.style.zIndex)).toBeGreaterThan(Number(slot.style.zIndex))
+  })
+
   it('collapses both chrome tracks and mounts the peek strips when on', async () => {
     renderWithProviders(<App />, { route: '/chat' })
     const toggle = await screen.findByTestId('focus-mode-toggle')
@@ -170,6 +217,33 @@ describe('focus mode — shell layout', () => {
 
     expect(screen.getByTestId('focus-peek-top')).toBeTruthy()
     expect(screen.getByTestId('focus-peek-rail')).toBeTruthy()
+  })
+
+  it('reserves the native caption strip in focus mode, from CSS alone', () => {
+    // The reserve is now pure CSS: .win-electron/.linux-electron already sit on
+    // the shell root (App.tsx), so nothing has to compute a width at runtime.
+    // jsdom applies no stylesheet, so the rules are pinned against index.css
+    // source the same way the side-panel corner masks are.
+    const css = cssSource()
+    const reserve = (platform: string) => css.match(
+      new RegExp(`body\\.mc-focus-mode \\.${platform}-electron \\.focus-caption-reserve\\{padding-right:(\\d+)px\\}`),
+    )
+    const header = (platform: string) => css.match(
+      new RegExp(`\\.${platform}-electron header\\.topbar-glass\\{[\\s\\S]*?padding-right:(\\d+)px`),
+    )
+
+    for (const platform of ['win', 'linux']) {
+      const rule = reserve(platform)
+      expect(rule, `${platform}-electron focus-mode caption reserve`).not.toBeNull()
+      // Same band the DOCKED header clears: this reserve exists only because
+      // focus mode takes that header out of flow, so the two must not drift.
+      expect(rule![1]).toBe(header(platform)![1])
+    }
+
+    // Deliberately NO platform-agnostic rule. It would out-specify the strip's
+    // Tailwind px-2 (0,2,1 vs 0,1,0) and zero the gutter on macOS and in the
+    // browser, where nothing is painted over that corner to begin with.
+    expect(css).not.toContain('body.mc-focus-mode .focus-caption-reserve{')
   })
 
   it('hides the Electron chrome with the header and brings it back on peek', async () => {

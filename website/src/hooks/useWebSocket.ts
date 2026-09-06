@@ -4,19 +4,22 @@ import { isArtifactEditing } from '../utils/artifactEditGuard'
 import { isReconcileNote } from '../lib/noteContract'
 import { useAppDispatch, useAppSelector } from '../store'
 import { store } from '../store'
-import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
+import { sseStatus, sseYolo, sseConnected, sseDisconnected, sseSlots, sseTodoUpdate, sseMcpReportUpdate, setChannelTrusted, sseSlotTitle, triggerRefresh, fetchSlots, markSlotUnread, setUpdateProgress, sseSubagentStatus, sseSubagentText, touchSlotActivity, patchSlotSourceLinks, type SubagentDetail } from '../store/dashboardSlice'
 import { addNotification, ackNotificationByTs, unackNotificationByTs, removeNotificationByTs, clearAllNotifications, fetchNotifications, markBootNotificationsFetched } from '../store/notificationsSlice'
 import { dispatchMcNotification, TURN_DONE_KIND, APPROVAL_KIND, shouldChimeOnTurnDone } from './notificationEvent'
 import { emitThemeSound } from './themeSound'
+import { streamingFlushHoldMs } from '../lib/streamHold'
 import {
   fetchHistory, missedChunkMarker, sseChatMessage, sseChatMessageUpdate, sseChatMessagePatchByTs, sseThinkingChunk, refreshSlot, warmSlotCache, sseContextUsage, clearMessages, clearSlotCache, setVoicePlaying, setVoiceAudio, resolveByApprovalId, clearSubagentsForSnapshot, sseSubagentPending, sseSubagentSpawn, sseSubagentQueued, sseSubagentTool, sseSubagentStalled, sseSubagentRetrying, sseSubagentDone, sseSubagentSnapshot, sseSubagentBatchUpdate, sseSubagentBatchChunks, sseToolActivity, sseToolResult, sseActivityEvent, sseSideResult, sseWorkflowEvent, setSlotStatusDetail, removeQueuedMessage, appendQueuedMessage, cancelQueuedMessage, editQueuedMessage, reorderQueuedMessages, appendSlotMessage, setQuestionCard, resolveQuestionCard, setFollowupCard, setFolderSuggestion, sseMcpAppRender, setGoalLoops, sseGoalLoop, sseSideQueue, reconcileWorkflowRuns
 } from '../store/chatSlice'
 import { anchorForSlot, loadLayout, sessionSlots } from './splitLayoutStore'
 import { TAB_ID } from '../api/tabId'
 import { api } from '../api/client'
+import { AUTONUDGE_LOOPS_QUERY_KEY } from '../components/autoNudgeLoop'
 import { sanitizeLlmOutput } from '../utils/sanitize'
 import { applyStatusDelta, parseStatusDelta } from '../utils/pullRequestStatusDelta'
-import type { StatusData, ChatMessage, ChatSlot, ChatFolder, Notification, PullRequestStatusBatch, TodoList } from '../types'
+import { slotChangeUrls } from '../utils/pullRequestLinks'
+import type { StatusData, ChatMessage, ChatSlot, ChatFolder, Notification, PullRequestStatusBatch, TodoList, McpSessionReport } from '../types'
 import { i18nT } from '../i18n/t'
 
 type LogCallback = ((data: { level: string; msg: string }) => void) | null
@@ -93,6 +96,32 @@ export function resolvedSince(log: Map<string, number>, watermark: number): stri
   const out: string[] = []
   for (const [askId, seq] of log) if (seq > watermark) out.push(askId)
   return out
+}
+
+/** sessionStorage key latched when an in-app update reaches its `restarting`
+ *  step. The gateway then execs itself and the socket drops; on the next
+ *  successful reconnect the latch tells this tab to reload — the signal the
+ *  version comparison cannot give when a git checkout rebuilds the SAME
+ *  version. Session-scoped on purpose: only the tab that watched the update
+ *  restart needs it (other tabs recover via the bundle-id comparison). */
+export const UPDATE_RESTART_LATCH_KEY = 'mc-update-restarting'
+
+/** How long the latch stays honored. A restart resolves in seconds; a latch
+ *  older than this belongs to an update the user cancelled or that died
+ *  before exec, and reloading over an unrelated later reconnect would look
+ *  like the app randomly refreshing itself. */
+export const UPDATE_RESTART_LATCH_TTL_MS = 15 * 60 * 1000
+
+/** Read-and-clear the restart latch. True only when a fresh latch existed —
+ *  the caller reloads exactly once per latched update. Clears a stale latch
+ *  too, so an abandoned update cannot linger into a later session. */
+export function consumeUpdateRestartLatch(now: number = Date.now()): boolean {
+  let raw: string | null = null
+  try { raw = sessionStorage.getItem(UPDATE_RESTART_LATCH_KEY) } catch { return false }
+  if (raw === null) return false
+  try { sessionStorage.removeItem(UPDATE_RESTART_LATCH_KEY) } catch { /* best effort */ }
+  const at = Number(raw)
+  return Number.isFinite(at) && now - at < UPDATE_RESTART_LATCH_TTL_MS
 }
 
 /** Decide what a reconnect reconcile should drop and re-add.
@@ -225,8 +254,16 @@ export function useWebSocket() {
   const wasConnectedRef = useRef(false)
   const reconnectingRef = useRef(false)  // suppress markSlotUnread during reconnect catch-up
   const lastVersionRef = useRef<string | null>(null)
+  // Served-bundle hash from the last status frame. A same-version rebuild (a
+  // git checkout's in-app update) moves this while `version` stays put, so it
+  // is the cross-push comparison that catches the case the version check
+  // cannot — and it reaches every open tab, not just the one that clicked
+  // Update. '' from the server means "no built bundle / unknown" and is never
+  // treated as a change in either direction.
+  const lastBundleIdRef = useRef<string | null>(null)
   const lastGitlabHostsGenRef = useRef<number | null>(null)
   const lastFoldersGenRef = useRef<number | null>(null)
+  const lastGovernanceGenRef = useRef<number | null>(null)
   const lastSlotsRawRef = useRef<string | null>(null)
   const lastSlotsArrayRef = useRef<ChatSlot[] | null>(null)
   const voiceQueueRef = useRef<string[]>([])
@@ -360,6 +397,9 @@ export function useWebSocket() {
     // an exception escaping here would silently strand those — a cosmetic seed
     // must never be able to do that.
     try {
+      // Same moment, same reason, for the full-registry readers: a stop that
+      // landed while the socket was down was a frame nobody received.
+      queryClient.invalidateQueries({ queryKey: AUTONUDGE_LOOPS_QUERY_KEY })
       api.autonudgeList()
         .then(res => {
           // A live frame superseded this snapshot — it is now stale, so drop it
@@ -374,7 +414,7 @@ export function useWebSocket() {
         })
         .catch(() => {})
     } catch { /* seed is cosmetic — never break the connect path */ }
-  }, [dispatch])
+  }, [dispatch, queryClient])
 
   const syncPendingApprovals = useCallback(async () => {
     try {
@@ -593,6 +633,13 @@ export function useWebSocket() {
   const scheduleChunkFlush = useCallback(() => {
     if (chunkFlushScheduledRef.current) return
     chunkFlushScheduledRef.current = true
+    // While a UI animation holds the pipelines (see lib/streamHold.ts), defer
+    // this flush to the hold's end instead of the next frame. The buffer keeps
+    // absorbing chunks meanwhile, and the guard flag stays set, so the whole
+    // burst lands as ONE flush when the hold lapses. A flush already scheduled
+    // when a hold STARTS still fires — at most one frame leaks into the slide.
+    const hold = streamingFlushHoldMs()
+    if (hold > 0) { chunkTimerRef.current = setTimeout(() => flushChunks(), hold + 16); return }
     if (typeof requestAnimationFrame === 'function') chunkRafRef.current = requestAnimationFrame(() => flushChunks())
     else chunkTimerRef.current = setTimeout(() => flushChunks(), 16)
   }, [flushChunks])
@@ -640,6 +687,10 @@ export function useWebSocket() {
   const scheduleSlotActivityFlush = useCallback(() => {
     if (slotActivityFlushScheduledRef.current) return
     slotActivityFlushScheduledRef.current = true
+    // Same hold as scheduleChunkFlush — a recency bump reorders sidebar rows,
+    // which is main-thread layout work mid-slide.
+    const hold = streamingFlushHoldMs()
+    if (hold > 0) { slotActivityTimerRef.current = setTimeout(() => flushSlotActivity(), hold + 16); return }
     if (typeof requestAnimationFrame === 'function') slotActivityRafRef.current = requestAnimationFrame(() => flushSlotActivity())
     else slotActivityTimerRef.current = setTimeout(() => flushSlotActivity(), 16)
   }, [flushSlotActivity])
@@ -679,6 +730,10 @@ export function useWebSocket() {
   const scheduleSubagentChunkFlush = useCallback(() => {
     if (subagentChunkFlushScheduledRef.current) return
     subagentChunkFlushScheduledRef.current = true
+    // Same hold as scheduleChunkFlush — several subagents streaming at once is
+    // exactly the reported worst case for the drawer slide.
+    const hold = streamingFlushHoldMs()
+    if (hold > 0) { subagentChunkTimerRef.current = setTimeout(() => flushSubagentChunks(), hold + 16); return }
     if (typeof requestAnimationFrame === 'function') subagentChunkRafRef.current = requestAnimationFrame(() => flushSubagentChunks())
     else subagentChunkTimerRef.current = setTimeout(() => flushSubagentChunks(), 16)
   }, [flushSubagentChunks])
@@ -721,12 +776,24 @@ export function useWebSocket() {
       lastGitlabHostsGenRef.current = null
       // Same process-local reasoning for the folder-tree generation.
       lastFoldersGenRef.current = null
+      // …and for the governance-ceiling generation.
+      lastGovernanceGenRef.current = null
       // Forget the last raw slots frame too, so a reconnect whose first frame
       // repeats the last one before it cannot swallow that first frame.
       lastSlotsRawRef.current = null
       // Cache auto-speak preference
       api.voiceConfig().then(c => { autoSpeakRef.current = !!c.autoSpeak }).catch(() => {})
       if (wasConnectedRef.current) {
+        // Reconnecting after an in-app update's restart: the disconnect WAS the
+        // gateway exec'ing its updated self, and this tab's JS predates the
+        // rebuild. Reload instead of the state re-fetch below — on a git
+        // checkout the version often does not change, so the 'dashboard'
+        // frame's version comparison would never fire and the tab would sit on
+        // the stale bundle (with the update overlay's spinner) forever.
+        if (consumeUpdateRestartLatch()) {
+          window.location.reload()
+          return
+        }
         // Reconnecting after disconnect — re-fetch state instead of
         // reloading the page.  Preserves unsent messages, scroll
         // position, and form inputs.
@@ -807,6 +874,11 @@ export function useWebSocket() {
               if (member !== active && liveKeys.has(member)) dispatch(warmSlotCache(member))
             }
           } catch (err) {
+            // This catch deliberately swallows so a corrupt persisted layout cannot
+            // abort the rest of reconnect setup; the cost is that the skipped
+            // re-hydration's only symptom is a co-rendered pane still showing the
+            // queue it held at the drop.
+            // eslint-disable-next-line no-console -- only trace of a skipped re-hydration
             console.warn('reconnect split-pane warm skipped', err)
           }
         }
@@ -881,7 +953,14 @@ export function useWebSocket() {
             const prev = lastVersionRef.current
             const next = (data as StatusData).version
             if (next) lastVersionRef.current = next
-            if (prev && next && prev !== next) {
+            // Same rule for the served-bundle hash: a git checkout's in-app
+            // update rebuilds the SAME version, so `version` never moves and
+            // only the bundle id records that this tab's JS is now stale.
+            const prevBundle = lastBundleIdRef.current
+            const nextBundle = (data as StatusData).bundle_id
+            if (nextBundle) lastBundleIdRef.current = nextBundle
+            if ((prev && next && prev !== next)
+                || (prevBundle && nextBundle && prevBundle !== nextBundle)) {
               window.location.reload()
               return
             }
@@ -984,6 +1063,18 @@ export function useWebSocket() {
                 queryClient.invalidateQueries({ queryKey: ['dashboardConfig'] })
               }
             }
+            // Same contract for the governance ceiling: a centrally pushed policy
+            // swaps it mid-session and bumps this generation, and the config
+            // endpoint derives `social_share_enabled` from that ceiling. Without
+            // this the cached answer would keep offering the Share entry for the
+            // rest of its stale window after the fleet withdrew it.
+            if (typeof msg.governanceGeneration === 'number') {
+              const prevGovGen = lastGovernanceGenRef.current
+              lastGovernanceGenRef.current = msg.governanceGeneration
+              if (prevGovGen === null || prevGovGen !== msg.governanceGeneration) {
+                queryClient.invalidateQueries({ queryKey: ['dashboardConfig'] })
+              }
+            }
             break
           }
           case 'skills.pending_changed': {
@@ -998,6 +1089,15 @@ export function useWebSocket() {
           case 'todo_update': {
             const d = data as unknown as { slot?: string; todo?: TodoList | null }
             if (d.slot) dispatch(sseTodoUpdate({ slot: d.slot, todo: d.todo ?? null }))
+            break
+          }
+          case 'mcp_report_update': {
+            // A null report is a real value here, not a missing one: the gateway
+            // sends it when a session reset invalidates the previous report.
+            const d = data as unknown as { slot?: string; mcp_report?: McpSessionReport | null }
+            if (d.slot) {
+              dispatch(sseMcpReportUpdate({ slot: d.slot, mcp_report: d.mcp_report ?? null }))
+            }
             break
           }
           case 'slot_title':
@@ -1241,13 +1341,15 @@ export function useWebSocket() {
             break
           case 'chat_message_update':
             // Server emits this for two distinct flows: tool_call_id-keyed
-            // updates from claude-agent-acp tool_call_update, and ts-keyed
+            // updates from claude-agent-acp tool_call_update, and row-keyed
             // patches for mcp_oauth banner state flips. Route by which key
-            // the payload carries.
+            // the payload carries. The row-keyed branch prefers `mid` (the
+            // server-minted row identity) over `ts`, which two restored rows
+            // can share.
             if ((data as { tool_call_id?: string }).tool_call_id) {
               dispatch(sseChatMessageUpdate(data as { slot: string; tool_call_id: string; content?: string; meta?: Record<string, unknown> }))
             } else {
-              dispatch(sseChatMessagePatchByTs(data as { slot: string; ts: string; meta?: Record<string, unknown>; content?: string }))
+              dispatch(sseChatMessagePatchByTs(data as { slot: string; ts: string; mid?: string; meta?: Record<string, unknown>; content?: string }))
             }
             break
           case 'queue_pop':
@@ -1271,9 +1373,20 @@ export function useWebSocket() {
             // into the meta so the reconcile in appendSlotMessage can match the
             // optimistic bubble by id instead of by content (#6075).
             const steerSid = (data as { sendId?: unknown }).sendId
+            // `steerState` says which of written/consumed/requeued this row is in.
+            // The server sends `written` here and patches the row to consumed or
+            // requeued later via `chat_message_update`, so the badge only claims a
+            // successful mid-turn injection once the backend has confirmed one
+            // (#7246). Absent on a pre-#7246 server, which the renderer treats as
+            // the legacy row shape.
+            const steerState = (data as { steerState?: unknown }).steerState
+            // The server row's own id. Stored so the later `chat_message_update`,
+            // which is keyed on `mid`, resolves this row -- without it that patch
+            // matches nothing and the state never moves until a reload.
+            const steerMid = (data as { mid?: unknown }).mid
             dispatch(appendSlotMessage({
               slot: (data as { slot?: string }).slot || store.getState().chat.activeSlot || '',
-              message: { role: 'user', content: (data as { content?: string }).content || '', cls: 'msg msg-u', meta: { steer: true, ...(typeof steerSid === 'string' && steerSid ? { sendId: steerSid } : {}) }, ts: (data as { ts?: string }).ts },
+              message: { role: 'user', content: (data as { content?: string }).content || '', cls: 'msg msg-u', meta: { steer: true, ...(typeof steerSid === 'string' && steerSid ? { sendId: steerSid } : {}), ...(typeof steerState === 'string' && steerState ? { steerState } : {}), ...(typeof steerMid === 'string' && steerMid ? { mid: steerMid } : {}) }, ts: (data as { ts?: string }).ts },
             }))
             // Steering is the other way to type into a busy session, so it
             // settles the rank exactly like a queued send. The server appends a
@@ -1678,16 +1791,41 @@ export function useWebSocket() {
               // Turn boundary: the finished turn is the likeliest moment for
               // this session's PRs to have moved (comments, mergeability, a
               // pushed revision) — changes the lightweight status delta does NOT
-              // carry. Invalidate the detail/status queries so they refetch.
-              // For the ACTIVE slot, refetch now (the panel is on screen). For a
-              // BACKGROUND slot, only MARK stale (refetchType: 'none'): its
-              // detail query is staleTime:Infinity, so without this it would stay
-              // "fresh" forever and render pre-turn data when the user later
-              // switches to it — but refetching an off-screen PR every background
-              // turn would be wasteful, so defer the fetch to its next mount.
+              // carry. Invalidate the detail queries of THIS slot's own pull
+              // requests so they refetch. For the ACTIVE slot, refetch now (the
+              // panel is on screen). For a BACKGROUND slot, only MARK stale
+              // (refetchType: 'none'): its detail query is staleTime:Infinity,
+              // so without this it would stay "fresh" forever and render
+              // pre-turn data when the user later switches to it — but
+              // refetching an off-screen PR every background turn would be
+              // wasteful, so defer the fetch to its next mount.
+              //
+              // Scoped to the slot's own links, never the whole key family: an
+              // unscoped invalidation marked EVERY session's PR stale on EVERY
+              // turn anywhere, so a panel reopened while any chat was running
+              // always refetched (five provider subprocesses per open) even
+              // though nothing about that PR had changed.
+              //
+              // The ACTIVE slot additionally refetches whatever detail query is
+              // MOUNTED — the PR on screen: the slots payload names only the
+              // first few chips, so a session with more PRs than chips could
+              // otherwise have the very PR the user is looking at fall outside
+              // the scoped set. `refetchQueries` with `type: 'active'` is the
+              // primitive for that: it refetches the mounted queries only and
+              // marks nothing else stale. (`invalidateQueries` with
+              // `refetchType: 'active'` would NOT do — refetchType limits only
+              // the refetch, the stale marking still hits every cached PR.) A
+              // background slot's overflow PRs are left to the status-delta
+              // path (lifecycle / CI / merge pair); their comments may lag until
+              // the next event or remount.
               const isActive = data.slot === store.getState().chat.activeSlot
               const refetchType = isActive ? 'active' : 'none'
-              queryClient.invalidateQueries({ queryKey: ['pull-request-source'], refetchType })
+              if (isActive) {
+                void queryClient.refetchQueries({ queryKey: ['pull-request-source'], type: 'active' })
+              }
+              for (const url of slotChangeUrls(store.getState().dashboard.slots, data.slot)) {
+                queryClient.invalidateQueries({ queryKey: ['pull-request-source', url], refetchType: 'none' })
+              }
               queryClient.invalidateQueries({ queryKey: ['pull-request-statuses'], refetchType })
             }
             if ((!autoSpeakRef.current || voiceMutedRef.current) && data.slot === store.getState().chat.activeSlot) {
@@ -1722,6 +1860,11 @@ export function useWebSocket() {
                 max_cycles: Number(nudge.loop?.max_cycles) || 0,
               }))
             }
+            // Readers of the FULL registry (the Crew Members drawer's patrol
+            // block needs stopped_reason, next_due_ts and banner, none of which
+            // ride this frame) re-read it in place rather than merging a partial
+            // payload — one seed path, not a third copy of the merge.
+            queryClient.invalidateQueries({ queryKey: AUTONUDGE_LOOPS_QUERY_KEY })
             break
           }
           case 'voice_chunk': {
@@ -1756,6 +1899,19 @@ export function useWebSocket() {
             break
           case 'update_progress': {
             const prog = data as { step: string; detail: string }
+            // `restarting` is the last event before the gateway execs itself
+            // and this socket dies — latch it so the reconnect handler knows
+            // the next successful connect is a post-update gateway and this
+            // tab's bundle must be reloaded (a same-version rebuild moves
+            // neither `version` nor anything else the tab compares).
+            if (prog.step === 'restarting') {
+              try { sessionStorage.setItem(UPDATE_RESTART_LATCH_KEY, String(Date.now())) } catch { /* best effort */ }
+            } else if (prog.step === 'failed' || prog.step === 'error' || prog.step === 'done') {
+              // A failure AFTER `restarting` was pushed (invalid exe path) means
+              // no exec is coming — an armed latch would reload over the next
+              // unrelated blip. `done` is only ever simulated, same cleanup.
+              try { sessionStorage.removeItem(UPDATE_RESTART_LATCH_KEY) } catch { /* best effort */ }
+            }
             if (prog.step === 'done') {
               dispatch(setUpdateProgress(null))
             } else {
@@ -1852,7 +2008,7 @@ export function useWebSocket() {
     }
 
     ws.onerror = () => { /* onclose will fire */ }
-  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, queryClient, stopVoice, syncPendingApprovals, syncPendingQuestions, seedGoalLoops, recordRetiredId])
+  }, [dispatch, flushChunks, flushBufferedThinking, scheduleChunkFlush, bufferSlotActivity, bufferSubagentChunk, flushSubagentChunks, playNextVoiceChunk, flushVoiceTail, queryClient, stopVoice, syncPendingApprovals, syncPendingQuestions, syncWorkflowRuns, seedGoalLoops, recordRetiredId])
 
   /**
    * Force an immediate reconnect: cancels any pending backoff timer, closes

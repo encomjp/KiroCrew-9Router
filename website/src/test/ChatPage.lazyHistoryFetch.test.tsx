@@ -51,7 +51,10 @@ vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
 vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
   useVirtualChat: () => ({
     virtualItems: [],
+    farmIsMeasured: () => true,
+    farmRecord: () => true,
     isAtBottom: true,
+    getFollow: () => true,
     scrollToBottom: vi.fn(),
     mountIndex: vi.fn(),
     measureRef: () => () => {},

@@ -1,7 +1,8 @@
 """Shared constants for the Meetings builtin app.
 
 Every hardcoded string/limit the app's business logic depends on lives here
-(AGENTS.md "no hardcoded strings in business logic"). Nothing in this module
+(docs/system-specs/common/code-style.md: no hardcoded strings in business
+logic). Nothing in this module
 touches the network or the filesystem at import time, so it is safe to import
 from a Windows gateway even though the app's live-transcription feature is
 macOS/Linux only.
@@ -53,6 +54,24 @@ ICS_FETCH_TIMEOUT_SECS = 20
 ICS_MAX_REDIRECTS = 5
 CALENDAR_SYNC_DAYS = 7
 
+#: How often the background calendar poll runs when nothing overrides it. Five
+#: minutes catches a meeting accepted an hour before it starts and stays well
+#: inside every provider's rate limit; a manual Sync is still instant.
+CALENDAR_POLL_INTERVAL_SECS = 300
+#: Bounds on the configurable poll cadence. The floor keeps a misconfigured
+#: install from hammering a calendar host; the ceiling keeps "every so often"
+#: from silently becoming "never".
+CALENDAR_POLL_MIN_SECS = 60
+CALENDAR_POLL_MAX_SECS = 3600
+#: How long before a calendar event starts its meeting directory is created, so
+#: the user opens a meeting that already exists rather than an empty list. ``0``
+#: turns pre-creation off while leaving the background sync on.
+CALENDAR_PRECREATE_LEAD_MINUTES = 15
+CALENDAR_PRECREATE_LEAD_MAX_MINUTES = 24 * 60
+#: Pause before the first background poll after the gateway starts, so a
+#: calendar fetch is not part of the startup path.
+CALENDAR_POLL_STARTUP_DELAY_SECS = 20
+
 # Per-agent batching dispatcher.
 BATCH_INTERVAL_SECS = 30.0
 MAX_DISPATCH_FAILURES = 3
@@ -99,8 +118,19 @@ ALLOWED_TRANSITIONS: dict[str, tuple[str, ...]] = {
 WIDGET_EXT_MAP: dict[str, str | None] = {"markdown": ".md", "html": ".html", "chat": None}
 DEFAULT_WIDGET_TYPE = "markdown"
 
+#: The one widget type whose output the user may edit (the editable minutes).
+#:
+#: ``html`` is a GENERATED artifact — the sketch artist's Mermaid document — not
+#: prose, so a textarea over its source is not an affordance anyone wants, and
+#: accepting hand-written HTML would open a document-authoring surface whose output
+#: renders in an iframe for no gain (it is sandboxed and CSP-locked, so this is not a
+#: new hole — just not a surface worth opening). ``chat`` agents have no output file
+#: at all. Read by BOTH the edit-write gate and the read overlay, so the rule lives
+#: in exactly one place and cannot come apart.
+EDITABLE_WIDGET_TYPE = "markdown"
+
 # On-disk layout under ``app_data_dir("meetings")``.
-DATA_SUBDIRS = ("meetings", "notes", "widgets", "tasks", "configs")
+DATA_SUBDIRS = ("meetings", "notes", "widgets", "tasks", "configs", "edits")
 CONFIG_FILE = "config.json"
 DICTIONARY_FILE = "dictionary.toml"
 CALENDAR_CACHE_FILE = "calendar-cache.json"
@@ -239,3 +269,37 @@ MAX_TRANSLATION_BACKLOG = 40
 #: Trimmed from the front when exceeded. Line numbers stay monotonic, so a client
 #: polling with ``since`` is unaffected by trimming — it only loses scroll-back.
 MAX_TRANSLATION_LINES = 2000
+# ── editable minutes ────────────────────────────────────────────────────────
+
+#: App-owned root holding user edits of agent outputs, outside every meeting's
+#: agent-writable directory.
+#:
+#: The complete path is ``<data>/edits/<safe_meeting_id>/<agent-output-name>``.
+#: ``apps/meetings/data/edits`` is protected by the shared sensitive-path gate, so
+#: an agent can neither read an owner's unredacted correction nor overwrite it with
+#: ``fs_write``. The app backend opens the sidecars directly and remains able to
+#: save, overlay, revert, and delete them.
+AGENT_EDITS_DIR = "edits"
+
+#: Ceiling on one edited agent output.
+#:
+#: This is a whole GENERATED document the user is correcting rather than a short
+#: field: the note-taker rewrites its entire file after every transcription batch,
+#: so a long meeting's minutes are already larger than anything a person types into
+#: the app's ordinary forms.
+MAX_MINUTES_CHARS = 200_000
+
+#: Body cap for the minutes PUT specifically, replacing ``_common.MAX_BODY_BYTES``.
+#:
+#: **The relationship to :data:`MAX_MINUTES_CHARS` is load-bearing, so it is spelled
+#: out.** ``json_body``'s default cap is 256 KiB, which is FEWER wire bytes than
+#: ``MAX_MINUTES_CHARS`` characters as soon as the text is not ASCII. A valid JSON
+#: client may also escape an astral character as two UTF-16 surrogate escapes —
+#: twelve wire bytes for one Python character. The body cap has to cover that valid
+#: worst case, not only the browser's compact UTF-8 encoding, or the route accepts a
+#: character count that some callers cannot save.
+#:
+#: 3 MiB covers ``200_000 * 12`` plus the small JSON envelope, and remains far
+#: below the gateway's own 60 MiB ``client_max_size``. Raised for this ONE route
+#: rather than for all of them: every other body here is a short field.
+MAX_MINUTES_BODY_BYTES = 3 * 1024 * 1024

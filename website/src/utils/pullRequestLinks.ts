@@ -1,7 +1,21 @@
-import type { ChatMessage } from '../types'
+import type { ComponentType } from 'react'
+import type { ChatMessage, ChatSlot, SourceProviderId } from '../types'
+import { reportSeamCollision } from '../apps/seamCollision'
 import { safeSetItem } from './safeStorage'
 
-export type PullRequestProvider = 'github' | 'gitlab' | 'jira'
+/** A provider brand glyph. Rendered by the chip / tab sites at THEIR size, so a
+ *  descriptor supplies a component rather than an element: the same mark draws
+ *  at 10px in a sidebar chip and 13px in a panel tab. Kept as a component
+ *  REFERENCE (no JSX in this util) — the renderer instantiates it. */
+export type SourceProviderIcon = ComponentType<{ size?: number; className?: string }>
+
+/** Which source system a link belongs to.
+ *
+ *  Open by design — see `SourceProviderId` in `../types`. The three built-ins
+ *  are still literal, so every existing `provider === 'github'` narrowing keeps
+ *  working; a provider registered by a downstream edition flows through as its
+ *  own id. */
+export type PullRequestProvider = SourceProviderId
 
 /**
  * What a mentioned provider URL points at. 'change' is a pull request / merge
@@ -29,6 +43,198 @@ export function partitionSourceLinks(
   for (const link of links) (link.kind === 'issue' ? issues : changes).push(link)
   return { changes, issues }
 }
+
+/**
+ * The pull-request URLs a slot's sidebar chips name — the set a turn-boundary
+ * invalidation is scoped to. Issue links are skipped (their panel has no
+ * turn-boundary refresh), an unknown slot yields nothing, and the list is the
+ * serialized chip subset, not every link in the transcript: the slots payload
+ * carries only the first few, so a session with more PRs than chips has its
+ * overflow left to the status-delta path.
+ */
+export function slotChangeUrls(slots: readonly ChatSlot[], slotKey: string): string[] {
+  const slot = slots.find(s => s.key === slotKey)
+  if (!slot?.source_links) return []
+  const urls: string[] = []
+  for (const link of slot.source_links) {
+    if (link.kind === 'issue' || !link.url || urls.includes(link.url)) continue
+    urls.push(link.url)
+  }
+  return urls
+}
+
+/* ── Source-provider registry (edition extension seam) ────────────────────────
+ *
+ * The three built-in providers stay hard-coded below, byte-for-byte: their host
+ * checks, path grammars, and chip conventions are unchanged and are consulted
+ * FIRST. This registry is what lets a downstream edition add a fourth — an
+ * internal code-review system, say — from its own `extensions.tsx` composition
+ * root, instead of shadowing this file on every upstream sync.
+ *
+ * A descriptor owns exactly the knowledge only its provider has: how to
+ * recognize its URLs, what its objects are called, and which panel affordances
+ * its backend can actually serve. Everything else — dedup, first-mention
+ * attribution, the per-role cap, persistence, the incremental index — is shared
+ * and needs no per-provider branch.
+ */
+
+/** What the panel may offer for a provider. Each flag gates a UI affordance
+ *  whose backing call the provider's BACKEND plugin must implement; a `false`
+ *  here is what keeps the dashboard from rendering a button that can only 400.
+ *
+ *  Read as "this provider can serve it", never as "the user may do it": owner
+ *  gating and every other authorization check stay entirely server-side. */
+export interface SourceProviderCapabilities {
+  /** CI checks are fetchable — gates the Checks tab and its poll. Backend
+   *  hooks: `fetch_checks` (required anyway) plus `fetch_check_status` for the
+   *  sidebar chip badge. */
+  checks: boolean
+  /** Mergeability / merge-state detail is reported — gates the merge-blocker
+   *  banner and the ready-for-review + auto-merge actions. Backend hooks:
+   *  `mark_ready` and `enable_auto_merge`. */
+  mergeState: boolean
+  /** Review threads can be resolved / reopened / replied to. One flag for all
+   *  three: the backend plugin must implement `resolve_thread` (dispatched with
+   *  `resolved=True` and `False`) AND `reply_to_thread`, because this flag is
+   *  what renders the reply box and the reopen toggle. */
+  resolveThreads: boolean
+  /** A top-level comment can be posted. Backend hook: `comment`. */
+  comment: boolean
+}
+
+export interface SourceProviderDescriptor {
+  /** The `provider` value this descriptor owns. Must equal the `provider` field
+   *  of every link its `parse` returns, and must match the backend plugin id so
+   *  one payload round-trips through both layers. */
+  id: string
+  /** Human-readable provider name for the panel header (e.g. `'Acme Review'`).
+   *  Not translated: it is a product name, like `'GitHub'`. */
+  displayName: string
+  /** Recognize one URL, or return null. Receives a defensive COPY of the parsed
+   *  `URL`, so mutating it cannot affect the built-in parse or another
+   *  descriptor. Must return an already-canonical `url` (the exact string the
+   *  panel will persist and re-parse) or its tabs will not survive a reload,
+   *  and a `kind` of `'change'` — issue refs are refused at admission because
+   *  the issue pipeline is built-in-only (see `validRegisteredLink`). */
+  parse(url: URL): PullRequestLink | null
+  /** Sidebar chip label, or null to fall back to the provider-neutral form. */
+  chipLabel(link: PullRequestLink): string | null
+  /** The provider's own short reference for an object (`'CR-123'`), used in tab
+   *  strips, titles, and agent handoffs. */
+  refLabel(number: number): string
+  /** Optional brand glyph for chips and tab strips. Absent → the renderer's
+   *  provider-neutral fallback glyph (never another provider's mark). */
+  icon?: SourceProviderIcon
+  capabilities: SourceProviderCapabilities
+}
+
+/** Ids the core owns. A descriptor may never claim one: the built-in branches
+ *  run first, so a shadowing registration would be silently dead for extraction
+ *  yet live for chip labels — two layers disagreeing about one provider. */
+const BUILTIN_PROVIDER_IDS: ReadonlySet<string> = new Set(['github', 'gitlab', 'jira'])
+
+/** Registration order is consultation order, so a later provider cannot
+ *  intercept an earlier one's URLs. */
+const SOURCE_PROVIDERS = new Map<string, SourceProviderDescriptor>()
+
+/** A provider id must be a short, lowercase, URL-and-storage-safe token: it is
+ *  embedded in payloads, compared across the frontend/backend boundary, and
+ *  rendered into query keys. */
+const PROVIDER_ID_RE = /^[a-z][a-z0-9_-]{0,31}$/
+
+/**
+ * Register a source provider. Call once, from the edition composition root
+ * (`extensions.tsx`), before `App` mounts — the registry is read during
+ * extraction and render, not reactively.
+ *
+ * Collisions and malformed descriptors route through `reportSeamCollision`
+ * (throws in dev/test, warns and ignores in production), the same policy every
+ * other frontend seam uses. The core's built-ins always win.
+ */
+export function registerSourceProvider(descriptor: SourceProviderDescriptor): void {
+  const id = descriptor?.id
+  if (typeof id !== 'string' || !PROVIDER_ID_RE.test(id)) {
+    reportSeamCollision(
+      'sourceProviders',
+      `provider id ${String(id)} is not a lowercase token matching ` +
+        `${PROVIDER_ID_RE} — ignoring`,
+    )
+    return
+  }
+  if (BUILTIN_PROVIDER_IDS.has(id)) {
+    reportSeamCollision('sourceProviders', `provider ${id} is a built-in; ignoring override`)
+    return
+  }
+  if (SOURCE_PROVIDERS.has(id)) {
+    reportSeamCollision('sourceProviders', `provider ${id} already registered; ignoring duplicate`)
+    return
+  }
+  if (typeof descriptor.parse !== 'function'
+    || typeof descriptor.chipLabel !== 'function'
+    || typeof descriptor.refLabel !== 'function'
+    || !descriptor.capabilities) {
+    reportSeamCollision(
+      'sourceProviders',
+      `provider ${id} descriptor is missing parse/chipLabel/refLabel/capabilities — ignoring`,
+    )
+    return
+  }
+  SOURCE_PROVIDERS.set(id, descriptor)
+}
+
+/** The descriptor for a provider id, or undefined for a built-in / unknown one. */
+export function sourceProviderDescriptor(
+  provider: PullRequestProvider,
+): SourceProviderDescriptor | undefined {
+  return SOURCE_PROVIDERS.get(provider)
+}
+
+/** Drop every registration. Test-only — the registry is module state, so a test
+ *  that registers a fake provider must not leak it into the next file. */
+export function resetSourceProvidersForTests(): void {
+  SOURCE_PROVIDERS.clear()
+}
+
+/** Validate a descriptor-returned link the same way the built-in parsers are
+ *  validated by construction. A descriptor is edition code, not chat content, but
+ *  a malformed link would be persisted and re-parsed, so it is checked rather
+ *  than trusted: a link that does not round-trip makes a revealed tab vanish on
+ *  reload, which is exactly the failure this seam must not introduce. */
+function validRegisteredLink(
+  link: PullRequestLink | null,
+  descriptor: SourceProviderDescriptor,
+): boolean {
+  if (!link || typeof link !== 'object') return false
+  if (link.provider !== descriptor.id) return false
+  if (typeof link.url !== 'string' || !link.url.startsWith('https://')) return false
+  if (link.url.length > MAX_PERSISTED_SOURCE_URL_LENGTH) return false
+  if (!Number.isInteger(link.number) || link.number <= 0) return false
+  // Change refs only. The issue pipeline (fetch, panel, chip status) is
+  // built-in-only, so an admitted `kind: 'issue'` link from a descriptor would
+  // render a chip whose panel can only fail. The backend admission check
+  // mirrors this; widening both is additive if a plugin issue path ever exists.
+  if (link.kind !== 'change') return false
+  return typeof link.repo === 'string'
+}
+
+/** Consult every registered provider, in registration order. A descriptor that
+ *  throws is skipped rather than allowed to break the whole scan — one edition
+ *  bug must not stop GitHub links from being extracted. */
+function parseRegisteredCandidate(url: URL): PullRequestLink | null {
+  for (const descriptor of SOURCE_PROVIDERS.values()) {
+    let link: PullRequestLink | null
+    try {
+      // A fresh URL per descriptor: URL is mutable, so a descriptor that
+      // rewrote it would otherwise change what the next one sees.
+      link = descriptor.parse(new URL(url.href))
+    } catch {
+      continue
+    }
+    if (validRegisteredLink(link, descriptor)) return link
+  }
+  return null
+}
+
 
 /**
  * First-mention attribution: whoever mentioned a PR FIRST owns its
@@ -251,7 +457,13 @@ function parseCandidate(
   // self-hosted Jira/Data Center instances require explicit allowlisting via
   // dashboard.jira_hosts, matching the same discipline as self-hosted GitLab.
   if (isAtlassianCloudHost(host) || anyJiraHost || jiraHosts.has(hostWithPort)) return jiraLink(hostWithPort, path)
-  return null
+  // Registered providers are consulted LAST, so a built-in host can never be
+  // reinterpreted by an edition and the three built-in grammars keep exactly the
+  // precedence they had. Note this is only reached for a host no built-in
+  // branch claimed — including the permissive `anyGitlabHost` / `anyJiraHost`
+  // probes, which claim (and may reject) any host. `parseStoredCanonicalLink`
+  // therefore adds its own registry-only probe.
+  return parseRegisteredCandidate(url)
 }
 
 /** True when a stored URL is already in canonical form.
@@ -275,6 +487,15 @@ function parseCandidate(
 function parseStoredCanonicalLink(value: string): PullRequestLink | null {
   return parseCandidate(value, NO_GITLAB_HOSTS, true)
     ?? parseCandidate(value, NO_GITLAB_HOSTS, false, NO_JIRA_HOSTS, true)
+    // Third probe, non-permissive, for the REGISTERED providers. The two probes
+    // above cannot reach them: each turns on a permissive host branch that
+    // claims every unknown host and returns null for a path it does not
+    // recognize, short-circuiting before the registry. Without this probe a
+    // registered provider's url is never canonical, so `isCanonicalStoredUrl`
+    // rejects it and every revealed tab and selected tab silently vanishes on
+    // reload — the same class of bug a mismatched write/read probe caused for
+    // Jira. Every reader of a persisted url goes through this one helper.
+    ?? parseCandidate(value)
 }
 
 function isCanonicalStoredUrl(value: string): boolean {
@@ -331,7 +552,21 @@ export function parseSourceLinkUrl(
  *  null for Jira (which labels itself with the issue key) and for any shape
  *  the parser would not have produced. */
 export function forgeChipLabel(link: PullRequestLink): string | null {
-  if (link.provider !== 'github' && link.provider !== 'gitlab') return null
+  if (link.provider !== 'github' && link.provider !== 'gitlab') {
+    // Jira labels itself with its issue key, so it has no forge-style chip and
+    // still returns null (no descriptor can be registered under a built-in id).
+    // A REGISTERED provider gets to name its own chip instead of being dropped
+    // to the provider-neutral fallback.
+    const descriptor = sourceProviderDescriptor(link.provider)
+    if (!descriptor) return null
+    let label: string | null
+    try {
+      label = descriptor.chipLabel(link)
+    } catch {
+      return null
+    }
+    return typeof label === 'string' && label ? label : null
+  }
   let path: string
   try {
     path = new URL(link.url).pathname

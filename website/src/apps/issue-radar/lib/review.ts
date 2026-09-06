@@ -28,10 +28,12 @@ export interface UseReviewPr {
   busy: boolean
   error: Error | null
   concludedFor: string | null
+  /** Go to the chat page with Older Sessions open — see `useAgentSession`. */
+  openOlderSessions: () => void
 }
 
 export function useReviewPr(): UseReviewPr {
-  const { openSession, busy, error, concludedFor } = useAgentSession()
+  const { openSession, busy, error, concludedFor, openOlderSessions } = useAgentSession()
   // Live selection rather than the stored one -- see useInvestigate.
   const { aiLanguage } = useIssueRadar()
 
@@ -56,5 +58,5 @@ export function useReviewPr(): UseReviewPr {
     [openSession, aiLanguage],
   )
 
-  return { reviewPr, busy, error, concludedFor }
+  return { reviewPr, busy, error, concludedFor, openOlderSessions }
 }

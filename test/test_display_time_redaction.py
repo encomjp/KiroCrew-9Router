@@ -69,14 +69,14 @@ def _rewrite_last_meta(log, key: str, meta: dict) -> None:
 @pytest.mark.parametrize("role", ["assistant", "system", "tool"])
 def test_prepare_messages_redacts_every_non_user_role(role: str) -> None:
     """`system` was excluded by the old gate, so stored secrets were emitted raw."""
-    out = _prepare_messages([{"role": role, "content": f"key {SECRET}", "cls": "msg"}], False)
+    out = _prepare_messages([{"role": role, "content": f"key {SECRET}", "cls": "msg"}], False, live_child="")
     assert SECRET not in json.dumps(out), f"{role} content emitted unredacted"
 
 
 def test_prepare_messages_leaves_user_content_alone() -> None:
     """User content is deliberately NOT redacted — the author is the only reader."""
     out = _prepare_messages(
-        [{"role": "user", "content": f"key {SECRET}", "cls": "msg msg-u"}], False
+        [{"role": "user", "content": f"key {SECRET}", "cls": "msg msg-u"}], False, live_child=""
     )
     assert SECRET in out[0]["content"]
 
@@ -89,7 +89,9 @@ def test_prepare_messages_redacts_stored_meta_not_just_cls_meta() -> None:
     redaction was the only guard.
     """
     out = _prepare_messages(
-        [{"role": "tool", "content": "ok", "cls": "msg", "meta": {"tool_input": SECRET}}], False
+        [{"role": "tool", "content": "ok", "cls": "msg", "meta": {"tool_input": SECRET}}],
+        False,
+        live_child="",
     )
     assert SECRET not in json.dumps(out), "stored meta emitted unredacted"
 
@@ -163,20 +165,27 @@ def test_side_chat_parent_snapshot_keeps_user_text() -> None:
 
 
 def test_stage_result_capture_redacts_before_writing_to_disk(tmp_path, monkeypatch) -> None:
-    """_capture_stage_result writes assistant text to a NEW file on disk.
+    """The stage-result capture writes assistant text to a NEW file on disk.
 
     A gateway restart mid-orchestration leaves restored (now unredacted) turns in
     the window, so without redaction here those bytes would be written out.
+
+    Composed from the two halves the stage loop itself calls: the message walk
+    runs on the caller (it reads live slot state) and the redact-plus-write half
+    takes only strings, which is what makes it safe to hand to a worker thread.
     """
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
     monkeypatch.setattr("kiro_crew.dashboard.chat_orchestrator.config_dir", lambda: tmp_path)
-    from kiro_crew.dashboard.chat_orchestrator import _capture_stage_result
+    from kiro_crew.dashboard.chat_orchestrator import (
+        _collect_stage_result_parts,
+        _write_stage_result,
+    )
     from kiro_crew.dashboard.state import _ChatSlot
 
     slot = _ChatSlot("chat-1-stage")
     slot.append("assistant", f"result with {SECRET}", "msg msg-a", broadcast=False)
 
-    path = _capture_stage_result(slot, 1)
+    path = _write_stage_result(slot.key, 1, _collect_stage_result_parts(slot))
     written = pathlib.Path(path).read_text()
     assert SECRET not in written, "stage result persisted an unredacted credential"
 
@@ -293,7 +302,7 @@ def test_load_redacts_content_restoring_the_chokepoint(tmp_path, monkeypatch) ->
     loaded = " ".join(m.get("content", "") for m in slot.messages)
     assert SECRET not in loaded, "content must be clean in memory (the chokepoint)"
     # …and still clean on the way out.
-    assert SECRET not in json.dumps(_prepare_messages(slot.messages, False))
+    assert SECRET not in json.dumps(_prepare_messages(slot.messages, False, live_child=""))
 
 
 def test_load_leaves_user_content_raw(tmp_path, monkeypatch) -> None:
@@ -363,7 +372,7 @@ def test_load_does_not_redact_meta_keeping_boot_fast(tmp_path, monkeypatch) -> N
     loaded_meta = json.dumps([m.get("meta") for m in slot.messages])
     assert SECRET in loaded_meta, "meta was scanned on load — the ~5.5s cost is back"
     # …and the emit path still cleans it on the way out.
-    assert SECRET not in json.dumps(_prepare_messages(slot.messages, False))
+    assert SECRET not in json.dumps(_prepare_messages(slot.messages, False, live_child=""))
 
 
 # ── 6. the META side: a non-emit reader that RE-EMITS the dict ────────────────
@@ -444,10 +453,22 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
                     "role": "mcp_oauth",
                     "content": "authorize",
                     "cls": "msg msg-info",
-                    "meta": {"server_name": "acme", "oauth_url": url},
+                    # Stamped with the child the caller resolves as LIVE, which is
+                    # what a banner the user can still act on always carries:
+                    # `_emit_mcp_oauth_request` is the only producer of these rows
+                    # and it always stamps. An unstamped row means a dead flow and
+                    # is withdrawn on purpose (issues #7654, #8149) -- pinned by
+                    # the next test, so this one keeps measuring what it was
+                    # written to measure: the redaction gate.
+                    "meta": {
+                        "server_name": "acme",
+                        "oauth_url": url,
+                        "child": "live-child",
+                    },
                 }
             ],
             False,
+            live_child="live-child",
         )
         if out[0]["meta"].get("oauth_url") != url:
             blanked.append(provider)
@@ -455,6 +476,34 @@ def test_oauth_url_corpus_survives_the_emit_path(monkeypatch) -> None:
         "the emit path blanked a legitimate consent URL — the Authorize banner "
         f"would silently vanish for: {blanked}"
     )
+
+
+def test_a_legitimate_url_from_a_dead_child_is_withdrawn() -> None:
+    """The other side of the corpus test: a real URL is no longer a live one.
+
+    A banner carrying no child stamp was persisted by an earlier build, so the
+    process that owned its loopback listener and PKCE verifier is gone. The URL is
+    still a perfectly well-formed provider URL — that is exactly why the scheme and
+    credential gates cannot catch it, and why the liveness gate has to (issues
+    #7654, #8149).
+    """
+    from oauth_url_corpus import LEGIT_OAUTH_URLS
+
+    _, url = LEGIT_OAUTH_URLS[0]
+    out = _prepare_messages(
+        [
+            {
+                "role": "mcp_oauth",
+                "content": "authorize",
+                "cls": "msg msg-info",
+                "meta": {"server_name": "acme", "oauth_url": url},
+            }
+        ],
+        False,
+        live_child="live-child",
+    )
+    assert out[0]["meta"]["expired"] is True
+    assert not out[0]["meta"].get("oauth_url"), "a dead flow still offered its link"
 
 
 def test_oauth_url_gate_still_blocks_a_tampered_url() -> None:

@@ -7,7 +7,7 @@ for that state instead: a mutable **state record** (goal, phase, next intent,
 tried approaches, artifact pointers) carrying a bounded **event tail**. The
 context window becomes a cache; the ledger is the authority.
 
-Layout (see docs/system-specs/features/session-work-ledger.md):
+Layout (see docs/system-specs/modules/session-work-ledger.md):
 
     <data_home>/ledger/<store-name>/
         slot_key        # breadcrumb: the exact ledger key this dir belongs to
@@ -28,8 +28,14 @@ Design notes, each earned by a review finding:
   inside :func:`_store_name` — a lossy charset fold as the identity would map
   distinct channel session keys (colon-structured) onto one ledger.
 - **Bounded lock.** The per-ledger lock acquire is a bounded poll and fails
-  closed with ``OSError`` — a wedged cross-process holder costs one refused
-  write, never an executor thread parked forever.
+  closed with ``OSError`` — a *live cross-process holder* of the flock costs
+  one refused write, not an executor thread parked on it forever. The bound
+  covers only what the deadline can reach: contention for an already-created
+  lock inode. It does NOT cover a wedged filesystem/mount — the pre-lock
+  ``mkdir``/``os.open`` are ordinary path/inode syscalls that a dead NFS mount
+  or dying disk can stall unboundedly, and no in-process deadline can
+  interrupt a stalled syscall. That mount-level failure is a distinct,
+  out-of-scope failure mode, not a bound this code promises.
 - **Size ceiling before parse.** A state file past ``_MAX_STATE_BYTES`` is
   treated as corrupt/absent rather than parsed, so a hostile or damaged file
   cannot make every nudge fire allocate its size.
@@ -83,7 +89,7 @@ _MAX_EVENT_TAIL = 20
 _MAX_STATE_BYTES = 1_000_000
 
 #: Lock acquire budget. Every in-tree critical section is a sub-millisecond
-#: read + atomic rename, so this is a ceiling against a wedged cross-process
+#: read + atomic rename, so this is a ceiling against a live cross-process
 #: holder, not a normal wait. On expiry the write FAILS CLOSED with OSError.
 _LOCK_TIMEOUT_SECS = 5.0
 _LOCK_POLL_SECS = 0.05
@@ -173,20 +179,43 @@ def _clamp(value: Any, limit: int = _MAX_TEXT) -> str:
 
 @contextmanager
 def _locked(dir_path: Path) -> Iterator[None]:
-    """Bounded cross-process exclusive lock over one ledger directory.
+    """Bounded-against-a-holder exclusive lock over one ledger directory.
 
     The lock file is a dedicated inode that writes never replace (replacing
     the locked inode would let a second writer lock the NEW inode and
     interleave). The acquire is a bounded poll over
     :func:`platform_compat.try_acquire_lock` — the repo's one non-blocking
     acquire primitive, covering POSIX and Windows alike — and FAILS CLOSED
-    with ``OSError`` rather than entering the critical section unserialized
-    or parking a worker thread on a wedged holder forever.
+    with ``OSError`` rather than entering the critical section unserialized.
+
+    Scope of the bound (be precise — the docstring must not out-promise the
+    code). ``_LOCK_TIMEOUT_SECS`` bounds ONLY the ``try_acquire_lock`` poll
+    loop below: against a *live cross-process holder* of the flock, this
+    refuses with ``OSError`` instead of waiting forever. The deadline is
+    checked between sleeps rather than during one, so the refusal lands within
+    the budget plus at most one ``_LOCK_POLL_SECS`` interval — a bound, not an
+    exact wall-clock cap.
+
+    The pre-lock ``mkdir``/``os.open`` are ordinary path/inode syscalls; on a
+    wedged filesystem (hard NFS mount, dying disk) they can stall unboundedly,
+    and NO in-process deadline can interrupt them — SIGALRM is main-thread +
+    POSIX-only (this runs on an ``asyncio.to_thread`` worker), a bounded
+    dedicated-thread offload leaks an unkillable thread and a held fd on a
+    hard hang, and ``O_NONBLOCK`` does not cover path-resolution/inode stalls
+    (only FIFO/device opens). A wedged mount is therefore explicitly OUT OF
+    SCOPE of this lock's deadline, not a bound this contextmanager promises.
+
+    The deadline is established immediately before the poll it governs and is
+    NOT hoisted above ``mkdir``/``os.open`` — hoisting would spend the budget
+    on the pre-lock syscalls and leave a near-zero retry window for genuine
+    contention, which is the inversion that must not recur.
     """
     dir_path.mkdir(parents=True, exist_ok=True)
     lock_path = dir_path / _LOCK_FILE
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
+        # Bound only the acquire poll: set the deadline adjacent to the loop
+        # it governs, after the pre-lock syscalls (which it cannot bound).
         deadline = time.monotonic() + _LOCK_TIMEOUT_SECS
         while not try_acquire_lock(fd, exclusive=True):
             if time.monotonic() >= deadline:
@@ -381,11 +410,16 @@ def record(
             state["events"] = events[-_MAX_EVENTS:]
         state["last_progress_at"] = now
         state["schema"] = SCHEMA_VERSION
-        atomic_write(dir_path / _STATE_FILE, _serialize_bounded(state) + "\n", mode=0o600)
+        blob = _serialize_bounded(state, source=dir_path.name)
+        atomic_write(dir_path / _STATE_FILE, blob + "\n", mode=0o600)
+        # ``_serialize_bounded`` evicted from THIS dict, so the caller's
+        # post-write view is the document that just landed on disk. Do not
+        # serialize a copy here: that would return the pre-eviction lists
+        # while disk held the evicted ones (#6290).
         return state
 
 
-def _serialize_bounded(state: dict[str, Any]) -> str:
+def _serialize_bounded(state: dict[str, Any], source: str = "") -> str:
     """Serialize the state document, guaranteeing it fits the read ceiling.
 
     The reader treats a file past ``_MAX_STATE_BYTES`` as damage and reads it
@@ -400,33 +434,77 @@ def _serialize_bounded(state: dict[str, Any]) -> str:
     the oldest tried entries, are evicted until it fits. History ages out;
     the current state (goal/phase/next/artifacts) is never dropped and cannot
     exceed the ceiling on its own.
+
+    Every one of those evictions DISCARDS data that never reaches disk, so
+    unlike the read side there is no original file left to recover it from —
+    the loss is permanent the moment the write lands. The reader already WARNs
+    when the ceiling makes it discard a whole file; discarding history to stay
+    under that same ceiling is the same loss in a smaller quantity and is
+    reported the same way: one line per over-budget serialization, naming what
+    went and how much, and nothing at all when the document fits. The line
+    describes the document this call built, not a durable write — the caller's
+    ``atomic_write`` runs afterwards and may still fail.
+
+    Mutates *state* in place while evicting, and ``record`` returns that same
+    dict — deliberately, so a caller's post-write view is the document on
+    disk. See the note at the ``return`` in ``record``.
     """
     budget = _MAX_STATE_BYTES - 4096  # headroom so the reader's check never ties
-    while True:
-        blob = json.dumps(state, ensure_ascii=False)
-        if len(blob.encode("utf-8")) <= budget:
-            return blob
-        if state["events"]:
-            state["events"] = state["events"][1:]
-        elif state["tried"]:
-            state["tried"] = state["tried"][1:]
-        else:
-            # History is gone and the document still does not fit. The known
-            # fields are all clamped well under the budget, so the excess can
-            # only live in UNKNOWN fields carried forward by ``_coerce_state``
-            # (a newer writer's data, or a corrupt/hostile file that parsed).
-            # Preserving unknown fields is best-effort forward compatibility;
-            # preserving THE LEDGER is the contract — a document past the
-            # reader's ceiling is discarded wholesale on the next read, which
-            # loses the known state too. Drop the extras and retry once.
-            extras = [k for k in state if k not in _empty_state()]
-            if extras:
-                for k in extras:
-                    state.pop(k, None)
-                continue
-            # Unreachable with the field clamps; refuse rather than write a
-            # document the reader is guaranteed to discard.
-            raise ValueError("record too large to store")
+    evicted_events = 0
+    evicted_tried = 0
+    dropped_extras: list[str] = []
+    try:
+        while True:
+            blob = json.dumps(state, ensure_ascii=False)
+            if len(blob.encode("utf-8")) <= budget:
+                return blob
+            if state["events"]:
+                state["events"] = state["events"][1:]
+                evicted_events += 1
+            elif state["tried"]:
+                state["tried"] = state["tried"][1:]
+                evicted_tried += 1
+            else:
+                # History is gone and the document still does not fit. The known
+                # fields are all clamped well under the budget, so the excess can
+                # only live in UNKNOWN fields carried forward by ``_coerce_state``
+                # (a newer writer's data, or a corrupt/hostile file that parsed).
+                # Preserving unknown fields is best-effort forward compatibility;
+                # preserving THE LEDGER is the contract — a document past the
+                # reader's ceiling is discarded wholesale on the next read, which
+                # loses the known state too. Drop the extras and retry once.
+                extras = [k for k in state if k not in _empty_state()]
+                if extras:
+                    for k in extras:
+                        state.pop(k, None)
+                    dropped_extras.extend(extras)
+                    continue
+                # Unreachable with the field clamps; refuse rather than write a
+                # document the reader is guaranteed to discard.
+                raise ValueError("record too large to store")
+    finally:
+        # In ``finally`` so the refusal path reports too: it raises with the
+        # in-memory record already gutted, which is exactly when an operator
+        # most needs to know what this call threw away.
+        losses: list[str] = []
+        if evicted_events:
+            losses.append(f"oldest events[] evicted x{evicted_events}")
+        if evicted_tried:
+            losses.append(f"oldest tried[] evicted x{evicted_tried}")
+        if dropped_extras:
+            losses.append("unknown fields dropped: " + ", ".join(sorted(dropped_extras)))
+        if losses:
+            # Describes the DOCUMENT being serialized, not a completed write:
+            # ``atomic_write`` runs after this and can still fail (ENOSPC),
+            # leaving the previous file intact, and the refusal path above
+            # never writes at all. Either way this call's in-memory record has
+            # already lost the entries named here.
+            logger.warning(
+                "ledger state exceeded the %d-byte serialization budget%s; discarded: %s",
+                budget,
+                f" ({source})" if source else "",
+                "; ".join(losses),
+            )
 
 
 def purge(slot_key: str) -> None:

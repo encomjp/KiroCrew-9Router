@@ -253,7 +253,10 @@ Useful when something renders as text and you need to find where the chain broke
    so a slow app degrades to text rather than wedging the turn.
 3. The gateway writes the payload to a spool file at
    `$KIROCREW_HOME/mcp-apps/<uuid4hex>.json` and injects an opaque marker
-   `[kirocrew-mcp-app:<uuid4hex>]` into the tool result *text*.
+   `[kirocrew-mcp-app:<uuid4hex>]` at the START of the tool result *text*. It
+   leads the text (rather than trailing it) so it survives the ACP result
+   truncation cuts before the detector below runs — a long first text block
+   would otherwise lose a trailing marker and the app would never mount.
 4. That text reaches the dashboard backend as a tool result. `mcp_apps_render.py`
    detects the marker, loads the spooled payload, pushes an `mcp_app_render`
    websocket event to the chat slot, and strips the marker from the transcript.
@@ -294,4 +297,5 @@ app HTML is **server-controlled code running in your dashboard**.
 
 For **which** iframe host a new dashboard feature should use, and why an iframe
 can never be moved in the DOM without reloading it, see
-[Dashboard iframe hosts](dashboard-iframe-hosts.md).
+[Dashboard iframe hosts](https://github.com/kirodotdev/KiroCrew/blob/main/docs/architecture/dashboard-iframe-hosts.md)
+in the contributor documentation.

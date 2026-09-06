@@ -113,14 +113,33 @@ def test_only_this_changes_files_can_be_its_offenders() -> None:
     # gate, once per rebase, which is why the scope is pinned rather than trusted.
     source = SCRIPT.read_text(encoding="utf-8")
     assert "unlisted & changed" in source
+    # The resolver itself lives in scripts/ratchet_scope.py, which four merge-ref
+    # ratchets now share (#3057): a private copy per gate is how they would come to
+    # disagree about the same added line. So this gate must DELEGATE, and the shape
+    # assertions below hold against the module that owns the answer.
+    assert "ratchet_scope.py" in source, "the gate no longer delegates its scope resolution"
+    assert (
+        "def _changed_paths" not in source
+    ), "the gate has grown a private copy of the shared resolver again"
+    scope_source = (ROOT / "scripts" / "ratchet_scope.py").read_text(encoding="utf-8")
     # Both diff shapes: local branch tip, and CI's merge commit whose parents are
     # base and PR head.
-    assert '"HEAD^1", "HEAD"' in source, "the merge-vs-first-parent diff is the exact one"
-    assert '"HEAD^1", "HEAD^2"' in source
-    assert "{base}...HEAD" in source
+    assert '"HEAD^1", "HEAD"' in scope_source, "the merge-vs-first-parent diff is the exact one"
+    assert '"HEAD^1", "HEAD^2"' in scope_source
+    assert "{base}...HEAD" in scope_source
+    # The merge diffs are only exact when HEAD^1 IS the base; a local
+    # `git merge origin/main` puts the feature tip first and the same diff
+    # would scope to what main brought in. The resolver must verify which
+    # parent the base can reach before trusting the merge shape -- and the
+    # probe must actually GATE the merge attempts, not merely exist.
+    assert (
+        '"merge-base", "--is-ancestor", "HEAD^1", base' in scope_source
+    ), "the resolver no longer verifies HEAD^1 is the base before taking the merge diff"
+    assert "if is_merge and _first_parent_is_base():" in scope_source
     # And it must fail CLOSED when the base is unresolvable: judge everything
     # rather than nothing.
     assert "new_offenders = sorted(unlisted)" in source
+    assert "undeterminable (judging the whole tree)" in scope_source
     # And it must SAY which scope it used. The silent fallback is what hid the
     # earlier misbehaviour through two CI rounds.
     assert 'print(f"black gate scope: {scope_label}"' in source

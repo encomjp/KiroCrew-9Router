@@ -35,6 +35,7 @@ from kiro_crew.dashboard.origin import (
 from kiro_crew.dashboard.refresh_tokens import (
     MAX_REFRESH_TTL_SECS,
     REFRESH_COOKIE_PATH,
+    bind_chain_peer,
     cookie_jar_needs_pruning,
     foreign_port_cookies,
     generate_refresh_token,
@@ -57,6 +58,7 @@ from kiro_crew.dashboard.revocation_gen import (  # noqa: F401  # re-exports
 from kiro_crew.dashboard.tailnet import (
     ForwardedPeer,
     TailnetTrust,
+    is_forwarded_tailnet_request,
     login_allowed,
     peer_pin_key,
     peer_pin_key_for_claim,
@@ -1419,15 +1421,48 @@ def _app_api_allowlist(app_name: str) -> tuple[str, ...]:
     return allow
 
 
+# Literal first path segments registered under ``/api/apps/`` that are NOT the
+# ``/api/apps/{name}`` catch-all. Source of truth is the route table in
+# ``kiro_crew.apps.routes.setup_routes`` (the ``add_get``/``add_post`` calls for
+# ``/api/apps/registry``, ``/api/apps/registries``, ``/api/apps/blob``,
+# ``/api/apps/registry/install``, ``/api/apps/install`` and
+# ``/api/apps/register``), all registered BEFORE ``/api/apps/{name}``.
+#
+# These segments resolve to SHARED literal routes (registry listing, registry
+# install, blob proxy, install, self-registration, registry refresh — which
+# triggers outbound git fetches of every configured registry). Without this
+# carve-out an app that names itself after one of them (e.g. ``registries``)
+# would implicitly own that route via ``_app_owns_path`` and could invoke it
+# with no ``permissions.api`` grant (CWE-269 authorization bypass). The carve-out
+# is the primary security boundary; ``apps.manifest.RESERVED_APP_PATH_SEGMENTS``
+# mirrors this set to also refuse such names at manifest validation for NEW apps
+# (defense-in-depth). Keep both lists in sync with the routes.py table.
+RESERVED_APP_PATH_SEGMENTS: frozenset[str] = frozenset(
+    {"registry", "registries", "blob", "install", "register"}
+)
+
+
 def _app_owns_path(app_name: str, path: str) -> bool:
     """True if *path* is within *app_name*'s own namespace.
 
     Covers the reverse-proxy + UI surface (``/apps/<name>/...``) and the
     per-app management/config surface (``/api/apps/<name>/...``). Membership is
     a path-boundary match so app ``foo`` cannot reach app ``foo-bar``.
+
+    Carve-out: the ``/api/apps/<name>`` branch does NOT match when ``app_name``
+    is one of ``RESERVED_APP_PATH_SEGMENTS`` — those segments resolve to shared
+    literal routes registered before ``/api/apps/{name}``, so treating them as an
+    app's own namespace would hand any app so named implicit ownership of those
+    routes without a ``permissions.api`` grant. The ``/apps/<name>`` reverse-proxy
+    branch is a separate namespace (its literal-page reservations live in
+    ``apps.manifest.RESERVED_ROUTE_APP_NAMES``) and is intentionally left
+    unchanged.
     """
-    for base in (f"/apps/{app_name}", f"/api/apps/{app_name}"):
-        if path == base or path.startswith(base + "/"):
+    if path == f"/apps/{app_name}" or path.startswith(f"/apps/{app_name}/"):
+        return True
+    if app_name not in RESERVED_APP_PATH_SEGMENTS:
+        api_base = f"/api/apps/{app_name}"
+        if path == api_base or path.startswith(api_base + "/"):
             return True
     return False
 
@@ -2109,8 +2144,7 @@ def token_auth_middleware(
         peer: ForwardedPeer | None = None
         if (
             tailnet_trust is not None
-            and tailnet_trust.trust_identity
-            and tailnet_trust.allowed_logins
+            and tailnet_trust.enforces_identity
             and (
                 bool(request.query.get("token"))
                 or any(c.startswith(("mc_token_", "mc_refresh_")) for c in request.cookies)
@@ -2132,6 +2166,40 @@ def token_auth_middleware(
                     error="login not in allowed_logins",
                 )
                 _log_auth(request, peer.login, "denied", "tailnet login not allowed")
+                return _deny(request, "tailnet login not allowed")
+            if (
+                peer is None
+                and tailnet_trust.identity_unknown
+                and is_forwarded_tailnet_request(request, tailnet_trust)
+            ):
+                # Config load could not read the operator's allowlist, and this
+                # forwarded tailnet peer could not be attributed either (daemon
+                # down, timeout, or a header that disagreed). Falling through
+                # here would admit it on the token alone — which is exactly the
+                # widening this gate exists to stop, so the "unknown policy"
+                # deny would announce itself and then not happen.
+                #
+                # Distinct from the ordinary enabled path, where an unresolved
+                # peer deliberately falls through (fail-closed on identity,
+                # fail-open on availability): there the operator's allowlist is
+                # KNOWN, so availability is the only thing at stake. Here the
+                # restriction itself is missing, and there is nothing left to be
+                # available for.
+                #
+                # ``is_forwarded_tailnet_request`` is what keeps this from being
+                # a lockout: a local request resolves to no peer for an entirely
+                # different reason and is not touched, so the operator can still
+                # reach the dashboard to repair config.json.
+                _sel = _sel_fn()
+                _sel.log_api_access(
+                    caller=request.remote or "",
+                    operation="tailnet_peer_auth",
+                    outcome="denied",
+                    source="token_auth",
+                    resources=path,
+                    error="tailnet allowlist unreadable and peer unresolved",
+                )
+                _log_auth(request, "", "denied", "tailnet identity policy unreadable")
                 return _deny(request, "tailnet login not allowed")
         # Audit attribution (RFC §3): when a peer resolved, the trail names a
         # person; otherwise it stays the immediate peer address as today.
@@ -2909,14 +2977,55 @@ def token_auth_middleware(
                     # at restart while a 30-day refresh credential beside it
                     # re-minted a fresh session on the next visit, and "ends at
                     # restart" would be false by one rotation.
+                    #
+                    # Peer binding for the CHAIN (issue #2417). The QR "persistent"
+                    # session shape brought its own ``require_peer`` claim on the
+                    # link; an ordinary Phase-3 session did not, so its chain was
+                    # minted UNBOUND even though its access token was pinned to a
+                    # verified peer. That asymmetry was the laundering path: a
+                    # refresh cookie stolen from allowed node A, replayed from
+                    # allowed node B, rotated cleanly and handed back an access
+                    # token pinned to B. Binding here closes it at the mint, so
+                    # the chain says who owns it from its first byte rather than
+                    # relying on the rotation handler to infer it.
+                    #
+                    # Gated on a RESOLVED peer, not on ``peer_key``: that helper
+                    # answers ``ip:<addr>`` when no peer resolved, and binding a
+                    # chain to the tunnel's shared loopback address would read as
+                    # a pin while excluding nobody. ``bind_refresh_chains`` is the
+                    # operator's documented opt-out for cross-device roaming at
+                    # node scope.
+                    _refresh_require_peer = str(data.get("require_peer", "")) == "1"
+                    _refresh_peer_key = _session_peer_key
+                    if (
+                        not _refresh_require_peer
+                        and peer is not None
+                        and tailnet_trust is not None
+                        and tailnet_trust.bind_refresh_chains
+                        and peer_key.startswith("ts:")
+                    ):
+                        _refresh_require_peer = True
+                        _refresh_peer_key = peer_key
                     refresh_token, chain_id, _jti, refresh_exp = generate_refresh_token(
                         user_id,
                         boot=str(data.get("boot", "")),
-                        require_peer=str(data.get("require_peer", "")) == "1",
-                        peer_key=_session_peer_key,
+                        require_peer=_refresh_require_peer,
+                        peer_key=_refresh_peer_key,
                     )
                     refresh_remaining = int(refresh_exp - time.time())
                     if refresh_remaining > 0:
+                        if _refresh_peer_key:
+                            # Server-side twin of the signed claim above. The
+                            # claim is authoritative and cannot be forged, but it
+                            # only binds chains whose mint path remembered to set
+                            # it — and this issue exists because one did and the
+                            # others did not. A record the presented token cannot
+                            # influence makes the next forgetful mint path fail
+                            # closed instead of silently unbound. Offloaded
+                            # because it writes refresh_chains.json.
+                            await asyncio.to_thread(
+                                bind_chain_peer, chain_id, _refresh_peer_key, refresh_exp
+                            )
                         resp.set_cookie(
                             refresh_cookie_name(_cookie_port_from_host(request, port)),
                             refresh_token,

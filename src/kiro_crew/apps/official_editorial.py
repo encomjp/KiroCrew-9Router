@@ -40,6 +40,7 @@ from kiro_crew.apps.official_catalog import (
     _resolve_ref,
     fetch_document,
 )
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 
 logger = logging.getLogger(__name__)
@@ -104,14 +105,25 @@ def _read_cache() -> dict[str, Any] | None:
 def _write_cache(doc: dict[str, Any]) -> None:
     path = _cache_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(doc), encoding="utf-8")
+        atomic_write(path, json.dumps(doc))
     except OSError:
         logger.debug("could not cache the editorial document", exc_info=True)
 
 
 def _write_failure() -> None:
     _write_cache({_FAILED_KEY: time.time()})
+
+
+def forget_cache() -> None:
+    """Drop the cached document and any failure memory; the next read re-fetches.
+
+    Same contract as ``official_catalog.forget_cache`` -- see there for why a
+    file delete (not a re-fetch) is the whole job.
+    """
+    try:
+        _cache_path().unlink(missing_ok=True)
+    except OSError:
+        logger.debug("could not drop the editorial cache", exc_info=True)
 
 
 def _download() -> dict[str, Any] | None:
@@ -338,4 +350,4 @@ def load_sections(fetcher: Any = None) -> list[dict[str, Any]]:
     return out
 
 
-__all__ = ["load_sections", "MAX_BYTES", "OFFICIAL_EDITORIAL_URL"]
+__all__ = ["forget_cache", "load_sections", "MAX_BYTES", "OFFICIAL_EDITORIAL_URL"]

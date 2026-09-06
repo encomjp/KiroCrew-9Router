@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew import platform_compat
+from kiro_crew.apps.builtins.ops_mission_control.backend.models import CorruptDocumentError
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 
@@ -129,11 +130,95 @@ def policy_path() -> Path:
 
 
 def _read() -> dict[str, Any]:
+    """The stored ceiling, or ``{}`` when there is nothing readable.
+
+    A DISPLAY/GATE read: it must degrade to the caller's DEFAULT rather than
+    raise. Every caller left on this path has a RESTRICTIVE default -- an
+    unreadable ceiling reads as ``observe`` with no act-rules, the destination
+    and identity keys read as unset -- so degrading is the safe direction. The
+    one key whose default is permissive (``PRIMARY_KEY``, see
+    ``rotation.is_primary``) does NOT read through here: authority decisions
+    go through :func:`read_authority`, which refuses what this read degrades.
+    Found in review (GPT 5.6), two rounds: swallowing more here widened the
+    fail-open door, and scoping it out as pre-existing was rightly rejected --
+    a corrupt file granting prune authority is the corruption-enables-
+    destruction failure this change exists to remove.
+
+    An absent file is silent -- no ceiling has been stored yet, not a fault.
+    A degraded read is logged: the state is restrictive but it is also
+    silent, and nothing else would tell an operator their configuration has
+    stopped applying.
+    """
     try:
         raw = json.loads(policy_path().read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         return {}
-    return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning(
+            "ops-mission-control: keystone policy file unreadable; every key will "
+            "read as its restrictive default",
+            exc_info=True,
+        )
+        return {}
+    if not isinstance(raw, dict):
+        # The same degradation reached without a parse failure -- same silence
+        # problem, same log line.
+        logger.warning(
+            "ops-mission-control: keystone policy file root is not an object; "
+            "every key will read as its restrictive default"
+        )
+        return {}
+    return raw
+
+
+def _read_for_update() -> dict[str, Any]:
+    """The ceiling a read-modify-write is allowed to publish over.
+
+    ``_PolicyLock`` documents that every writer here is a read-modify-write and
+    that ``atomic_write`` REPLACES the whole file. So an empty base is not
+    "nothing to carry forward" -- it is "discard every other operator-only key",
+    and this file holds ALL of them: the autonomy ceiling, the outbound ledger
+    remote and Slack channel, the rotation identity, the primary-instance flag.
+    Only a MISSING file makes that base true.
+
+    Losing them is not a preference reset. Each key is fenced onto the keystone
+    floor precisely because the agent must not be able to set it, and every one
+    reverts to a value the agent CAN influence: ``mode`` and ``autonomy_rules``
+    fall back to a default the route re-derives, and the destination and identity
+    keys fall back to absent, which is how the off-shift refusal and the
+    ``not_primary`` gate get their inputs. Silently dropping the operator's
+    ceiling on one transient EACCES is the failure this file exists to prevent,
+    arriving by accident instead of by attack. The error propagates and the
+    write is abandoned instead.
+
+    Corruption propagates too (#7805, mirroring #7794): "cannot merge into" is
+    not "safe to destroy", and for THIS file silent replacement re-opens the
+    exact bypass the keystone floor exists to prevent -- a truncated document
+    rewritten from empty reverts every fenced key to a value the constrained
+    party can influence. Every corruption door raises the one named type,
+    :class:`CorruptDocumentError`: a parse failure, a byte stream that is not
+    UTF-8 (a ``ValueError`` but NOT a ``JSONDecodeError``, so unwrapped it
+    would slip past every corruption clause at the callers), and valid JSON
+    whose root is not an object (which parses without raising, so coercing it
+    to ``{}`` would destroy a document nobody could read). No per-entry check
+    beyond the root: values here are arbitrary JSON passed through verbatim,
+    so a parsed document survives a read-write cycle by construction.
+    """
+    try:
+        raw = json.loads(policy_path().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        raise CorruptDocumentError(exc.msg, exc.doc, exc.pos) from exc
+    except UnicodeDecodeError as exc:
+        raise CorruptDocumentError(
+            f"policy file is not valid UTF-8: {exc.reason}",
+            exc.object.decode("utf-8", "replace")[:120],
+            0,
+        ) from exc
+    if not isinstance(raw, dict):
+        raise CorruptDocumentError("policy file root is not a JSON object", str(raw)[:120], 0)
+    return raw
 
 
 #: Lock filename beside the policy file. Not the policy file itself: locking the file being
@@ -224,11 +309,15 @@ def set_ceiling(*, mode: str | None = None, rules: list[Any] | None = None) -> N
     could fix because the interleaving comes from another request.
 
     ``None`` means "leave unchanged", so this is also the single-field writer.
+
+    Raises ``OSError`` when the existing ceiling could not be read; see
+    :func:`_read_for_update` for why that is not collapsed to an empty document
+    here.
     """
     if mode is None and rules is None:  # pragma: no cover — programming error, not input
         raise ValueError("set_ceiling requires at least one of mode/rules")
     with _PolicyLock():
-        data = _read()
+        data = _read_for_update()
         if mode is not None:
             data[_MODE_KEY] = mode
         if rules is not None:
@@ -268,12 +357,44 @@ def get(key: str, default: Any = None) -> Any:
     return data.get(key, default)
 
 
+def read_authority(key: str, default: Any = None) -> Any:
+    """Read one operator-only value for an AUTHORITY decision -- strict, never lenient.
+
+    :func:`get` degrades an unreadable or corrupt file to the caller's default, which is
+    safe exactly when the default is the restrictive answer -- true for every key here
+    except one. ``PRIMARY_KEY`` defaults to TRUE (``rotation.is_primary``), so the lenient
+    read turns a truncated policy file into GRANTED ledger-prune authority: the corrupt
+    file becomes the key that unlocks destroying shared knowledge, which is the exact
+    corruption-enables-destruction failure #7805 exists to remove. Found in review
+    (GPT 5.6), which correctly rejected scoping this out as pre-existing.
+
+    Reuses :func:`_read_for_update`'s read, deliberately: one strict reader, one set of
+    corruption doors (parse failure, non-UTF-8, non-object root), no second copy to
+    drift. Only a MISSING file reads as the default -- a fresh install is genuinely the
+    default state, while an unreadable or corrupt file is an UNKNOWN state, and an
+    authority check that cannot read its input must refuse rather than guess. Callers
+    whose failure posture is "deny" catch the raise and answer False.
+
+    Not folded into :func:`get` wholesale because the restrictive-default keys WANT the
+    lenient read: failing ``read_mode`` on a transient EACCES would wedge every
+    authorization gate on a condition that clears by itself, to protect keys whose
+    degraded answer is already the safe one.
+    """
+    if key not in OPERATOR_ONLY_KEYS:  # pragma: no cover — programming error, not input
+        raise KeyError(f"{key!r} is not an operator-only key; use config.json for it")
+    return _read_for_update().get(key, default)
+
+
 def put(key: str, value: Any) -> None:
-    """Write one operator-only value. Dashboard-PUT only — see the module docstring."""
+    """Write one operator-only value. Dashboard-PUT only — see the module docstring.
+
+    Raises ``OSError`` when the existing ceiling could not be read, for the reason
+    :func:`_read_for_update` gives.
+    """
     if key not in OPERATOR_ONLY_KEYS:  # pragma: no cover — programming error, not input
         raise KeyError(f"{key!r} is not an operator-only key; use config.json for it")
     with _PolicyLock():
-        data = _read()
+        data = _read_for_update()
         data[key] = value
         _write(data)
 

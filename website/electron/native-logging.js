@@ -8,12 +8,18 @@
 // process's raw stderr, and a GUI launch (Dock, Finder, Start menu) discards
 // stderr entirely. It is not in the macOS unified log either — verified against
 // a real renderer abort: `log show --last 12h` filtered to the Electron
-// framework returned zero fatal lines. So the single most useful sentence about
-// a renderer death — V8's own `Fatal error in ... / Reached heap limit /
-// invalid size` — was being thrown away, leaving only a `.ips` crash report
-// whose `asi` field is null and whose every frame symbol is a
+// framework returned zero fatal lines. What that leaves behind is a `.ips`
+// crash report whose `asi` field is null and whose every frame symbol is a
 // nearest-neighbour mismatch. `renderer-recovery.js` could say THAT the
 // renderer died and reload it; nothing could say WHY.
+//
+// What this does NOT capture, stated plainly because an earlier version of this
+// comment claimed the opposite: V8's own fatal line (`Fatal error in ... /
+// Reached heap limit / invalid size`) is printed with `fputs` to raw fd 2, and
+// `--enable-logging=file` redirects Chromium's `LOG()` sink, which is a
+// DIFFERENT stream. A V8 fatal therefore never lands in chromium.log. See the
+// "Deliberately NOT attempted" note below for why fd 2 is still unredirected,
+// and `cage-trace.js` for the narrower capture that does reach V8's own path.
 //
 // This is the same correction already applied to the gateway child process,
 // whose spawn used `stdio:"ignore"` until a silent Gatekeeper SIGKILL proved
@@ -31,6 +37,11 @@
 //      never set on the launch that actually crashed.
 //   2. A local minidump via `crashReporter`. Carries the abort context for a
 //      renderer that dies without printing anything at all.
+//
+// Capturing is only half of it: `crash-collector.js` is what makes either
+// channel reachable by the person who hit the crash, by noticing new artifacts
+// and recording them in a `crashes.log` ledger the user can hand over. Until
+// that landed, both channels wrote files nothing ever mentioned again.
 //
 // Both are bounded by keeping exactly two generations of the log file (see
 // `rotateNativeLog`): the run being debugged is almost never the run that is
@@ -51,6 +62,10 @@
 //
 
 const path = require("path");
+// The SAME debug opt-in the desktop profiler uses, rather than a second one:
+// `enable-precise-memory-info` below is a profiling switch, and one gate for
+// all of them keeps `KIROCREW_DEBUG=1` the single answer to "turn profiling on".
+const { profilingEnabled } = require("./perf-metrics");
 
 /** Log file name, alongside gateway-launch.log in the app's logs directory. */
 const NATIVE_LOG_BASENAME = "chromium.log";
@@ -80,15 +95,36 @@ function previousNativeLogPath(logPath) {
  * switch names: these are Chromium's spelling, not Electron's, and a typo here
  * fails silently (an unknown switch is ignored, logging simply stays off).
  *
+ * @param {object} [env] Environment consulted for the debug opt-in.
  * @returns {Array<[string, string]>} `[name, value]` pairs for appendSwitch.
  */
-function nativeLoggingSwitches(logPath) {
-  return [
+function nativeLoggingSwitches(logPath, env = process.env) {
+  const switches = [
     // `=file` is what sends output to --log-file instead of stderr, which the
     // GUI launch we are compensating for would throw away again.
     ["enable-logging", "file"],
     ["log-file", String(logPath)],
   ];
+  // Makes `performance.memory` exact and uncached. Without it Chromium
+  // BUCKETIZES those values and caches them for 20 MINUTES unless the renderer
+  // happens to be locked to a site -- so a memory probe reading it can return a
+  // plausible-looking constant forever and be misread as "flat and healthy".
+  // The renderer-memory trajectory (src/lib/memoryWatch.ts) derives V8 external
+  // memory from that reading, so this switch is what makes its series real; its
+  // flush reports `externalMoved=NO-FROZEN-VALUE` if the number never changes,
+  // which is the check that this switch actually took effect. Value-less switch,
+  // so the empty string is the whole argument.
+  //
+  // DEBUG-ONLY, unlike the two above: the bucketization it removes is a
+  // Chromium PRIVACY control, and it is removed per-PROCESS for every renderer
+  // -- including the browser-panel renderers that load UNTRUSTED pages, where
+  // exact heap sizes are the side channel the bucketing exists to blunt. The
+  // logging switches serve a user debugging their own crash; this one widens
+  // what an arbitrary page can measure, so it stays behind the same
+  // KIROCREW_DEBUG opt-in as the rest of the profiling surface and is OFF on a
+  // normal install. Turning it on is what a memory investigation already does.
+  if (profilingEnabled(env)) switches.push(["enable-precise-memory-info", ""]);
+  return switches;
 }
 
 /**
@@ -161,6 +197,7 @@ function rotateNativeLog(logPath, { fs, log = () => {} } = {}) {
  * @param {(opts: object) => void} [deps.startCrashReporter]
  * @param {object} [deps.fs]                 Injected for the rotate step.
  * @param {(msg: string) => void} [deps.log]
+ * @param {object} [deps.env]                Environment for the debug opt-in.
  * @returns {{logPath: string, previousPath: string|null, rotated: boolean, blocked: boolean, switches: string[], crashReporter: boolean}}
  */
 function initNativeLogging({
@@ -169,6 +206,7 @@ function initNativeLogging({
   startCrashReporter,
   fs,
   log = () => {},
+  env = process.env,
 } = {}) {
   const logPath = nativeLogPath(logsDir);
   const applied = [];
@@ -194,7 +232,7 @@ function initNativeLogging({
         `sink is skipped this launch rather than risk overwriting it`
     );
   } else {
-    for (const [name, value] of nativeLoggingSwitches(logPath)) {
+    for (const [name, value] of nativeLoggingSwitches(logPath, env)) {
       try {
         appendSwitch(name, value);
         applied.push(name);

@@ -122,15 +122,24 @@ describe('widgetHeights', () => {
     const util = read('utils', 'widgetHeights.ts')
     const frame = read('components', 'WidgetFrame.tsx')
     const page = read('pages', 'ArtifactsPage.tsx')
+    // WidgetThumb -- the gallery's consumer of this cache -- was extracted out of
+    // ArtifactsPage into this shared module so a second page (the Drive library
+    // gallery) renders identical previews. So the CONSUMER moved; the invariant
+    // did not. The page is still held to "must not contain the key", and the
+    // import/no-private-map assertions now follow WidgetThumb to where it lives.
+    const thumbs = read('components', 'library', 'ArtifactThumbs.tsx')
     // The key, the map, the debounce and the persist live in exactly one file.
     expect(util).toContain("'mc-widget-heights'")
     expect(frame).not.toContain('mc-widget-heights')
     expect(page).not.toContain('mc-widget-heights')
-    // ...and both consumers go through it rather than keeping a private copy.
-    for (const [name, text] of [['WidgetFrame', frame], ['ArtifactsPage', page]] as const) {
-      expect(text, `${name} must import the shared cache`).toMatch(/from '\.\.\/utils\/widgetHeights'/)
+    expect(thumbs).not.toContain('mc-widget-heights')
+    // ...and every consumer goes through it rather than keeping a private copy.
+    for (const [name, text] of [['WidgetFrame', frame], ['ArtifactThumbs', thumbs]] as const) {
+      expect(text, `${name} must import the shared cache`).toMatch(/from '(\.\.\/)+utils\/widgetHeights'/)
       expect(text, `${name} must not hold its own map`).not.toMatch(/const heightCache/)
     }
+    // The page must not have quietly grown a replacement on its way out.
+    expect(page, 'ArtifactsPage must not hold its own map').not.toMatch(/const heightCache/)
     // The frame takes the DEFAULT key space, which is what keeps the entries it
     // already persisted resolvable across the extraction.
     expect(frame).toMatch(/widgetHeightKey\(html\)/)

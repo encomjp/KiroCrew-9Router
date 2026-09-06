@@ -157,7 +157,7 @@ choice blob makes the usage line unreadable.
 | `kirocrew spawn run/list` | Manage background subagents |
 | `kirocrew app install/list/enable/disable/uninstall` | Manage App Kit apps. Uninstall preserves `apps/<name>/data/` by default. |
 | `kirocrew app uninstall NAME --purge-data` | Explicitly uninstall an app and permanently delete its app data. |
-| `kirocrew app dev <name> [--off]` | Toggle an installed app into/out of dev mode (no-store UI serving + live reload on file change). See [App Dev Mode](#app-dev-mode). |
+| `kirocrew app dev <name> [--off] [--confirm-out-of-install-root]` | Toggle an installed app into/out of dev mode (no-store UI serving + live reload on file change). See [App Dev Mode](#app-dev-mode). |
 | `kirocrew learn add/list/remove` | Manage learned corrections |
 | `kirocrew run TASK.md` | Run an autonomous task from a spec file |
 | `kirocrew token` | Print a dashboard access URL with auth token |
@@ -185,6 +185,13 @@ choice blob makes the usage line unreadable.
 | `kirocrew restore --list-components` | Show available component names |
 | `kirocrew snapshot --allow-unpinned-staging` | Stage by path name where a directory cannot be pinned by descriptor |
 | `kirocrew restore <file> --allow-unpinned-staging` | Same, for the restore side |
+| `kirocrew agent list/create/update/delete/reset-model` | Manage Kiro Crew agent definitions (`kiro_agent`, `workspace`, `memory_store` bindings). `reset-model` clears a spec's pinned model, the narrow way back to the shipped default — see [providers.md](providers.md). |
+| `kirocrew artifact list/show/save/update/versions/delete` | Manage saved artifacts (LLM-generated UI). Same store the MCP tools and dashboard use — see [artifacts.md](artifacts.md). |
+| `kirocrew consolidate [session_key] [--all]` | Force history consolidation, which triggers skill extraction. Omit the key to list sessions with unconsolidated messages. |
+| `kirocrew eval [scenarios…] [--all] [--judge]` | Run multi-session evaluation scenarios; a bare invocation is the ~30s smoke test — see [knowledge.md](knowledge.md). |
+| `kirocrew sandbox install-profile/status/remove-profile` | Manage the AppArmor profile the agent sandbox needs (Linux) — see [security.md](security.md). |
+| `kirocrew tailnet status/up/down` | Publish the dashboard on your tailnet (Tailscale) and trust its origin, or stop publishing — see [remote-and-mobile](../../guides/remote-and-mobile.md). |
+| `kirocrew telemetry status/disable/enable` | Inspect exactly what the anonymous beacon sends, or turn it off permanently — see [metrics.md](metrics.md) and [governance.md](governance.md). |
 
 ### Staging is descriptor-pinned, and refuses rather than degrading silently
 
@@ -236,7 +243,10 @@ path gives up is ancestor-swap resistance, not link resistance.
 | `kirocrew memory show [preferences\|projects\|history]` | Read the markdown memory layer (all three when no target given); `--format md\|json`, `--since YYYY-MM-DD` for history |
 | `kirocrew memory export/import/migrate` | Export memory to JSON (`--include-markdown` adds the markdown layer), import it back, or migrate legacy markdown memory into the vector store |
 | `kirocrew policy show/validate/explain/profile` | Inspect the effective enterprise security policy, load-check it and all profiles, explain one tool/scope decision for a surface, or print a profile. `show` also summarizes the built-in denied-command catalog as grouped counts (`--ids` lists each category's rule ids), on every install regardless of whether an enterprise policy is active — the one place an agent can learn a class of work is hard-denied before planning around it. |
-| `kirocrew pod up/down/ls/status/token/url/logs/exec/install/provision` | Isolated worktree test gateways (**Linux `systemd --user` only** — every systemd-touching verb refuses with a one-line message on macOS/Windows). See `src/kiro_crew/pod/README.md`. |
+| `kirocrew pod up/down/ls/status/token/url/scenarios/api/logs/exec/install/provision` | Isolated worktree test gateways (**Linux `systemd --user` only** — every systemd-touching verb refuses with a one-line message on macOS/Windows). See `src/kiro_crew/pod/README.md`. |
+| `kirocrew pod scenarios [--json]` | List packaged seed scenarios in deterministic name order. Human output shortens each description to the last complete sentence that fits, cutting between words with an ellipsis when none does; `--json` emits an array of `{name, description}` rows with each fixture manifest's complete `description:` scalar; literal (`|`) blocks preserve newlines, while folded (`>`) blocks normalize to one paragraph. Extraction stays dependency-free without requiring PyYAML at runtime. An empty registry returns success with `[]` in JSON mode or an explicit human diagnostic. |
+| `kirocrew pod api` | `api <wt> <METHOD> <path> [--data JSON] [--allow-write]` makes one authenticated request and prints `{name, method, path, status, ok, body}`; GET/HEAD are the default surface and other methods require `--allow-write`. It refuses caller-supplied `token` query parameters without echoing them, authenticates with the dashboard's query-token contract, caps response reads, and mints only after the pod PID record agrees with systemd MainPID (listener tools are optional corroboration). The authenticated request goes over the pod's private `dashboard-<port>.sock` in the pod's own home with no TCP fallback, so the minted token cannot reach a process that took the pod's port; an absent socket refuses through the envelope before minting. See `src/kiro_crew/pod/README.md`. |
+| `kirocrew pod up --seed <scenario\|dir>` | Pre-populate the isolated home. A bare name is a packaged fixture and populates the whole home; a path contributes only its sanitized `config.json`. Unknown names are refused with the available list. Named fixtures copy directly into the final home through pinned source/destination directory descriptors; config/workspace setup uses the same held home, and the manifest lands last as the completion marker. Populated homes are never overwritten: a named-seed request against one refuses before start even when its marker matches; use plain `pod up` to restart it unchanged. Seeded config disables channel enablement and restores the sandbox floor. A per-instance systemd drop-in runs the checkout's own venv binary, post-health marker readback detects a seed that did not land, and `pod down` removes the drop-in with the home. Pod homes provide operational/state isolation, not protection from arbitrary same-UID host processes; Controller v1 invokes seeding from the host control plane and does not support nested pod control. |
 | `kirocrew knowledge dedup [--apply]` | Collapse cross-source duplicate knowledge documents (dry-run unless `--apply`) |
 | `kirocrew cron preview <script>` | Run a script cron locally with real MCP tools; notifications are captured and printed instead of delivered |
 | `kirocrew workspace create/update --dir <name>` | `--dir` is a directory NAME that must resolve to a **strict descendant of the data home** (`~` is expanded first); anything landing outside — and the home **root itself**, in any spelling — is refused with a SEL `denied` audit event. Containment, not an absolute-path ban: an absolute path *under* the home resolves where the relative form would and is accepted. The strict-descendant test is what closes the root case for tilde paths, since the per-call-site root-equality checks compare un-expanded `config_dir() / ws_dir`. Deliberately stricter than the dashboard's `POST /api/workspaces`, which accepts an absolute `dir` anywhere, screened by `is_sensitive_path`. |
@@ -765,6 +775,24 @@ runtime that still ships the API keeps the mitigation. Without that guard the
 Linux pidfd branch raised `AttributeError` and `kirocrew gateway` died before
 binding its port, while every other subcommand kept working.
 
+### Linux gateway heap reclamation
+
+The event-loop heartbeat offers a self-gating maintenance object a tick every
+five seconds. At most once every ten minutes on Linux, it reads current RSS
+directly from procfs. When RSS is at least 1.5 GiB, it asks glibc
+`malloc_trim(0)` to return wholly-free heap pages to the OS and logs reductions
+of at least 16 MiB. The probe and allocator call run in a worker thread, after
+the dashboard socket has bound, so maintenance cannot delay readiness or block
+the event loop. Healthy gateways remain below the threshold and do no
+allocator-wide work.
+
+The heartbeat waits at most two seconds for a pass. A timed-out worker keeps the
+single in-flight slot until it exits, preventing repeated submissions or a
+watchdog-triggering wait when the executor is saturated. Missing `ctypes`,
+non-glibc libc, failed current-RSS probes, and rejected trim calls are
+best-effort no-ops: reclamation must never stop the liveness heartbeat or make
+the gateway unavailable. macOS and Windows are unchanged.
+
 ### Live-target bootstrap
 
 On the `gateway` command path only, immediately after `_JAILED_COMMANDS`
@@ -841,7 +869,8 @@ Each step checks if the tool is already installed and skips if present.
 12. **WhatsApp (optional)**: printed whether or not the channel is enabled, because a channel that is invisible in the preflight is the failure this section exists to catch. When enabled it reports the optional `neonize` extra, checked with `find_spec` and never imported (importing it loads a ~19 MB ctypes CDLL plus protobuf descriptors, and a health check must not initialize the subsystem it inspects, nor construct a client), and whether the linked-device session store exists at `<data home>/whatsapp/session.db`, resolved from the same expression the channel opens it with so the two can never describe different files. A missing extra IS an issue: the channel is enabled, cannot start, and the fix is one offline `pip install`. An absent store is a `⚠️` note and never an issue, because pairing is a QR scan served BY the running gateway, so failing here would break the documented `kirocrew doctor && kirocrew gateway` chain at the one moment the operator has to start the gateway to make progress. Group membership is not knowable offline, so the section reports the configured count and the gateway logs the unmatched JIDs on connect
 13. kiro-cli connectivity
 14. Gateway running status
-15. **Cron job health**: names cron jobs that auto-paused after repeated failures (`Fix: kirocrew cron resume <id>`) and jobs whose last run errored while still scheduled (`Fix: kirocrew cron trigger <id>`), with an aggregate count each and the named list capped at 5 plus a `+N more` tail. Read-only — doctor never resumes or triggers a job, because an auto-pause after `_AUTO_PAUSE_THRESHOLD` consecutive failures is usually load-bearing and lifting it silently would hide the problem the run is meant to find. The scan is `cron.unhealthy_jobs_from_disk()`, which reads `crons.json` directly rather than via the gateway API: the dashboard's per-job `err` badge and the gateway's hourly failure re-alert both run inside the gateway, so neither can report a wedged one, and that out-of-process property is the point of this check. A job the user paused explicitly is never reported (only `auto_paused` is a health signal, and both flags can be set at once since pausing an auto-paused job preserves `auto_paused`). Silent on a healthy store and on a fresh install with no `crons.json`. A store that EXISTS but yields no readable job list — unparseable, non-UTF-8, wrong shape, or holding no usable record — is reported instead, because the scheduler can load nothing from it and every job has stopped; reporting that as a clean bill of health would reproduce the silence this check exists to break. No corruption aborts the run
+15. **Loop-stall crash dump attribution**: when a dump with thread stacks is less than 7 days old, the section prints the wedged main-thread frames and then an `attribution:` block from `stall_attribution.attribute_dump(dump, config_dir())`, read from disk with no gateway involved: the surface the loop was serving (named by the OUTERMOST recognised frame of the wedged stack, so a cron turn that passes through the Slack gateway module still reads as `cron`), the gate frame when the stall is inside the permission gate, and — for a cron surface — the job, joined by PID to the in-flight markers under `<data home>/cron-running/` (`cron_inflight`: written when a run starts executing, cleared on every `finally`, so a surviving marker whose PID is dead is a run a hard exit interrupted). Exactly one marker matching the dump's `# PID:` names the job and yields `recommended: kirocrew cron pause <id>` plus the job's current pause state from `crons.json` (`job_pause_state_from_disk`); several markers list the candidates and say one cannot be named; none says so; a non-cron surface is named and implicates no job. Every line is evidence or the one action it supports — the check never guesses a job. An attributed job is also added to the issues summary.
+16. **Cron job health**: names cron jobs that auto-paused after repeated failures (`Fix: kirocrew cron resume <id>`) and jobs whose last run errored while still scheduled (`Fix: kirocrew cron trigger <id>`), with an aggregate count each and the named list capped at 5 plus a `+N more` tail. Read-only — doctor never resumes or triggers a job, because an auto-pause after `_AUTO_PAUSE_THRESHOLD` consecutive failures is usually load-bearing and lifting it silently would hide the problem the run is meant to find. The scan is `cron.unhealthy_jobs_from_disk()`, which reads `crons.json` directly rather than via the gateway API: the dashboard's per-job `err` badge and the gateway's hourly failure re-alert both run inside the gateway, so neither can report a wedged one, and that out-of-process property is the point of this check. A job the user paused explicitly is never reported (only `auto_paused` is a health signal, and both flags can be set at once since pausing an auto-paused job preserves `auto_paused`). Silent on a healthy store and on a fresh install with no `crons.json`. A store that EXISTS but yields no readable job list — unparseable, non-UTF-8, wrong shape, or holding no usable record — is reported instead, because the scheduler can load nothing from it and every job has stopped; reporting that as a clean bill of health would reproduce the silence this check exists to break. No corruption aborts the run
 
 ## Update Command
 
@@ -866,7 +895,13 @@ Each step checks if the tool is already installed and skips if present.
    edits in another terminal to rescue them is the natural response to the
    prompt, and is exactly what would otherwise be reset away). Only `HEAD` can
    move in that window, so the re-check needs no second fetch.
-2. Rebuilds the dashboard via `build_frontend_sync()` (npm; non-fatal on failure)
+2. Rebuilds the dashboard via `build_frontend_sync()` (npm; non-fatal on failure).
+   Non-fatal also means non-destructive: `npm ci` deletes `node_modules` before it
+   installs, so the tree is moved aside and restored unless the install succeeds
+   (`node_modules_txn.NodeModulesBackup`). A failed install therefore costs the
+   rebuild, not the dependency tree -- which matters because the registry needed
+   to rebuild one is usually what was unavailable. The gateway's unattended
+   auto-apply takes the async sibling and is protected the same way.
 3. Reinstalls backend via `pip install -e .`
 
 ## Client Port Resolution
@@ -1007,6 +1042,15 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
    already has it to install it. That case carries SEL
    `reason=<tool>_outside_trusted_dirs`, distinct from `<tool>_not_found`, so
    the two are separable in the audit log.
+   When the trusted lookup tool exists but returns no pid, stop makes one
+   fixed-loopback `POST /api/shutdown` request carrying the gateway generation's
+   local secret. That handler independently requires loopback origin and a
+   constant-time secret match, then triggers the same graceful shutdown event as
+   SIGTERM. The acknowledgement body is capped at 4 KiB before JSON parsing;
+   excessive nesting is treated as malformed input. A successful acknowledgement
+   ends the stop command; a missing secret, refusal, malformed response, or
+   transport failure retains the ordinary no-gateway diagnostic. This fallback never converts the pid sidecar into
+   authority to signal a process.
 3. `platform_compat.process_command_line(pid)` to verify it's a KiroCrew process —
    `/proc/<pid>/cmdline` (Linux), `ps -o command=` (macOS), `Win32_Process.CommandLine`
    via WMI (Windows). The Windows venv `kirocrew.exe` re-execs `python.exe`, so the
@@ -1039,12 +1083,19 @@ that must not change, because the SPA's per-origin `localStorage` is keyed on it
      on Windows) to detect a running gateway. If found — OR if the lookup
      tool is absent (`not listening_pid_tool_available()`, so a missing
      tool is not mistaken for a dead gateway) — run the existing `_stop`
-     kill-by-port path. If not (e.g. the user runs `restart` after a
-     crash), skip the stop step rather than erroring — the user expects to
-     end up with a running gateway either way. The `_stop` call is wrapped
-     in a `try / except SystemExit` so a TOCTOU race (gateway exits between
-     the listener check and `_stop`'s own lookup → `_stop` calls
-     `sys.exit(1)`) does not abort the restart before the spawn.
+     path. When the trusted lookup tool exists but returns no pid, restart
+     independently attempts the authenticated shutdown request. An acknowledged
+     request always refuses the immediate replacement and tells the operator to
+     retry after shutdown completes: neither an absent pid sidecar nor a live
+     same-user pid from that sidecar can prove singleton-lock release, because a
+     stale pid may be recycled and exit before the incumbent. The second restart
+     sees no incumbent and safely starts the replacement.
+   - If no incumbent evidence exists (e.g. the user runs `restart` after a
+     crash), skip the stop step rather than erroring — the user expects to end
+     up with a running gateway either way. The `_stop` call is wrapped in a
+     `try / except SystemExit` so a TOCTOU race (gateway exits between the
+     listener check and `_stop`'s own lookup → `_stop` calls `sys.exit(1)`)
+     does not abort the restart before the spawn.
    - Spawn a detached `kirocrew gateway` via `subprocess.Popen`, stdin set
      to `subprocess.DEVNULL`, and stdout + stderr redirected to
      `~/.kiro/crew/gateway.log` (the same file the `kirocrew logs` command
@@ -1071,9 +1122,12 @@ on crash, and starts on boot. Implemented in `src/kiro_crew/service/`.
     ship no `sudo` binary — and a non-root caller with no `sudo` fails
     with a clear `ServiceInstallError` rather than an uncaught
     `FileNotFoundError`.
-  - The gateway runs as `User=$USER Group=$(id -gn)` — kirocrew
-    code never runs under sudo. Only `install` and `systemctl` invocations
-    are elevated.
+  - The gateway runs as `User=$USER Group=$(id -gn)`. Every elevated
+    executable is a stock system program, not a kirocrew one; the module
+    docstring in `service/linux.py` sits next to the call sites, names the
+    current set, and records what escalating the AppArmor step's
+    interpreter does and does not guarantee. [security](security.md)
+    carries the reasoning behind that step's four tools.
   - **Environment**: values are captured from the installer's environment
     into the unit's `Environment=` lines at install time
     (`service_environment()` in `service/common.py`) — this is how
@@ -1200,24 +1254,47 @@ and prints uptime, sessions, messages, tool calls, subagents, crons, lessons.
 
 ## App Dev Mode
 
-`kirocrew app dev <name> [--off]` toggles an installed App Kit app into (or,
-with `--off`, out of) **dev mode**, which speeds the app-UI edit loop by serving
-UI files uncached and live-reloading the dashboard on file change. The command
-writes the flag out-of-process; the running gateway's watcher picks it up within
-one poll interval, so no gateway restart is needed. Full App Kit developer docs
-live in `docs/app-kit/api-reference.md`; the durable contract surfaces this
-feature introduces are:
+`kirocrew app dev <name> [--off] [--confirm-out-of-install-root]` toggles an
+installed App Kit app into (or, with `--off`, out of) **dev mode**, which speeds
+the app-UI edit loop by serving UI files uncached and live-reloading the
+dashboard on file change. The command writes the flag out-of-process; the
+running gateway's watcher picks it up within one poll interval, so no gateway
+restart is needed. Full App Kit developer docs live in
+`docs/app-kit/api-reference.md`; the durable contract surfaces this feature
+introduces are:
 
 - **Persisted schema — `installed.json` `dev: bool`** (default `false`): a
   per-app flag in each app's `~/.kiro/crew/apps/<name>/installed.json`. Tolerant
-  on read (absent ⇒ `false`), reversible, no migration. This field is the sole
-  authoritative source of truth for an app's dev-mode state. Builtin apps cannot
-  enter dev mode.
+  on read (absent ⇒ `false`), reversible, no migration. This field is the
+  authoritative source of truth for **watching and no-store serving**; enabling
+  also records a gateway-owned **operator grant** binding the ui root's resolved
+  path, which is what authorizes serving a ui root outside the install directory
+  (see api-reference.md). Builtin apps cannot enter dev mode.
 - **Endpoint — `POST /api/apps/{name}/dev`**, body `{"enabled": <bool>}`,
-  returns `{"name": <name>, "dev": <bool>}`. Behind standard gateway auth; emits
-  an `app_dev_mode` SEL audit event. `400` for a non-boolean body, a builtin
-  app, or an unsafe app name; `404` when the app is not installed. Equivalent to
-  the CLI toggle for in-dashboard control.
+  returns `{"name": <name>, "dev": <bool>}`. Behind standard gateway auth;
+  emits an `app_dev_mode` SEL audit event. `400` for a non-boolean body, a
+  builtin app, an unsafe app name, or a refused grant (a sensitive ui root is
+  never grantable; an out-of-install root always answers `400` over HTTP —
+  only the CLI flag, run on the gateway host, supplies the confirmation,
+  because a request-body flag from the dashboard origin is app-controllable);
+  `404` when the app is not installed. The flag is additionally operator-only
+  against agent shells through three tiers: the builtin rule
+  `self-protection-dev-mode-out-of-root-confirm` (literal text plus its argv
+  floor) refuses any agent shell command carrying it; the flag's consumption
+  point performs a runtime human-vs-agent check that refuses a process
+  showing evidence of agent-shell confinement
+  (`dev_mode_operator_attestation_required`) — closing runtime flag
+  synthesis, which no command-text scan can see; and the grant record
+  (`~/.kiro/crew/apps/.dev-grants.json`) is sealed read-only inside the agent
+  OS sandbox
+  (materialized at gateway startup so the seal always has a target), so a
+  sandboxed process cannot write a grant at all — any grant-touching toggle
+  from such a process is refused up front
+  (`dev_mode_grant_record_readonly`; use the dashboard toggle instead). Only
+  the operator's own terminal can supply the attestation — and both the
+  confirmed grant and each refusal emit a SEL event
+  (`dev_mode_out_of_install_grant` for the permission decision,
+  `dev_mode_grant_write` for the sealed-record refusal).
 - **WebSocket event — `app_reload`**, payload `{"app": <name>, "ts": <float>}`,
   broadcast when a dev-mode app's `ui/` tree changes; the dashboard reloads that
   app so edits appear immediately.
@@ -1234,7 +1311,8 @@ contract — its path and format are internal and may change without notice.
 ## Computer Use Commands
 
 `kirocrew computer {doctor [--json] | apps | call}` — hand-rolled dispatch
-mirroring `browser/cli.py` (see [computer-use.md](computer-use.md)).
+rather than argparse subparsers, because the parent CLI forwards `REMAINDER`
+(see [computer-use.md](computer-use.md)).
 
 **`doctor`** reports, in order: whether the platform is supported (macOS today;
 Windows and Linux report a typed refusal), whether the keystone primary enable at

@@ -9,8 +9,15 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+from kiro_crew.auth.login.builder_id import BuilderIdAuthError
 from kiro_crew.auth.login.device import DeviceAuthError
-from kiro_crew.auth.service import KasLoginService, UnknownLoginError
+from kiro_crew.auth.service import (
+    InvalidRegionError,
+    KasLoginService,
+    LoopbackUnavailableError,
+    MissingStartUrlError,
+    UnknownLoginError,
+)
 from kiro_crew.auth.store import TokenStore, TokenStoreError
 from kiro_crew.config.paths import data_home
 from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
@@ -114,7 +121,11 @@ async def api_kas_login_status(request: web.Request) -> web.Response:
 
 
 async def api_kas_login_begin_device(request: web.Request) -> web.Response:
-    """POST /api/kas-login/device {provider} — start a device-code login."""
+    """POST /api/kas-login/device {provider, start_url?, region?} — start a device login.
+
+    ``start_url`` and ``region`` apply to the ``idc`` provider only (the company's
+    IAM Identity Center portal); other providers ignore them.
+    """
     denied = await _require_owner(request, "kas_login_begin_device")
     if denied is not None:
         return denied
@@ -123,18 +134,30 @@ async def api_kas_login_begin_device(request: web.Request) -> web.Response:
         return _unavailable()
     body = await _read_json(request)
     provider = str((body or {}).get("provider") or "")
+    start_url = str((body or {}).get("start_url") or "")
+    region = str((body or {}).get("region") or "")
     if not provider:
         return web.json_response(
             {"error": "Missing 'provider'.", "code": "invalid_provider"}, status=400
         )
     try:
-        result = await service.begin_device(provider)
+        result = await service.begin_device(provider, start_url=start_url, region=region)
     except ValueError:
         return web.json_response(
             {"error": f"Unknown provider: {provider}", "code": "invalid_provider"},
             status=400,
         )
-    except DeviceAuthError as err:
+    except MissingStartUrlError:
+        return web.json_response(
+            {"error": "Company SSO requires a start URL.", "code": "missing_start_url"},
+            status=400,
+        )
+    except InvalidRegionError:
+        return web.json_response(
+            {"error": "Not a valid AWS region name.", "code": "invalid_region"},
+            status=400,
+        )
+    except (DeviceAuthError, BuilderIdAuthError) as err:
         await _audit(request, "kas_login_begin_device", "failed", error=str(err))
         return web.json_response(
             {"error": str(err), "code": "device_authorization_failed"}, status=502
@@ -210,4 +233,62 @@ async def api_kas_login_logout(request: web.Request) -> web.Response:
             status=500,
         )
     await _audit(request, "kas_login_logout", "success")
+    return web.json_response({"ok": True})
+
+
+async def api_kas_login_begin_loopback(request: web.Request) -> web.Response:
+    """POST /api/kas-login/loopback {provider} — start a loopback (PKCE) sign-in.
+
+    Returns the portal URL for the dashboard to open plus the polling handle. A
+    coded 409 ``loopback_unavailable`` means "start the device flow instead": the
+    install shape does not support loopback or every allowlisted port is busy.
+    """
+    denied = await _require_owner(request, "kas_login_begin_loopback")
+    if denied is not None:
+        return denied
+    service = _service(request)
+    if service is None:
+        return _unavailable()
+    body = await _read_json(request)
+    provider = str((body or {}).get("provider") or "")
+    if not provider:
+        return web.json_response(
+            {"error": "Missing 'provider'.", "code": "invalid_provider"}, status=400
+        )
+    try:
+        result = await service.begin_loopback(provider)
+    except ValueError:
+        return web.json_response(
+            {"error": f"Unknown provider: {provider}", "code": "invalid_provider"},
+            status=400,
+        )
+    except LoopbackUnavailableError as err:
+        await _audit(request, "kas_login_begin_loopback", "failed", error=str(err))
+        return web.json_response(
+            {"error": "Loopback sign-in is not available here.", "code": "loopback_unavailable"},
+            status=409,
+        )
+    await _audit(request, "kas_login_begin_loopback", "success")
+    return web.json_response(result)
+
+
+async def api_kas_login_cancel(request: web.Request) -> web.Response:
+    """POST /api/kas-login/cancel {login_id} — abandon a pending sign-in.
+
+    Releases a loopback listener's callback port immediately instead of at its
+    deadline. Idempotent, so the dashboard can call it on every start-over path.
+    """
+    denied = await _require_owner(request, "kas_login_cancel")
+    if denied is not None:
+        return denied
+    service = _service(request)
+    if service is None:
+        return _unavailable()
+    body = await _read_json(request)
+    login_id = str((body or {}).get("login_id") or "")
+    if not login_id:
+        return web.json_response(
+            {"error": "Missing 'login_id'.", "code": "missing_login_id"}, status=400
+        )
+    await service.cancel(login_id)
     return web.json_response({"ok": True})

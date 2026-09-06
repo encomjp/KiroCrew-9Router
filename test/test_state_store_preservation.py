@@ -118,6 +118,63 @@ class TestChatPinsPreservation:
         assert st._chat_pins == []
         assert st._unparsed_chat_pin_entries == [{"stale": "kept"}]
 
+    def test_oversized_records_are_dropped_and_preserved(self, cfg):
+        """A hand-edited pin exceeding the create-time length caps must not be
+        served: it is dropped from the active list and preserved verbatim in
+        ``_unparsed`` (mirrors api_chat_pins_create's ingress caps)."""
+        from kiro_crew.dashboard.chat_pins import (
+            _MAX_MESSAGE_TS_CHARS,
+            _MAX_MID_CHARS,
+            _MAX_PREVIEW_INPUT_CHARS,
+        )
+
+        big_preview = dict(self._valid_pin("bigprev"), preview="x" * (_MAX_PREVIEW_INPUT_CHARS + 1))
+        big_mid = dict(self._valid_pin("bigmid"), mid="m" * (_MAX_MID_CHARS + 1))
+        big_ts = {
+            "id": "bigts",
+            "slot_key": "slot1",
+            "message_ts": "t" * (_MAX_MESSAGE_TS_CHARS + 1),
+            "preview": "ok",
+            "pinned_at": "2026-01-01T00:00:00Z",
+        }
+        (cfg / "chat_pins.json").write_text(
+            json.dumps([self._valid_pin("good1"), big_preview, big_mid, big_ts]),
+            encoding="utf-8",
+        )
+        st = self._fresh()
+        st.load_chat_pins()
+        assert [p["id"] for p in st._chat_pins] == ["good1"]
+        assert big_preview in st._unparsed_chat_pin_entries
+        assert big_mid in st._unparsed_chat_pin_entries
+        assert big_ts in st._unparsed_chat_pin_entries
+
+    def test_non_string_identity_does_not_crash_the_loader(self, cfg):
+        """A hand-edited record with a non-string ``mid`` (e.g. a JSON number)
+        but a valid string ``message_ts`` must not crash the loader when the
+        length caps are applied: ``len()`` is only taken on string identities.
+        Before the isinstance guard, ``len(123)`` raised TypeError and took the
+        whole loader (and startup) down. The record remains valid via its
+        string ``message_ts`` identity; the point is that loading does not
+        raise."""
+        numeric_mid = {
+            "id": "nummid",
+            "slot_key": "slot1",
+            "mid": 123,  # non-string identity — must not reach len()
+            "message_ts": "2026-01-01T00:00:00Z",
+            "preview": "ok",
+            "pinned_at": "2026-01-01T00:00:00Z",
+        }
+        (cfg / "chat_pins.json").write_text(
+            json.dumps([self._valid_pin("good1"), numeric_mid]),
+            encoding="utf-8",
+        )
+        st = self._fresh()
+        st.load_chat_pins()  # must not raise TypeError
+        # good1 always loads; the numeric-mid record survives via its valid
+        # string message_ts identity. The regression is the crash, not the
+        # record's fate — assert the loader completed and good1 is present.
+        assert "good1" in [p["id"] for p in st._chat_pins]
+
 
 # --------------------------------------------------------------------------- #
 # tags — the boot-erasure case

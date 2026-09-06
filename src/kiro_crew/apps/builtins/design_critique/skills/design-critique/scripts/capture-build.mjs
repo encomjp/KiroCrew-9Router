@@ -22,6 +22,7 @@ import { existsSync, readFileSync, statSync, mkdirSync, readdirSync } from 'node
 import { join, resolve, extname, isAbsolute } from 'node:path'
 import { tmpdir } from 'node:os'
 import { getPlaywright } from './ensure-playwright.mjs'
+import { installSsrfGuard } from './ssrf-guard.mjs'
 
 // Build outputs worth trying, best first. storybook-static is the richest:
 // every component in every state, already rendered.
@@ -80,6 +81,14 @@ function findBuild(root, notes) {
  * user input left to get wrong, and CodeQL's "uncontrolled data in a path
  * expression" no longer has a flow to report because every path handed to fs
  * originates from our own readdir walk.
+ *
+ * WHAT THIS ENUMERATES IS A CONTRACT with routes.py's `_served_signature`, which
+ * takes the staleness token that decides whether a probe screenshot may be reused
+ * for a later render. That token signs exactly the set indexed here — the Dirent
+ * test below counts neither a symlinked directory nor a symlinked file, and
+ * dot-entries are skipped. Widening this walk without widening that one leaves a
+ * served file unsigned, so a change to it would not move the token and a stale
+ * screenshot would be reused. Change both together.
  */
 function indexBuildFiles(rootDir) {
   const root = resolve(rootDir)
@@ -179,6 +188,31 @@ function findOverlay(page) {
   }).catch(() => null)
 }
 
+/**
+ * Whether the page's scrollable height already fits the viewport, so a viewport
+ * screenshot holds the same pixels a fullPage one would.
+ *
+ * THIS IS A CONTRACT with routes.py, which reuses a probe PNG for a later /render
+ * only when the screen record says the PNG covers the whole page. Playwright's
+ * `fullPage` extends a capture along the HEIGHT only — width stays the viewport
+ * width either way — so height is the only axis on which the two modes differ.
+ *
+ * An unreadable page (detached frame, hostile script) counts as NOT fitting: the
+ * caller then re-captures with --full rather than assuming an equivalence it could
+ * not confirm. Erring this way costs one screenshot; erring the other way silently
+ * drops everything below the fold from a critique.
+ */
+function pageFitsViewport(page) {
+  return page.evaluate(() => {
+    // The scrolling box is documentElement in standards mode, but a page can put
+    // overflow on body instead; take the taller so neither is missed.
+    const h = Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0)
+    // scrollHeight is a rounded integer while innerHeight can be fractional under a
+    // non-integral devicePixelRatio, so allow one pixel of rounding slack.
+    return h > 0 && h <= innerHeight + 1
+  }).catch(() => false)
+}
+
 const sig = (o) => (o && o.text ? o.text.slice(0, 60).toLowerCase() : '')
 
 async function main() {
@@ -231,10 +265,17 @@ async function main() {
     process.exit(3)
   }
   const browser = await pw.chromium.launch({ channel: 'chrome' }).catch(() => pw.chromium.launch())
+  // Guard on the CONTEXT so popups inherit it, and block service workers so a
+  // built page cannot route requests through a worker the page-level interceptor
+  // never sees. The served base is our own loopback server (allowed for THIS
+  // origin only); the guard blocks a built page's redirect/subresource to any
+  // other private or loopback address.
+  const ctx = await browser.newContext({ viewport: { width: opt.width, height: opt.height }, serviceWorkers: 'block' })
+  await installSsrfGuard(ctx, base)
   const screens = []
   try {
     for (const route of routes) {
-      const page = await browser.newPage({ viewport: { width: opt.width, height: opt.height } })
+      const page = await ctx.newPage()
       const url = base + (route.startsWith('/') ? route : '/' + route)
       let chars = 0
       try {
@@ -242,12 +283,21 @@ async function main() {
         await page.waitForTimeout(350)
         chars = await page.evaluate(() => (document.body?.innerText || '').replace(/\s+/g, ' ').trim().length).catch(() => 0)
         const overlay = await findOverlay(page)
+        // Measure before the screenshot but after the settle above, so lazy content
+        // that changes the page height is already in.
+        const fits = await pageFitsViewport(page)
         const safe = route.replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '') || 'index'
         const outPath = join(outDir, `build-${safe}-${Date.now()}.png`)
         await page.screenshot({ path: outPath, fullPage: opt.full })
         // Same rule as render.mjs: a blank page is NOT a seen screen.
         if (chars < 8) skipped.push({ route, why: 'rendered blank (' + chars + ' chars) — not counted as seen' })
-        else screens.push({ route, path: outPath, chars, overlay: overlay || null })
+        // `fullPageCoverage` describes the PNG, not the page: a --full capture always
+        // covers it, and a viewport capture does when the page fits. routes.py reuses
+        // a probe PNG only when this is true.
+        else screens.push({
+          route, path: outPath, chars, overlay: overlay || null,
+          fullPageCoverage: opt.full || fits,
+        })
       } catch (err) {
         skipped.push({ route, why: (err && err.message ? err.message : String(err)).slice(0, 120) })
       } finally {

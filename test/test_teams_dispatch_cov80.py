@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.teams.client import TeamsInbound
 from kiro_crew.teams.transport_dispatch import TeamsDispatcher
 
@@ -137,6 +138,12 @@ class _Sessions:
 
     async def get_or_create(self, key, *, agent, channel_id):
         return self._p, True, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns = getattr(self, "begin_turns", 0) + 1
+        if getattr(self, "closing", False):
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, cid) -> None:
         pass

@@ -156,23 +156,65 @@ is_macos_intel_backend() {
 # is not enough: an ABI mismatch or missing executable otherwise reaches every
 # user as an unusable Download button. Model weights are deliberately not involved
 # in this gate.
+#
+# THREE outcomes, not two, because the decoder answers two independent questions
+# (see transcribe.PackagedDecoderProbe):
+#
+#   exit 0  everything loaded and ran
+#   exit 1  the recogniser is broken, OR no decoder AUTHENTICATED -- a defect in
+#           what we are about to publish, so the build stops
+#   exit 2  the decoder authenticated but this HOST would not run it
+#
+# Exit 2 is a warning and not a failure, and that is the whole point of splitting
+# them. Authenticity is a property of the artifact and is gated everywhere;
+# executability is a property of the build machine. A build image missing an OS
+# library the pinned executable load-time imports refuses it before its entry
+# point runs -- Windows Server Core, which every CodeBuild Windows image is built
+# on, ships no Video for Windows components and so cannot load an ffmpeg that
+# imports AVICAP32.dll -- while the identical bytes run correctly on a user's
+# machine. Blocking a release on that withholds a correct artifact because the
+# machine that assembled it was not the machine that runs it.
 #   $1 = bundled interpreter
 local_voice_runtime_gate() {
-  local python="$1"
+  local python="$1" report status
   log "Verifying bundled local voice runtime…"
-  env PYTHONNOUSERSITE=1 PYTHONPATH= "$python" -s -c '
+  # `if` rather than a bare assignment: under `set -e` a command substitution that
+  # exits non-zero aborts the script, which would make exit 2 a hard failure again.
+  if report="$(env PYTHONNOUSERSITE=1 PYTHONPATH= "$python" -s -c '
+import sys
+
 from kiro_crew.stt.engine import probe
 from kiro_crew.transcribe import _packaged_ffmpeg_version_probe
 
 state = probe()
 if not state.ok:
-    raise SystemExit(f"{state.code}: {state.detail}")
-if not _packaged_ffmpeg_version_probe():
-    raise SystemExit("bundled ffmpeg executable is missing, modified, or cannot run")
-' || {
-    echo "ERROR: bundled local voice runtime cannot load" >&2
-    exit 1
-  }
+    sys.stderr.write(f"{state.code}: {state.detail}\n")
+    raise SystemExit(1)
+
+decoder = _packaged_ffmpeg_version_probe()
+if decoder.ok:
+    raise SystemExit(0)
+sys.stderr.write(f"{decoder.code}: {decoder.detail}\n")
+raise SystemExit(1 if not decoder.authentic else 2)
+' 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ -n "$report" ]; then
+    printf '    %s\n' "$report"
+  fi
+  case "$status" in
+    0) ;;
+    2)
+      echo "  ⚠ the bundled decoder authenticated but does not run on THIS host." >&2
+      echo "    Its bytes are the pinned payload, so the bundle is shipped as-is." >&2
+      ;;
+    *)
+      echo "ERROR: bundled local voice runtime cannot load" >&2
+      exit 1
+      ;;
+  esac
 }
 
 # Re-stamp every staged backend tree with <dist>, for the Linux multi-format
@@ -483,6 +525,73 @@ LAUNCH
   # After pruning, so it validates what actually ships.
   stdlib_probe_gate "$out"
 
+  # Compile the WHOLE shipped tree as checked-hash pycs, then let the runtime
+  # forbid writing any.
+  #
+  # This is what keeps the signed .app's seal intact. codesign seals every file
+  # under Contents/, so bytecode written there after signing invalidates the
+  # signature and Gatekeeper refuses the app as "damaged" -- which is what
+  # managed Macs report, because their policy re-evaluates instead of reusing a
+  # cached accept verdict.
+  #
+  # Deliberately the whole tree, not the traced startup closure the Windows lane
+  # ships. The pipeline signs a COMPLETE bundle, so nothing on a user's machine
+  # has any business writing into it -- and a module left uncompiled is exactly
+  # what creates the reason to. Windows can afford the narrower closure because
+  # Authenticode seals no resource tree, so a later write there is harmless; on
+  # macOS an uncovered module is a latent signature break, so coverage has to be
+  # total rather than measured.
+  #
+  # The MODE is the other half. The prune above deletes the TIMESTAMP pycs pip
+  # left behind, and deleting them is not squeamishness -- a timestamp pyc
+  # records the mtime of the source it was built from, `ditto` restamps sources
+  # at extraction, so every shipped timestamp pyc is guaranteed to look stale on
+  # the user's machine and be rewritten in place. That rewrite IS the corruption.
+  # CHECKED_HASH validates against contents, so an extraction-restamped source
+  # still matches.
+  #
+  # `-q -f`: quiet, and force so nothing is skipped on a stale timestamp cache.
+  # A failure to compile one module must not fail the build -- compileall exits
+  # non-zero on a syntax error in any file it walks, including vendored samples
+  # that are not importable on this interpreter -- so the exit code is reported
+  # and tolerated while the coverage assertion below is what actually gates.
+  log "Precompiling the shipped tree as checked-hash pycs ($(basename "$out"))…"
+  env PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 PYTHONPATH= \
+    "$out/bin/python3.12" -s -m compileall -q -f \
+    --invalidation-mode checked-hash "$out/lib" \
+    || echo "    compileall reported errors (unimportable vendored samples are expected)"
+
+  # Coverage gate: the point of the exercise is that the runtime never needs to
+  # write, so a tree that shipped without caches would silently reintroduce the
+  # defect the moment PYTHONDONTWRITEBYTECODE is honoured.
+  "$out/bin/python3.12" -s - "$out/lib" <<'COVERAGE'
+import os, sys
+root = sys.argv[1]
+missing = []
+for dirpath, dirnames, filenames in os.walk(root):
+    if os.path.basename(dirpath) == "__pycache__":
+        continue
+    cache = os.path.join(dirpath, "__pycache__")
+    for name in filenames:
+        if not name.endswith(".py"):
+            continue
+        stem = name[:-3]
+        if not any(
+            f.startswith(stem + ".") and f.endswith(".pyc")
+            for f in (os.listdir(cache) if os.path.isdir(cache) else ())
+        ):
+            missing.append(os.path.join(dirpath, name))
+if missing:
+    print(f"    {len(missing)} module(s) shipped without a bytecode cache", file=sys.stderr)
+    for path in missing[:10]:
+        print(f"      {os.path.relpath(path, root)}", file=sys.stderr)
+    # A handful of unimportable vendored samples is tolerable; a wholesale miss
+    # means compileall did not run and every launch would want to write.
+    if len(missing) > 50:
+        print("ERROR: bytecode coverage is too low to forbid runtime writes", file=sys.stderr)
+        raise SystemExit(1)
+COVERAGE
+
   echo "    $(basename "$out") size: $(du -sh "$out" 2>/dev/null | cut -f1)"
 }
 
@@ -694,9 +803,73 @@ else
   fi
 fi
 
+# A leftover staged marker from an earlier interrupted build is removed on
+# EVERY run, before any early exit: step 3b re-stages it when asked. This sits
+# ahead of the SKIP_ELECTRON return so a backend-only build cannot leave a
+# stale declaration behind for a hand-run electron-builder to pack.
+rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+
 if [ "${SKIP_ELECTRON:-0}" = "1" ]; then
   log "SKIP_ELECTRON=1 — backend(s) ready under $ELECTRON_DIR/backend-dist/"
   exit 0
+fi
+
+# --- 3b. Baked EXTERNALLY-MANAGED marker (optional) --------------------------
+# An edition whose installs are owned by an external package manager (a Toolbox,
+# a corporate installer) declares that at BUILD time by naming its marker here.
+# The file is copied to $ELECTRON_DIR/EXTERNALLY-MANAGED, which package.json's
+# `files` list packs INTO app.asar next to main.js -- so the running app reads
+# it as its own code, on every platform, with no ownership probe (see
+# readExternallyManaged in website/electron/auto-update.js). A marker dropped
+# beside the app after the build (`<resources>/EXTERNALLY-MANAGED`) is the
+# repackager affordance and stays gated on file provenance; that gate refuses
+# every user-owned install and can never pass on Windows, which is why an
+# edition bakes instead of dropping.
+#
+# The copy is validated as the JSON object the reader accepts -- string fields
+# only, under the reader's 8 KiB read cap -- and the build FAILS on anything
+# else: the reader treats a malformed marker as "managed, nothing to run", so a
+# typo here would silently ship an app that can neither self-update nor be
+# updated from its About panel. Unset, nothing is staged: the unconditional
+# cleanup above (ahead of the SKIP_ELECTRON exit) already removed any leftover
+# from a previous local build, so a stale declaration cannot ride along.
+if [ -n "${KIROCREW_MANAGED_INSTALL_MARKER:-}" ]; then
+  MARKER_SRC="$KIROCREW_MANAGED_INSTALL_MARKER"
+  test -f "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER does not name a file: $MARKER_SRC" >&2; exit 1; }
+  node -e '
+    const fs = require("fs");
+    const [src] = process.argv.slice(1);
+    const buf = fs.readFileSync(src);
+    if (buf.length > 8192) { console.error(`marker is ${buf.length} bytes; the reader caps at 8192`); process.exit(1); }
+    let parsed;
+    try { parsed = JSON.parse(buf.toString("utf8")); } catch (e) { console.error(`marker is not JSON: ${e.message}`); process.exit(1); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { console.error("marker must be a JSON object"); process.exit(1); }
+    const allowed = ["managedBy", "updateCommand", "checkCommand"];
+    // The reader TRIMS each field and slices it to a cap (auto-update.js:
+    // MANAGED_BY_MAX_CHARS / UPDATE_COMMAND_MAX_CHARS / CHECK_COMMAND_MAX_CHARS).
+    // Validate the value the reader will actually see: a whitespace-only
+    // command would trim to nothing and turn the marker bare, and an over-cap
+    // one would be truncated into a DIFFERENT command. Both are refused here.
+    const caps = { managedBy: 128, updateCommand: 512, checkCommand: 512 };
+    for (const k of Object.keys(parsed)) {
+      if (!allowed.includes(k)) { console.error(`marker has unknown field "${k}" (allowed: ${allowed.join(", ")})`); process.exit(1); }
+      if (typeof parsed[k] !== "string") { console.error(`marker field "${k}" must be a string`); process.exit(1); }
+      if (parsed[k].trim() !== parsed[k]) { console.error(`marker field "${k}" has leading/trailing whitespace the reader would trim`); process.exit(1); }
+      if (parsed[k].length > caps[k]) { console.error(`marker field "${k}" is ${parsed[k].length} chars; the reader caps at ${caps[k]} and would truncate the command`); process.exit(1); }
+    }
+    if (!parsed.updateCommand) { console.error("marker has no updateCommand: it would disable updates without offering any"); process.exit(1); }
+  ' "$MARKER_SRC" || { echo "❌ KIROCREW_MANAGED_INSTALL_MARKER rejected: $MARKER_SRC" >&2; exit 1; }
+  # Staged for THIS build only: electron-builder packs it below, and the copy
+  # must not outlive the run -- a later build of a different edition from the
+  # same tree (or a hand-run electron-builder) would otherwise pack the previous
+  # edition's commands. The unconditional rm above covers the next
+  # build-desktop.sh run; this covers every other exit path. The trap is armed
+  # BEFORE the copy so there is no instant at which the file exists without
+  # its cleanup -- an interrupt between the two would leave a stale marker for
+  # a hand-run `npm run dist` to pack.
+  trap 'rm -f "$ELECTRON_DIR/EXTERNALLY-MANAGED"' EXIT
+  cp "$MARKER_SRC" "$ELECTRON_DIR/EXTERNALLY-MANAGED"
+  log "Baking EXTERNALLY-MANAGED marker into the app from $MARKER_SRC"
 fi
 
 # --- 4. Package the desktop app with electron-builder -----------------------

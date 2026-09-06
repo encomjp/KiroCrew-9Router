@@ -85,6 +85,10 @@ class _FakeRequest(dict):
         self.headers = headers or {}
         self.content = _FakeContent(body)
         self.content_length = len(body) if content_length is None else content_length
+        # ``read_bounded_json`` decodes with ``request.charset or "utf-8"``, the
+        # same way ``request.json()`` does. A real ``web.Request`` always
+        # exposes it (None when the Content-Type declares no charset).
+        self.charset: str | None = None
         self.app = app if app is not None else {"allowed_origins": {"http://localhost:5476"}}
 
 

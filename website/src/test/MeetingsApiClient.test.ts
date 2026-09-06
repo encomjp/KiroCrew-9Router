@@ -130,6 +130,27 @@ describe('meetingsApi transport', () => {
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
       config: { task_provider: 'local' },
     })
+
+    fetchMock.mockClear()
+    await meetingsApi.saveOutput('meeting one', 'note-taker', '# Mine\n')
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/api/apps/meetings/meetings/meeting%20one/outputs',
+    )
+    expect(fetchMock.mock.calls[0][1].method).toBe('PUT')
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      agent_id: 'note-taker',
+      content: '# Mine\n',
+    })
+
+    fetchMock.mockClear()
+    await meetingsApi.revertOutput('meeting one', 'note-taker')
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/api/apps/meetings/meetings/meeting%20one/outputs',
+    )
+    expect(fetchMock.mock.calls[0][1].method).toBe('DELETE')
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      agent_id: 'note-taker',
+    })
   })
 })
 

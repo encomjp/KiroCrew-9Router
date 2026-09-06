@@ -29,6 +29,11 @@ vi.mock('../api/client', () => ({
 
 vi.mock('../hooks/useTheme', () => ({ useTheme: () => ({ theme: 'dark' }) }))
 
+// The Library tiles' overflow menu is a Radix DropdownMenu, which happy-dom
+// cannot drive — swap in the repo's stateful mock (FileExplorerPageCoverage
+// pattern): Trigger click toggles, items render inline as role="menuitem".
+vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
+
 vi.mock('../components/AppIcon', () => ({
   default: ({ icon, iconUrl }: { icon?: string; iconUrl?: string }) => (
     <div data-testid="app-icon" data-icon={icon || ''} data-icon-url={iconUrl || ''} />
@@ -173,8 +178,10 @@ describe('AppsPage — hybrid Discover', () => {
       .toHaveAttribute('href', '/apps/-/updates')
     // Update All left with the banner — the hint row carries no batch action.
     expect(screen.queryByRole('button', { name: 'Update All' })).toBeNull()
-    // The affected card still wears its version chip (current → pending).
-    expect(screen.getByText('v1.0.0 (v1.1.0 available)')).toBeInTheDocument()
+    // The affected tile still offers per-app Update — in its overflow menu
+    // (the redesigned action bar caps at Open + menu).
+    fireEvent.click(screen.getByRole('button', { name: 'More actions for Secretary' }))
+    expect(screen.getByRole('menuitem', { name: 'Update' })).toBeInTheDocument()
   })
 
   it('persists and migrates the stored tab (installed → library)', async () => {

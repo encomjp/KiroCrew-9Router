@@ -14,7 +14,9 @@ import TaskList from './TaskList'
 
 import { i18nT } from '../../../i18n/t'
 import { useImeGuard } from '../../../hooks/useImeGuard'
-interface Selection {
+import { containedSelectionRange } from '../../../utils/selectionContainment'
+
+export interface Selection {
   text: string
   x: number
   y: number
@@ -24,6 +26,17 @@ interface Selection {
    *  LAST — the agent then received a quote that does not appear in the file it
    *  was told to fix. */
   tab: string
+}
+
+/** Lifted so SpecDetail can remount this view (column ↔ overlay) without
+ *  dropping an in-progress comment. Required — both production hosts pass it. */
+export interface DocComposer {
+  sel: Selection | null
+  setSel: (s: Selection | null) => void
+  note: Selection | null
+  setNote: (s: Selection | null) => void
+  draft: string
+  setDraft: (s: string) => void
 }
 
 /** Catalog key per document tab; a literal Record of keys is the shape
@@ -41,6 +54,8 @@ export interface DocViewProps {
    *  empty state, so an in-flight document reads as pending, not absent. */
   running?: boolean
   addComment: (c: { file: string; quote: string; note: string }) => void
+  /** Lifted by SpecDetail so an overlay transition preserves a draft. */
+  composer: DocComposer
   /** Dispatch a single task. Absent = the run controls are not offered. */
   runTask?: (task: SpecTask) => void
   pendingTaskIndex?: number | null
@@ -51,6 +66,7 @@ export default function DocView({
   tab,
   addComment,
   running = false,
+  composer,
   runTask,
   pendingTaskIndex = null,
 }: DocViewProps) {
@@ -58,9 +74,7 @@ export default function DocView({
   const fname = tab + '.md'
   const content = detail?.files?.[fname]
   const boxRef = useRef<HTMLDivElement>(null)
-  const [sel, setSel] = useState<Selection | null>(null)
-  const [note, setNote] = useState<Selection | null>(null)
-  const [draft, setDraft] = useState('')
+  const { sel, setSel, note, setNote, draft, setDraft } = composer
   const [taskDocument, setTaskDocument] = useState(false)
 
   const onSelectionSettled = () => {
@@ -68,8 +82,13 @@ export default function DocView({
     const text = s ? s.toString().replace(/\s+/g, ' ').trim() : ''
     if (!text || text.length < 3 || !boxRef.current || !s || !s.rangeCount) { setSel(null); return }
     const range = s.getRangeAt(0)
-    if (!boxRef.current.contains(range.commonAncestorContainer)) { setSel(null); return }
-    const r = range.getBoundingClientRect()
+    // A triple-click of the document's LAST paragraph normalizes to a boundary
+    // point past the pane, so ancestor containment alone would dismiss it and
+    // the Comment pill would never appear (#7891). The pill is positioned from
+    // the clamped range, keeping an accepted overhang's line box out of the rect.
+    const contained = containedSelectionRange(range, boxRef.current)
+    if (!contained) { setSel(null); return }
+    const r = contained.getBoundingClientRect()
     const host = boxRef.current.getBoundingClientRect()
     setSel({ text: text.slice(0, 500), x: r.left - host.left + r.width / 2, y: r.top - host.top + boxRef.current.scrollTop, tab })
   }
@@ -137,7 +156,7 @@ export default function DocView({
           // sentence pinned to the top-left read as a glitch — the same fix
           // Issue Radar's ListEmptyState made for its columns.
           <div className="h-full flex flex-col items-center justify-center gap-2.5 text-center px-6">
-            <FileText size={26} strokeWidth={1.5} className="text-muted opacity-50" />
+            <FileText strokeWidth={1.5} className="lucide-inline text-muted opacity-50" />
             <div className="text-[13px] text-muted max-w-[420px] leading-relaxed">
               {Object.prototype.hasOwnProperty.call(EMPTY_KEY, tab)
                 ? i18nT(EMPTY_KEY[tab])
@@ -180,7 +199,7 @@ export default function DocView({
               onChange={(e) => setDraft(e.target.value)}
               {...ime.bindEnter({ onEnter: submit, onEscape: () => { setNote(null); setDraft('') } })}
               placeholder={i18nT('apps.specBuilder.components.docView.your_feedback_on_this_passage_enter_adds_it_to_t')}
-              aria-label={i18nT('apps.specBuilder.components.docView.your_feedback_on_the_passage_in', { document: note.tab }) + '.md'}
+              aria-label={i18nT('apps.specBuilder.components.docView.your_feedback_on_the_passage_in', { document: note.tab + '.md' })}
               className="flex-1"
             />
             <Btn label={<><Plus className="lucide-inline" /> {i18nT('apps.specBuilder.components.docView.add_comment')}</>} primary disabled={!draft.trim()} onClick={submit} />

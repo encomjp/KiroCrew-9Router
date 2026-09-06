@@ -44,7 +44,7 @@ $VenvPytest = Join-Path $VenvDir "Scripts\pytest.exe"
 # ensure-python.sh's MIN_MAJOR/MIN_MINOR rather than parsed: this script must
 # work before any interpreter is known to exist.
 $MinPyMajor = 3
-$MinPyMinor = 10
+$MinPyMinor = 12
 
 function Write-Step($msg) { Write-Host "  -> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg) { Write-Host "  [ok] $msg" -ForegroundColor Green }
@@ -109,8 +109,8 @@ function Read-Marker($path) {
 # installing an interpreter is a bigger side effect than a build target should
 # have on a developer machine.
 #
-# Candidate order matches ensure-python.sh: newest SUPPORTED minor first (3.12
-# is the CI/build target), with 3.13 after it -- numpy 1.x ships no 3.13 Windows
+# Candidate order matches ensure-python.sh: the tested minor first (3.12 is the
+# CI/build target), with 3.13 after it -- numpy 1.x ships no 3.13 Windows
 # wheel, so a 3.12 that is present must win.
 function Ensure-Python {
     if ($Py) {
@@ -126,7 +126,7 @@ function Ensure-Python {
     # `py -3.12` before a bare `python`: the launcher reports real CPython
     # installs only, so it never hands back the Store alias stub.
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        foreach ($v in @("3.12", "3.11", "3.10", "3.13")) {
+        foreach ($v in @("3.12", "3.13")) {
             $probe = Invoke-Probe "py" @("-$v", "-c", "import sys; print(sys.executable)")
             if ($probe -and (Test-PythonUsable $probe)) {
                 $resolved = Resolve-PythonPath $probe
@@ -136,7 +136,7 @@ function Ensure-Python {
         }
     }
 
-    foreach ($name in @("python3.12", "python3.11", "python3.10", "python", "python3")) {
+    foreach ($name in @("python3.12", "python", "python3")) {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
         if (-not $cmd) { continue }
         $path = $cmd.Source
@@ -285,6 +285,22 @@ function Invoke-Frontend {
             Invoke-Step $npm @("install", "--no-audit", "--no-fund") "npm install"
         }
         Invoke-Step $npm @("run", "build") "npm run build"
+        # website/electron is its own npm package (website/package.json declares
+        # no `workspaces`), so the install above never reaches it -- and
+        # `npm test` / `npm run check` in website/ then die with MODULE_NOT_FOUND
+        # on its missing deps. Install it here, AFTER the build, so the
+        # desktop-only dependency tree cannot block building the dashboard
+        # itself (#7226).
+        Push-Location "electron"
+        try {
+            if (Test-Path "package-lock.json") {
+                Invoke-Step $npm @("ci", "--no-audit", "--no-fund") "npm ci (electron)"
+            } else {
+                Invoke-Step $npm @("install", "--no-audit", "--no-fund") "npm install (electron)"
+            }
+        } finally {
+            Pop-Location
+        }
     } finally {
         Pop-Location
     }

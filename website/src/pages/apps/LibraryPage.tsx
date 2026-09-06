@@ -2,15 +2,19 @@
  * LibraryPage — installed-app management, split out of the old AppsPage
  * (PR1 App Store split; route `/apps/library`).
  *
- * Search, the management cards (InstalledAppCard), and the uninstall preview
- * flow — all moved unchanged from AppsPage's library branch. Data identity
- * (installed list, update map, mc:apps-changed announcement) lives in the
- * shared `useAppsData` hook so this page and Discover cannot drift.
+ * The list presentation is a macOS-Launchpad-style icon grid (PR3, approved
+ * mockup frame #a): each installed app is a `LaunchpadTile` whose pin badge
+ * toggles whether the app appears in the sidebar (persisted as the HIDDEN
+ * set under `mc-app-nav-hidden`, owned by `lib/appNavHidden.ts`), with a
+ * hover action bar carrying the management verbs the old cards offered.
+ * Search and the uninstall preview flow survive from the card list. Data
+ * identity (installed list, update map, mc:apps-changed announcement) lives
+ * in the shared `useAppsData` hook so this page and Discover cannot drift.
  *
  * Pending updates surface here as a light one-line hint linking to the
  * Discover Updates sub-page (`/apps/-/updates`), which owns the update
- * worklist and Update All (PR2 App Store split). Per-row Update stays on the
- * cards via the shared `useAppUpdates` hook.
+ * worklist and Update All (PR2 App Store split). Per-tile Update stays on
+ * the action bar via the shared `useAppUpdates` hook.
  */
 import { useMemo, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
@@ -22,16 +26,17 @@ import { api } from '../../api/client'
 import { appNavTarget } from '../../appNav'
 import { Btn, EmptyState, PageHeader, SearchInput } from '../../components/ui'
 import { recordEvent } from '../../rum'
-import InstalledAppCard from '../../components/appstore/InstalledAppCard'
 import TrustAppModal, { isTrustDeniedError } from '../../components/appstore/TrustAppModal'
 import type { InstalledApp } from '../../components/appstore/types'
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
 import ErrorBoundary from '../../components/ErrorBoundary'
+import { toggleAppNavHidden, useAppNavHidden } from '../../lib/appNavHidden'
 import useAppsData from './useAppsData'
 import { useAppActions } from './useAppActions'
 import { useAppUpdates } from './useAppUpdates'
 import { cardDataKey } from './cardDataKey'
+import LaunchpadTile from './LaunchpadTile'
 
 /** Uninstall preview payload (mirrors ``api.uninstallPreview`` return shape). */
 type UninstallPreview = Awaited<ReturnType<typeof api.uninstallPreview>>
@@ -49,6 +54,10 @@ export default function LibraryPage() {
   const [query, setQuery] = useState('')
   const [successMsg, setSuccessMsg] = useState('')
   const [actionLoading, setActionLoading] = useState<string | null>(null)
+  // `openCommand` apps opened from a remote/headless gateway cannot launch
+  // here — the backend answers `{remote: true, command}` and the user runs
+  // the command locally instead.
+  const [remoteCmd, setRemoteCmd] = useState('')
 
   const {
     setError, displayError, dismissError,
@@ -71,6 +80,26 @@ export default function LibraryPage() {
     apps, updatables, announceAppsChanged, updateApp,
     setError, setSuccess: showSuccess,
   })
+
+  // Which sidebar rows the user unpinned (`mc-app-nav-hidden`) — held as
+  // React state, not a raw read, so a pin toggle repaints every tile's badge
+  // at once. The module's own event covers same-tab writes (this page's
+  // toggles included, via the module's dispatch-on-write); the `storage`
+  // listener covers a toggle made in ANOTHER tab — the same two-listener
+  // shape App.tsx's sidebar filter uses.
+  const navHidden = useAppNavHidden()
+
+  // Pin toggle — resolve the tile's app to the SAME nav id the sidebar rows
+  // carry (`appNavTarget(app).id`, the rail's own derivation) and flip it in
+  // the persisted hidden set. The module's write dispatches the sync event,
+  // which feeds the state above and App.tsx's sidebar filter — no local
+  // set-state here. A tile without a nav target never offers the toggle
+  // (`pinnable` below), so the null branch is only a race guard.
+  const togglePin = (name: string) => {
+    const app = installedApps.find(a => a.name === name)
+    const id = app ? appNavTarget(app)?.id : undefined
+    if (id) toggleAppNavHidden(id)
+  }
 
   // Uninstall confirmation state
   const [uninstallTarget, setUninstallTarget] = useState<InstalledApp | null>(null)
@@ -173,19 +202,42 @@ export default function LibraryPage() {
       />
 
       <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
-        {/* Notifications. No hand-off on the error notice: management actions
-            share this page — navigating away would discard in-flight state. */}
+        {/* Notifications. askAgent on: this page holds no text draft — the search box
+            is a filter and the uninstall confirm's keep-data checkboxes reset on close —
+            so the hand-off destroys nothing. */}
         {displayError && (
           <ErrorNotice
             message={displayError}
             onDismiss={dismissError}
             className="mb-4 animate-rise"
+            askAgent
           />
         )}
         {successMsg && (
           <div className="mb-4 bg-bg-elevated border rounded-lg p-3 flex items-center gap-3 animate-rise" style={{ borderColor: 'color-mix(in srgb, var(--ok) 45%, transparent)' }}>
             <span className="text-text text-sm flex-1">{successMsg}</span>
             <button aria-label={i18nT('pages.appsPage.dismiss_message')} className="text-muted hover:text-text text-sm" onClick={() => setSuccessMsg('')}><X className="lucide-inline" /></button>
+          </div>
+        )}
+
+        {remoteCmd && (
+          <div
+            className="mb-4 bg-accent/10 border border-accent/20 rounded-lg p-3 text-[13px] animate-rise"
+            ref={el => {
+              // The clicked tile can be scrolled far below this notice; without
+              // bringing it into view the Open click looks like a no-op on a
+              // remote gateway (UX finding: off-locus feedback).
+              el?.scrollIntoView({ block: 'nearest' })
+            }}
+          >
+            <div className="flex items-start justify-between gap-2">
+              <div>
+                <span className="text-text font-medium">{i18nT('components.appstore.installedAppCard.remote_environment_detected')}</span>
+                <p className="text-muted mt-1">{i18nT('components.appstore.installedAppCard.run_this_on_your_local_machine')}</p>
+                <code className="block mt-1.5 bg-bg-elevated px-2 py-1 rounded text-[12px] font-mono select-all">{remoteCmd}</code>
+              </div>
+              <button aria-label={i18nT('components.appstore.installedAppCard.dismiss')} className="text-muted hover:text-text text-sm shrink-0" onClick={() => setRemoteCmd('')}><X className="lucide-inline" /></button>
+            </div>
           </div>
         )}
 
@@ -213,6 +265,8 @@ export default function LibraryPage() {
             onKeyDown={e => { if (e.key === 'Escape') { setUninstallTarget(null); setUninstallPreview(null) } }}
             tabIndex={-1} ref={el => el?.focus()} role="dialog" aria-modal="true" aria-label={i18nT('pages.appsPage.confirm_uninstall')}
           >
+            {/* Stop clicks inside the dialog card from reaching the backdrop's
+                dismiss handler; presentation-only, no interaction of its own. */}
             <div role="presentation" className="bg-card border border-border rounded-xl p-6 max-w-md w-full mx-4 shadow-xl" onClick={e => e.stopPropagation()}>
               <div className="flex items-center gap-3 mb-4">
                 <div className="w-10 h-10 rounded-xl bg-danger/10 flex items-center justify-center">
@@ -363,27 +417,37 @@ export default function LibraryPage() {
                 </Link>
               </div>
             )}
-            <div className="space-y-3">
-              {filteredInstalled.map(app => (
-                <ErrorBoundary
-                  /* Full-data key (cardDataKey): the boundary latches
-                     its error state, so remount when the installed app or its
-                     update availability changes — e.g. when an updated payload
-                     fixes a broken card (#3719). */
-                  key={cardDataKey(app)}
-                  scope="apps:installed-card"
-                  fallback={
-                    <div className="border border-border rounded-lg p-4 flex items-center gap-3">
-                      <AlertTriangle aria-hidden className="lucide-inline text-[var(--warn)] shrink-0" />
-                      <div className="min-w-0 text-sm flex-1">
-                        <span className="font-medium text-text">{app.manifest?.displayName || app.name}</span>
-                        <span className="text-muted ml-2">{i18nT('pages.appsPage.this_app_could_not_be_displayed')}</span>
-                      </div>
-                      {/* The crashed card removed the app's management surface, so the
-                          fallback must keep one recovery path: quiet a broken enabled
-                          app, or remove a disabled one entirely (locked apps cannot
-                          be uninstalled). Same handlers as the healthy card. */}
-                      <div className="shrink-0">
+            {/* Launchpad grid (mockup frame #a): ~5 columns at desktop width,
+                stepping down responsively. Tiles come from `installedApps`
+                (GET /api/apps records) — the Discover/Library built-in
+                SURFACES are frontend nav entries, never installed-app
+                records, so they cannot appear as tiles. */}
+            <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 xl:grid-cols-6 gap-x-3 gap-y-7">
+              {filteredInstalled.map(app => {
+                // The sidebar's own eligibility/id derivation decides
+                // pinnability: a tile only offers a pin for a row the rail
+                // could actually show, under the byte-identical id the
+                // sidebar filter matches against.
+                const target = appNavTarget(app)
+                return (
+                  <ErrorBoundary
+                    /* Full-data key (cardDataKey): the boundary latches
+                       its error state, so remount when the installed app or its
+                       update availability changes — e.g. when an updated payload
+                       fixes a broken tile (#3719). */
+                    key={cardDataKey(app)}
+                    scope="apps:installed-card"
+                    fallback={
+                      <div className="flex flex-col items-center gap-2 rounded-xl border border-border px-1.5 pt-3.5 pb-2.5 text-center">
+                        <div className="w-[58px] h-[58px] rounded-[15px] bg-bg-elevated flex items-center justify-center">
+                          <AlertTriangle aria-hidden className="lucide-inline text-[var(--warn)]" />
+                        </div>
+                        <span className="text-[12px] font-semibold text-text-strong max-w-full truncate">{app.manifest?.displayName || app.name}</span>
+                        <span className="text-[10.5px] text-muted leading-tight">{i18nT('pages.appsPage.this_app_could_not_be_displayed')}</span>
+                        {/* The crashed tile removed the app's management surface, so the
+                            fallback must keep one recovery path: quiet a broken enabled
+                            app, or remove a disabled one entirely (locked apps cannot
+                            be uninstalled). Same handlers as the healthy tile. */}
                         {app.enabled ? (
                           <Btn
                             onClick={() => handleAction(app.name, 'disable')}
@@ -397,20 +461,37 @@ export default function LibraryPage() {
                           </Btn>
                         )}
                       </div>
-                    </div>
-                  }
-                >
-                  <InstalledAppCard
-                    app={app}
-                    actionLoading={updatingAll
-                      ? `${app.name}:update`
-                      : updatePending ? `${updatePending}:update` : actionLoading}
-                    onAction={handleAction}
-                    onOpen={() => navigate(appNavTarget(app)?.route || `/apps/${app.name}`)}
-                    onDetail={() => openDetail(app.name)}
-                  />
-                </ErrorBoundary>
-              ))}
+                    }
+                  >
+                    <LaunchpadTile
+                      app={app}
+                      pinned={!!target && !navHidden.has(target.id)}
+                      pinnable={!!target}
+                      actionLoading={updatingAll
+                        ? `${app.name}:update`
+                        : updatePending ? `${updatePending}:update` : actionLoading}
+                      onTogglePin={togglePin}
+                      onAction={handleAction}
+                      onOpen={() => {
+                        // An `openCommand` app opens by RUNNING its command
+                        // never by
+                        // routing — `appNavTarget` is null for it, and the
+                        // `/apps/${name}` fallback would land on a detail page
+                        // pretending to be the app. Remote gateways answer
+                        // `{remote: true}` with the command to run locally.
+                        if (app.manifest?.openCommand) {
+                          api.openApp(app.name).then((res: { remote?: boolean; command?: string; message?: string } | null) => {
+                            if (res?.remote) setRemoteCmd(res.command || res.message || i18nT('components.appstore.installedAppCard.app_cannot_be_opened_kirocrew_is_running_in_a_he'))
+                          }).catch(() => {})
+                          return
+                        }
+                        navigate(target?.route || `/apps/${app.name}`)
+                      }}
+                      onDetail={() => openDetail(app.name)}
+                    />
+                  </ErrorBoundary>
+                )
+              })}
             </div>
           </>
         )}

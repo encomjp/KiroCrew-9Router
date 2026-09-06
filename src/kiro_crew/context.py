@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from kiro_crew import model_registry
 from kiro_crew.agent import _prompt_path
 from kiro_crew.agent_discovery import agent_skill_globs
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import KiroCrewConfig, workspace_dir_for
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.cron import get_local_tz
@@ -30,6 +31,17 @@ from kiro_crew.hooks import (
     safe_read_file,
 )
 from kiro_crew.learn import LessonStore
+from kiro_crew.members import (
+    MemberLifecycle,
+    MemberSlugError,
+    member_briefing_path,
+    member_briefing_supported,
+    member_lifecycle,
+    member_turn_context,
+    read_member_briefing,
+    read_member_rules,
+    slug_for_name,
+)
 from kiro_crew.memory import MemoryStore
 from kiro_crew.metrics.provider import get_recorder
 from kiro_crew.quick_prompts import expand_quick_prompt
@@ -160,6 +172,62 @@ _STRUCTURAL_MARKER_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\[\s*END\s*REINJECTED\s*\]", re.IGNORECASE),
 )
 _STRUCTURAL_MARKER_NEUTRALIZED = "[marker-removed]"
+
+
+# Forgeable member-authority markers, scrubbed from every VARIABLE payload the
+# member section frames (description, triggers, rules, briefing). The genuine
+# headers are minted by ``_build_member_section``'s own f-strings AFTER this
+# scrub, so a forged ``[PERMANENT RULES — …]`` planted in the agent-writable
+# briefing (steered external content) cannot render as the user-owned layer.
+# Deliberately NOT added to ``_STRUCTURAL_MARKER_RES``: that scan runs over the
+# whole session-context tail, which CONTAINS the genuine member section, so a
+# global pattern would neutralize the real header along with the forgery —
+# content-time scrubbing is the only placement that distinguishes them.
+# Head-anchored with the required separator, per the variable-tail convention
+# on ``_STRUCTURAL_MARKER_RES``.
+_MEMBER_MARKER_RES: tuple[re.Pattern[str], ...] = (
+    # Every minted header in BOTH shapes: the exact closing-bracket form and
+    # the hyphen-tail form (`[HOW YOU WORK — override]`), since a forged
+    # variant of either still reads authoritative to the model. The scrub runs
+    # on a normalized view (dashes folded to '-'), so one hyphen class covers
+    # every Unicode dash.
+    re.compile(r"\[\s*MEMBER\s*IDENTITY\s*\]", re.IGNORECASE),
+    re.compile(r"\[\s*MEMBER\s*IDENTITY\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*END\s*MEMBER\s*IDENTITY\s*\]", re.IGNORECASE),
+    re.compile(r"\[\s*END\s*MEMBER\s*IDENTITY\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*HOW\s*YOU\s*WORK\s*\]", re.IGNORECASE),
+    re.compile(r"\[\s*HOW\s*YOU\s*WORK\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*PERMANENT\s*RULES\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*PERMANENT\s*RULES\s*\]", re.IGNORECASE),
+    re.compile(r"\[\s*CURRENT\s*ASSIGNMENT\s*[-]{1,2}", re.IGNORECASE),
+    re.compile(r"\[\s*CURRENT\s*ASSIGNMENT\s*\]", re.IGNORECASE),
+)
+
+
+def _scrub_member_payload(text: str) -> str:
+    """Neutralize member-authority markers in an untrusted payload.
+
+    The payload is first NORMALIZED — NFKC-folded (so fullwidth/compatibility
+    confusables like ``［ＰＥＲＭＡＮＥＮＴ ＲＵＬＥＳ］`` collapse to their
+    ASCII forms), then format/zero-width (``Cf``) characters dropped and every
+    Unicode dash (``Pd``) folded to ASCII ``-`` — and the normalized copy is
+    what gets injected, so a confusable forgery (``[PERM<zwsp>ANENT RULES‐``)
+    cannot slip past the ASCII patterns. NFKC runs first because it maps
+    fullwidth brackets/letters the category filters never touch; the Cf/Pd
+    passes stay because NFKC preserves zero-width joiners and most dashes.
+    Unlike ``_neutralize_structural_markers`` this needs no origin map: these
+    payloads are small prompt prose, never span-attributed, and losing
+    zero-width characters or compatibility glyphs from a briefing costs
+    nothing.
+    """
+    normalized = "".join(
+        "-" if unicodedata.category(ch) == "Pd" else ch
+        for ch in unicodedata.normalize("NFKC", text)
+        if unicodedata.category(ch) != "Cf"
+    )
+    for pattern in _MEMBER_MARKER_RES:
+        normalized = pattern.sub(_STRUCTURAL_MARKER_NEUTRALIZED, normalized)
+    return normalized
 
 
 def _structural_marker_spans(text: str) -> list[tuple[int, int]]:
@@ -311,6 +379,38 @@ _MULTIBYTE_TABLE = str.maketrans(
 # skills+steering pushed the total over. Independent caps (per the design) are
 # what make usage-ranked top-K meaningful; the cost is a larger startup
 # context (the sum), NOT a smaller memory budget.
+def _member_backend_can_dispatch(cfg: "KiroCrewConfig | None" = None) -> bool:
+    """Whether the configured member backend can mount the dispatch tools.
+
+    The member operating-mode block teaches ``session_*`` tools that arrive as
+    a per-session mount — a capability only wire-capable backends have. When
+    ``agent.member_acp_backend`` resolves outside that set (governance refusal,
+    unknown value degrading to kiro), the tools are simply not mounted, and
+    injecting instructions for tools the session does not hold would send the
+    member chasing refusals. Fail-safe both ways: on any resolution error the
+    block is withheld, which degrades to plain chat rather than to a lie.
+
+    ``cfg`` lets a caller that already loaded the config share the handle —
+    the context builder calls this once per member turn, so a second disk
+    read would be pure waste.
+    """
+    try:
+        from kiro_crew.acp_backends import (
+            ACP_BACKENDS_MEMBER_DISPATCH,
+            resolve_selected_backend,
+        )
+
+        if cfg is None:
+            from kiro_crew.config import KiroCrewConfig
+
+            cfg = KiroCrewConfig.load()
+        backend = resolve_selected_backend(cfg.agent.member_acp_backend)
+        return backend in ACP_BACKENDS_MEMBER_DISPATCH
+    except Exception:
+        logger.debug("member backend capability check failed", exc_info=True)
+        return False
+
+
 def _budget(fraction: float) -> int:
     """A section char cap as a percentage of the budget base."""
     return int(_CONTEXT_BUDGET_BASE * fraction)
@@ -944,6 +1044,43 @@ _UI_LANGUAGE_CATALOGS = frozenset(
 )
 
 
+def normalize_ui_language_tag(value: object, *, source: str = "language") -> str:
+    """Admit an arbitrary value as a usable UI language tag, or return ``""``.
+
+    The single gate a BCP-47 tag passes to become a *usable* UI language,
+    whatever its provenance: the persisted ``dashboard.language`` (see
+    :func:`ui_language_tag`) or a value handed over by a caller — e.g. a
+    request-scoped hint carrying the language a browser already resolved for
+    itself, which is the only way the backend can learn an implicitly chosen
+    language at all. Both clear the identical bar deliberately: the frontend
+    admits a language through exactly one gate, and a second, laxer copy here
+    would let the two disagree about what the active language is (#1130).
+
+    Rejected as ``""``: a non-string, a blank, a value that is not tag-shaped
+    (``_UI_LANGUAGE_TAG_RE``), and a shape-valid tag naming no shipped catalog
+    (``_UI_LANGUAGE_CATALOGS``) — the last because steering a model to a
+    language the chrome around it cannot render puts two languages on one
+    screen. ``""`` therefore always means "no usable language", never "English";
+    callers must treat it as unknown.
+
+    ``source`` labels the provenance in the debug line only — it never changes
+    the verdict.
+    """
+    if not isinstance(value, str):
+        return ""
+    tag = value.strip()
+    if not tag or not _UI_LANGUAGE_TAG_RE.match(tag):
+        return ""
+    if tag not in _UI_LANGUAGE_CATALOGS:
+        # Debug, not warning: this fires on every context build for as long as
+        # the value stays persisted, and the UI itself already degraded to
+        # auto-detect — but without a line here an operator cannot distinguish
+        # "not configured" from "rejected" when the steer is absent.
+        logger.debug("%s %r names no shipped catalog; not steering", source, tag)
+        return ""
+    return tag
+
+
 def ui_language_tag(cfg: "KiroCrewConfig") -> str:
     """Return ``dashboard.language`` as a validated, *shipped* tag, or ``""``.
 
@@ -968,22 +1105,12 @@ def ui_language_tag(cfg: "KiroCrewConfig") -> str:
     ``""`` means "the backend does not know" — nothing was chosen (the
     "follow the browser" sentinel, resolved in the SPA's ``resolveLanguage()``),
     the stored value is not tag-shaped, or it names no shipped catalog. Callers
-    must treat it as unknown rather than as English.
+    must treat it as unknown rather than as English. A caller that CAN learn an
+    unconfigured browser's resolved language (a request-scoped hint) validates it
+    through the same :func:`normalize_ui_language_tag` gate this delegates to,
+    so config and hint can never disagree about what counts as usable.
     """
-    lang = cfg.dashboard.language
-    if not isinstance(lang, str):
-        return ""
-    lang = lang.strip()
-    if not lang or not _UI_LANGUAGE_TAG_RE.match(lang):
-        return ""
-    if lang not in _UI_LANGUAGE_CATALOGS:
-        # Debug, not warning: this fires on every context build for as long as
-        # the value stays persisted, and the UI itself already degraded to
-        # auto-detect — but without a line here an operator cannot distinguish
-        # "not configured" from "rejected" when the steer is absent.
-        logger.debug("dashboard.language %r names no shipped catalog; not steering", lang)
-        return ""
-    return lang
+    return normalize_ui_language_tag(cfg.dashboard.language, source="dashboard.language")
 
 
 def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
@@ -1041,6 +1168,27 @@ def _build_ui_language_section(cfg: "KiroCrewConfig") -> str:
     )
 
 
+def steering_target_admissible(resolved: Path, base: Path | None = None) -> bool:
+    """Admission gate for a steering document's RESOLVED path.
+
+    The session loader (:func:`_load_steering_resources`) admits a glob hit —
+    symlinks included, since ``Path.resolve()`` follows them — when the target
+    stays under the trust base, is a regular file, and is not a sensitive
+    location. *base* defaults to ``$HOME``, the loader's own anchor; the
+    dashboard's steering listing admits a leaf symlink through this same
+    predicate with the source's LINK trust base (``$HOME`` for ``user``, the
+    steering root itself for ``workspace``), so a repository-committed link
+    can never read outside the root it ships in, and the ``user`` case cannot
+    disagree with what the loader injects.
+    """
+    base_resolved = str((base or Path.home()).resolve()) + os.sep
+    return (
+        str(resolved).startswith(base_resolved)
+        and resolved.is_file()
+        and not is_sensitive_path(str(resolved))
+    )
+
+
 def _load_steering_resources() -> str:
     """Load steering files from the agent config's resources array.
 
@@ -1053,24 +1201,33 @@ def _load_steering_resources() -> str:
         cfg_path = kiro_agents_dir() / "kirocrew.json"
         if not cfg_path.exists():
             return ""
-        cfg = json.loads(safe_read_file(str(cfg_path)))
+        # The agents dir is user-writable and shared with other tools, so the
+        # spec goes through the hardened agent-spec reader. ``safe_read_file``
+        # screened the resolved target but read it with an unbounded
+        # ``fh.read()`` -- the size cap guards ``safe_read_file_bytes``, the
+        # other helper -- and emitted no SEL event, so an oversized spec was
+        # still read whole here and a refusal was never audited. Every outcome
+        # the blanket ``except`` below used to absorb (PermissionError on a
+        # sensitive target, AttributeError on non-object JSON) now arrives as
+        # ``None`` and returns the same empty string, without the read.
+        from kiro_crew.agent_discovery import _read_agent_spec
+
+        cfg = _read_agent_spec(
+            cfg_path,
+            operation="steering_resources",
+            source="unknown",
+        )
+        if cfg is None:
+            return ""
         resources = cfg.get("resources", [])
         parts: list[str] = []
-        home_resolved = str(Path.home().resolve()) + os.sep
         for res in resources:
             if not isinstance(res, str) or not res.startswith("file://"):
                 continue
             raw_pattern = res.removeprefix("file://")
             base = Path.home()
             for p in sorted(base.glob(raw_pattern)):
-                resolved = p.resolve()
-                if not str(resolved).startswith(home_resolved):
-                    continue
-                if (
-                    resolved.is_file()
-                    and p.suffix == ".md"
-                    and not is_sensitive_path(str(resolved))
-                ):
+                if p.suffix == ".md" and steering_target_admissible(p.resolve()):
                     try:
                         parts.append(safe_read_file(str(p)))
                     except PermissionError:
@@ -1103,6 +1260,14 @@ _DIFF_RULE_DASHBOARD = (
     "`+++ new_path` headers and an `@@` hunk line; use /dev/null for new "
     "files / deletions — the headers let the dashboard's diff viewer link to "
     "the file), because no card is rendered for those.\n"
+    "When a substantive report, synthesis, or results table is NOT your turn's "
+    "final message (more tool calls or messages follow it), end that message "
+    "with <!-- keep-visible --> as its final line. The dashboard transcript's "
+    "collapse-all mode shows only the turn's last substantive message and folds "
+    "earlier ones into the collapsed steps pane; this marker exempts the "
+    "message so mid-turn deliverables stay visible. The marker is an HTML "
+    "comment and renders as nothing in the dashboard -- do not use it on "
+    "routine progress notes, only on content the user must see.\n"
 )
 _DIFF_RULE_CHANNEL = (
     "After ANY file change (create, edit, append, delete), you MUST show a "
@@ -1144,6 +1309,10 @@ _CRITICAL_RULES_TAIL = (
     'widget" | "Include the stop button too" -- sent alone, the second names '
     "no action). Fold the shared base action into each label instead "
     '("Build the widget with the stop button included").\n'
+    "Keep each option label SHORT -- aim for at most 8 words. The chip row "
+    "renders each label on a single line, so a long label displays cut off; "
+    "put supporting detail in the message body before the [OPTIONS:] line and "
+    "keep the label itself to the bare instruction.\n"
     "[END CRITICAL RULES]\n\n"
 )
 # The dashboard variant is the module's canonical block: tests and the
@@ -1151,6 +1320,67 @@ _CRITICAL_RULES_TAIL = (
 # these two fixed strings, so both stay module constants (never templated).
 _CRITICAL_RULES = _CRITICAL_RULES_HEAD + _DIFF_RULE_DASHBOARD + _CRITICAL_RULES_TAIL
 _CRITICAL_RULES_CHANNEL = _CRITICAL_RULES_HEAD + _DIFF_RULE_CHANNEL + _CRITICAL_RULES_TAIL
+
+# Product-owned working protocol for crew members (layer 2 of the member
+# system prompt — see ContextBuilder._build_member_section for the layer
+# model). Identical for every member; per-member content lives in the
+# derived identity layer above it and the rules/briefing layers below it.
+_MEMBER_HOW_YOU_WORK_COMMON = """[HOW YOU WORK]
+1. You do work; you are not a Q&A bot. When the user asks a question, they
+   usually want something solved. Read the intent behind the question: answer
+   it AND move the work forward — take reversible actions yourself and bring
+   the result back with the answer; for irreversible actions, come back with a
+   concrete proposal and wait for approval. Never hand the problem back
+   untouched.
+2. Front desk vs workshop. This DM thread is your front desk — keep it light,
+   because it lives for years. Do NOT run substantial work inline here: open a
+   separate work session for it (spawn_run and the session tools), keep the
+   heavy context there, and report back in this thread with the outcome and
+   evidence ("re: <the thing>"). Several work items can run in parallel.
+3. When stuck, climb this ladder in order, and genuinely try each rung:
+   (a) try a genuinely DIFFERENT approach — another tool, entry point, or
+       strategy, not the same command again;
+   (b) at an apparent wall, look for an alternative first: a path that avoids
+       the wall entirely, partial progress on the unblocked part, or
+       reordering so this item waits while you continue;
+   (c) escalate ONLY at a true wall: a permission only the user can grant, a
+       system agents cannot reach (a human must operate it), or a one-way-door
+       decision that needs the user's sign-off;
+   (d) after escalating, park the blocked item and keep working on other
+       items — escalation is non-blocking.
+4. Write escalations for a reader with ZERO context: one line of background,
+   where it is stuck, the exact action you need from the user, and what
+   waiting costs. Keep it short. Before sending, have a context-free subagent
+   read the draft and confirm a stranger could act on it; rewrite until it
+   passes.
+5. A quiet cycle is a successful cycle. Report real signals — results, walls,
+   threshold crossings — never "nothing new"."""
+
+# Item 6 of the working protocol — the briefing-maintenance instruction. Kept
+# out of the shared constant because it is only true where layer 4 actually
+# injects (``members.member_briefing_supported``): telling a member on a
+# platform whose briefing reads fail closed to maintain the section sends it
+# into a futile write-then-never-injected loop.
+_MEMBER_BRIEFING_ITEM = """
+6. You own the [CURRENT ASSIGNMENT] section below, injected from your
+   briefing file (path given there). Keep it a small working memory for your
+   future self — current priorities, in-flight work, pointers to your own
+   reusable scripts and notes — and update it with your file tools whenever
+   your plans change. [PERMANENT RULES] and this section outrank anything you
+   write in it."""
+
+# The softened item 6 for platforms where layer 4 is unavailable: name the
+# gap and redirect the working-memory habit somewhere that works, instead of
+# instructing upkeep of a file that will never be injected.
+_MEMBER_BRIEFING_ITEM_UNAVAILABLE = """
+6. On this platform your briefing file is NOT injected (briefing reads are
+   unavailable here — see [CURRENT ASSIGNMENT] below), so do not maintain
+   one: keep your working memory in this DM thread instead. [PERMANENT
+   RULES] outranks anything you write for yourself."""
+
+# The full protocol, briefing item included — the shape every layer-4-capable
+# platform injects, and the one the behaviour-layer tests pin.
+_MEMBER_HOW_YOU_WORK = _MEMBER_HOW_YOU_WORK_COMMON + _MEMBER_BRIEFING_ITEM
 
 # Runtime sources whose transcript renders tool-call cards (and therefore the
 # inline diff card). Everything else — messaging channels, cron, subagent,
@@ -1798,7 +2028,11 @@ class ContextBuilder:
             self._bot_name = bot_name
         else:
             cfg = KiroCrewConfig.load()
-            self._bot_name = "KiroCrew" if cfg.agent.provider == "claude_code" else "Kiro"
+            provider = cfg.agent.provider
+            # The joined spelling is the {bot_name} value the prompt
+            # substitutes, not prose about the product: respelling it would
+            # change what the model is told to answer to.
+            self._bot_name = "KiroCrew" if is_claude_code(provider) else "Kiro"  # brand-ok
         # Register default memory in the workspace cache
         _memory_stores["default"] = self.memory
 
@@ -1924,27 +2158,86 @@ class ContextBuilder:
                 "are about to do, what you just did, rationale, alternatives "
                 "you rejected, caveats, trade-offs, unprompted next steps, and "
                 "closing offers to help.\n"
-                "- A change, a command, or a value IS the answer. Show it and "
-                "stop; do not narrate it.\n"
+                "- Whatever the user needs in order to know or to act IS the "
+                "answer — a change, a command, a value, a verdict. Lead with "
+                "it and stop; do not narrate it. The work that produced it — "
+                "the evidence, the search, the options you weighed — is "
+                "explanation, so it is opt-in like the rest. Naming your "
+                "findings is not naming the answer: if the user has to derive "
+                "it from what you found, you have not answered.\n"
                 "- One exception to stopping: when that command or change "
                 "destroys, overwrites or rewrites something, the undo path "
                 "rides along with it in the same reply — how to get it back, "
                 "or plainly that you cannot. One clause is enough. A "
                 "destructive one-liner handed over with no undo path is not a "
                 "terse answer, it is a trap.\n"
-                "- Plain words, short sentences. Brevity is not enough — a "
-                "short reply can still be dense and unreadable. Drop jargon "
-                "that dresses up a simple point, hedges, and repetition; a "
-                "technical term stays only when it IS the fact, not when it is "
-                "decoration.\n"
+                "- Plain words, short sentences, and the point at the front of "
+                "each one. Write the WHOLE reply at the `explain-for` skill's "
+                "Age 10 row: everyday words, plain cause and effect, and no "
+                "term that is not itself the fact. Plain does not mean "
+                "childish — write for a capable "
+                "reader in a hurry, not for a five-year-old. Brevity is not "
+                "enough: a short reply can still be dense and unreadable. Put "
+                "what the user must know in the first few words and stop; do "
+                "not make them assemble it across clauses chained with here, "
+                "then, but, so that or which means, and do not frame a fact as "
+                "a correction of something they never said (“this is not X, "
+                "it's Y” — just say Y). Drop jargon that dresses up a simple "
+                "point, hedges, and repetition; a technical term stays only "
+                "when it IS the fact, not when it is decoration. If a sentence "
+                "has to be read twice to find the point, rewrite it.\n"
                 "- Answer the question that was asked and nothing adjacent. "
                 "Take a position instead of listing options.\n"
+                "- Stopping or deviating is still an answer, not a case to "
+                "argue. LEAD WITH THE ACTION you recommend, as one plain "
+                "imperative sentence — not with what you found, not with "
+                "the situation. Then at most two sentences of the state that "
+                "makes that action necessary, and stop. What led there — "
+                "what you found, what it collides with, why the old plan no "
+                "longer fits, why your call is right — is explanation, "
+                "and stays opt-in like the rest. Justifying a deviation feels "
+                "mandatory; it is not, and the derivation buries the one thing "
+                "the user has to decide.\n"
                 "- Code, commands, paths, identifiers, error strings and file "
                 "contents stay verbatim and complete — this mode cuts prose, "
-                "never payload.\n"
-                "- The moment the user asks why, asks you to explain, or asks "
-                "for a doc, review, walkthrough or deep dive, this mode is off "
-                "for that reply: give the full detail they asked for.\n\n"
+                "never payload. Payload is what the user asked for or has to "
+                "act on. Material you quote to prove a point is evidence, not "
+                "payload, and evidence is opt-in: leave it out and offer it.\n"
+                "- One sentence per thing you are telling them. The verdict is "
+                "a sentence; each recommendation is a sentence; each item in a "
+                "list is a sentence. This bounds each item, not the reply, so "
+                "a procedure that genuinely needs seven steps gets seven "
+                "one-sentence steps — but a reply that has grown sections, "
+                "numbered findings or bullets with sub-bullets is a report, "
+                "and the answer is buried inside it.\n"
+                "- Verify against the real thing, then answer without showing "
+                "the work. Reading the code, the log or the document is what "
+                "keeps you from being wrong; a file path, a line number, a "
+                "quoted function or a count of the steps you took only shows "
+                "that you read it. Say what the thing does, not where you "
+                "found it, and hand the reference over when the user asks to "
+                "check it.\n"
+                "- A request for the reason is not a request for a document. "
+                "When the user asks why, or asks you to explain something, the "
+                "reason turns ON and every length rule stays in force: a few "
+                "plain sentences, one per point, and nothing adjacent to what "
+                "they asked. Only an explicit request for depth — a doc, a "
+                "review, a walkthrough, a deep dive, in detail, everything — "
+                "lifts the bound, and for that reply this mode is off: give "
+                "the full detail they asked for.\n\n"
+                "That Age 10 row is the register for everything this mode "
+                "emits — the answer, the verdict, the warning, the one allowed "
+                "reason, the option labels — and it is the default, not a "
+                "choice you weigh per reply. It sets the REGISTER, never the "
+                "depth: the reader is capable and in a hurry, so it buys "
+                "clarity, costs the answer nothing, and never talks down. When "
+                "the explanation is itself the reply, load `explain-for`, "
+                "follow its Age 10 row, and take its one analogy from the "
+                "reader's own daily life. Borrow only the calibration from that "
+                "skill: its terseness clause lifts the ban on explaining, not "
+                "the length bound, so every length rule above still holds. An "
+                "audience named in the request wins over Age 10, and an "
+                "explicit request for depth still lifts the bound.\n\n"
                 "Explaining in full, unasked, is the rare exception — not a "
                 "lane you look for. The default, even for judgement calls, is "
                 'the terse answer plus a one-line offer (e.g. "say why for '
@@ -1990,13 +2283,14 @@ class ContextBuilder:
                 "skill for theme variables, format rules, interactive widgets, and "
                 "best practices when emitting one.\n\n"
                 "## Artifacts\n\n"
-                "Widgets render once and disappear with chat scrollback. Persist "
-                "and iterate on them via `@kirocrew-core/artifact_save`, "
-                "`artifact_get`, `artifact_update`, `artifact_list`, "
-                "`artifact_versions`, `artifact_delete`. Load the `artifacts` skill "
-                "for the full workflow — when to save proactively, the iterate "
-                "decision tree (including iterate-without-slug auto-save), naming "
-                "conventions, and worked examples."
+                "Every widget auto-registers as an UNPINNED artifact as its "
+                "response segment finalizes — do not "
+                "`@kirocrew-core/artifact_save` one you rendered. The user's "
+                "star pins it; unpinned ones are pruned oldest-first, and "
+                "registration is skipped in a restricted (incognito or "
+                "temporary) session. Save explicitly only for content you "
+                "never emitted as a widget; iterate with `artifact_get`, "
+                "`artifact_update`, `artifact_revert`. Load the `artifacts` skill."
             )
         else:
             widget_block = (
@@ -2005,8 +2299,9 @@ class ContextBuilder:
                 "plain markdown by default. Load the `widgets` skill when a widget is "
                 "genuinely warranted.\n\n"
                 "## Artifacts\n\n"
-                "Persist widgets via `@kirocrew-core/artifact_save` (and friends). "
-                "Load the `artifacts` skill when iterating, listing, or persisting."
+                "Every widget auto-registers as an unpinned artifact, so do not "
+                "`@kirocrew-core/artifact_save` one you rendered. Load the "
+                "`artifacts` skill to save other content, iterate or list."
             )
         return prompt.replace("{{WIDGET_BLOCK}}", widget_block)
 
@@ -2045,6 +2340,141 @@ class ContextBuilder:
                 continue
         return ""
 
+    def _build_member_section(self, member: str) -> str:
+        """Assemble the four-layer member identity block for a DM thread.
+
+        Layer ownership (precedence is the injection order — earlier outranks
+        later — with ONE stated exception: layer 3's header explicitly claims
+        precedence over the whole section, protocol included, so the user's
+        safety boundary is never formally outranked by product prose):
+
+        1. ``[MEMBER IDENTITY]`` — derived from the crew's registered config
+           (name, description, triggers). Auto-generated: works even for a
+           crew whose description is empty, which is exactly the case that
+           needs a floor.
+        2. ``[HOW YOU WORK]`` — the product-owned working protocol
+           (:data:`_MEMBER_HOW_YOU_WORK`), identical for every member.
+        3. ``[PERMANENT RULES]`` — user-owned. Read from the keystone-gated
+           ``trust/`` subtree, so the member's own file tools cannot rewrite
+           it; omitted entirely when the user has not written rules.
+        4. ``[CURRENT ASSIGNMENT]`` — member-owned working memory, read
+           (capped) from the member's own agent-writable briefing file.
+
+        Degrades on failure — with ONE deliberate exception: every layer's
+        failure yields ``""`` and the session runs as an ordinary crew
+        session, but an EXISTING-yet-unreadable rules file propagates
+        :class:`~kiro_crew.members.MemberRulesUnreadable` and ABORTS the
+        turn, because degrading the one safety-relevant layer would be the
+        fail-open (see the inline comment at the rules read below).
+
+        Blocking file IO inside — callers reach this via ``build_message``,
+        which chat paths already run off-loop.
+        """
+        try:
+            slug = slug_for_name(member)
+        except (MemberSlugError, ValueError):
+            return ""
+        try:
+            crew = KiroCrewConfig.load().agents.get(member)
+        except Exception:
+            crew = None
+        # Type-guarded, not just None-guarded: these fields come from an
+        # operator-editable JSON file, and a hand-edited non-string value
+        # (`"description": 1`) must degrade to the identity floor rather than
+        # crash the member's chat turn on `.strip()`.
+        _desc = getattr(crew, "description", "") if crew else ""
+        _trig = getattr(crew, "triggers", "") if crew else ""
+        description = _desc.strip() if isinstance(_desc, str) else ""
+        triggers = _trig.strip() if isinstance(_trig, str) else ""
+        # Rules are read OUTSIDE the total-degrade guard, deliberately: every
+        # other failure degrades this section to an ordinary session, but for
+        # the one safety-relevant layer that degrade IS the fail-open — a
+        # member the user bounded would keep running with no bounds at all.
+        # An unreadable rules file therefore propagates and ABORTS the turn:
+        # the member does not run until the user repairs or clears the file.
+        # (Missing file still reads as "" — the normal unbounded-by-choice
+        # state — and the file is gateway-written atomically, so corruption
+        # is an operator-level event, not a routine one.)
+        rules = read_member_rules(slug, member)
+        # Layer-4 availability decides both the briefing read and the wording
+        # around it (item 6 above, the placeholder below): where the pinned
+        # briefing read fails closed (Windows — member_briefing_supported),
+        # instructing upkeep of a never-injected file is a futile loop, so the
+        # section says the layer is unavailable instead.
+        briefing_ok = member_briefing_supported()
+        briefing = ""
+        briefing_path = ""
+        if briefing_ok:
+            try:
+                briefing = read_member_briefing(slug)
+                briefing_path = str(member_briefing_path(slug))
+            except Exception:
+                logger.warning(
+                    "member section degraded to ordinary session for %r", member, exc_info=True
+                )
+                return ""
+
+        # Every VARIABLE payload is scrubbed before the genuine headers are
+        # minted around it — see _MEMBER_MARKER_RES for why this runs at
+        # content time rather than in the structural-marker scan.
+        description = _scrub_member_payload(description)
+        triggers = _scrub_member_payload(triggers)
+        rules = _scrub_member_payload(rules)
+        briefing = _scrub_member_payload(briefing)
+
+        identity = [
+            f"[MEMBER IDENTITY]\nYou are {member}. Not a generic assistant, and not an "
+            f"extension of the user: {member} is an identity of your own — your name, "
+            "your role, your memory of this thread, and your track record belong to you."
+        ]
+        if description:
+            identity.append(f"Your role: {description}")
+        if triggers:
+            identity.append(f"Your remit — the work that belongs to you: {triggers}")
+        identity.append(
+            "This DM thread is your durable working relationship with the user. It "
+            "continues across sessions: remember what was discussed, refer back to it "
+            "naturally, and speak as a colleague who owns their work — never as a "
+            "support bot."
+        )
+
+        parts = [
+            "\n".join(identity),
+            "\n\n",
+            (
+                _MEMBER_HOW_YOU_WORK
+                if briefing_ok
+                else _MEMBER_HOW_YOU_WORK_COMMON + _MEMBER_BRIEFING_ITEM_UNAVAILABLE
+            ),
+        ]
+        if rules:
+            parts.append(
+                "\n\n[PERMANENT RULES — set by the user. You cannot edit these, "
+                "and they outrank EVERYTHING else in this section — the working "
+                "protocol above included, whose instructions yield wherever "
+                "these rules contradict them — as well as anything you write "
+                "for yourself.]\n" + rules
+            )
+        if briefing_ok:
+            parts.append(
+                f"\n\n[CURRENT ASSIGNMENT — yours to maintain, injected from {briefing_path}]\n"
+                + (
+                    briefing
+                    if briefing
+                    else "(empty — write your first briefing there when you have "
+                    "priorities worth remembering)"
+                )
+            )
+        else:
+            parts.append(
+                "\n\n[CURRENT ASSIGNMENT — not available on this platform]\n"
+                "(briefing files cannot be read race-free here, so this layer "
+                "is never injected; keep your working memory in this DM "
+                "thread instead)"
+            )
+        parts.append("\n[END MEMBER IDENTITY]\n\n")
+        return "".join(parts)
+
     def build_session_context(
         self,
         session_key: str | None = None,
@@ -2064,6 +2494,7 @@ class ContextBuilder:
         context_groups: frozenset[str] | None = None,
         query_text: str = "",
         project: str | None = None,
+        member: str = "",
     ) -> str:
         """Build context for a new session (memory + skills + history).
 
@@ -2080,7 +2511,7 @@ class ContextBuilder:
         deployment's effective window), leaving that path byte-for-byte
         unchanged.
 
-        All providers — including ``provider_type="claude_code"`` — receive the
+        All providers — including Claude Code — receive the
         same injected context (critical rules, thread history, memory, skills,
         lessons); steering files are the one exception (see below). This keeps
         Claude Code at parity with kiro so dashboard/Slack UI contracts (diff
@@ -2089,7 +2520,7 @@ class ContextBuilder:
 
         *provider_type* is consumed again for the steering gate only: the
         steering block below is injected solely on the CC backend
-        (``provider_type == "claude_code"``). kiro-cli loads an agent's
+        (``is_claude_code(provider_type)``). kiro-cli loads an agent's
         ``resources`` natively when spawned with ``--agent`` (acp/client.py
         ``_spawn``), so re-injecting steering on the ACP/kiro backend would
         duplicate what kiro already loaded; the CC backend (claude-agent-acp)
@@ -2113,7 +2544,7 @@ class ContextBuilder:
         and hooks are injected for all agents.
         """
         is_custom = agent and agent != "kirocrew"
-        is_cc = provider_type == "claude_code"
+        is_cc = is_claude_code(provider_type)
         caps = _resolve_caps(model_window)
         parts: list[str] = []
 
@@ -2211,12 +2642,78 @@ class ContextBuilder:
                 f"or the task requires it.\n\n"
             )
 
+        # Crew-member operating mode — injected only for a member's pinned DM
+        # session (mode carries the slot's mode; "member" slots are born only
+        # through the members thread route). The member is a CONTROLLER: its
+        # DM thread stays the identity/management loop while real work runs in
+        # worker sessions it dispatches and patrols. The session_* tools this
+        # block names arrive as a per-session mount of the dashboard
+        # session-control server (members.member_dispatch_session_server), and
+        # the server authorizes member callers automatically
+        # (dashboard/session_control.py), bounded to sessions the member
+        # created itself — so the instructions hold with zero configuration.
+        #
+        # circular import: members' module graph is heavy and this file
+        # sits below it in the layering (the same cycle-break
+        # chat_persistence uses for the members module).
+        from kiro_crew.members import DM_SLOT_MODE as _member_mode
+
+        # User-profile / skills config, loaded once and ALSO consulted by the
+        # member capability gate below — one read per context build.
+        _cfg = KiroCrewConfig.load()
+
+        if mode == _member_mode and _member_backend_can_dispatch(_cfg):
+            parts.append(
+                f"[CREW MEMBER OPERATING MODE]\n"
+                f'You are the crew member "{agent_label}". This pinned conversation is '
+                f"your DM thread with the user — your identity, your inbox, and your "
+                f"ledger. Keep it for decisions, reports, and escalations; do NOT run "
+                f"long or heavy work inline here.\n"
+                f"When real work arrives (a task to implement, an investigation to "
+                f"run), DISPATCH it: open a worker session with session_create, seed "
+                f"it with a self-contained brief via session_send (the worker has "
+                f"none of this thread's context), then PATROL your workers with "
+                f"session_read_message on a monitor_start loop — you own noticing a "
+                f"worker that stalled or died, restarting it, or escalating. Stop a "
+                f"runaway with session_stop. You can only control sessions you "
+                f"created.\n"
+                f"Report outcomes back in this thread when work completes or needs "
+                f"a decision only the user can make.\n\n"
+            )
+
+        # Member identity — ONLY for member DM threads (mode="member"). Four
+        # layers with distinct ownership, in fixed precedence order (a layer
+        # outranks everything injected below it):
+        #   1. identity   — derived from the crew's own config, nobody hand-writes it
+        #   2. behavior   — product-owned working protocol (the constant below)
+        #   3. rules      — user-owned, stored under the keystone-gated trust/
+        #                   subtree so the member's file tools cannot rewrite
+        #                   its own safety boundary
+        #   4. briefing   — member-owned working memory, agent-writable by design
+        #
+        # Ordering vs the operating-mode block above: that block is the
+        # dispatch-capability mechanics from the per-session session_* mount
+        # (product-owned, backend-gated) and reads first so the four layers —
+        # including the user-owned rules — rank below product protocol, per
+        # the earlier-outranks-later convention of this preamble.
+        #
+        # FRESH leg of the member lifecycle: reaching this line means a full
+        # (non-minimal) session-start build — the minimal path early-returned
+        # above — so the verdict comes from the same chokepoint every other
+        # delivery branch consults (kiro_crew.members.member_turn_context).
+        # Delivery enforces the rules gate: the section builder reads
+        # [PERMANENT RULES] fresh and fails closed on an unreadable file.
+        if member_turn_context(member, MemberLifecycle.FRESH).deliver_section:
+            _member_section = self._build_member_section(member)
+            if _member_section:
+                parts.append(_member_section)
+        _mark("member")
+
         # User profile — onboarding answers (role + technical comfort).
         # Injected for ALL agents like date/agent identity: it describes the
         # person, not the project or workspace. Empty (no block at all) when
-        # the user skipped the questions. The load below is mtime-cached and
-        # shared with the skills lazy-load gate further down.
-        _cfg = KiroCrewConfig.load()
+        # the user skipped the questions. Uses the ``_cfg`` loaded above the
+        # member block, shared with the skills lazy-load gate further down.
 
         # UI language — a rendering contract like [RUNTIME] above, not a
         # communication-style hint: it tells the model which language the
@@ -2594,6 +3091,7 @@ class ContextBuilder:
         user_span_out: list[int] | None = None,
         needs_reinjection: bool = False,
         context_groups: frozenset[str] | None = None,
+        member: str = "",
     ) -> tuple[str, HookResult]:
         """Build the full message with context and hook processing.
 
@@ -2626,13 +3124,73 @@ class ContextBuilder:
         # Set together with the user's text part when user_text_range is given.
         _user_bounds: tuple[int, int] | None = None
         _user_part_index: int | None = None
-        is_cc = provider_type == "claude_code"
+        is_cc = is_claude_code(provider_type)
+
+        # Layer-3 rules gate + section delivery, per session-lifecycle branch.
+        # The INVARIANT: every member turn passes the fail-closed rules gate,
+        # and every turn whose live context cannot be carrying the CURRENT
+        # member section gets it injected fresh. The decision lives in ONE
+        # chokepoint — kiro_crew.members.member_turn_context — which every
+        # delivery branch below consults instead of branching by hand, so a
+        # future session-lifecycle branch added here cannot silently skip
+        # both the member section and the rules gate. Per lifecycle state:
+        #   FRESH            -> build_session_context injects the full
+        #      section; the rules read inside enforces the gate.
+        #   WARM_REINJECTION -> the post-compaction block below re-injects
+        #      the current section; same gate inside.
+        #   WARM             -> THIS block validates rules per-turn (a
+        #      first-turn abort leaves a warm session — the provider client
+        #      survives the raise — and without this the member would run
+        #      with no bounds); the delivered section is still live in the
+        #      provider conversation, so no re-injection.
+        #   SLIM_RESUME      -> handled inside the is_new_session branch
+        #      below: session/load restored the ORIGINAL section, whose
+        #      [PERMANENT RULES] may have changed or become unreadable while
+        #      the session idled, so the CURRENT section is re-injected (and
+        #      its rules read keeps the gate).
+        #   MINIMAL (cron)   -> never a member thread; member is "".
+        # Missing file still reads as "" (the normal unbounded-by-choice
+        # state); a bad slug degrades like the builder.
+        _member_turn = member_turn_context(
+            member,
+            member_lifecycle(
+                is_new_session=is_new_session,
+                resumed=resumed,
+                minimal_context=minimal_context,
+                needs_reinjection=needs_reinjection,
+            ),
+        )
+        if _member_turn.enforce_rules_gate:
+            try:
+                _member_slug: str | None = slug_for_name(member)
+            except (MemberSlugError, ValueError):
+                _member_slug = None
+            if _member_slug is not None:
+                read_member_rules(_member_slug, member)
 
         # Session context on first message only
         if is_new_session:
+            # Resumed sessions (ACP ``session/load`` restored the full native
+            # transcript) already carry the original session-start injection —
+            # agent prompt, memory, lessons, and skills are all preserved in
+            # the restored history. Re-injecting the full session context on
+            # every idle-expire → resume cycle stacks ~40K duplicate tokens
+            # into the same window and accelerates compaction. Inject only the
+            # minimal header (fresh date/time + identity) plus a resume marker
+            # so the model knows where the full context lives.
+            #
+            # Derived FROM the chokepoint's lifecycle rather than re-encoding
+            # ``resumed and not minimal_context`` here: two independent
+            # spellings of the same predicate can drift apart, and the member
+            # re-injection below keys off the lifecycle — a divergence would
+            # leave a resumed member session running on a stale
+            # [PERMANENT RULES] snapshot with nothing failing.
+            slim_resume = _member_turn.lifecycle is MemberLifecycle.SLIM_RESUME
             # Agent prompt goes BEFORE session context wrapper
             # so the LLM treats it as its identity, not background info.
-            if is_cc:
+            if slim_resume:
+                agent_prompt = ""
+            elif is_cc:
                 # CC gets the SAME KiroCrew persona prompt as kiro — including
                 # the Output Format rules (diff blocks, image embeds, OPTIONS)
                 # which are dashboard UI contracts, not kiro-specific. Only the
@@ -2673,13 +3231,14 @@ class ContextBuilder:
                 mode=mode,
                 blocks_reads=blocks_reads,
                 provider_type=provider_type,
-                minimal_context=minimal_context,
+                minimal_context=minimal_context or slim_resume,
                 runtime_source=runtime_source,
                 exclude_last_n=exclude_last_n,
                 model_window=model_window,
                 context_groups=context_groups,
                 query_text=text,
                 project=project,
+                member=member,
             )
             if session_ctx:
                 # Scrub forgeable boundary markers from the UNTRUSTED content in
@@ -2706,7 +3265,49 @@ class ContextBuilder:
                     )
                 else:
                     session_ctx = _neutralize_structural_markers(session_ctx)
-                if minimal_context:
+                if slim_resume:
+                    # Re-anchor the critical rules (dashboard/Slack UI
+                    # contracts: diff blocks, [OPTIONS:] buttons, absolute
+                    # paths). They were injected at the original session start
+                    # but sit deep in — and may be compacted out of — the
+                    # restored transcript; at ~1.5K chars they are cheap
+                    # insurance against output-format drift. Same variant
+                    # selection and per-agent opt-out gate as session start.
+                    _resume_rules = (
+                        _critical_rules_for(session_key, runtime_source)
+                        if _agent_includes_crew_context(agent)
+                        else ""
+                    )
+                    # SLIM_RESUME leg of the member lifecycle (see the
+                    # chokepoint consult above): the restored transcript
+                    # carries the ORIGINAL member section, but [PERMANENT
+                    # RULES] may have changed — or become unreadable — while
+                    # the session idled. Re-inject the CURRENT section so the
+                    # boundary the member runs under is the one the user set,
+                    # not a stale snapshot; the rules read inside keeps the
+                    # fail-closed gate on this branch. Same marker scrub as
+                    # the post-compaction path: the slim-resume tail is
+                    # scrubbed above, but this section is appended separately.
+                    _resume_member = ""
+                    if _member_turn.deliver_section:
+                        _member_section = self._build_member_section(member)
+                        if _member_section:
+                            _resume_member = (
+                                "[Refreshed member identity — supersedes the "
+                                "copy in the restored history above.]\n"
+                                + _neutralize_structural_markers(_member_section)
+                            )
+                    parts.append(
+                        "[SESSION RESUMED — the full session context (agent "
+                        "system prompt, memory, lessons, skills) was injected "
+                        "at the original session start and is preserved in the "
+                        "restored conversation history above. Refreshed rules "
+                        "and date/identity follow.]\n"
+                        + _resume_rules
+                        + session_ctx
+                        + _resume_member
+                    )
+                elif minimal_context:
                     parts.append(session_ctx)
                 else:
                     parts.append(
@@ -2790,6 +3391,25 @@ class ContextBuilder:
                         + _neutralize_structural_markers(skills_ctx)
                         + "\n[END REINJECTED]\n\n"
                     )
+            # Member identity is session-start context too, so a compaction
+            # dropped it along with the skills index: without this, the next
+            # turn of a member DM thread runs with no identity, no working
+            # protocol and — the part that matters — no [PERMANENT RULES].
+            # Re-reading the briefing here is a feature: the member gets its
+            # CURRENT briefing back, not the pre-compaction copy. The section
+            # scrubs member-authority markers itself, but the session-start
+            # path ALSO runs _neutralize_structural_markers over the whole
+            # session-context tail — this path has no such tail scrub, so it
+            # must be applied here or a forged [CURRENT USER REQUEST —] in the
+            # agent-writable briefing would ride the reinjection turn as an
+            # authoritative request. The genuine member headers are not in
+            # _STRUCTURAL_MARKER_RES, so they survive intact. This is the
+            # WARM_REINJECTION leg of the member lifecycle (see the
+            # chokepoint consult above).
+            if _member_turn.deliver_section:
+                _member_section = self._build_member_section(member)
+                if _member_section:
+                    parts.append(_neutralize_structural_markers(_member_section))
 
         # Channel history — inject on every message for group channel context
         ch_ctx: str | None = None

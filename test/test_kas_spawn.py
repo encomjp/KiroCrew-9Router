@@ -236,7 +236,7 @@ class TestSandboxClassification:
             captured.update(kwargs)
             raise self._Abort
 
-        async def fake_bin():
+        async def fake_bin(*, environ=None, home=None):
             return "/usr/bin/kiro-cli"
 
         monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin)
@@ -354,7 +354,7 @@ def kas_stub(tmp_path, monkeypatch):
     launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}"\n')
     launcher.chmod(0o755)
 
-    async def fake_bin() -> str:
+    async def fake_bin(*, environ=None, home=None) -> str:
         return str(launcher)
 
     monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", fake_bin)
@@ -419,7 +419,7 @@ class TestKasInvocation:
         """No kiro-cli means no relay, and the message must say which binary."""
         from kiro_crew.acp.session_handle import AcpRuntimeError
 
-        async def no_bin() -> None:
+        async def no_bin(*, environ=None, home=None) -> None:
             return None
 
         monkeypatch.setattr("kiro_crew.acp.runtime._resolve_kiro_bin_for_spawn", no_bin)

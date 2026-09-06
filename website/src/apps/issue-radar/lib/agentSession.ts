@@ -115,6 +115,21 @@ export interface UseAgentSession {
    * Cleared by the next `openSession` rather than by a separate resetter: every
    * call clears it on entry, so a click declined again simply re-sets it. */
   concludedFor: string | null
+  /** Go to the chat page with its Older Sessions pane already open — where a
+   * closed session's transcript is.
+   *
+   * The counterpart to declining the click. A concluded item's session has been
+   * closed, and `api_chat_slot_delete` archives a session before popping the
+   * slot, so the transcript is still readable; rehydrating it is what is refused
+   * (`adopt_closed` gates that and this app never passes it). So the only correct
+   * affordance is to point at history — and pointing has to be something the user
+   * can DO, not a sentence naming a pane they then have to find.
+   *
+   * Lives here rather than in the button because navigation is already this
+   * module's job (`openSession` ends in `navigate('/chat')`), which keeps
+   * `AgentSessionButton` free of router context — it is shared presentation, and
+   * two of its tests render it without a router. */
+  openOlderSessions: () => void
 }
 
 export function useAgentSession(): UseAgentSession {
@@ -326,5 +341,11 @@ export function useAgentSession(): UseAgentSession {
     [dispatch, navigate],
   )
 
-  return { openSession, busy, error, concludedFor }
+  // `?history=1` rather than a scroll target or a click simulation: the pane's
+  // disclosure is ChatSidebar's own state, and the sidebar reads this param when
+  // it mounts. Issue Radar is a different route, so arriving at /chat always
+  // mounts a fresh sidebar and the param is read exactly once.
+  const openOlderSessions = useCallback(() => { navigate('/chat?history=1') }, [navigate])
+
+  return { openSession, busy, error, concludedFor, openOlderSessions }
 }

@@ -31,6 +31,145 @@ logger = logging.getLogger(__name__)
 
 _WS_STATUS_INTERVAL = 5  # seconds between dashboard status pushes
 _WS_COUNTS_CACHE_TTL = 30  # seconds between refreshing lesson/cron counts
+# Consecutive failed count refreshes before (a) backing off to the normal TTL
+# cadence and (b) one operator-visible warning: failures retry every pusher
+# tick (~5s), so 6 ≈ 30s of sustained failure — long enough to skip transient
+# sqlite busy-timeouts, short enough that a store that never initializes
+# surfaces the same minute it happens.
+_WS_COUNTS_WARN_AFTER_FAILURES = 6
+# Gateway-wide floor between count-failure warnings: the fault is global (one
+# store), so N open sockets must not emit N identical warnings per streak.
+# None = never warned — NOT 0.0, which time.monotonic() (time since boot) is
+# still within for 10 minutes after host boot, and which would swallow the
+# streak's only warning exactly when autostarted gateways hit a bad store.
+# Reset to None on a successful refresh so each NEW streak warns again.
+_WS_COUNTS_WARN_INTERVAL_SECS = 600.0
+_last_counts_warn_monotonic: float | None = None
+
+# Gateway-wide count cache: ONE store touch per TTL no matter how many sockets
+# are open. Per-connection caches would make every dashboard tab an
+# independent contender on the vector store's shared sqlite connection, whose
+# _db_lock a busy-timeout read can hold for seconds while loop-thread readers
+# (get_semantic_context et al.) block on it uninstrumented — N tabs polling
+# independently is exactly the loop-freeze class no-blocking-call-on-event-loop
+# exists to prevent. All four cells are only ever read/written from the event
+# loop thread, so no lock is needed; the in-flight flag makes the refresh
+# single-flight (a second socket's tick returns the stale cache immediately
+# instead of piling a duplicate store read onto the executor).
+_counts_cache: tuple[int | None, int | None] = (None, None)
+_counts_cache_ts: float = float("-inf")
+_counts_cache_failures: int = 0
+_counts_refresh_inflight: bool = False
+
+
+def _counts_refresh_decision(failures: int, error: str | None) -> tuple[bool, int, bool]:
+    """Pure decision after one count-refresh attempt: ``(stamp_ttl, failures, warn)``.
+
+    Success (``error is None``) re-arms the cache TTL and resets the streak. A
+    failure leaves the TTL un-stamped so the next pusher tick (~5s) retries —
+    fast recovery for TRANSIENT faults — but once the streak reaches
+    ``_WS_COUNTS_WARN_AFTER_FAILURES`` the TTL is stamped even on failure,
+    degrading a PERSISTENT fault to the normal 30s cadence instead of
+    hammering the store and the shared default executor every tick. ``warn``
+    is True exactly once per streak, at the threshold. Extracted as a pure
+    function so the cache policy is testable without driving a WebSocket.
+    """
+    if error is None:
+        return True, 0, False
+    failures += 1
+    return (
+        failures >= _WS_COUNTS_WARN_AFTER_FAILURES,
+        failures,
+        failures == _WS_COUNTS_WARN_AFTER_FAILURES,
+    )
+
+
+def _warn_counts_failure(failures: int, error: str | None) -> None:
+    """One operator-visible warning per streak, rate-limited gateway-wide.
+
+    The per-attempt causes are logged at debug; without this line a permanent
+    fault (store never initializes) would pin cached/unknown counts forever
+    with no trace at default log level. Module-level latch (the event loop is
+    single-threaded, so no lock) keeps repeat streaks within the interval from
+    spamming; a successful refresh clears the latch so the NEXT streak warns.
+    """
+    global _last_counts_warn_monotonic
+    now = time.monotonic()
+    if (
+        _last_counts_warn_monotonic is not None
+        and now - _last_counts_warn_monotonic < _WS_COUNTS_WARN_INTERVAL_SECS
+    ):
+        return
+    _last_counts_warn_monotonic = now
+    logger.warning(
+        "ws: status counts failed %d consecutive refreshes (%s); "
+        "serving cached values, retrying at the normal cadence",
+        failures,
+        error,
+    )
+
+
+async def _refresh_status_counts(state: DashboardState) -> tuple[int | None, int | None]:
+    """Return the gateway-wide cached counts, refreshing at most once per TTL.
+
+    Callable every pusher tick from every connection: it returns the shared
+    cache immediately unless this call is the one that finds it stale (and no
+    refresh is already in flight), in which case it awaits one off-loop load
+    and applies ``_counts_refresh_decision``. Single-flight + shared cache =
+    one store touch per TTL for the whole gateway, however many sockets are
+    open, and no per-socket count divergence.
+    """
+    global _counts_cache, _counts_cache_ts, _counts_cache_failures
+    global _counts_refresh_inflight, _last_counts_warn_monotonic
+    now = time.monotonic()
+    if _counts_refresh_inflight or now - _counts_cache_ts < _WS_COUNTS_CACHE_TTL:
+        return _counts_cache
+    _counts_refresh_inflight = True
+    try:
+        crons, lessons, error = await _load_status_counts(state, fallback=_counts_cache)
+        _counts_cache = (crons, lessons)
+        stamp, _counts_cache_failures, warn = _counts_refresh_decision(
+            _counts_cache_failures, error
+        )
+        if stamp:
+            _counts_cache_ts = now
+        if error is None:
+            # New streaks warn again: the rate-limit floor is for repeats
+            # WITHIN one streak, not for distinct outages.
+            _last_counts_warn_monotonic = None
+        elif warn:
+            _warn_counts_failure(_counts_cache_failures, error)
+        return _counts_cache
+    finally:
+        _counts_refresh_inflight = False
+
+
+def _status_frame(
+    state: DashboardState, *, crons: int | None, lessons: int | None
+) -> dict[str, Any]:
+    """Build the Tier-0 ``dashboard`` frame payload.
+
+    ``status_snapshot`` computes a missing count INLINE on the event loop
+    (that is its contract for the HTTP/SSE callers), so a sentinel 0 is passed
+    to suppress that, and the two keys are then overwritten with the true
+    cached values — which are ``None`` (rendered as a loading skeleton) until
+    the first successful refresh. The overwrite half is load-bearing: without
+    it the sentinel 0 ships as an authoritative count, which is the false-zero
+    #7204 fixes. Module-level (not a closure) so a test can pin exactly that.
+    """
+    return {
+        **state.status_snapshot(
+            cron_jobs=crons if crons is not None else 0,
+            lessons=lessons if lessons is not None else 0,
+            **status_update_fields(),  # type: ignore[arg-type]
+        ),
+        "cron_jobs": crons,
+        "lessons": lessons,
+        "version": _local_version,
+        "platform": sys.platform,
+    }
+
+
 # Reconnect replay: more subagent frames than this collapse into ONE
 # subagent_snapshot_batch frame (scale plumbing — a per-agent burst at
 # 60-100 agents saturates the socket the moment a client reconnects).
@@ -39,6 +178,24 @@ SUBAGENT_REPLAY_BATCH_THRESHOLD = 8
 SIDE_RESULT_EVENT = "chat.side_result"
 SIDE_QUEUE_EVENT = "chat.side_queue"
 SIDE_KIND = "side"
+
+
+def _subagent_replay_has_owner(frame: object) -> bool:
+    """Whether a replay frame names the chat that owns the subagent.
+
+    ``spawn_run`` can continue in degraded mode when caller identity cannot be
+    resolved, leaving ``parent_session_key == ""``. Such a run is visible in the
+    global spawn inventory, but it has no session-scoped destination. Sending an
+    empty ``slot`` to a chat client is unsafe: older reducers interpreted it as
+    the currently active slot, so a fresh popout adopted unrelated agents.
+    """
+    if not isinstance(frame, dict):
+        return False
+    data = frame.get("data")
+    if not isinstance(data, dict):
+        return False
+    slot = data.get("slot")
+    return isinstance(slot, str) and bool(slot.strip())
 
 
 def build_subagent_snapshot(a: Any, *, now: float | None = None) -> dict:
@@ -116,17 +273,50 @@ def _audit_grant_quietly(app: str, event: str) -> None:
         logger.debug("ws: SEL audit for %s grant failed", event, exc_info=True)
 
 
-async def _load_status_counts(state: DashboardState) -> tuple[int, int]:
-    """Return ``(cron_count, lesson_count)`` loaded OFF the event loop.
+async def _load_status_counts(
+    state: DashboardState, *, fallback: tuple[int | None, int | None] = (None, None)
+) -> tuple[int | None, int | None, str | None]:
+    """Return ``(cron_count, lesson_count, error)`` loaded OFF the event loop.
 
-    ``LessonStore.load_all()`` performs blocking file I/O (JSONL ``stat()`` +
-    ``read_text()``) and the cron count comes from a direct read-only parse of
-    ``crons.json`` (``count_enabled_from_disk``). The WS status pusher runs on
-    the event loop, so computing these inline would stall the loop — and with
-    it EVERY other WebSocket / coroutine on the gateway — for the duration of
-    that disk latency (seconds on a slow/large home dir or a contended NFS
-    mount). Offload both to a worker thread so the loop stays responsive; the
-    pusher is a periodic background task, so the extra thread hop is free.
+    ``DashboardState._count_lessons()`` performs blocking I/O on two stores:
+    the JSONL file (``stat()`` + ``read_text()`` via ``load_all``) PLUS a
+    SQLite ``COUNT(*)`` via ``VectorMemoryStore.count_lessons`` (serialized on
+    the shared connection through ``_fetch_all_locked``, documented as
+    executor-thread safe). The cron count comes from a direct read-only parse
+    of ``crons.json`` (``count_enabled_from_disk``). The WS status pusher runs
+    on the event loop, so computing these inline would stall the loop — and
+    with it EVERY other WebSocket / coroutine on the gateway — for the
+    duration of that disk latency (seconds on a slow/large home dir or a
+    contended NFS mount). Offload both to a worker thread so the loop stays
+    responsive; the pusher is a periodic background task, so the extra thread
+    hop is free.
+
+    The lesson count MUST come from ``_count_lessons`` (JSONL + vector store),
+    the same total ``/api/status`` and the SSE updates path report via
+    ``status_snapshot``'s default (those two callers still compute it inline
+    on the loop; only this path offloads). Counting only ``lessons.load_all()``
+    here made the pusher's cached value override the correct default with the
+    JSONL-only half, so the Overview card showed 0 on hosts whose lessons
+    live in the vector store (issue #7204).
+
+    Each count is guarded INDEPENDENTLY: on failure that component falls back
+    to its ``fallback`` half while the other keeps its fresh value — the
+    vector-store read can surface ``sqlite3.OperationalError`` (busy timeout,
+    disk I/O) or ``RuntimeError`` (store not initialized), and an exception
+    escaping into ``_push_status``'s loop would silently end that connection's
+    status frames, losing the version/liveness signal until a page reload. A
+    lessons failure must not also discard a successfully-read cron count.
+    ``None`` means UNKNOWN, never 0: the pusher seeds its cache with ``None``
+    so a component that has never refreshed successfully is published as
+    ``null`` (the dashboard renders a loading skeleton) instead of an
+    authoritative-looking 0 — the exact false-zero #7204 fixes. ``error``
+    joins each failed component's exception TYPE name (``None`` on full
+    success) so the operator-visible warning can name the cause without
+    leaking store paths (``str(OSError)`` embeds its filename); it never
+    enters the WS frame. The guards catch ``Exception`` only, so
+    ``asyncio.CancelledError`` (a ``BaseException``) propagates out of THIS
+    helper uncaught — that is this function's contract; the pusher's own
+    outer handler decides its task's teardown semantics.
 
     NOTE: this deliberately uses ``count_enabled_from_disk`` rather than
     ``list_jobs``. ``list_jobs`` calls ``_sync()`` → ``_load()`` → ``_arm_timer()``,
@@ -136,9 +326,24 @@ async def _load_status_counts(state: DashboardState) -> tuple[int, int]:
     ``count_enabled_from_disk`` is a pure read that never mutates loop-owned
     state or the timer, so it is safe off-thread.
     """
-    crons = await asyncio.to_thread(state.crons.count_enabled_from_disk)
-    lessons = await asyncio.to_thread(state.lessons.load_all)
-    return crons, len(lessons)
+    errors: list[str] = []
+    try:
+        crons: int | None = await asyncio.to_thread(state.crons.count_enabled_from_disk)
+    except Exception as exc:
+        logger.debug("ws: cron count refresh failed; keeping cached count", exc_info=True)
+        # Exception TYPE only: str()/repr() of an OSError embeds the absolute
+        # store path (the operator's username) via its filename attribute, and
+        # this string reaches logger.warning at default level. The full
+        # traceback is already in the debug log above. Never the WS frame.
+        crons = fallback[0]
+        errors.append(f"crons: {type(exc).__name__}")
+    try:
+        lessons: int | None = await asyncio.to_thread(state._count_lessons)
+    except Exception as exc:
+        logger.debug("ws: lesson count refresh failed; keeping cached count", exc_info=True)
+        lessons = fallback[1]
+        errors.append(f"lessons: {type(exc).__name__}")
+    return crons, lessons, "; ".join(errors) or None
 
 
 def broadcast_side_result(
@@ -330,6 +535,11 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
         gitlab_hosts_generation,
         is_owner_dashboard_request,
         schedule_check_refresh,
+        schedule_visibility_refresh,
+    )
+    from kiro_crew.platform.governance_profiles import (
+        governance_answer_generation,
+        poll_profiles_fresh,
     )
 
     owner_request = is_owner_dashboard_request(request)
@@ -401,9 +611,25 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
 
     # Push current slots immediately so sidebar populates without waiting.
     # App tokens get only the slots their manifest scope allows.
+    # Read the governance-answer generation ONCE here and seed both the initial frame
+    # and the refresh loop's baseline from it. Two independent reads would leave a
+    # gap: a ceiling swapped between them is already the loop's baseline, so the
+    # loop never pushes, while the client still holds the number the frame sent —
+    # the change would be missed until an unrelated slot mutation.
+    #
+    # This token covers the PROFILE layer as well as the ceiling (#8623). Watching
+    # the ceiling counter alone meant an operator tightening a capability in a local
+    # profile file was enforced on the next decision but never invalidated the
+    # dashboard's cached answer, so the UI kept offering a withdrawn entry until the
+    # 30s staleness window. The local is named for the answer, not the ceiling,
+    # because it is no longer ceiling-only.
+    initial_answer_generation = governance_answer_generation()
     try:
-        all_slots = state.serialize_slots(include_check_status=owner_request)
-        if ws.get("_is_dashboard_user", False):
+        is_dashboard_user = ws.get("_is_dashboard_user", False)
+        all_slots = state.serialize_slots(
+            include_check_status=owner_request, dashboard_user=is_dashboard_user
+        )
+        if is_dashboard_user:
             slots_data = all_slots
         elif ws_app:
             slots_data = filter_slots_for_app(all_slots, ws_app, allowed_events, state)
@@ -454,9 +680,10 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                 # Seed the client's generation baseline so a later change is
                 # detectable as a change rather than as a first sighting.
                 "gitlabHostsGeneration": gitlab_hosts_generation(),
+                "governanceGeneration": initial_answer_generation,
             }
         )
-        if owner_request:
+        if owner_request or is_dashboard_user:
             # Issue links carry no check status — skip them so the scheduler
             # never hands an issue URL to the pull-request-only chip fetch.
             urls = [
@@ -466,31 +693,42 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                 if link.get("kind", "change") == "change"
             ]
             if urls:
-                schedule_check_refresh(urls, state.push_slots_update)
+                # Both the status refresh AND the visibility probe run the
+                # operator's `gh`/`glab` credentials, so a NON-owner connection
+                # must trigger NEITHER — otherwise a non-owner would cause
+                # authenticated provider reads (status content AND repo
+                # visibility metadata) on repos it has no right to drive traffic
+                # for (GPT #6789). Only the OWNER's connection refreshes the
+                # caches; a non-owner is READ-ONLY against them. The owner is the
+                # dashboard operator and is effectively always connected, so its
+                # driver classifies each repo's visibility and fetches public
+                # status once, and every authenticated non-owner viewer then
+                # renders that cached public-repo status via the fail-closed
+                # `is_repo_public` gate in `_project_source_links`. A repo the
+                # owner has never classified stays owner-only for non-owners
+                # (fail closed) — no non-owner-driven credentialed probe.
+                if owner_request:
+                    schedule_visibility_refresh(urls, state.push_slots_update)
+                    schedule_check_refresh(urls, state.push_slots_update)
     except Exception:
         pass
 
     # Background task: push dashboard status periodically
     async def _push_status() -> None:
-        _cached_lessons = 0
-        _cached_crons = 0
-        _counts_ts = 0.0
+        # Governance-ceiling watch rides this tick rather than a task of its own.
+        # Seeded from the value the initial slots frame carried, not a fresh read:
+        # the client's baseline IS that value, so a swap since then must register
+        # here as a change or the two sides disagree with no push to reconcile.
+        answer_generation = initial_answer_generation
         try:
             while not ws.closed and not shutdown_event.is_set():
-                now = time.time()
-                # Refresh lesson/cron counts every 30s (not every 5s).
-                if now - _counts_ts > _WS_COUNTS_CACHE_TTL:
-                    _cached_crons, _cached_lessons = await _load_status_counts(state)
-                    _counts_ts = now
-                data = {
-                    **state.status_snapshot(
-                        cron_jobs=_cached_crons,
-                        lessons=_cached_lessons,
-                        **status_update_fields(),  # type: ignore[arg-type]
-                    ),
-                    "version": _local_version,
-                    "platform": sys.platform,
-                }
+                # Gateway-wide cache: one store touch per TTL across ALL
+                # sockets; this call returns the shared cache immediately
+                # unless it is the one that refreshes it. Counts are None
+                # (published as null → loading skeleton) until the first
+                # successful refresh — never an authoritative false 0 (#7204).
+                _cached_crons, _cached_lessons = await _refresh_status_counts(state)
+                data = _status_frame(state, crons=_cached_crons, lessons=_cached_lessons)
                 if not ws.get("_is_dashboard_user", False):
                     # This frame is Tier 0 — always delivered, because every
                     # client needs the version (to force a reload across a
@@ -515,6 +753,33 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                     await ws.send_json({"type": "dashboard", "data": data})
                 except Exception:
                     break
+                # A centrally pushed policy (``policy_distribution.apply_ceiling``)
+                # swaps the ceiling between slot mutations, and the dashboard-config
+                # fields derived from it (``social_share_enabled``) would otherwise
+                # keep their cached answer until an unrelated message carried the
+                # new generation. Every dashboard-user socket watches — owner or
+                # not — so a fleet that tightened policy while only a non-owner
+                # window was open still reaches that window. Not folded into the
+                # owner-only credential driver below: this compares one counter and
+                # asks for a (coalesced) slots push, which every dashboard
+                # connection may do, and spends no credentials.
+                if ws.get("_is_dashboard_user", False):
+                    try:
+                        # The profile half of this token needs the profiles directory
+                        # re-stat'd, and ``_dir_fingerprint`` is an ``iterdir`` plus a
+                        # ``stat`` per file — a synchronous filesystem walk, which is
+                        # what AUTOSDE's ``no-blocking-call-on-event-loop`` prohibits
+                        # here. Offloaded, so a slow or large profile store delays
+                        # this socket's own tick instead of stalling chat turns and
+                        # heartbeats for every session on the loop. The token read
+                        # itself is two locked integer reads and stays inline.
+                        await asyncio.to_thread(poll_profiles_fresh)
+                        current = governance_answer_generation()
+                        if current != answer_generation:
+                            answer_generation = current
+                            state.push_slots_update()
+                    except Exception:
+                        logger.warning("governance watch tick failed; continuing", exc_info=True)
                 await asyncio.sleep(_WS_STATUS_INTERVAL)
         except (asyncio.CancelledError, Exception):
             pass
@@ -559,6 +824,14 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                 if urls:
                     offset = (refresh_round * CHECK_STATUS_PENDING_MAX) % len(urls)
                     urls = urls[offset:] + urls[:offset]
+                    # Owner-only driver (see _run_status_driver): both refreshes
+                    # run operator credentials, so only the owner's connection
+                    # drives them. This keeps the check + visibility caches warm
+                    # for every repo the owner's slots reference; non-owner
+                    # viewers render the resulting cached public-repo status
+                    # read-only via is_repo_public. No non-owner-driven
+                    # credentialed provider read (GPT #6789).
+                    schedule_visibility_refresh(urls, state.push_slots_update)
                     schedule_check_refresh(urls, state.push_slots_update)
                 refresh_round += 1
             except asyncio.CancelledError:
@@ -566,7 +839,16 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
             except Exception:
                 logger.warning("check-status refresh round failed; continuing", exc_info=True)
 
-    check_task = asyncio.create_task(_refresh_check_loop()) if owner_request else None
+    # Run the refresh driver ONLY for the owner connection: both the status and
+    # the visibility refresh call the operator's `gh`/`glab` credentials, so a
+    # non-owner must never drive them (GPT #6789). The owner is the dashboard
+    # operator and is effectively always connected, so its driver keeps the
+    # check + visibility caches warm for every repo its slots reference; a
+    # non-owner dashboard connection renders the resulting cached PUBLIC-repo
+    # status read-only (via the fail-closed is_repo_public gate) and spawns no
+    # provider subprocess. App tokens never render status either way.
+    _run_status_driver = owner_request
+    check_task = asyncio.create_task(_refresh_check_loop()) if _run_status_driver else None
     # The resume prefetch this socket's most recent slot_focused frame armed.
     # Tracked per connection so a focus change (or blur/disconnect) cancels
     # only this socket's speculation, never another window's.
@@ -751,10 +1033,18 @@ async def api_ws(request: web.Request) -> web.WebSocketResponse:
                         # replay writes to the socket directly, so it must
                         # apply the same check. Dashboard users pass through
                         # ``_ws_client_allowed`` unconditionally.
+                        #
+                        # Ownership is a separate prerequisite: an unresolved
+                        # parent produces ``slot: ''``. That run remains visible
+                        # through the global spawn inventory, but there is no
+                        # chat authorized to adopt it. Filter before batching so
+                        # even an older client with an empty-slot fallback never
+                        # receives the orphan as session-scoped state.
                         _replay = [
                             _f
                             for _f in _replay
-                            if state._ws_client_allowed(
+                            if _subagent_replay_has_owner(_f)
+                            and state._ws_client_allowed(
                                 ws, str(_f.get("type", "")), _f.get("data", {})
                             )
                         ]

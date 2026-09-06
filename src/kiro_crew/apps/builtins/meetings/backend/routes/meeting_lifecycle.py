@@ -9,6 +9,8 @@
 ``DELETE …/{id}``             permanently remove an inactive meeting
 ``GET  …/{id}/transcript``     finalized speech and typed broadcasts
 ``GET  …/{id}/outputs``       batch-read every agent output + tasks.json
+``PUT  …/{id}/outputs``       save the user's edit of one agent's output (sidecar)
+``DELETE …/{id}/outputs``     revert to what the agent itself last wrote
 ``POST …/{id}/attachments``   add/remove context attachments
 """
 
@@ -115,6 +117,12 @@ def _init_meeting(meeting_id: str, title: str, body: dict[str, Any], root: Any) 
     enabled = sess.get_enabled_agents(config, agents_enabled)
     store.ensure_agent_files(meeting_id, enabled, meta.get("title", "Meeting Notes"), root)
     return meta
+
+
+#: Public name for the blocking init, so the calendar poller (which pre-creates a
+#: meeting the same way the dashboard does) reuses this transaction rather than
+#: keeping a second copy of the folder/metadata/tasks/outputs sequence.
+init_meeting_blocking = _init_meeting
 
 
 async def handle_meeting_init(request: web.Request) -> web.Response:
@@ -537,8 +545,19 @@ async def handle_stop_meeting(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "status": k.STATUS_ENDED, "meta": meta})
 
 
-def _collect_outputs(meeting_id: str, root: Any) -> tuple[dict[str, str], list[dict[str, Any]]]:
-    """Read every configured agent's output and the task list. BLOCKING.
+def _is_editable(agent_def: dict[str, Any]) -> bool:
+    """Whether this agent's output is one the user may edit.
+
+    See :data:`constants.EDITABLE_WIDGET_TYPE`. Used by the read overlay AND the
+    write gate, so "editable" means the same thing in both directions.
+    """
+    return str(agent_def.get("widget_type") or k.DEFAULT_WIDGET_TYPE) == k.EDITABLE_WIDGET_TYPE
+
+
+def _collect_outputs(
+    meeting_id: str, root: Any
+) -> tuple[dict[str, str], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Read every agent's EFFECTIVE output, the edit metadata, and the tasks. BLOCKING.
 
     Runs on a worker thread, never the event loop: the note-taker is prompted to
     rewrite its WHOLE file after each transcription batch, so these reads are
@@ -547,8 +566,23 @@ def _collect_outputs(meeting_id: str, root: Any) -> tuple[dict[str, str], list[d
     meeting, so doing it inline would stall every other task on the loop —
     including the liveness heartbeat — on a repeating timer.
 
-    Both halves are redacted. The outputs are model-generated prose; the tasks
-    come from `tasks.json`, which an agent writes, so they go through the task
+    A user EDIT of an agent's output takes precedence over the generated text, so
+    ``outputs`` is what the meeting actually shows and the client needs no merge
+    step. ``edits`` carries only the ``stale`` metadata, because
+    the content is already in ``outputs`` and sending it twice would double the
+    poll for the app's largest field.
+
+    **The generated half is redacted and the edited half is not**, which looks
+    inconsistent and is not:
+
+    * agent output is model-generated prose the user has never vetted, so it is
+      scrubbed on every read (unchanged from before this feature);
+    * an edit is owner-authored text, not untrusted model output. The editor can
+      accept arbitrary pasted text, including text that merely resembles a
+      credential, so it must be stored and returned byte-for-byte. Re-scrubbing
+      it would silently modify the user's document.
+
+    Tasks come from `tasks.json`, which an agent writes, so they go through the task
     module's own normalizer (which redacts every field and drops a malformed
     record) rather than being forwarded raw.
     """
@@ -558,15 +592,124 @@ def _collect_outputs(meeting_id: str, root: Any) -> tuple[dict[str, str], list[d
         agent_id: redact(content)
         for agent_id, content in store.read_agent_outputs(meeting_id, agents, root).items()
     }
-    return outputs, task_routes.read_normalized(meeting_id, root)
+    # Only EDITABLE agents are consulted, using the same predicate the write gate
+    # does. Filtering here as well as there is what keeps a sidecar written while an
+    # agent was markdown from being served after its widget_type is changed to html —
+    # at which point the user's markdown would be handed to the iframe renderer.
+    edits = store.read_agent_edits(meeting_id, [a for a in agents if _is_editable(a)], root)
+    for agent_id, edit in edits.items():
+        outputs[agent_id] = str(edit.pop("content", ""))
+    return outputs, edits, task_routes.read_normalized(meeting_id, root)
 
 
 async def handle_get_outputs(request: web.Request) -> web.Response:
-    """Batch-read every configured agent's output plus the task list."""
+    """Batch-read every configured agent's effective output plus the task list."""
     meeting_id = _meeting_id(request)
     root = data_root(request)
-    outputs, tasks = await asyncio.to_thread(_collect_outputs, meeting_id, root)
-    return web.json_response({"outputs": outputs, "tasks": tasks})
+    outputs, edits, tasks = await asyncio.to_thread(_collect_outputs, meeting_id, root)
+    return web.json_response({"outputs": outputs, "edits": edits, "tasks": tasks})
+
+
+def _editable_agent(agent_id: str, root: Any) -> dict[str, Any]:
+    """The agent definition *agent_id* names, if its output can be edited. BLOCKING.
+
+    Raises rather than returning None, because the two failures are distinct answers
+    the dashboard acts on differently: an unknown agent is a 404, and an agent whose
+    output is not prose is a 409 (see :data:`constants.EDITABLE_WIDGET_TYPE`).
+    """
+    config = store.read_config(root)
+    agent_def = next(
+        (a for a in (config.get("meeting_agents") or []) if a.get("id") == agent_id), None
+    )
+    if agent_def is None:
+        raise BadRequest("unknown agent", status=404, code="agent_not_found")
+    if not _is_editable(agent_def):
+        raise BadRequest(
+            "only a markdown agent's output can be edited",
+            status=409,
+            code="agent_output_not_editable",
+        )
+    return agent_def
+
+
+def _save_edit(meeting_id: str, agent_id: str, content: str, root: Any) -> None:
+    """Validate the agent, then persist the edit. BLOCKING.
+
+    The meeting existence check and the write share the metadata transaction with
+    deletion. Without it, a PUT for an unknown meeting created an orphan ``edits/``
+    directory, and a concurrent delete could remove ``session.json`` just before the
+    write recreated that same orphan. The agent definition is one authorization
+    snapshot; the read overlay re-applies the editable predicate on every poll.
+    """
+    with store.meta_transaction():
+        if store.read_meeting_meta(meeting_id, root) is None:
+            raise BadRequest("meeting not found", status=404, code="meeting_not_found")
+        store.write_agent_edit(meeting_id, _editable_agent(agent_id, root), content, root)
+
+
+def _drop_edit(meeting_id: str, agent_id: str, root: Any) -> bool:
+    """Validate the meeting and agent, then delete its edit sidecar. BLOCKING."""
+    with store.meta_transaction():
+        if store.read_meeting_meta(meeting_id, root) is None:
+            raise BadRequest("meeting not found", status=404, code="meeting_not_found")
+        return store.revert_agent_edit(meeting_id, _editable_agent(agent_id, root), root)
+
+
+async def handle_put_output(request: web.Request) -> web.Response:
+    """Save the user's edit of one agent's output — the editable minutes.
+
+    The edit lands in a SIDECAR, never in the agent's file (see the block comment
+    above ``store.agent_edits_dir``). So the agent keeps writing its own document
+    throughout, the next outputs poll's ``stale`` flag is how the user learns it
+    has, and ``DELETE`` restores the generated text by deleting one file.
+
+    Not redacted (the asymmetry ``_collect_outputs`` spells out), and validated by
+    hand rather than with ``field_str``, for two reasons: ``field_str`` treats a
+    non-string as MISSING (so a malformed body would answer 200 having replaced the
+    minutes with ``""``) and it ``strip()``s, which would eat the trailing newline
+    of every markdown document it touched.
+    """
+    meeting_id = _meeting_id(request)
+    root = data_root(request)
+    # A whole document, not a short field — hence the raised cap. See
+    # `constants.MAX_MINUTES_BODY_BYTES` for why the default 256 KiB is wrong here.
+    body = await json_body(request, max_bytes=k.MAX_MINUTES_BODY_BYTES)
+    agent_id = store.safe_agent_id(field_str(body, "agent_id", required=True, max_len=64))
+    content = body.get("content")
+    if not isinstance(content, str):
+        raise BadRequest("content must be a string")
+    if len(content) > k.MAX_MINUTES_CHARS:
+        raise BadRequest(f"content must be at most {k.MAX_MINUTES_CHARS} characters", status=413)
+    # JSON's ``\udXXX`` escapes can decode into UNPAIRED surrogates, which are
+    # valid Python str but not encodable UTF-8 — the sidecar write would then
+    # raise mid-request and the user would see a 500 for a malformed input.
+    # Reject it here as the client error it is.
+    try:
+        content.encode("utf-8")
+    except UnicodeEncodeError:
+        raise BadRequest(
+            "content contains unpaired surrogate characters", code="content_not_unicode"
+        )
+
+    await asyncio.to_thread(_save_edit, meeting_id, agent_id, content, root)
+    audit("meetings.edit_output", f"{meeting_id} agent:{agent_id}", outcome="ok")
+    return web.json_response({"ok": True, "agent_id": agent_id})
+
+
+async def handle_delete_output(request: web.Request) -> web.Response:
+    """Revert one agent's output to what the agent itself last wrote.
+
+    ``reverted: false`` for an agent with no edit is a success, not a 404: the
+    request asked for "no edit on this agent" and that is the state afterwards.
+    """
+    meeting_id = _meeting_id(request)
+    root = data_root(request)
+    body = await json_body(request)
+    agent_id = store.safe_agent_id(field_str(body, "agent_id", required=True, max_len=64))
+
+    reverted = await asyncio.to_thread(_drop_edit, meeting_id, agent_id, root)
+    audit("meetings.revert_output", f"{meeting_id} agent:{agent_id}", outcome="ok")
+    return web.json_response({"ok": True, "agent_id": agent_id, "reverted": reverted})
 
 
 def _read_translations_since(meeting_id: str, since: int, root: Any) -> dict[str, Any]:

@@ -2,173 +2,254 @@
 
 All notable changes to KiroCrew are documented in this file.
 
-## [0.5.0-1.0] — 2026-09-06
+## [0.6.0] - 2026-09-05
 
-kirocrew-customapi release `v0.5.0-1.0` — kiro base `0.5.0` + fork version `1.0`.
+Kiro Crew stops being one agent on one machine: choose the harness that runs
+your sessions, start a chat on another crew you are connected to, and let crew
+members dispatch workers of their own. Chat gets quieter, with folded diffs,
+resumed sessions that stop re-reading their own context, and refused commands
+that tell the agent what it may do instead. Python 3.12 is the new floor.
 
-- **Base rebase:** upstream Kiro Crew `v0.5.0` (AWS Control app, centrally published fleet security policy, session tabs, idle sidebar fold-away, bulk/one-call approvals, local dictation provider, atomic self-update — full list in the upstream `## [0.5.0]` notes below)
-- **Versions:** `src/kiro_crew/__init__.py` and Electron `package.json`/`package-lock.json` stamped `0.5.0-1.0` (`pyproject.toml` stays plain PEP440 `0.5.0`)
-- **config-baseline union:** every fork provider/shim/vision key (safe_mode, use_shim + shim endpoint/key, provider_base_url/api_key/api_format, model_whitelist, image_redirect, vision_fallback_model, vision_providers, text_only_models, image_input_mode, provider enum `acp|claude_code|opencode`) merged with upstream 0.5.0 additions (mcp_quarantine_after_failures, app execution trust, trusted apps/repos)
-- i18n catalogs: upstream 0.5.0 content with fork `kirocrew-customapi` renames re-applied
+### Before you upgrade
 
-## [0.4.1-1.7] — 2026-09-03
+- **Python 3.12 is now the floor**: a host on 3.10 or 3.11 must move up before
+  installing or updating, and every installer provisions 3.12 itself when the
+  system package manager has none.
 
-kirocrew-customapi release `v0.4.1-1.7` — kiro base `0.4.1` + fork version `1.7`.
+### Pick the harness that runs your sessions (Preview)
 
-- **README:** hero revamp — "Made in the European Union · for everyone" tagline plus `assets/made-in-europe.svg` banner, synced to the canonical `lenovo-legion-tool` asset
-- **Versions:** `src/kiro_crew/__init__.py` and Electron `package.json`/`package-lock.json` bumped `0.4.1-1.6` → `0.4.1-1.7` (`pyproject.toml` stays at `0.4.1` PEP440)
+- **Claude Code, Codex and KAS are selectable harnesses**: turn on Developer
+  Mode in Settings → Developer (off by default), then pick one under
+  Developer → Agent Backend, where each option says whether it is installed,
+  missing on this machine, or waiting on a gateway restart.
+- **A tool pre-approved in Claude's own settings never reaches Crew's approval
+  path**, so its deny rules and audit log do not see that call, and Codex
+  refuses to start while the sandbox is off.
+- **Monitor loops, project changes, follow-up cards and conversation reset work
+  on every backend**, where they previously failed closed outside Kiro CLI.
 
-### Contributors
+### Remote crews become one dashboard (Preview)
 
-- @encomjp
+- **Run a chat on another crew you are connected to**: set `instances.enabled`
+  in `config.json` and turn on Developer → Feature Previews → Chat on a crew
+  (both off by default), then pick the peer under New chat on crew in the
+  sidebar's new-chat menu; the transcript stays local while every turn runs on
+  that crew.
+- **A session that runs elsewhere carries a server badge and the crew's name
+  in your sidebar**, so remote work is openable from the list you already read.
+- **Crews connect themselves** on app load and on tab focus, on by default and
+  switchable at Settings → Remote Instances → Auto-connect crews.
 
-## [0.4.1-1.6] — 2026-08-31
+### Chat that stays out of the way
 
-kirocrew-customapi release `v0.4.1-1.6` — kiro base `0.4.1` + fork version `1.6`.
+- **Diffs start folded** as a chip naming the file and its +N/-M counts, and
+  Settings → Display → Plain diffs (off by default) renders patches as plain
+  monospace text instead.
+- **A sketch pad and a share action**: the composer's + menu gains a Sketch row
+  that draws an image and attaches it, and an assistant reply's Share as image
+  action exports a branded PNG or prefills an X or LinkedIn post.
+- **The composer says where you are and when it will compact**: its footer
+  shows the project's branch and uncommitted file count, and the context
+  popover's threshold slider sets compaction for this session alone.
 
-- **Bridge:** `kirocrew_call` alias removed — `CallTool` now rejects unknown names including `kirocrew_call` (only 3 allowlisted tools)
-- **Tests:** `test_fork_review_regressions` now 11 behavior tests (PATCH mask, GET mask, `prefixed_router_model_id`, catalog union, `_model_via_env`, effective key, shim 502, bridge) instead of 6 `Path.read_text` checks
-- **Electron:** `package-lock.json` synced `0.4.1-1.0` → `0.4.1-1.5`/`1.6` (keep `pyproject` at `0.4.1` PEP440)
+### Sessions you can find, file and leave open
 
-### Contributors
+- **Search sessions by the pull request, review or issue on their badge** from
+  the sidebar search box, not just by title.
+- **A resumed session no longer re-injects its full memory, lessons and skills
+  block**, so an idle session that comes back reaches compaction far later.
+- **Folders auto-tag the chats you start in them**, set under the folder
+  menu's Folder settings, and the sidebar's Collapse dormant sessions picker
+  now defaults to 7 days instead of 2.
 
-- @encomjp
+### Agents that dispatch and watch
 
-## [0.4.1-1.5] — 2026-08-31
+- **Agents arm their own watch**: an agent can start, revise and stop a
+  monitoring loop on its own session from the dashboard, a Slack thread or a
+  Discord DM, and a loop that names one pull request wakes the agent only when
+  that pull request moves.
+- **Crew members dispatch work into worker sessions** from their own thread on
+  the Claude and KAS backends, and each worker inherits its creator's trust
+  posture so it no longer stalls on a first tool call.
+- **Session control is on by default**; set `agent.session_control` to false
+  in `config.json` to withdraw it from every agent at once.
 
-kirocrew-customapi release `v0.4.1-1.5` — kiro base `0.4.1` + fork version `1.5`.
+### Crew members get faces (Preview)
 
-- **Dashboard OpenAI catalog** now uses `effective_provider_api_key` (keyring/env) instead of plaintext `provider_api_key` — keyring-only setups no longer get empty `Bearer`
-- **Regression tests** for all leftover fork-review fixes: `PATCH` mask skip, bridge inner whitelist, `live ∪ static cmc`, `model_via_env` post-whitelist, and `Bearer` effective key
+- **Give a crew a face**: build its ghost avatar trait by trait or upload a
+  picture at Agent Capabilities → Agents → Avatar → Customize.
+- **The member drawer shows recent activity and the schedules and webhooks
+  that can wake it** when you pick a member on the Crew Members page, and the
+  desktop-only Crew Companion app, enabled from Apps → Library, shows one
+  avatar across all displays.
+- **Crew is a preview opt-in**: turn on Developer Mode in Settings →
+  Developer, then Developer → Feature Previews → Crew, to get the Crew Members
+  entry and the new-crew-chat entry back.
 
-### Contributors
+### Apps get a Launchpad
 
-- @encomjp
+- **Installed apps show as a Launchpad grid** under Apps → Library, each an
+  icon tile with a pin badge for the sidebar, an Open button and a menu for
+  Details, Update, Disable and Uninstall.
+- **An app can own background work, Command Bar rows and an embedded chat**:
+  its manifest declares `permissions.jobs` for server-side runs that continue
+  when you navigate away and `contributes.commands` for rows in the Cmd+K
+  Command Bar, and its page can embed the conversation without the sessions
+  rail.
+- **Dev mode for a UI folder outside an app's install now needs the terminal**:
+  the dashboard and the API refuse it, and only
+  `kirocrew app dev <name> --confirm-out-of-install-root` grants it.
 
-## [0.4.1-1.4] — 2026-08-31
+### Your cloud drive, inside the app
 
-kirocrew-customapi release `v0.4.1-1.4` — kiro base `0.4.1` + fork version `1.4`.
+- **AWS Control navigates by Files, Library, Backup and Access**, each with its
+  own URL, with Accounts & credentials and Usage & costs at the rail's foot;
+  the app ships off, so enable it from Apps → Library first.
+- **The Files pane lists what is actually in the bucket**, with real
+  thumbnails, drag to move, drop to upload and delete behind an inline confirm,
+  and a storage meter sits on the Usage & costs pane.
+- **A running backup survives leaving the page**: coming back to Backup shows
+  it still going, and a run orphaned by a gateway that is gone reads as
+  interrupted instead of running forever.
 
-- **Hardened 30+ edge cases** across 10 subsystems: ACP stderr drain deadlock (oversize line) and streaming budget, prompt turn TOCTOU lock and blocking config load off-loop, provider secret masking for `provider_api_key` and `telegram.accounts`, torn-read fail-closed and atomic save lock, pipe-to-shell bypass (`|bash` without spaces), sandbox mount TOCTOU, governance fail-open, dashboard `500` on bad JSON and symlink race, workspace lost-update, websocket origin/CSRF via `X-Forwarded-For`, bounded image budget and concurrent vision describes, cron DST/leap and orphan kill, task parallel half-commit, FAISS and SQLite races, and `mcp wait` cancellation
+### Meetings, Jira and the Changes panel
+
+- **Meeting minutes are editable in place**: press Edit this output on an
+  agent's card, then Save, or Discard my edits to get the agent's version back.
+- **Meetings prepares the meeting about to start** once you set a calendar
+  under Meetings → Settings → Calendar; the background polling is already on.
+- **A Jira issue keeps its formatting and shows its Fix Version** in the Issues
+  panel once a Jira API token is in your environment, and the Changes panel
+  now opens instantly from what it already holds and refreshes behind you.
+
+### Channels and MCP servers
+
+- **Saving an MCP server no longer resets your session** on Kiro CLI 2.10.0 or
+  newer, and the chat session menu's MCP servers view reports what this
+  session actually mounted.
+- **An agent can message a channel by name** with `send_message`, reaching
+  Slack, Discord, Telegram, WhatsApp, Webex, Teams, iMessage and Feishu.
+- **Search your sessions from Telegram** with `/sessions <words>` in a direct
+  message; with no words it lists the ten most recent.
+
+### A gate that explains itself
+
+- **A blocked tool call now explains the way forward**, so the agent stops
+  retrying the same blocked shape, and `kirocrew doctor` prints a Credentials
+  section that lists your AWS profiles without opening a secret.
+- **Deny rules survive re-spelling**: quoting, escapes, command substitution,
+  line continuations, `find` and `grep -r` traversals and wildcard-spelled
+  program names all reach the rule they used to dodge, and a recursive content
+  read rooted at the crew data home is refused.
+- **A host that cannot sandbox refuses to run the agent**: armv7l, riscv64,
+  ppc64le and s390x Linux, a libc without `prctl`, and Windows with Kiro CLI's
+  internal sandbox off all fail closed unless you set `agent.sandbox` to `off`
+  or `agent.sandbox_allow_unsandboxed_exec` to true in `config.json`.
+
+### Approvals you can shape
+
+- **A sandboxed command can no longer rewrite your ceiling**: the security
+  policy, admission policy, profiles and denied-command list are sealed
+  read-only in every sandbox mode, so an app script, a hook or a command cron
+  cannot grant itself more than you did.
+- **A restart says when it dropped your auto-approve grant**, and Settings →
+  Security → Denied Commands tags any deny rule your edition contributed so
+  you can switch it off by id.
+
+### The terminal, themes and artifacts
+
+- **The built-in terminal draws all sixteen ANSI colours from your theme**, and
+  setting `dashboard.terminal.completion.enabled` to false in `config.json`
+  silences its inline completion menus.
+- **An installed theme pack can rebrand the whole dashboard shell**, product
+  name, logo and favicon included, once you add a pack that declares branding
+  at Settings → Display → Install Theme.
+- **Saving an artifact warns when its colours are hardcoded**, in the agent's
+  tool result and on `kirocrew artifact save`, which now takes `--slug` for an
+  exact handle and refuses a taken one instead of renaming it.
+
+### Faster, lighter, and measured
+
+- **Every turn reports its tokens, spend and latency across cron, heartbeat,
+  subagents, workflows and every messaging channel**, on Developer → Telemetry
+  with Developer Mode on; the latency and fault-rate charts also need
+  `telemetry.enabled` set to true (off by default).
+- **Semantic memory uses about 1.2 GB less**, the session list is over twice
+  as fast on a large store, and credential scanning is 2.6 to 2.9x faster,
+  with nothing to turn on.
+- **The command gate decides a very long command in milliseconds** instead of
+  seconds, and the gateway stays responsive while other sessions read large
+  transcripts or synthesize speech.
+
+### Installing and the desktop app
+
+- **Setup catches a Kiro CLI too old for agent sessions**: the startup gate
+  shows Kiro CLI update needed with an Update Kiro CLI button that runs the
+  update for you.
+- **Answer a default that changed under you**: `kirocrew config defaults`
+  lists stored values still holding a superseded default, `--adopt` takes the
+  new defaults and `--keep` records yours as intentional.
+- **The desktop app raises OS notifications for alerts and approvals** with
+  nothing to switch on, and an externally managed install now reads its update
+  commands only from a marker file this user cannot rewrite.
+
+### Around the dashboard
+
+- **Write your own prompts, and see and set each steering document's inclusion
+  mode**, on the Prompts and Steering tabs of the Agent Capabilities page.
+- **`.docx` and `.pptx` files show their text inline in the file viewer**,
+  in-page tab strips are all one pill control, and the PR and issue chips on
+  session cards switch off at Settings → Chat.
+- **Automatic knowledge folders are gone**: a folder enters the Library only
+  when you add and confirm it, and a folder an older install registered by
+  itself is held pending until you do.
 
 ### Notable fixes
 
-- `api/send-message` now bounded at `100 KiB` with `413` and `400 body_not_object`, not `500`; `api/file-read` uses `O_NOFOLLOW`; `kinds` rejects `400 invalid_kinds`
-- `search_semantic` and episodic `LIKE` now `ESCAPE '\'` and FTS `MATCH` sanitized; `memory.db-wal/shm` and `memory_index.db` now `0600`
-- `prefixed_router_model_id` correctly maps `deepseek/deepseek-v4-pro` → `cmc/deepseek-v4-pro`; `cmc` vendor-prefixed raws no longer dropped
-- `subagent` recursion blocked (`subagent:` parent rejected), `cron` timeout now kills child tree, `task` retry counts separated
+For anyone checking whether their particular annoyance is gone.
 
-### Contributors
+**Chat and sessions.** The transcript holds your place through new messages,
+reloads and a reply that grows, and each turn renders exactly once. Cancelling
+a queued message returns exactly what you typed with your files re-staged. A
+backend that cannot compact says so at once instead of hanging for five
+minutes.
 
-- @encomjp
+**Approvals and the sandbox.** Denying one tool call denies that call only, so
+the agent can revise and ask again. Sandboxed commands run on hosts that
+restrict unprivileged namespaces, and the sandbox reclaims its leftover mount
+directories. Ordinary commands that merely mention a credential variable now
+run.
 
-## [0.4.1-1.3] — 2026-08-30
+**Credentials.** Credentials are redacted before long text is shortened
+anywhere, so a key straddling the cut no longer survives. Log output escapes
+every control character. A URL carrying genuine sign-in parameters is no longer
+refused as a bare secret.
 
-kirocrew-customapi release `v0.4.1-1.3` — kiro base `0.4.1` + fork version `1.3`.
+**The gateway.** It restarts itself when a package update prunes the running
+install, and survives a workspace on a synced or network volume. An interrupted
+first start can no longer leave an empty signing key that fails every signed
+action forever. Knowledge ingestion, embedding and session teardown do their
+disk work off the gateway loop.
 
-- Packaged `kirocrew-bridge` MCP adapter with the native app: `mcp/kirocrew-bridge` (Node, bundled 583K) is now in `resources/kirocrew-bridge/` via `extraResources` and auto-installs to `~/.config/opencode/mcp/kirocrew-bridge/` on app start, registering `mcp__ssh__*`, `memory_tencentdb_*`, `cron_*` etc. for opencode sessions without manual `opencode mcp add`
-- Bridge proxies via `X-Internal-Secret` to `127.0.0.1:5476` (gateway) with `XDG_DATA_HOME` for `opencode` auth, fallback to direct `ssh` spawn when gateway is down
-- Published as stable (not prerelease) — `latest` now points to this build
+**Sub-agents and jobs.** A run parked on an unanswered spawn approval says so
+everywhere it is listed. A task run keeps its worktree, branch and lessons
+across a gateway restart. A script job can perform state-mutating tool calls
+instead of reporting success while writing nothing.
 
-## [0.4.1-1.1] — 2026-08-30
+**MCP and channels.** The built-in tool surface comes back within minutes when
+a long-lived helper goes stale. A Slack turn that dies mid-reply keeps the
+partial answer you already saw. A rerouted thread keeps the agent you bound to
+it.
 
-kirocrew-customapi release `v0.4.1-1.1` — kiro base `0.4.1` + fork version `1.1`.
+**Knowledge and skills.** Keyword search finds Chinese, Japanese and Korean
+text on its own. The skill editor preserves comments, quoted keys and
+indentation it does not own. A negative retention value is clamped instead of
+wiping all daily memory.
 
-- Fix `muse-spark-1.2-contributor` via opencode: bare id now correctly routes via `opencode-go` native provider (was `kirocrew/bare` → Not Found), deduplicates bare vs `opencode-go/...` to single picker entry labeled `via opencode-go`, free variant `opencode/muse-spark-1.2-contributor-free` kept separate
-- Provider model picker now respects whitelist strictly: selecting only `muse-spark` shows only that model (was showing all `ollama`/`openai` via CLI union bypass), empty whitelist still shows all 90+ logged-in opencode models without reconfiguring
-- Isolated opencode HOME now inherits real `~/.local/share/opencode/auth.json` via `XDG_DATA_HOME` so `openai`/`ollama-cloud` oauth models work without copying keys, isolated `opencode.json` 0600, no secrets in logs
-- i18n parity: restored `tailnetMobile` (42 keys) + 312 upstream `en.json` keys, fixed `en.json`/`en.manual.json` shadowing, regenerated `en-XA`, placeholders aligned for `row_breathing`/`paste_lines`/`batch_move_failed`/`unit_hours`
-- Frontend: `kiro-native` Save button restored (was hidden, so switching to native never persisted), model cache invalidation on provider switch (clears `kc.acp.models.v1` + `available-models` + per-chat slot models)
-
-## [0.4.1-1.0] — 2026-08-30
-
-kirocrew-customapi release `v0.4.1-1.0` — kiro base `0.4.1` + fork version `1.0`.
-
-- Rebase onto upstream `v0.4.1` (whole-history rebase of all fork commits):
-  gateway auto-update hardening (primary-branch allowlist, tracked-upstream
-  check, exec-config refusal), desktop update flow rework, enterprise MCP
-  registry mode, harness-parity error-code contract
-- Fork feature set carried: `claude_code` / `opencode` backends for
-  self-hosted Anthropic-compatible routers, provider settings + presets,
-  vision image redirect, keyring secrets, kirocrew-customapi branding
-- Upstream 0.4.x adoption: model fallback chain, hold-to-talk voice input,
-  background auto-check for managed installs, touch gestures, Windows
-  cold-start/perf fixes
-
-## [0.3.1-1.1] — 2026-08-25
-
-kirocrew-customapi release `v0.3.1-1.1` — kiro base `0.3.1` + fork version `1.1`.
-
-- Desktop Linux packages install under one coherent `kirocrew-desktop`
-  identity — launcher, binary and menu entry now agree, unblocking the
-  release pipeline that v0.3.1-1.0 tripped
-- Windows shortcuts and the running app share one `com.kirocrew.customapi`
-  identity; macOS declares a local-network purpose string so LAN access
-  can be granted
-- Recovery links after a failed update point at files this release
-  actually ships, and a failed update survives a renderer reload
-
-## [0.3.1-1.0] — 2026-08-23
-
-kirocrew-customapi release `v0.3.1-1.0` — kiro base `0.3.1` + fork version `1.0`.
-
-- Provider hardening: OS-keyring API keys, safe_mode endpoint gate,
-  `kirocrew secret migrate/set/clear/status`
-- Built-in Anthropic↔OpenAI shim (streaming tool-calls, usage, count_tokens)
-- Rebase onto upstream v0.5.0-era main with zero-divergence sync
-- vision_analyze MCP tool, fork-only dashboard routes restored
-- 198 pre-existing test-drift failures repaired (i18n catalogs rebuilt,
-  productName interpolation, lost constants restored)
-
-## [0.2.0-customapi.5] — 2026-08-08 — Vision
-
-**Big feature: native vision — image models feel first-class, not bolted on.**
-
-![Vision tool — describe any image on a text-only model](assets/vision-tool.png)
-
-Every model now reports `supports_vision`; the picker groups **Vision — image input** (muted **Image** pill) above **Text**, and **Settings → Chat → Vision** governs how text-only models handle images (describe subagent / switch / off + fallback model). Attach any image via the composer's `+` / drag-drop — it rides as native pixels on vision models, or as a one-shot `vision_subagent_describe` on text-only ones (the `vision_analyze` MCP tool is also available to the agent). Images are downscaled to model limits before they ever reach the gateway.
-
-### Added
-
-- **`vision_analyze` MCP tool** — the main agent can describe any local path or http(s) image URL on demand (`vision_analyze({ path|url })`), so screenshots the agent itself captures enter the conversation as text.
-- **Vision-aware image routing** — `prompt_blocks` downscales + `vision.decide_image_input_mode` routes `auto` → native vs text; `AcpClient` + shared-runtime `AcpSessionHandle` both honor it so Slack/cron/dashboard share one implementation. Two new config keys surface in `config.json` (`agent.image_input_mode: auto|native|text`, `agent.image_redirect: subagent|switch|off`) and the new Settings card.
-- **Reported `supports_vision` flag** — every `GET /api/models` row carries it (registry `supports_vision` + router catalog `capabilities` + ACP `oc/ol deepseek-v4-flash` denylist), wired `AcpAdapter` → `ModelDropdownList` grouping.
-- **Multi-provider picker — full catalogs** — `oc/` (opencode-go) and `ol/` (ollama) now expose their full catalogs (mimo-v2.5, glm, kimi, minimax, qwen, gemma, …), with 9router `ocg`/`ollama` normalization so `oc/mimo-v2.5`, `ol/glm-5.2` etc. are selectable end-to-end.
-- **Settings → Chat → Vision** — native `Image input mode`, `On text-only models`, and `Vision fallback model` selects, right next to Default Model. The model picker's Vision grouping is derived from the reported flag, not a hard-coded client list.
-
-### Fixed
-
-- AppImage gateway startup blockers (packaged-build path) and shared-runtime image prompt parity.
-
-## [0.2.0-customapi.4] — 2026-08-08
-
-The kirocrew-customapi fork: Kiro Crew with the Claude Code ACP backend re-enabled for self-hosted LLM routers (9router, CLIProxyAPI, OpenCode Zen, Ollama Cloud, and any Anthropic/OpenAI-compatible endpoint).
-
-### Fixed
-
-- **Endless loading in chat (OpenCode backend)** — the OpenCode ACP process now runs in an isolated `HOME`, so user-installed plugins (Honcho) and MCP servers can no longer stall the session.
-- **Ollama Cloud 405/Unauthorized** — Ollama Cloud's Anthropic endpoint rejects cloud API keys; the wire format is now forced to OpenAI (`/v1/chat/completions`) which accepts the same keys and models.
-- **Provider preset reset to "custom"** — the preset now derives from the saved URL, so it stays selected after save + reload.
-- **"connection failed: undefined" on Test** — the provider test now uses the stored API key when no draft key is entered.
-- **Stale model from old provider** — switching provider clears the default model and model whitelist, so old ids (e.g. `deepseek-v4-flash:0731`, `oc/mimo`) no longer leak into the new provider's picker.
-- **Router-prefixed models in kiro-native** — `cx/`, `oc/`, `ol/` prefixed models are cleared on provider switch and no longer appear in the kiro-native model list.
-
-### Added
-
-- **Provider binary warnings** — Settings > Chat now warns when the selected backend's binary (OpenCode CLI or claude-agent-acp) is not installed.
-- **New provider presets** — Ollama Cloud (OpenAI wire), OpenCode Zen/Go, commandcode.ai, 9router, CLIProxyAPI, OmniRouter, Anthropic, OpenRouter, xAI, Mistral, DeepSeek, Together, OpenAI, Groq.
-
-### Verified
-
-- 767 Python tests + frontend tests pass.
-- Live AppImage chat returns instantly.
-- All 14 provider URLs verified (200 or auth-required).
-
-## [0.2.0-customapi.1] — 2026-08-06
-
-Initial kirocrew-customapi fork. Re-enabled the dormant `claude_code` provider (the `ACP_BACKEND_CLAUDE` seam) so Kiro Crew can drive your own model router speaking the Anthropic API instead of Kiro's built-in Bedrock catalog.
-
-## [0.4.0] — 2026-08-21
+**Windows, desktop and CLI.** A non-ASCII account name or path no longer breaks
+diagnostics, the service install or a network-drive permission check. The
+signed macOS app no longer reports itself as damaged on a managed Mac. Kiro Crew
+imports on Python 3.13 and 3.14, and setup finishes under a C or POSIX locale.
 
 ## [0.5.0] — 2026-08-29
 

@@ -70,14 +70,27 @@ import os
 import stat
 from pathlib import Path
 
-#: Config-named executable vectors, disabled on OUR argv (``-c`` beats any repo config).
-#: ``core.hooksPath`` to os.devnull disables every hook; ``core.fsmonitor=false`` disables the
-#: fsmonitor daemon. Both are global options and must precede the subcommand.
+from kiro_crew.atomic_write import atomic_write
+
+#: Config-named host execution/read vectors, disabled on OUR argv (``-c`` beats any repo
+#: config). Hooks and fsmonitor are disabled; external attributes/excludes files are pinned
+#: to Git's cross-platform ``/dev/null`` spelling (Git-for-Windows maps it correctly) so Git
+#: cannot open agent-selected UNC/network/FIFO paths. ``push.recurseSubmodules=no`` stops a
+#: push from recursing into submodule remotes: the egress guard validates only the SINGLE
+#: superproject origin, so an agent that set an attacker-controlled submodule remote plus
+#: recursive push could otherwise ship unscanned submodule objects to an unvalidated host.
+#: All options must precede the subcommand.
 GIT_SAFE_CONFIG: tuple[str, ...] = (
     "-c",
     f"core.hooksPath={os.devnull}",
     "-c",
     "core.fsmonitor=false",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "core.excludesFile=/dev/null",
+    "-c",
+    "push.recurseSubmodules=no",
 )
 
 #: What gets written to ``.git/info/attributes``.
@@ -248,7 +261,7 @@ def _pin(git_dir_owner: Path | str) -> str:
 
     Raises :class:`GitSafetyError` if a gitdir EXISTS but the pin cannot be safely written (a
     symlink swap on any component, an unwritable ``info``). Link-checks every component and
-    writes ``O_NOFOLLOW`` so a symlink swapped in at the last instant is refused by the kernel.
+    atomically replaces ``attributes`` so symlinks/hardlinks are never written through.
     """
     gitdir = _resolve_gitdir(git_dir_owner)  # may raise GitSafetyError on a linked `.git`
     if gitdir is None:
@@ -259,16 +272,16 @@ def _pin(git_dir_owner: Path | str) -> str:
         info.mkdir(parents=True, exist_ok=True)
         target = info / "attributes"
         _reject_link(target)
-        if target.is_file() and target.read_text(encoding="utf-8") == _ATTRIBUTES_PIN:
+        if (
+            target.is_file()
+            and target.lstat().st_nlink == 1
+            and target.read_text(encoding="utf-8") == _ATTRIBUTES_PIN
+        ):
             return "pinned"
-        # O_NOFOLLOW: a symlink at `target` fails the open (ELOOP) rather than being written
-        # through. O_TRUNC replaces stale/partial content. 0o600 — this is our file.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(str(target), flags, 0o600)
-        try:
-            os.write(fd, _ATTRIBUTES_PIN.encode("utf-8"))
-        finally:
-            os.close(fd)
+        # Replace the directory entry atomically rather than truncating it in
+        # place. If an agent hardlinked `attributes` to an external file, the
+        # external inode remains untouched and the clone receives our own file.
+        atomic_write(target, _ATTRIBUTES_PIN, mode=0o600, newline="")
         return "pinned"
     except GitSafetyError:
         raise

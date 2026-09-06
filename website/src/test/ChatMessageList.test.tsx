@@ -122,15 +122,17 @@ describe('ChatMessageList', () => {
     })
 
     it('renders stop_event messages via kind field', () => {
-      const stopMsg = msg('user', 'Session stopped', { kind: 'stop_event' })
+      // The row draws the shared StopEventCard, which reads `meta.state` — a
+      // stop event's `content` is the card's own JSON envelope, never prose.
+      const stopMsg = msg('user', 'Session stopped', { kind: 'stop_event', meta: { state: 'stopped' } })
       render(<ChatMessageList messages={[stopMsg]} running={false} />)
-      expect(screen.getByText('Session stopped')).toBeInTheDocument()
+      expect(screen.getByTestId('stop-event-card').getAttribute('data-state')).toBe('stopped')
     })
 
     it('renders stop_event messages via meta.kind', () => {
-      const stopMsg = msg('user', 'Halted', { meta: { kind: 'stop_event' } })
+      const stopMsg = msg('user', 'Halted', { meta: { kind: 'stop_event', state: 'stop_failed_reset' } })
       render(<ChatMessageList messages={[stopMsg]} running={false} />)
-      expect(screen.getByText('Halted')).toBeInTheDocument()
+      expect(screen.getByTestId('stop-event-card').getAttribute('data-state')).toBe('stop_failed_reset')
     })
 
     it('returns null for thinking messages rendered individually', () => {

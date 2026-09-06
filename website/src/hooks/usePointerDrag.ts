@@ -1,40 +1,12 @@
 import { useCallback, useRef } from 'react'
 
 /**
- * Apple "Designing Fluid Interfaces" physics helpers + a shared Pointer-Events
- * drag hook — one implementation for resizers across the app that:
+ * Shared Pointer-Events drag hook — one implementation for resizers across the
+ * app that:
  *   - works on touch as well as mouse (Pointer Events + setPointerCapture),
- *   - tracks release velocity (for momentum handoff),
  *   - applies a movement threshold before committing to a drag (hysteresis),
  *   - survives the pointer leaving the element bounds (capture).
  */
-
-/**
- * Project the resting position of a flick from its release velocity, matching
- * Apple's exponential-decay scroll deceleration (NOT the textbook v²/2a form).
- *
- * @param velocity      release velocity in px/s
- * @param decelerationRate 0.998 ≈ normal scroll feel; 0.99 ≈ snappier
- * @returns the additional distance (px) the element should travel after release
- */
-export function project(velocity: number, decelerationRate = 0.998): number {
-  return ((velocity / 1000) * decelerationRate) / (1 - decelerationRate)
-}
-
-/**
- * Progressive boundary resistance ("rubber-banding"). The further past the
- * boundary the user drags, the less the element follows — real things slow
- * before they stop, instead of hitting a rigid wall.
- *
- * @param overshoot  how far past the boundary the raw pointer is (px)
- * @param dimension  the reference dimension (e.g. panel size) the resistance scales against
- * @param constant   resistance constant (0.55 matches UIKit)
- * @returns the damped overshoot to actually apply past the boundary
- */
-export function rubberband(overshoot: number, dimension: number, constant = 0.55): number {
-  if (dimension <= 0) return 0
-  return (overshoot * dimension * constant) / (dimension + constant * Math.abs(overshoot))
-}
 
 export interface PointerDragState {
   /** total delta from the drag origin */
@@ -43,9 +15,6 @@ export interface PointerDragState {
   /** current pointer position */
   x: number
   y: number
-  /** instantaneous velocity in px/s (from the last two samples) */
-  vx: number
-  vy: number
   /** true on the first committed move of this drag */
   first: boolean
   /** whether the gesture crossed the movement threshold. Only meaningful in onEnd
@@ -64,11 +33,15 @@ export interface PointerDragOptions {
 interface DragInternal {
   startX: number
   startY: number
+  /** last position from a user-driven coordinate-bearing event (down/move/up).
+   *  Platform-fired ends can carry sentinel coordinates: the Pointer Events
+   *  spec leaves got/lostpointercapture coordinates undefined, and engines
+   *  have shipped pointercancel with 0,0 (the spec needed an explicit
+   *  clarification that cancel coordinates must match the last dispatched
+   *  event) — so the end payload derives from this instead of trusting a
+   *  terminal event. */
   lastX: number
   lastY: number
-  lastT: number
-  vx: number
-  vy: number
   active: boolean
   committed: boolean
 }
@@ -80,7 +53,7 @@ interface DragInternal {
  */
 export function usePointerDrag(opts: PointerDragOptions) {
   const st = useRef<DragInternal>({
-    startX: 0, startY: 0, lastX: 0, lastY: 0, lastT: 0, vx: 0, vy: 0, active: false, committed: false,
+    startX: 0, startY: 0, lastX: 0, lastY: 0, active: false, committed: false,
   })
   const optsRef = useRef(opts)
   optsRef.current = opts
@@ -91,16 +64,15 @@ export function usePointerDrag(opts: PointerDragOptions) {
     const el = e.currentTarget as HTMLElement
     try { el.setPointerCapture(e.pointerId) } catch { /* capture is best-effort */ }
     const s = st.current
-    s.startX = s.lastX = e.clientX
-    s.startY = s.lastY = e.clientY
-    s.lastT = e.timeStamp
-    s.vx = 0
-    s.vy = 0
+    s.startX = e.clientX
+    s.startY = e.clientY
+    s.lastX = e.clientX
+    s.lastY = e.clientY
     s.active = true
     s.committed = (optsRef.current.threshold ?? 10) <= 0
     optsRef.current.onStart?.(e)
     if (s.committed) {
-      optsRef.current.onMove({ dx: 0, dy: 0, x: e.clientX, y: e.clientY, vx: 0, vy: 0, first: true })
+      optsRef.current.onMove({ dx: 0, dy: 0, x: e.clientX, y: e.clientY, first: true })
     }
     e.preventDefault()
   }, [])
@@ -108,12 +80,10 @@ export function usePointerDrag(opts: PointerDragOptions) {
   const onPointerMove = useCallback((e: React.PointerEvent) => {
     const s = st.current
     if (!s.active) return
-    const dt = Math.max(1, e.timeStamp - s.lastT)
-    s.vx = ((e.clientX - s.lastX) / dt) * 1000
-    s.vy = ((e.clientY - s.lastY) / dt) * 1000
+    // Track pre-threshold moves too: a capture loss during hysteresis must
+    // still end from the true (small) delta, not a stale origin.
     s.lastX = e.clientX
     s.lastY = e.clientY
-    s.lastT = e.timeStamp
     const dx = e.clientX - s.startX
     const dy = e.clientY - s.startY
     const threshold = optsRef.current.threshold ?? 10
@@ -121,7 +91,7 @@ export function usePointerDrag(opts: PointerDragOptions) {
       if (Math.hypot(dx, dy) < threshold) return
       s.committed = true
     }
-    optsRef.current.onMove({ dx, dy, x: e.clientX, y: e.clientY, vx: s.vx, vy: s.vy, first: false })
+    optsRef.current.onMove({ dx, dy, x: e.clientX, y: e.clientY, first: false })
   }, [])
 
   const end = useCallback((e: React.PointerEvent) => {
@@ -136,18 +106,54 @@ export function usePointerDrag(opts: PointerDragOptions) {
     // click on a thin handle would leave that state set forever. dx/dy reflect
     // actual movement (≈0 for a tap); `committed` tells the consumer whether the
     // gesture crossed the threshold so it can skip drag-only work.
+    //
+    // The payload derives from the last coordinate-bearing event, not from
+    // this event unconditionally. This is an ALLOW-list: only pointerup — the
+    // user-driven end whose coordinates are spec-defined — refreshes the
+    // tracker. Every platform-fired end is excluded, because their
+    // coordinates are unreliable by spec or by shipped engines: the Pointer
+    // Events spec leaves got/lostpointercapture coordinates undefined, and
+    // engines have delivered pointercancel with 0,0 (Pointer Events L3 added
+    // an explicit clarification that cancel coordinates must match the last
+    // dispatched event precisely because behavior diverged). Trusting a
+    // sentinel would hand consumers dx of roughly -startX: resizers run
+    // persist(apply(sign * dx)) in onEnd, which would snap the pane to a
+    // clamped extreme or its collapsed state and WRITE it to localStorage,
+    // a persisted wrong layout on the exact path this hook exists to heal.
+    // On a conformant engine the excluded cancel carries the last dispatched
+    // coordinates — exactly what the tracker already holds — so committing
+    // the tracked position is lossless there and fail-safe everywhere else.
+    if (e.type === 'pointerup') {
+      s.lastX = e.clientX
+      s.lastY = e.clientY
+    }
     optsRef.current.onEnd?.({
-      dx: e.clientX - s.startX,
-      dy: e.clientY - s.startY,
-      x: e.clientX,
-      y: e.clientY,
-      vx: s.committed ? s.vx : 0,
-      vy: s.committed ? s.vy : 0,
+      dx: s.lastX - s.startX,
+      dy: s.lastY - s.startY,
+      x: s.lastX,
+      y: s.lastY,
       first: false,
       committed: s.committed,
     })
     s.committed = false
   }, [])
 
-  return { onPointerDown, onPointerMove, onPointerUp: end, onPointerCancel: end }
+  // lostpointercapture is the terminal event the Pointer Events spec fires
+  // when capture ends for ANY reason (explicit release, a capture steal by
+  // another element, browser-initiated cancellation). Without it, a drag
+  // whose capture dies mid-gesture never delivers onEnd: pointerup stops
+  // being retargeted to this element, so consumer onStart side effects
+  // (several resizers suppress body-wide text selection; others pin
+  // body.cursor or teardown-critical dragging flags) stay stuck while the
+  // component remains mounted and its unmount guards never run. The normal
+  // end path stays single-fire: `end` flips `s.active` false BEFORE calling
+  // releasePointerCapture, so the lostpointercapture that release triggers
+  // is a no-op re-entry.
+  return {
+    onPointerDown,
+    onPointerMove,
+    onPointerUp: end,
+    onPointerCancel: end,
+    onLostPointerCapture: end,
+  }
 }

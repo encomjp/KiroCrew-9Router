@@ -259,10 +259,26 @@ def _redact_tree(value: Any) -> Any:
 
 
 async def _json_body(request: web.Request) -> dict[str, Any]:
-    """Parse a JSON object body, tolerating an empty one."""
+    """Parse a JSON object body, tolerating an empty one.
+
+    Diverges DELIBERATELY from the dashboard contract
+    (``dashboard/handlers/_shared.read_bounded_json``, which answers 400 for a
+    non-object): every call site here treats the result as a config *patch* and
+    only ever reads known keys off it (``set(patch)``, ``patch.items()``,
+    ``body.get(...)``), so an empty object is a legitimate no-op request. A
+    malformed OR non-object body therefore collapses to ``{}`` (an empty patch)
+    on purpose rather than a 400 — there is no field whose absence widens an
+    operation here, unlike ``session_storage._json_body``.
+
+    The catch is narrowed to the client-input failure set
+    (``LookupError`` from an unknown ``charset=`` codec, ``RecursionError`` from a
+    deeply nested body, ``ValueError``/``UnicodeDecodeError`` from undecodable or
+    non-JSON bytes) so a mid-read transport error (a client disconnect) still
+    propagates rather than being mislabelled a client mistake.
+    """
     try:
         body = await request.json()
-    except Exception:  # noqa: BLE001 - malformed body is a client error, not a crash
+    except (LookupError, RecursionError, ValueError):
         return {}
     return body if isinstance(body, dict) else {}
 
@@ -341,7 +357,7 @@ async def _handle_setup_clone(request: web.Request) -> web.StreamResponse:
         return busy
 
     def _clone() -> tuple[dict, str]:
-        return clone_setup.setup_safe_clone(url, store.scratch_dir())
+        return clone_setup.setup_safe_clone(url, store.scratch_path())
 
     # `result` is a PARAMETER, not a closure read. It used to be a free variable of this
     # handler, which broke the moment clone+persist moved inside `_clone_and_persist` to take
@@ -782,6 +798,13 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
         clone = str(config.get("clone") or "").strip()
         if not clone:
             return {"ok": False, "error": "no repository configured"}
+        try:
+            isolated = clone_setup._repository_is_isolated(Path(clone))
+        except clone_setup.IsolationProbeError as exc:
+            # Sandbox failure, not an isolation verdict — name it (#8151).
+            return {"ok": False, "error": str(exc)}
+        if not isolated:
+            return {"ok": False, "error": "repository isolation check failed — re-run setup"}
 
         body = body_path.read_text(encoding="utf-8")
         # The queued body leads with the summary as an H1; the recipe wants the
@@ -938,7 +961,14 @@ async def _handle_draft_pr(request: web.Request) -> web.StreamResponse:
     if result.get("ok"):
         return web.json_response(result, status=200)
     return web.json_response(
-        {"code": "draft_pr_failed", "error": str(result.get("detail") or "")},
+        {
+            "code": "draft_pr_failed",
+            # `_draft()`'s failure dicts carry `error`; `detail` is kept as the
+            # legacy fallback. Reading only `detail` serialized every failure —
+            # including the sandbox-launcher diagnosis this route now surfaces —
+            # as an empty string. Raised by the GPT review of this branch.
+            "error": _redact_for_display(str(result.get("error") or result.get("detail") or "")),
+        },
         status=400,
     )
 
@@ -1291,11 +1321,12 @@ async def _handle_commit(request: web.Request) -> web.StreamResponse:
             sha=str(result.get("sha") or ""),
         )
         return web.json_response(result, status=200)
-    # Redacted, like every sibling error response here. `commit.py` builds its `error` from
-    # `(proc.stderr or '')[:160]` — raw git stderr, which quotes the ref, the path, and
-    # anything a repository's own hook printed. Latent while nothing rendered it; D-97 started
-    # showing it at the finding row, which made it a live egress path to the browser.
-    # Raised by the GPT review.
+    # Redacted, like every sibling error response here. `commit.py` builds its `error`
+    # from git stderr — which quotes the ref, the path, and anything a repository's own
+    # hook printed — scrubbed at the source with `redact_via_context` so its bound can
+    # never cut a credential mid-match. Latent while nothing rendered it; D-97 started
+    # showing it at the finding row, which made it a live egress path to the browser, so
+    # this pass stays as the output-boundary backstop. Raised by the GPT review.
     return web.json_response(
         {"code": "request_failed", "error": _redact_for_display(str(result.get("error") or ""))},
         status=400,
@@ -1355,6 +1386,14 @@ async def _handle_run_start(_request: web.Request) -> web.StreamResponse:
 
     try:
         result = await asyncio.to_thread(_start)
+    except clone_setup.IsolationProbeError as exc:
+        # Before the generic clause: this subclasses RuntimeError, but it is a
+        # sandbox-launcher failure, not a config/state conflict — a distinct
+        # `code` so a UI branching on it does not render the misleading
+        # push-isolation guidance (#8151). The message is the actionable part.
+        return web.json_response(
+            {"code": "sandbox_launcher_failed", "error": str(exc)}, status=409
+        )
     except (RuntimeError, ValueError, PermissionError) as exc:
         # Already running / no repository configured / push not disabled — all three are
         # "the request conflicts with current state", all three are user-fixable, and the

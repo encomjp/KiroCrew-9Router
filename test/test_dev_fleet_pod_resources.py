@@ -9,13 +9,14 @@ exercise the parse / CPU-delta / TTL-cache / absent-off-Linux contracts.
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-import kiro_crew.apps.builtins.dev_fleet.server as mod
+from kiro_crew.apps.builtins.dev_fleet import fleet_state, runtime
 
 # Pod HOME values are opaque here -- ``rt.pod_home`` is stubbed and nothing
 # touches the filesystem -- but they are built from the platform temp dir rather
@@ -59,11 +60,11 @@ def _cfg():
 @pytest.fixture(autouse=True)
 def _reset_module_state():
     """Isolate the module-level CPU/home caches between tests."""
-    mod._POD_CPU_SAMPLES.clear()
-    mod._POD_HOME_SIZE_CACHE.clear()
+    fleet_state._POD_CPU_SAMPLES.clear()
+    fleet_state._POD_HOME_SIZE_CACHE.clear()
     yield
-    mod._POD_CPU_SAMPLES.clear()
-    mod._POD_HOME_SIZE_CACHE.clear()
+    fleet_state._POD_CPU_SAMPLES.clear()
+    fleet_state._POD_HOME_SIZE_CACHE.clear()
 
 
 def _stub_rt(monkeypatch, *, show_stdout="", show_exc=None, home=_HOME_MISSING):
@@ -80,7 +81,7 @@ def _stub_rt(monkeypatch, *, show_stdout="", show_exc=None, home=_HOME_MISSING):
         systemctl=_systemctl,
         orphan_homes=lambda cfg: [],
     )
-    monkeypatch.setattr(mod, "rt", ns, raising=False)
+    monkeypatch.setattr(runtime, "rt", ns, raising=False)
     return ns
 
 
@@ -88,7 +89,7 @@ def _stub_rt(monkeypatch, *, show_stdout="", show_exc=None, home=_HOME_MISSING):
 # _parse_systemctl_records + _coerce_uint
 # --------------------------------------------------------------------------
 def test_parse_splits_records_in_order():
-    records = mod._parse_systemctl_records(_CANNED_TWO_PODS)
+    records = fleet_state._parse_systemctl_records(_CANNED_TWO_PODS)
     assert len(records) == 2
     assert records[0]["MemoryCurrent"] == "652242944"
     assert records[0]["MemoryAccounting"] == "yes"
@@ -98,19 +99,19 @@ def test_parse_splits_records_in_order():
 
 
 def test_parse_empty_input_is_no_records():
-    assert mod._parse_systemctl_records("") == []
-    assert mod._parse_systemctl_records("\n\n") == []
+    assert fleet_state._parse_systemctl_records("") == []
+    assert fleet_state._parse_systemctl_records("\n\n") == []
 
 
 def test_coerce_uint_rejects_sentinels():
     # max-uint (systemd 'infinity'/'not measured') and [not set] collapse to None.
-    assert mod._coerce_uint("18446744073709551615") is None
-    assert mod._coerce_uint("[not set]") is None
-    assert mod._coerce_uint("infinity") is None
-    assert mod._coerce_uint("") is None
-    assert mod._coerce_uint(None) is None
+    assert fleet_state._coerce_uint("18446744073709551615") is None
+    assert fleet_state._coerce_uint("[not set]") is None
+    assert fleet_state._coerce_uint("infinity") is None
+    assert fleet_state._coerce_uint("") is None
+    assert fleet_state._coerce_uint(None) is None
     # A real measurement survives.
-    assert mod._coerce_uint("652242944") == 652242944
+    assert fleet_state._coerce_uint("652242944") == 652242944
 
 
 def test_a_short_record_list_never_misattributes(monkeypatch, _cfg):
@@ -132,7 +133,7 @@ def test_a_short_record_list_never_misattributes(monkeypatch, _cfg):
         "MemoryAccounting=yes\nCPUAccounting=no\n"
     )
     _stub_rt(monkeypatch, show_stdout=dump)
-    out = mod._pod_resources_sync(_cfg, ["alpha", "beta", "gamma"])
+    out = fleet_state._pod_resources_sync(_cfg, ["alpha", "beta", "gamma"])
     # beta was unknown to systemd -> absent, not filled with gamma's block.
     assert "beta" not in out
     assert out["alpha"]["mem_current"] == 100
@@ -148,12 +149,12 @@ def test_home_size_cache_drops_pods_that_stopped(monkeypatch, _cfg):
     now pruned against the same liveness signal as the CPU samples.
     """
     _stub_rt(monkeypatch, show_stdout=_CANNED_TWO_PODS)
-    mod._POD_HOME_SIZE_CACHE[_UNIT_A] = (1.0, 111)
-    mod._POD_HOME_SIZE_CACHE["kirocrew-pod@evicted.service"] = (1.0, 999)
-    mod._pod_resources_sync(_cfg, ["alpha", "beta"])
-    assert _UNIT_A in mod._POD_HOME_SIZE_CACHE
-    assert "kirocrew-pod@evicted.service" not in mod._POD_HOME_SIZE_CACHE
-    assert mod._coerce_uint("0") == 0
+    fleet_state._POD_HOME_SIZE_CACHE[_UNIT_A] = (1.0, 111)
+    fleet_state._POD_HOME_SIZE_CACHE["kirocrew-pod@evicted.service"] = (1.0, 999)
+    fleet_state._pod_resources_sync(_cfg, ["alpha", "beta"])
+    assert _UNIT_A in fleet_state._POD_HOME_SIZE_CACHE
+    assert "kirocrew-pod@evicted.service" not in fleet_state._POD_HOME_SIZE_CACHE
+    assert fleet_state._coerce_uint("0") == 0
 
 
 # --------------------------------------------------------------------------
@@ -163,11 +164,11 @@ def test_resources_parse_two_pods(monkeypatch, _cfg):
     _stub_rt(monkeypatch, show_stdout=_CANNED_TWO_PODS)
     # Avoid the du path: home size is None for a nonexistent tree.
     monkeypatch.setattr(
-        mod.subprocess,
+        subprocess,
         "run",
         MagicMock(return_value=SimpleNamespace(returncode=1, stdout="", stderr="")),
     )
-    out = mod._pod_resources_sync(_cfg, ["alpha", "beta"])
+    out = fleet_state._pod_resources_sync(_cfg, ["alpha", "beta"])
 
     a = out["alpha"]
     assert a["mem_current"] == 652242944
@@ -194,7 +195,7 @@ def test_resources_empty_running_set_short_circuits(monkeypatch, _cfg):
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     ns.systemctl = _tracking
-    assert mod._pod_resources_sync(_cfg, []) == {}
+    assert fleet_state._pod_resources_sync(_cfg, []) == {}
     assert called["n"] == 0  # no subprocess spawned when nothing is running
 
 
@@ -205,24 +206,30 @@ def test_cpu_percent_null_then_pct():
     unit = "kirocrew-pod@alpha.service"
     rec_on = {"CPUAccounting": "yes", "CPUUsageNSec": "1000000000"}  # 1.0s cpu
     # First observation at t=100.0 -> null (no prior sample).
-    assert mod._cpu_percent(unit, rec_on, 100.0) is None
+    assert fleet_state._cpu_percent(unit, rec_on, 100.0) is None
     # Second observation 2 wall-seconds later, +1.0 cpu-second -> 50.0%.
     rec2 = {"CPUAccounting": "yes", "CPUUsageNSec": "2000000000"}
-    assert mod._cpu_percent(unit, rec2, 102.0) == 50.0
+    assert fleet_state._cpu_percent(unit, rec2, 102.0) == 50.0
 
 
 def test_cpu_percent_absent_when_accounting_off():
     unit = "kirocrew-pod@x.service"
-    assert mod._cpu_percent(unit, {"CPUAccounting": "no", "CPUUsageNSec": "5"}, 1.0) is None
+    assert fleet_state._cpu_percent(unit, {"CPUAccounting": "no", "CPUUsageNSec": "5"}, 1.0) is None
     # Accounting-off must not leave a stale sample that fakes a later delta.
-    assert unit not in mod._POD_CPU_SAMPLES
+    assert unit not in fleet_state._POD_CPU_SAMPLES
 
 
 def test_cpu_percent_null_on_counter_reset():
     unit = "kirocrew-pod@y.service"
-    assert mod._cpu_percent(unit, {"CPUAccounting": "yes", "CPUUsageNSec": "500"}, 10.0) is None
+    assert (
+        fleet_state._cpu_percent(unit, {"CPUAccounting": "yes", "CPUUsageNSec": "500"}, 10.0)
+        is None
+    )
     # Counter went backwards (unit restarted) -> null, not a negative %.
-    assert mod._cpu_percent(unit, {"CPUAccounting": "yes", "CPUUsageNSec": "100"}, 12.0) is None
+    assert (
+        fleet_state._cpu_percent(unit, {"CPUAccounting": "yes", "CPUUsageNSec": "100"}, 12.0)
+        is None
+    )
 
 
 def test_cpu_percent_null_across_a_fast_restart():
@@ -237,14 +244,14 @@ def test_cpu_percent_null_across_a_fast_restart():
     """
     unit = "kirocrew-pod@z.service"
     first = {"CPUAccounting": "yes", "CPUUsageNSec": "1000000000", "InvocationID": "aaa"}
-    assert mod._cpu_percent(unit, first, 100.0) is None
+    assert fleet_state._cpu_percent(unit, first, 100.0) is None
     # Restarted (new invocation) AND already past the old total, so the delta is
     # positive -- the guard that would catch a backwards counter does not fire.
     restarted = {"CPUAccounting": "yes", "CPUUsageNSec": "3000000000", "InvocationID": "bbb"}
-    assert mod._cpu_percent(unit, restarted, 102.0) is None
+    assert fleet_state._cpu_percent(unit, restarted, 102.0) is None
     # The new invocation's own next sample is comparable again.
     same = {"CPUAccounting": "yes", "CPUUsageNSec": "4000000000", "InvocationID": "bbb"}
-    assert mod._cpu_percent(unit, same, 104.0) == 50.0
+    assert fleet_state._cpu_percent(unit, same, 104.0) == 50.0
 
 
 def test_empty_running_set_clears_stale_caches(monkeypatch, _cfg):
@@ -256,11 +263,11 @@ def test_empty_running_set_clears_stale_caches(monkeypatch, _cfg):
     a restarted pod's counter.
     """
     _stub_rt(monkeypatch, show_stdout="")
-    mod._POD_CPU_SAMPLES["kirocrew-pod@gone.service"] = (1.0, 5, "aaa")
-    mod._POD_HOME_SIZE_CACHE["kirocrew-pod@gone.service"] = (1.0, 999)
-    assert mod._pod_resources_sync(_cfg, []) == {}
-    assert mod._POD_CPU_SAMPLES == {}
-    assert mod._POD_HOME_SIZE_CACHE == {}
+    fleet_state._POD_CPU_SAMPLES["kirocrew-pod@gone.service"] = (1.0, 5, "aaa")
+    fleet_state._POD_HOME_SIZE_CACHE["kirocrew-pod@gone.service"] = (1.0, 999)
+    assert fleet_state._pod_resources_sync(_cfg, []) == {}
+    assert fleet_state._POD_CPU_SAMPLES == {}
+    assert fleet_state._POD_HOME_SIZE_CACHE == {}
 
 
 # --------------------------------------------------------------------------
@@ -269,7 +276,7 @@ def test_empty_running_set_clears_stale_caches(monkeypatch, _cfg):
 def test_probe_failure_yields_empty(monkeypatch, _cfg):
     # rt.systemctl raising (require_systemd off Linux, or any error) -> {}.
     _stub_rt(monkeypatch, show_exc=RuntimeError("systemctl unavailable off Linux"))
-    assert mod._pod_resources_sync(_cfg, ["alpha"]) == {}
+    assert fleet_state._pod_resources_sync(_cfg, ["alpha"]) == {}
 
 
 # --------------------------------------------------------------------------
@@ -285,17 +292,17 @@ async def test_home_size_cached_within_ttl(monkeypatch, _cfg):
         calls["argv"] = argv
         return 0, f"123456\t{_HOME_ALPHA}\n", ""
 
-    monkeypatch.setattr(mod, "_run_cmd", _fake_run_cmd)
+    monkeypatch.setattr(runtime, "_run_cmd", _fake_run_cmd)
 
     unit = "kirocrew-pod@alpha.service"
     # t=1000: first call runs du.
-    assert await mod._pod_home_size(_cfg, "alpha", unit, 1000.0) == 123456
+    assert await fleet_state._pod_home_size(_cfg, "alpha", unit, 1000.0) == 123456
     assert calls["n"] == 1
     # t=1000+30 (< TTL 60): served from cache, du NOT re-run.
-    assert await mod._pod_home_size(_cfg, "alpha", unit, 1030.0) == 123456
+    assert await fleet_state._pod_home_size(_cfg, "alpha", unit, 1030.0) == 123456
     assert calls["n"] == 1
     # t=1000+61 (> TTL): recomputed.
-    assert await mod._pod_home_size(_cfg, "alpha", unit, 1061.0) == 123456
+    assert await fleet_state._pod_home_size(_cfg, "alpha", unit, 1061.0) == 123456
     assert calls["n"] == 2
 
 
@@ -317,10 +324,10 @@ async def test_home_size_goes_through_the_routed_chokepoint(monkeypatch, _cfg):
         seen["argv"] = argv
         return 0, "1\t.\n", ""
 
-    monkeypatch.setattr(mod, "_run_cmd", _fake_run_cmd)
+    monkeypatch.setattr(runtime, "_run_cmd", _fake_run_cmd)
     raw = MagicMock()
-    monkeypatch.setattr(mod.subprocess, "run", raw)
-    await mod._pod_home_size(_cfg, "alpha", "kirocrew-pod@alpha.service", 1.0)
+    monkeypatch.setattr(subprocess, "run", raw)
+    await fleet_state._pod_home_size(_cfg, "alpha", "kirocrew-pod@alpha.service", 1.0)
     # Routed by NAME -- `_run_cmd` resolves and vets it; the caller never picks
     # the binary path itself.
     assert seen["argv"][0] == "du"
@@ -335,20 +342,22 @@ async def test_home_size_failure_is_none(monkeypatch, _cfg):
     async def _fail(argv, **kw):
         return 1, "", "err"
 
-    monkeypatch.setattr(mod, "_run_cmd", _fail)
-    assert await mod._pod_home_size(_cfg, "alpha", "kirocrew-pod@alpha.service", 1.0) is None
+    monkeypatch.setattr(runtime, "_run_cmd", _fail)
+    assert (
+        await fleet_state._pod_home_size(_cfg, "alpha", "kirocrew-pod@alpha.service", 1.0) is None
+    )
 
 
 def test_orphan_count(monkeypatch, _cfg):
     monkeypatch.setattr(
-        mod, "rt", SimpleNamespace(orphan_homes=lambda cfg: ["dead1", "dead2"]), raising=False
+        runtime, "rt", SimpleNamespace(orphan_homes=lambda cfg: ["dead1", "dead2"]), raising=False
     )
-    assert mod._orphan_count_sync(_cfg) == 2
+    assert fleet_state._orphan_count_sync(_cfg) == 2
 
     monkeypatch.setattr(
-        mod,
+        runtime,
         "rt",
         SimpleNamespace(orphan_homes=MagicMock(side_effect=OSError("boom"))),
         raising=False,
     )
-    assert mod._orphan_count_sync(_cfg) is None
+    assert fleet_state._orphan_count_sync(_cfg) is None

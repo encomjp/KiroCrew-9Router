@@ -51,6 +51,7 @@ import {
 } from '../../../components/ui/dialog'
 import { Badge, Btn, IconButton, Input, Toggle } from '../../../components/ui'
 import SimpleSelect from '../../../components/SimpleSelect'
+import ErrorNotice from '../../../components/ErrorNotice'
 import { useAgents } from '../../../hooks/useAgents'
 import { useAvailableModels } from '../../../hooks/useAvailableModels'
 import CrewGhost, { djb2, ghostVariantCount } from './CrewGhost'
@@ -216,7 +217,6 @@ function Field({
           caller passes either the custom `Input` or a `children` expression it
           cannot look inside. `label-has-associated-control`, the rule that
           replaced this deprecated one, is satisfied and stays on. */}
-      {/* eslint-disable-next-line jsx-a11y/label-has-for */}
       <label htmlFor={id} className="block">
         <span className="mb-1.5 block text-[13px] font-semibold text-text">{label}</span>
         {children}
@@ -340,8 +340,11 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
 
   /** The app's own agent roster — the same `/api/agents` list the chat and
    *  schedule pickers read, so a crew can only be pointed at an agent that
-   *  actually exists. `0` = never force a refresh; `App` owns the sync. */
-  const { agents } = useAgents(0)
+   *  actually exists. `0` = never force a refresh; `App` owns the sync. Since
+   *  the trigger is constant the fetch runs once per mount, so `reload` is the
+   *  ONLY retry this dialog has — a failure with no affordance would strand the
+   *  picker on an empty list for the life of the mount (#5990's shape). */
+  const { agents, error: rosterError, reload: reloadRoster, reloading: rosterReloading } = useAgents(0)
   /** THE model list, gated on `open`: this dialog stays mounted while closed
    *  (Radix owns the exit animation), and an ungated observer would spawn
    *  kiro-cli's `--list-models` merely because the Crews view is on screen. */
@@ -665,7 +668,6 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
               {/* The label wraps only the INPUT, not the Roll button beside it:
                   an interactive descendant of a label is a second thing to click
                   in one hit area. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for -- nested + htmlFor→id both hold; the deprecated rule cannot see through the custom `Input`. */}
               <label htmlFor="crew-editor-name" className="min-w-0 flex-1">
                 <span className="mb-1.5 block text-[13px] font-semibold text-text">
                   {t('apps.issueRadar.views.crews.editor.name_label')}
@@ -693,15 +695,17 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
                 {t('apps.issueRadar.views.crews.editor.name_roll')}
               </Btn>
             </div>
+            {/* No hand-off: the crew editor form (name, description, base branch,
+                worktree root) is unsaved while this shows. The wrapper keeps the
+                id the name input's `aria-describedby` points at. */}
             {nameError && (
-              <p
+              <div
                 id="crew-editor-name-error"
-                role="alert"
                 data-testid="crew-editor-name-error"
-                className="mt-1.5 text-[12px] font-medium text-danger"
+                className="mt-1.5"
               >
-                {nameError}
-              </p>
+                <ErrorNotice message={nameError} variant="inline" />
+              </div>
             )}
             {suggestions.length > 0 && (
               <div className="mt-2 flex flex-wrap gap-1.5">
@@ -742,6 +746,31 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
                 value={draft.agent}
                 onChange={v => patch('agent', v)}
               />
+              {/* A load failure is only worth reporting while it costs the user
+                  the list — gated on the ROSTER being empty, not `agentOptions`:
+                  in edit mode the crew's own stale agent stays selectable (the
+                  preservation above), and this line composes with that rather
+                  than replacing it. The retry re-runs the hook's fetch, which a
+                  constant trigger otherwise never repeats. */}
+              {rosterError && agents.length === 0 && (
+                <div className="mt-1.5 flex flex-wrap items-center justify-between gap-2">
+                  {/* No hand-off: the crew editor form around this row is unsaved. */}
+                  <ErrorNotice
+                    message={t('apps.issueRadar.views.crews.editor.agent_roster_failed')}
+                    variant="inline"
+                  />
+                  <Btn
+                    onClick={reloadRoster}
+                    disabled={rosterReloading}
+                    aria-busy={rosterReloading}
+                    className="text-[12px] px-2 py-1 shrink-0"
+                  >
+                    {rosterReloading
+                      ? t('apps.issueRadar.views.crews.editor.agent_roster_retrying')
+                      : t('apps.issueRadar.views.crews.editor.agent_roster_retry')}
+                  </Btn>
+                </div>
+              )}
               <p className="mt-1.5 text-[12px] leading-relaxed text-muted">
                 {t('apps.issueRadar.views.crews.editor.agent_hint')}
               </p>
@@ -938,15 +967,14 @@ export default function CrewEditor({ open, onClose, crew }: CrewEditorProps) {
         </DialogBody>
 
         <DialogFooter>
-          {formError && (
-            <p
-              role="alert"
-              data-testid="crew-editor-error"
-              className="mr-auto text-[12px] font-medium text-danger"
-            >
-              {formError}
-            </p>
-          )}
+          {/* No hand-off: the crew editor form above is unsaved — a save banner
+              shows precisely because it did not persist. */}
+          <ErrorNotice
+            message={formError}
+            variant="inline"
+            className="mr-auto"
+            testId="crew-editor-error"
+          />
           <Btn type="button" onClick={requestClose} className="py-1.5">
             {t('apps.issueRadar.views.crews.editor.cancel')}
           </Btn>

@@ -220,7 +220,75 @@ class TestReviewDriver(unittest.TestCase):
             return {"ok": True, "output": "", "error": ""}
         out = D.run_review(["CR-7"], dispatch=no_record, generate_report=False, root=self.root, post=True)
         self.assertEqual(out["deep_reviewed"], 0)
+        # The residual "turn completed, nothing written" case keeps this value;
+        # environment failures carry their own discriminated reasons instead.
         self.assertEqual(out["per_change"][0]["skipped_reason"], "no_review_recorded")
+        self.assertFalse(out["per_change"][0]["result_recorded"])
+
+    def test_incomplete_record_is_discriminated_from_no_record(self):
+        # A worker that writes a record but never marks the review complete is a
+        # DIFFERENT detectable cause than one that writes nothing — the two must
+        # not collapse into one reason (that ambiguity is what made the failure
+        # untriageable).
+        errors: dict = {}
+
+        def prog(cid, phase, extra=None):
+            if phase == "failed":
+                errors[cid] = (extra or {}).get("error", "")
+
+        def partial(task, timeout=0):
+            results.write_result({
+                "schema": "code-review-sage-result", "version": 1, "change_id": "CR-8",
+                "platform": "github", "repo_identity": "github.com/o/r", "revision": "1",
+                "phase1": {"gate_verdict": "PASS", "design_risk": "low", "criticality": "low"},
+                "blast_radius": {"rating": "SMALL", "signals": {}},
+                "counts": {"red": 0, "yellow": 0}, "findings": [],
+                "deep_reviewed": False, "title": "CR-8",
+                "files_covered": [], "coverage_complete": True,
+            }, self.root)
+            return {"ok": True, "output": "", "error": ""}
+
+        out = D.run_review(["CR-8"], dispatch=partial, generate_report=False,
+                           root=self.root, post=True, progress=prog)
+        rec = out["per_change"][0]
+        self.assertEqual(rec["skipped_reason"], "review_record_incomplete")
+        self.assertTrue(rec["result_recorded"])
+        self.assertIn("never completed", errors["CR-8"])
+        self.assertNotIn("no result record", errors["CR-8"])
+
+    def test_preflight_failure_fails_fast_and_never_dispatches(self):
+        # A failed runtime preflight must produce its own discriminated reason,
+        # name the missing runtime in the progress error, and return BEFORE any
+        # reviewer session is dispatched.
+        errors: dict = {}
+
+        def prog(cid, phase, extra=None):
+            errors[cid] = (phase, (extra or {}).get("error", ""))
+
+        out = D.run_review(
+            ["CR-1", "CR-2"], dispatch=self._fake_dispatch(),
+            generate_report=False, root=self.root, post=True, progress=prog,
+            preflight=lambda: "the reviewer cannot run: no kiro-cli executable "
+                              "was found on this host")
+        self.assertEqual(self.calls, [])            # nothing was dispatched
+        self.assertFalse(out["ok"])
+        self.assertIn("kiro-cli", out["error"])
+        self.assertEqual(out["changes"], 2)
+        self.assertEqual(out["result_records"], 0)
+        for rec in out["per_change"]:
+            self.assertEqual(rec["skipped_reason"], "runtime_unavailable")
+            self.assertIn("kiro-cli", rec["deep_error"])
+        self.assertEqual(errors["CR-1"][0], "failed")
+        self.assertIn("kiro-cli", errors["CR-1"][1])
+
+    def test_passing_preflight_runs_the_review(self):
+        # "" means the runtime is available — the run proceeds normally.
+        out = D.run_review(["CR-1"], dispatch=self._fake_dispatch(),
+                           generate_report=False, root=self.root, post=True,
+                           preflight=lambda: "")
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["deep_reviewed"], 1)
+        self.assertGreater(len(self.calls), 0)
 
     def test_each_task_is_single_change(self):
         D.run_review(["CR-1", "CR-2"], dispatch=self._fake_dispatch(), archiver=self._archiver,
@@ -246,6 +314,97 @@ class TestReviewDriver(unittest.TestCase):
     def test_empty_change_set(self):
         out = D.run_review([], dispatch=self._fake_dispatch(), root=self.root, post=True)
         self.assertFalse(out["ok"])
+
+    # ── The per-change progress entry must name its cause as a TOKEN ──
+    # Every failure path below already puts the token on its per_change RECORD
+    # (`skipped_reason`), but the record is driver-internal: what the dashboard
+    # reads is the `progress` entry, which carried prose only. So the cause had to
+    # be recognized by its wording, and rewording any message below silently
+    # reverted the card to untranslated pass-through with no test going red.
+    # These assert the token travels with the sentence on the entry itself, and
+    # that it AGREES with the record on the same path.
+
+    def _failed_entry(self, cid: str, **kw) -> dict:
+        """Drive ``run_review`` and return the `failed` progress entry for ``cid``."""
+        entries: dict = {}
+
+        def prog(c, phase, extra=None):
+            if phase == "failed":
+                entries[c] = dict(extra or {})
+
+        out = D.run_review([cid], generate_report=False, root=self.root,
+                           post=True, progress=prog, **kw)
+        self.out = out
+        return entries.get(cid, {})
+
+    def test_progress_entry_names_no_review_recorded(self):
+        entry = self._failed_entry(
+            "CR-7", dispatch=lambda task, timeout=0: {"ok": True, "output": "", "error": ""})
+        self.assertEqual(entry.get("reason"), "no_review_recorded")
+        # The sentence is unchanged -- the token is carried BESIDE it.
+        self.assertEqual(entry.get("error"), "review produced no result record")
+        self.assertEqual(self.out["per_change"][0]["skipped_reason"], entry.get("reason"))
+
+    def test_progress_entry_names_review_record_incomplete(self):
+        def partial(task, timeout=0):
+            results.write_result({
+                "schema": "code-review-sage-result", "version": 1, "change_id": "CR-8",
+                "platform": "github", "repo_identity": "github.com/o/r", "revision": "1",
+                "phase1": {"gate_verdict": "PASS", "design_risk": "low",
+                           "criticality": "low"},
+                "blast_radius": {"rating": "SMALL", "signals": {}},
+                "counts": {"red": 0, "yellow": 0}, "findings": [],
+                "deep_reviewed": False, "title": "CR-8",
+                "files_covered": [], "coverage_complete": True,
+            }, self.root)
+            return {"ok": True, "output": "", "error": ""}
+
+        entry = self._failed_entry("CR-8", dispatch=partial)
+        self.assertEqual(entry.get("reason"), "review_record_incomplete")
+        self.assertIn("never completed", entry.get("error", ""))
+        self.assertEqual(self.out["per_change"][0]["skipped_reason"], entry.get("reason"))
+
+    def test_progress_entry_names_review_failed(self):
+        entry = self._failed_entry(
+            "CR-9",
+            dispatch=lambda task, timeout=0: {"ok": False, "output": "", "error": "boom"})
+        self.assertEqual(entry.get("reason"), "review_failed")
+        # The spawn's own text, which for this cause is the information: it can be
+        # a missing-agent-spec message carrying its own repair command, so the
+        # sentence must survive alongside the (generic) token.
+        self.assertEqual(entry.get("error"), "boom")
+        self.assertEqual(self.out["per_change"][0]["skipped_reason"], entry.get("reason"))
+
+    def test_progress_entry_names_runtime_unavailable(self):
+        entries: dict = {}
+
+        def prog(cid, phase, extra=None):
+            if phase == "failed":
+                entries[cid] = dict(extra or {})
+
+        out = D.run_review(
+            ["CR-1", "CR-2"], dispatch=self._fake_dispatch(),
+            generate_report=False, root=self.root, post=True, progress=prog,
+            preflight=lambda: "the reviewer cannot run: no kiro-cli executable "
+                              "was found on this host")
+        # Every change of a preflight-failed run, not just the first.
+        for cid, rec in zip(("CR-1", "CR-2"), out["per_change"]):
+            self.assertEqual(entries[cid].get("reason"), "runtime_unavailable")
+            self.assertIn("kiro-cli", entries[cid].get("error", ""))
+            self.assertEqual(rec["skipped_reason"], entries[cid].get("reason"))
+
+    def test_progress_entry_names_a_refused_host_as_review_failed(self):
+        # `build_review_task` fails CLOSED when the link's host no longer
+        # revalidates. Patched rather than reached through a crafted URL so the
+        # test pins THIS site's payload, not the host-allowlist rules.
+        def refuse(link):
+            raise D.pipeline.adapters.AdapterError("host is not allowed")
+
+        with mock.patch.object(D, "build_review_task", refuse):
+            entry = self._failed_entry("CR-6", dispatch=self._fake_dispatch())
+        self.assertEqual(entry.get("reason"), "review_failed")
+        self.assertIn("refusing to review", entry.get("error", ""))
+        self.assertEqual(self.out["per_change"][0]["skipped_reason"], entry.get("reason"))
 
     def test_review_task_covers_design_and_is_single_pass(self):
         task = D.build_review_task("https://github.com/o/r/pull/7")
@@ -442,8 +601,14 @@ class TestWorkerPromptInterpreter(unittest.TestCase):
         return [D.build_review_task(self.LINK), D.build_review_followup_task(self.LINK)]
 
     def test_no_prompt_names_a_bare_interpreter(self):
+        # Both needles are anchored on the opening backtick of an inline code
+        # span: python_command() legitimately embeds the absolute
+        # sys.executable, which can itself end in "python3" (issue #8205), so
+        # an unanchored needle would fire on the correct path. Unbackticked
+        # prose is covered only by the span test below
+        # (test_every_script_command_carries_the_resolved_interpreter).
         for p in self._prompts():
-            self.assertNotIn("python3 ", p)
+            self.assertNotIn("`python3 ", p)
             self.assertNotIn("`python ", p)
 
     def test_every_script_command_carries_the_resolved_interpreter(self):

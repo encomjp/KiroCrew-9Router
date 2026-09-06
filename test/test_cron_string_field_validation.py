@@ -259,7 +259,16 @@ class TestCapAlignment:
     # table field -> CRON_ADD_SCHEMA field (where the names differ)
     _SCHEMA_NAME_MAP = {"agent_id": "agent"}
     # No boundary FieldSpec exists for these; the general ID cap applies.
-    _NO_SCHEMA_FIELDS = {"created_by", "session_key", "folder_id"}
+    _NO_SCHEMA_FIELDS = {
+        "created_by",
+        "session_key",
+        "folder_id",
+        # Secret-grant pins and the requesting session key are written only by
+        # the grant endpoint / cron_secret_request tool, never via
+        # CRON_ADD_SCHEMA (grants cannot be created through cron_add).
+        "secret_env_pin",
+        "secret_env_pending_pin",
+    }
 
     def test_table_caps_match_cron_add_schema(self):
         schema_caps = {spec.name: spec.max_len for spec in CRON_ADD_SCHEMA.fields}
@@ -298,6 +307,9 @@ class TestAntiDrift:
     # - last_status: set only by the execution engine ("ok" | "error")
     # - last_error: set only by the execution engine on failure
     # - last_result: set only by set_run_result() during execution
+    # - last_result_stamp: the run stamp, rendered by set_run_result() beside
+    #   last_result and never accepted from a caller, so there is no boundary
+    #   schema for its cap to mirror
     # - last_posted_hash: set by dedup logic when a Slack post is delivered
     # - last_failure_hash: set by dedup logic when a failure notification fires
     # - approval_mode: validated by a separate finite-set check, not length
@@ -307,6 +319,7 @@ class TestAntiDrift:
             "last_status",
             "last_error",
             "last_result",
+            "last_result_stamp",
             "last_posted_hash",
             "last_failure_hash",
             "approval_mode",

@@ -64,11 +64,14 @@ export default function PathBar({ rootPath, gitInfo, onChangeRoot, onNavigate }:
     if (!open && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) { setOpen(true); return }
     if (open && e.key === 'ArrowDown') { e.preventDefault(); setActiveIdx((i) => suggestions.length === 0 ? -1 : (i + 1) % suggestions.length) }
     else if (open && e.key === 'ArrowUp') { e.preventDefault(); setActiveIdx((i) => suggestions.length === 0 ? -1 : (i - 1 + suggestions.length) % suggestions.length) }
-    // Only the Enter branches are claimed — arrow/Tab navigation stays untouched.
+    // The Enter and Tab branches are claimed — arrow navigation stays untouched
+    // because it neither consumes the key nor rewrites the draft.
     else if (open && e.key === 'Enter') { if (!ime.claimEnter(e)) return; if (activeIdx >= 0 && suggestions[activeIdx]) accept(suggestions[activeIdx]); else commit() }
     else if (!open && e.key === 'Enter') { if (ime.claimEnter(e)) commit() }
     else if (e.key === 'Escape') { setDraft(rootPath); setEditing(false); setOpen(false) }
-    else if (e.key === 'Tab' && open && suggestions.length > 0) { e.preventDefault(); setDraft(suggestions[activeIdx >= 0 ? activeIdx : 0].path) }
+    // Tab accepts the highlighted suggestion INTO the draft, so an IME using Tab
+    // to cycle its candidate list would replace the text mid-composition.
+    else if (e.key === 'Tab' && open && suggestions.length > 0) { if (!ime.claimKey(e)) return; e.preventDefault(); setDraft(suggestions[activeIdx >= 0 ? activeIdx : 0].path) }
   }
 
   const segs = parentChain(rootPath)

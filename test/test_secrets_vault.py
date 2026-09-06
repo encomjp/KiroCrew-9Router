@@ -294,3 +294,255 @@ def test_vault_dir_is_hidden_by_the_os_sandbox() -> None:
             ".kiro/crew/.vault" in mode_list
         ), "the vault dir must be OS-sandbox-hidden in every mode"
         assert ".kirocrew/.vault" in mode_list, "the legacy vault dir path must also be hidden"
+
+
+# ── get_many: single-load batch read ──
+
+
+@pytest.mark.asyncio
+async def test_get_many_roundtrip(vault: SecretVault) -> None:
+    """get_many returns SecretValues for present names and None for absent."""
+    await vault.set("A", "va")
+    await vault.set("B", "vb")
+
+    result = vault.get_many(["A", "B", "MISSING"])
+    assert result["A"] is not None and result["A"].reveal() == "va"
+    assert result["B"] is not None and result["B"].reveal() == "vb"
+    assert result["MISSING"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_many_empty_list(vault: SecretVault) -> None:
+    """get_many([]) returns an empty mapping and reads nothing."""
+    await vault.set("A", "va")
+    assert vault.get_many([]) == {}
+
+
+def test_get_many_loads_store_and_key_once(tmp_path, monkeypatch) -> None:
+    """get_many reads secrets.enc once and the key file once for K names."""
+    vault = SecretVault(tmp_path)
+    vault._set_sync("A", "va")
+    vault._set_sync("B", "vb")
+    vault._set_sync("C", "vc")
+
+    load_calls = 0
+    key_calls = 0
+    orig_load = SecretVault._load_entries
+    orig_key = SecretVault._get_or_create_key
+
+    def counting_load(self):
+        nonlocal load_calls
+        load_calls += 1
+        return orig_load(self)
+
+    def counting_key(self):
+        nonlocal key_calls
+        key_calls += 1
+        return orig_key(self)
+
+    monkeypatch.setattr(SecretVault, "_load_entries", counting_load)
+    monkeypatch.setattr(SecretVault, "_get_or_create_key", counting_key)
+
+    result = vault.get_many(["A", "B", "C"])
+    assert {k: v.reveal() for k, v in result.items() if v} == {
+        "A": "va",
+        "B": "vb",
+        "C": "vc",
+    }
+    assert load_calls == 1
+    assert key_calls == 1
+
+
+def test_get_many_all_missing_does_not_create_key(tmp_path) -> None:
+    """get_many for names none of which exist does not create a key file.
+
+    Matches get()'s behaviour (returns before _get_or_create_key for a missing
+    name), so a spawn that references only absent secrets on a fresh vault does
+    not materialise vault key state.
+    """
+    vault = SecretVault(tmp_path)
+    result = vault.get_many(["NOPE", "ALSO_NOPE"])
+    assert result == {"NOPE": None, "ALSO_NOPE": None}
+    assert not (tmp_path / ".vault" / ".vault_key").exists()
+
+
+# ── Corrupt-store error contract ──
+
+
+def _seed_key(tmp_path: Path) -> None:
+    (tmp_path / ".vault").mkdir(exist_ok=True)
+    (tmp_path / ".vault" / ".vault_key").write_bytes(os.urandom(32))
+    os.chmod(str(tmp_path / ".vault" / ".vault_key"), 0o600)
+
+
+def _write_store(tmp_path: Path, entries) -> None:
+    store = {"version": 1, "backend": "file", "entries": entries}
+    (tmp_path / ".vault" / "secrets.enc").write_text(json.dumps(store))
+
+
+def test_corrupt_entries_not_a_dict_raises(tmp_path) -> None:
+    """A non-mapping 'entries' fails closed with a descriptive ValueError."""
+    _seed_key(tmp_path)
+    _write_store(tmp_path, ["not", "a", "dict"])
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError, match="Vault store corrupt: 'entries' must be an object"):
+        vault._load_entries()
+
+
+def test_corrupt_string_entry_raises_from_get(tmp_path) -> None:
+    """A string entry (not a dict) raises a descriptive ValueError from get()."""
+    _seed_key(tmp_path)
+    _write_store(tmp_path, {"A": "i-am-not-an-entry-dict"})
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError, match="Vault store corrupt: an entry is malformed"):
+        vault.get("A")
+
+
+def test_corrupt_null_entry_is_malformed_not_missing_in_get_many(tmp_path) -> None:
+    """A JSON ``null`` entry raises corrupt-store, not a missing-name ``None``.
+
+    ``entries.get(name)`` would fold a corrupt ``null`` value into the
+    missing-name branch, telling the operator to store a secret that IS in the
+    (corrupt) store. Membership is checked first so the null reaches
+    ``_decrypt_entry`` and fails closed with the corrupt-store message.
+    """
+    _seed_key(tmp_path)
+    _write_store(tmp_path, {"A\u202eEVIL": None})
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError) as exc:
+        vault.get_many(["A\u202eEVIL"])
+    msg = str(exc.value)
+    assert "Vault store corrupt: an entry is malformed" in msg
+    # The sink rule holds one layer down too: the caller-supplied entry name
+    # (which may carry injection-capable characters) never appears in the
+    # error text.
+    assert "EVIL" not in msg
+    assert "\u202e" not in msg
+
+
+def test_corrupt_missing_nonce_raises_from_get(tmp_path) -> None:
+    """An entry missing 'nonce' raises a descriptive ValueError."""
+    _seed_key(tmp_path)
+    _write_store(tmp_path, {"A": {"ct": "abcd"}})
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError, match="Vault store corrupt: an entry is malformed"):
+        vault.get("A")
+
+
+def test_corrupt_bad_hex_raises_from_get(tmp_path) -> None:
+    """An entry with non-hex nonce/ct raises a descriptive ValueError."""
+    _seed_key(tmp_path)
+    _write_store(tmp_path, {"A": {"nonce": "zzzz", "ct": "zzzz"}})
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError, match="Vault store corrupt: an entry is malformed"):
+        vault.get("A")
+
+
+def test_corrupt_error_does_not_leak_material(tmp_path) -> None:
+    """The corrupt-entry error carries no ciphertext/plaintext material."""
+    _seed_key(tmp_path)
+    secret_ct = "deadbeefdeadbeefdeadbeef"
+    _write_store(tmp_path, {"A": {"nonce": "zz", "ct": secret_ct}})
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError) as exc:
+        vault.get("A")
+    assert secret_ct not in str(exc.value)
+
+
+def test_corrupt_entry_raises_from_get_many(tmp_path) -> None:
+    """get_many surfaces the same descriptive ValueError on a corrupt entry."""
+    _seed_key(tmp_path)
+    _write_store(tmp_path, {"A": {"nonce": "zzzz", "ct": "zzzz"}})
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError, match="Vault store corrupt: an entry is malformed"):
+        vault.get_many(["A"])
+
+
+# ── Non-dict top-level envelope guard (F5) ──
+
+
+def _write_raw_store(tmp_path: Path, raw_json: str) -> None:
+    """Write raw JSON bytes directly to the store path, bypassing the envelope builder."""
+    (tmp_path / ".vault").mkdir(exist_ok=True)
+    (tmp_path / ".vault" / "secrets.enc").write_text(raw_json, encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "[]",  # JSON array
+        '["a","b"]',  # JSON array with content
+        '"x"',  # JSON string
+        "42",  # JSON number
+        "true",  # JSON boolean
+        "null",  # JSON null
+    ],
+)
+def test_non_dict_top_level_envelope_raises_value_error(tmp_path, raw) -> None:
+    """A store whose top-level JSON value is not an object fails closed with ValueError.
+
+    On origin/main (without the isinstance guard) this raised a raw AttributeError
+    from envelope.get().  The fix raises a descriptive ValueError that mirrors the
+    existing 'entries' guard, so callers see a consistent module-level error rather
+    than an internal implementation detail.
+    """
+    _seed_key(tmp_path)
+    _write_raw_store(tmp_path, raw)
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError, match="corrupt"):
+        vault._load_entries()
+
+
+def test_non_dict_envelope_error_contains_type_name(tmp_path) -> None:
+    """The ValueError message names the unexpected type, not the store content."""
+    _seed_key(tmp_path)
+    _write_raw_store(tmp_path, "[]")
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError) as exc:
+        vault._load_entries()
+    msg = str(exc.value)
+    # Message must mention "object" (expected) and the actual type.
+    assert "object" in msg
+    assert "list" in msg
+
+
+def test_non_dict_envelope_error_does_not_echo_store_content(tmp_path) -> None:
+    """The corrupt-envelope error carries no store content in the message."""
+    _seed_key(tmp_path)
+    store_payload = '"sensitive-payload-12345"'
+    _write_raw_store(tmp_path, store_payload)
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError) as exc:
+        vault._load_entries()
+    assert "sensitive-payload-12345" not in str(exc.value)
+
+
+def test_non_dict_envelope_raises_from_list_names(tmp_path) -> None:
+    """The public list_names() path surfaces the ValueError for a non-dict envelope."""
+    _seed_key(tmp_path)
+    _write_raw_store(tmp_path, "[]")
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError, match="corrupt"):
+        vault.list_names()
+
+
+def test_valid_store_still_loads_after_guard(tmp_path) -> None:
+    """A well-formed store is unaffected by the isinstance guard."""
+    vault = SecretVault(tmp_path)
+    vault._set_sync("k", "v")
+    # Must not raise — guard is only a speed-bump for non-dict values.
+    entries = vault._load_entries()
+    assert "k" in entries
+
+
+def test_corrupt_entries_guard_still_works_with_envelope_guard(tmp_path) -> None:
+    """The existing 'entries' guard (non-dict entries value) still fires correctly.
+
+    Ensures the new top-level guard does not mask or accidentally break the
+    entries-level guard that was already present.
+    """
+    _seed_key(tmp_path)
+    _write_store(tmp_path, ["not", "a", "dict"])
+    vault = SecretVault(tmp_path)
+    with pytest.raises(ValueError, match="Vault store corrupt: 'entries' must be an object"):
+        vault._load_entries()

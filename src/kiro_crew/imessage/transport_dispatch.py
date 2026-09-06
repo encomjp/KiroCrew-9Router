@@ -27,11 +27,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.history import mint_row_mid
 from kiro_crew.imessage.client import redact_handle
 from kiro_crew.imessage.commands import HELP_TEXT, ConversationState, parse_command
 from kiro_crew.imessage.renderer import IMessageRenderer
 from kiro_crew.imessage.rpc import RpcError, RpcTransportError
 from kiro_crew.imessage.transport import IMESSAGE_CAPABILITIES
+from kiro_crew.messaging.commands import compact_unsupported_backend
 from kiro_crew.messaging.dispatch import (
     ChannelTurn,
     build_directive_consumer,
@@ -287,9 +289,11 @@ class IMessageDispatcher:
         """
         if self.conv_log is None:
             return
-        self.conv_log.append(session_key, "user", user_text, agent=agent)
+        self.conv_log.append(session_key, "user", user_text, agent=agent, mid=mint_row_mid())
         if reply_text:
-            self.conv_log.append(session_key, "assistant", reply_text, agent=agent)
+            self.conv_log.append(
+                session_key, "assistant", reply_text, agent=agent, mid=mint_row_mid()
+            )
         if is_new:
             title = (user_text or "").strip().replace("\n", " ")[:40] or "iMessage"
             self.conv_log.set_title(session_key, title)
@@ -307,6 +311,14 @@ class IMessageDispatcher:
         assert self.client is not None
         handle = inbound.handle
         pct = self.sessions.check_context_usage(session_key, provider)
+        if pct >= self.cfg.imessage.soft_threshold_pct:
+            # Capability gate (#8156): no forced compaction to run and the
+            # soft nudge's /compact advice cannot work — the backend compacts
+            # on its own as context fills.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                logger.debug("imessage: context notice skipped — %s compacts itself", unsupported)
+                return
         if pct >= self.cfg.imessage.hard_threshold_pct:
             self._conv.clear_awaiting(handle)
             try:
@@ -348,6 +360,20 @@ class IMessageDispatcher:
             provider = self.sessions.get_provider(session_key)
             if provider is None:
                 await self._notify(handle, "ℹ️ There's no conversation to compact yet.")
+                return
+            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # backend that cannot serve a manual /compact treats the prompt as
+            # ordinary text and never answers, so dispatching would strand the
+            # unbounded wait below. Informational, never an error — and plain
+            # text, because iMessage speech carries no markdown.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                await self._notify(
+                    handle,
+                    "ℹ️ This backend manages compaction automatically — it "
+                    "summarizes the conversation on its own as context fills, "
+                    "so manual /compact isn't needed (and isn't supported) here.",
+                )
                 return
             await provider.compact()
             await provider.wait_for_compaction()

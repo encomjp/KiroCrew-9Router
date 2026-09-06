@@ -12,6 +12,7 @@ Each agent is identified by its ``modeId`` — the value passed to
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -144,6 +145,51 @@ SKILL_URI_PREFIX = "skill://"
 AGENT_SPEC_SUFFIX = ".agent-spec.json"
 
 
+def _audit_denied(*, operation: str, source: str, resources: str, error: str) -> None:
+    """Emit a denial audit row for a refused path, never raising.
+
+    BOTH denial paths in this module promise not to raise -- ``_read_agent_spec``
+    by the contract :func:`_warn_on_systematic_scan_failure` documents and its
+    callers read bare, and :func:`project_agent_names` in its own docstring
+    ("Never raises; an unreadable checkout yields an empty set"). Auditing the
+    denial must not become the one way to break either promise: for some
+    surfaces this is the process's FIRST SEL use, and constructing the singleton
+    mkdirs its home (``sel.py``), so an unwritable or hostile SEL directory
+    would abort whichever surface asked -- on exactly the hostile path the
+    refusal exists to handle.
+
+    The REFUSAL always stands, so nothing unaudited is ever read or scanned;
+    what is lost is the audit ROW. That is best-effort by the SEL API's own
+    design: ``log_api_access`` reserves fail-closed behaviour for its explicit
+    ``critical=True`` callers (``apps/admission.py``, the auto-improvement
+    server) and neither of these sites has ever been one. WARNING, not debug, so
+    an operator sees that the trail has a hole rather than finding out later.
+
+    The fallback names only the ``operation`` -- a fixed internal label. The
+    REFUSED PATH is deliberately not logged here: on this branch its resolved
+    target is a sensitive location (that is why it was refused), so writing it at
+    a default-visible level would leak the very thing the deny list protects.
+    The path already appears in the neighbouring ``debug`` line for anyone
+    debugging a specific file, and the SEL row -- the record designed to carry
+    it, redacted and clipped -- is what is being lost.
+    """
+    try:
+        _sel().log_api_access(
+            caller="agent_discovery",
+            operation=operation,
+            outcome="denied",
+            source=source,
+            resources=resources,
+            error=error,
+        )
+    except Exception:
+        logger.warning(
+            "SEL denial audit failed for a %s denial -- refusal stands, audit row lost",
+            operation,
+            exc_info=True,
+        )
+
+
 def _read_agent_spec(
     path: Path,
     *,
@@ -189,10 +235,8 @@ def _read_agent_spec(
         return None
     if is_sensitive_path(str(real)):
         logger.debug("Skipping sensitive agent config: %s", path)
-        _sel().log_api_access(
-            caller="agent_discovery",
+        _audit_denied(
             operation=operation,
-            outcome="denied",
             source=source,
             resources=str(real),
             error="sensitive path rejected",
@@ -330,7 +374,12 @@ def _project_signature(project_dir: str | Path) -> tuple[_ListAgentsSig, ...]:
     )
 
 
-def project_agent_names(project_dir: str | Path | None) -> frozenset[str]:
+def project_agent_names(
+    project_dir: str | Path | None,
+    *,
+    operation: str = "project_agent_names",
+    source: str = "project_agent_names",
+) -> frozenset[str]:
     """Dispatchable agent names declared by a project, cached on a stat signature.
 
     Only ``<project>/.kiro/agents/*.json`` contributes, because only those names are
@@ -342,6 +391,17 @@ def project_agent_names(project_dir: str | Path | None) -> frozenset[str]:
     resolver calls this on EVERY turn of a project-agent-bound session: bounding the
     file count is not enough on its own, since the cost that stalls a caller is the
     reads, not the count.
+
+    *operation*/*source* label the SEL denial event emitted on a sensitive
+    project directory, exactly as on :func:`_read_agent_spec` (#6764 mirrors
+    #6722): the calling surface names itself so the security trail attributes
+    the refusal to the request that triggered it. ``source`` is the interface
+    channel (``SecurityEvent.source`` vocabulary: dashboard, cli, slack, cron,
+    ...; ``"unknown"`` when the caller serves multiple channels) — every call
+    site passes it explicitly, enforced by the call-site ratchet test. Both
+    defaults exist ONLY so a bare call reproduces the historical event
+    byte-for-byte (a forgotten future call site degrades to exactly today's
+    trail); they are not for new call sites.
 
     Never raises; an unreadable checkout yields an empty set.
     """
@@ -355,11 +415,9 @@ def project_agent_names(project_dir: str | Path | None) -> frozenset[str]:
     # at a protected path, matching every other deny in this module.
     if is_sensitive_path(key):
         logger.debug("Skipping sensitive project dir for agent discovery: %s", project_dir)
-        _sel().log_api_access(
-            caller="agent_discovery",
-            operation="project_agent_names",
-            outcome="denied",
-            source="project_agent_names",
+        _audit_denied(
+            operation=operation,
+            source=source,
             resources=key,
             error="sensitive project dir rejected",
         )
@@ -416,7 +474,12 @@ def clear_project_agent_cache() -> None:
     _PROJECT_NAMES_CACHE.clear()
 
 
-async def warm_project_agent_names(project_dir: str | Path | None) -> None:
+async def warm_project_agent_names(
+    project_dir: str | Path | None,
+    *,
+    operation: str = "warm_project_agent_names",
+    source: str = "unknown",
+) -> None:
     """Populate the project name cache from the discovery pool, off the event loop.
 
     The counterpart to :func:`cached_project_agent_names`: an async caller runs this
@@ -428,6 +491,13 @@ async def warm_project_agent_names(project_dir: str | Path | None) -> None:
     ``StopIteration`` in particular cannot be delivered through a ``Future``, which
     hangs the awaiting caller instead of surfacing the error.
 
+    *operation*/*source* forward to :func:`project_agent_names` so a denial hit
+    during the warm names the surface that requested it rather than echoing the
+    helper's own name (#6764). The defaults name this hop truthfully: the warm
+    itself is the operation, and the helper serves several channels (dashboard
+    chat, spawn admission), so its channel is ``"unknown"`` unless the caller
+    says otherwise.
+
     A no-op without a *project_dir*. Best-effort and never raises: failing to warm
     costs one turn's fallback, and must not break turn handling.
     """
@@ -435,7 +505,8 @@ async def warm_project_agent_names(project_dir: str | Path | None) -> None:
         return
     try:
         await asyncio.get_running_loop().run_in_executor(
-            discovery_executor(), project_agent_names, project_dir
+            discovery_executor(),
+            functools.partial(project_agent_names, project_dir, operation=operation, source=source),
         )
     except Exception:  # noqa: BLE001 — a warm failure only costs a fallback
         logger.debug("Failed to warm project agent names for %s", project_dir, exc_info=True)

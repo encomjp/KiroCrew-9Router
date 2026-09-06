@@ -21,8 +21,15 @@ from kiro_crew.acp.types import TurnUsage
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.context_blocks import USER_LABEL
 from kiro_crew.hooks import validate_file_path
+from kiro_crew.jsonl_util import bounded_records
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.messaging.link import telemetry_channel_of
+from kiro_crew.metrics.turns import (
+    OUTCOME_UNCLASSIFIED,
+    emit_turn_duration,
+    emit_turn_usage,
+    turn_outcome,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,8 +200,8 @@ def slot_spend(days: int = SPEND_WINDOW_DAYS) -> dict[str, dict[str, float]]:
 
     for path in paths:
         try:
-            with path.open() as fh:
-                for line in fh:
+            with path.open("rb") as fh:
+                for line in bounded_records(fh, path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -293,6 +300,14 @@ _BACKGROUND_CHANNELS = frozenset(
         "heartbeat",
         "taskrunner",
         "workflow_pool",
+        # A workflow STAGE's own session, which gained the ``workflow`` label
+        # when the turn histogram needed one (it read ``other`` before, pooled
+        # with unrecognised key shapes). Listed deliberately rather than left to
+        # this set's fail-open behaviour: ``workflow_pool`` — the pool those
+        # stages run on — is already background, and a stage is the same kind of
+        # thing, so surfacing it as its own new panel category would split one
+        # concept across two rows.
+        "workflow",
         "background",
         "secretary",
     }
@@ -392,8 +407,8 @@ def context_occupancy(days: int = 14) -> dict[str, Any]:
 
     for shard_path in shard_paths:
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -610,8 +625,8 @@ def slot_turn_usage(
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).timestamp()
     for shard_path in _shards_in_window(days):
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -672,8 +687,8 @@ def context_trace(slot: str, days: int = 14) -> dict[str, Any]:
     totals: dict[str, int] = {}
     for shard_path in _shards_in_window(days):
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -793,8 +808,8 @@ def cost_breakdown(days: int = SPEND_WINDOW_DAYS) -> dict[str, Any]:
 
     for shard_path in shard_paths:
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -1367,6 +1382,13 @@ def persist_token_record(
     """Append a token usage record to today's shard under
     ``<data home>/usage/tokens/YYYY-MM-DD.jsonl`` (synchronous).
 
+    Has NO caller today, and unlike :func:`persist_token_record_async` it does
+    not emit ``kirocrew.turn.duration``. A future direct caller of this variant
+    would therefore write a usage row for a turn that appears in no latency or
+    fault-rate reading — silently reopening the gap the async variant's emit
+    closed. If you reach for this for a real per-turn path, emit there too (or
+    call the async variant).
+
     The ``provider`` field tags the source LLM backend (acp,
     claude_code, bedrock) so the dashboard chart can filter by provider.
     ``surface`` / ``agent`` tag the dispatch origin and resolved agent, and
@@ -1425,6 +1447,7 @@ async def persist_token_record_async(
     phase: str = "",
     app: str = "",
     model_source: object = None,
+    emit_metric: bool = True,
 ) -> None:
     """Async variant: builds the record on-loop, offloads the file write.
 
@@ -1435,6 +1458,32 @@ async def persist_token_record_async(
     See :func:`persist_token_record` for the ``surface`` / ``agent`` /
     ``context_used`` / ``context_window`` / ``elapsed_ms`` / ``model_source``
     fields.
+
+    ALSO emits the per-turn OTEL family — ``kirocrew.turn.duration`` plus the
+    turn's usage (``kirocrew.turn.tokens`` and whichever of
+    ``kirocrew.turn.credits`` / ``kirocrew.turn.cost_usd`` the backend billed in)
+    — and this is the only place that does. Being the one call every dispatch
+    surface already makes once per turn is exactly why: the emit used to live in
+    ``chat_runner`` beside the dashboard turn loop, so cron, heartbeat, memory
+    consolidation, subagents, task-runner steps, workflow stages and every
+    messaging channel were absent from turn latency and fault rate entirely — and
+    absent does not read as absent, it reads as healthy. See
+    :mod:`kiro_crew.metrics.turns`.
+
+    Every sample reuses the BUILT record's own fields — ``duration_ms``, the
+    token counts, ``credits``/``cost``, and the RESOLVED ``model``/``provider`` —
+    so the row store and the metrics cannot disagree about one turn, the property
+    the record builder's docstring already claims and now enforces by
+    construction rather than by two call sites being handed the same variables.
+
+    ``emit_metric=False`` says the CALLER owns this turn's samples. The
+    dashboard passes it because its persist call sits behind a
+    ``usage_has_billing`` gate: a turn that timed out having billed nothing
+    writes no row, and letting the row's absence swallow the samples would drop
+    exactly the faults ``fault_rate`` exists to count. It emits unconditionally
+    itself instead, which is also how its ``stall_exhausted`` refinement reaches
+    the histogram. Do NOT set this without emitting — the turn then goes
+    unrecorded, which reads as a healthy gap rather than a missing one.
     """
     try:
         model = _resolve_model(model, model_source)
@@ -1454,9 +1503,68 @@ async def persist_token_record_async(
             phase=phase,
             app=app,
         )
+        # Before the offloaded write: a file-write failure must not cost the
+        # latency sample, which needs nothing from disk.
+        if emit_metric:
+            _emit_turn_histogram(record, slot_key, event)
         await asyncio.to_thread(_write_token_record, record, now)
     except Exception:
         logger.debug("Failed to persist token record for slot %s", slot_key, exc_info=True)
+
+
+def _emit_turn_histogram(
+    record: dict,
+    slot_key: str,
+    event: object,
+) -> None:
+    """Emit this turn's OTEL samples from a built record.
+
+    ``kirocrew.turn.duration`` plus the turn's usage family
+    (``kirocrew.turn.tokens`` and whichever of ``kirocrew.turn.credits`` /
+    ``kirocrew.turn.cost_usd`` the backend billed in). Split out so the emit is
+    one statement in the persist path and can be asserted directly by a test
+    without writing a row.
+
+    Reads every value off the RECORD rather than recomputing from
+    ``event``/``elapsed_ms``: the builder already applies the
+    provider-reported-wins-else-wall-clock rule for the duration and already
+    coerces the usage fields, so duplicating either here is how the row store and
+    the metrics would come to disagree about one turn. ``model`` and ``provider``
+    come from the same place for the same reason — the record's ``model`` is the
+    RESOLVED one (``_resolve_model``), so the attribute names the model that ran
+    rather than the alias the caller asked for.
+
+    An ABSENT ``stop_reason`` attribute and a ``None``/empty one mean different
+    things and must not collapse. A bare ``TurnUsage`` has no such attribute and
+    cannot say how its turn ended (``unclassified``); an ``LLMEvent`` whose
+    ``stop_reason`` is ``None`` is reporting a CLEAN turn, which is what the acp
+    path leaves on a normal completion. The distinction lives here rather than in
+    ``turn_outcome`` because only this layer can see whether the attribute exists
+    at all — and it must not be resolved by a default: labelling the bare-usage
+    case ``ok`` claims successes nobody observed, while labelling it ``unknown``
+    puts it in ``telemetry._TERMINAL_FAULT_OUTCOMES`` and invents a fault for
+    every clean background turn.
+    """
+    _MISSING = object()
+    stop = getattr(event, "stop_reason", _MISSING)
+    outcome = OUTCOME_UNCLASSIFIED if stop is _MISSING else turn_outcome(stop)  # type: ignore[arg-type]  # noqa: E501
+    model = str(record.get("model") or "")
+    provider = str(record.get("provider") or "")
+    emit_turn_duration(
+        record.get("duration_ms"),
+        session_key=slot_key,
+        outcome=outcome,
+        model=model,
+        provider=provider,
+    )
+    emit_turn_usage(
+        input_tokens=record.get("input"),
+        output_tokens=record.get("output"),
+        credits=record.get("credits"),
+        cost_usd=record.get("cost"),
+        model=model,
+        provider=provider,
+    )
 
 
 def _parse_token_history() -> dict[str, Any]:
@@ -1524,8 +1632,8 @@ def _parse_token_history() -> dict[str, Any]:
 
     for shard_path in shard_paths:
         try:
-            with shard_path.open() as fh:
-                for line in fh:
+            with shard_path.open("rb") as fh:
+                for line in bounded_records(fh, shard_path, label="usage"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -1689,6 +1797,7 @@ def _parse_sessions() -> dict:
     total_msgs = 0
     total_tools = 0
     all_time_sessions = 0
+    refused_transcripts = 0
     now_dt = datetime.now()
     today_str = now_dt.strftime("%Y-%m-%d")
 
@@ -1706,6 +1815,16 @@ def _parse_sessions() -> dict:
         # Validate path through hooks.py (resolves symlinks, checks sensitive)
         resolved_str = validate_file_path(str(f))
         if resolved_str is None:
+            # Counted, not swallowed (#6733): a refusal here is indistinguishable
+            # from an idle account in the rendered numbers, and on a
+            # roaming-profile (UNC) home EVERY transcript lands in this branch --
+            # so the page reports a confident zero with nothing anywhere to say
+            # why. Aggregated after the loop rather than logged per file, because
+            # that failure mode refuses all of them. Admitting the transcript dir
+            # to the UNC gate -- which is what would make the count correct
+            # rather than merely explained -- is deferred to #8079; it needs a
+            # resolution that refuses links atomically first.
+            refused_transcripts += 1
             continue
         resolved = Path(resolved_str)
         try:
@@ -1720,8 +1839,8 @@ def _parse_sessions() -> dict:
         msgs = 0
         tools = 0
         try:
-            with resolved.open() as fh:
-                for line in fh:
+            with resolved.open("rb") as fh:
+                for line in bounded_records(fh, resolved, label="usage.sessions"):
                     try:
                         obj = json.loads(line)
                     except ValueError:
@@ -1747,6 +1866,17 @@ def _parse_sessions() -> dict:
         daily_tools[day] += tools
         total_msgs += msgs
         total_tools += tools
+
+    if refused_transcripts:
+        # Server-side only: %s of a Path is a filesystem path, which the
+        # returned payload deliberately never carries (see the iterdir handler
+        # above).
+        logger.warning(
+            "usage: %d transcript(s) refused by path validation in %s; "
+            "the reported session counts exclude them",
+            refused_transcripts,
+            sessions_dir,
+        )
 
     # Build daily history sorted by date
     all_days = sorted(set(daily.keys()))

@@ -22,8 +22,10 @@ afterEach(() => {
 
 // Arbitrary: short alphanumeric keys (real item keys are stable IDs).
 const keyArb = fc.stringMatching(/^[a-zA-Z0-9_-]{1,12}$/)
-// Arbitrary: non-negative finite heights (real heights are pixel measurements).
-const heightArb = fc.integer({ min: 0, max: 5000 })
+// Arbitrary: POSITIVE finite heights (real heights are pixel measurements).
+// Zero is deliberately outside the domain: load() drops it as poison (see the
+// zero-scrub suite below), so a zero does not round-trip BY DESIGN.
+const heightArb = fc.integer({ min: 1, max: 5000 })
 
 // Feature: chat-virtualizer, Property 3: Height Cache Consistency
 // **Validates: Requirements 3.1, 3.2**
@@ -539,5 +541,186 @@ describe('HeightCache: access-recency eviction', () => {
     expect(c.get('k4')).toBeUndefined()
     expect(c.get('k5')).toBeUndefined()
     expect(c.get('n2')).toBe(9002)
+  })
+
+  // ---- retire(): out of the mean, still in the cache (issue #6076) ----------
+  //
+  // A row leaving the list must stop pricing the rows that remain, but "leaving"
+  // is not always permanent: an optimistically truncated transcript is restored
+  // wholesale when the server refuses the press. Deleting the measurement would
+  // re-price those rows from the mean on the way back -- wrong spacers and a
+  // viewport jump, the failure this cache exists to prevent.
+
+  it('retire drops a key from the mean but keeps its measurement readable', () => {
+    const c = new HeightCache('retire-mean')
+    c.set('a', 300)
+    c.set('b', 300)
+    c.set('ghost', 20)
+    expect(c.averageHeight()).toBeCloseTo((300 + 300 + 20) / 3, 5)
+
+    c.retire('ghost')
+
+    // Out of the mean: unmeasured rows are priced by the two real messages.
+    expect(c.averageHeight()).toBe(300)
+    // Still readable: a restored row resolves its own exact height.
+    expect(c.peek('ghost')).toBe(20)
+    expect(c.get('ghost')).toBe(20)
+  })
+
+  it('retire is idempotent and ignores a key it never measured', () => {
+    const c = new HeightCache('retire-idem')
+    c.set('a', 300)
+    c.set('b', 100)
+    c.retire('b')
+    c.retire('b')
+    c.retire('never-measured')
+    expect(c.averageHeight()).toBe(300)
+    expect(c.peek('b')).toBe(100)
+  })
+
+  it('measuring a retired row again revives it into the mean', () => {
+    const c = new HeightCache('retire-revive')
+    c.set('a', 300)
+    c.set('ghost', 20)
+    c.retire('ghost')
+    expect(c.averageHeight()).toBe(300)
+
+    // The row is back and mounted, so its measurement counts again.
+    c.set('ghost', 20)
+    expect(c.averageHeight()).toBeCloseTo((300 + 20) / 2, 5)
+  })
+
+  it('falls back to the estimate when every measured row is retired', () => {
+    const c = new HeightCache('retire-all')
+    c.set('a', 300)
+    c.retire('a')
+    // n would be 0 here: the mean has no sample, so the caller's estimate wins
+    // rather than a division by zero.
+    expect(c.averageHeight(77)).toBe(77)
+  })
+
+  it('does not persist a retired key, so a reload cannot re-price from it', () => {
+    const c = new HeightCache('retire-persist')
+    c.set('a', 300)
+    c.set('ghost', 20)
+    c.retire('ghost')
+    c.flush()
+
+    const reloaded = new HeightCache('retire-persist')
+    expect(reloaded.peek('a')).toBe(300)
+    expect(reloaded.peek('ghost')).toBeUndefined()
+    expect(reloaded.averageHeight()).toBe(300)
+  })
+
+  it('revives a retired key when its row is in the list again', () => {
+    const c = new HeightCache('retire-revive-live')
+    c.set('a', 300)
+    c.set('b', 300)
+    c.set('tall', 900)
+    c.retire('tall')
+    expect(c.averageHeight()).toBe(300)
+
+    // The row came back (a refused truncation restored wholesale), so its
+    // measurement is a fact about the live transcript again.
+    c.reviveIfRetired('tall')
+    expect(c.averageHeight()).toBeCloseTo((300 + 300 + 900) / 3, 5)
+
+    // Idempotent: a second revive must not add the height twice.
+    c.reviveIfRetired('tall')
+    expect(c.averageHeight()).toBeCloseTo((300 + 300 + 900) / 3, 5)
+    // ...and reviving a key that was never retired is a no-op.
+    c.reviveIfRetired('a')
+    c.reviveIfRetired('never-seen')
+    expect(c.averageHeight()).toBeCloseTo((300 + 300 + 900) / 3, 5)
+  })
+
+  it('re-persists a revived key', () => {
+    const c = new HeightCache('retire-revive-persist')
+    c.set('a', 300)
+    c.set('tall', 900)
+    c.retire('tall')
+    c.reviveIfRetired('tall')
+    c.flush()
+
+    const reloaded = new HeightCache('retire-revive-persist')
+    expect(reloaded.peek('tall')).toBe(900)
+  })
+
+  it('evicts a retired entry before an older live one', () => {
+    // A transient row is measured immediately before it leaves, so it sits at
+    // the most-recently-used end. Under plain LRU order it would be the LAST
+    // evicted and an older LIVE row would lose its height instead.
+    const c = new HeightCache('retire-evict-first', { rowCount: 3 })
+    for (let i = 0; i < 1999; i++) c.set(`live${i}`, 100)
+    c.set('ghost', 20)
+    c.retire('ghost')
+    // Exactly at the 2000 cap, so nothing has been evicted yet.
+    expect(c.size()).toBe(2000)
+
+    // One more live measurement forces exactly one eviction.
+    c.set('fresh', 100)
+
+    // The dead row went; the oldest live row stayed.
+    expect(c.peek('ghost')).toBeUndefined()
+    expect(c.peek('live0')).toBe(100)
+    expect(c.peek('fresh')).toBe(100)
+    // And the mean is unaffected -- a retired height was never in it, so
+    // dropping the entry must not move it either.
+    expect(c.averageHeight()).toBe(100)
+  })
+
+  it('falls back to LRU order once no retired entry is left', () => {
+    const c = new HeightCache('retire-evict-drain', { rowCount: 3 })
+    for (let i = 0; i < 1998; i++) c.set(`live${i}`, 100)
+    c.set('ghostA', 20)
+    c.set('ghostB', 20)
+    c.retire('ghostA')
+    c.retire('ghostB')
+
+    // Three evictions: both retired entries, then the oldest live row.
+    c.set('n1', 100)
+    c.set('n2', 100)
+    c.set('n3', 100)
+
+    expect(c.peek('ghostA')).toBeUndefined()
+    expect(c.peek('ghostB')).toBeUndefined()
+    expect(c.peek('live0')).toBeUndefined()
+    expect(c.peek('live1')).toBe(100)
+    expect(c.averageHeight()).toBe(100)
+  })
+})
+
+// A persisted ZERO is poison, not a measurement — blobs written before the RO
+// path gained its h > 0 floor carry zeros from rows measured while an ancestor
+// was display:none. Loading one back defeats the write-side floor's self-heal:
+// the offset tree prices the region at 0px, the window mounts nothing there,
+// and a row that never mounts is never re-measured. Field signature: a session
+// opens to a full-viewport blank (items present, zero mounted rows, both
+// spacers 0px) and stays that way across reloads, because the poison reloads
+// with it. load() must drop zeros so those rows come back as UNMEASURED, which
+// the estimate path handles.
+describe('HeightCache: poisoned zero entries are dropped on load', () => {
+  it('drops zero heights from a persisted blob and keeps positive ones', () => {
+    window.localStorage.setItem(
+      'vc_heights_poisoned',
+      JSON.stringify({ a: 0, b: 120, c: 0, d: 36 }),
+    )
+    const cache = new HeightCache('poisoned')
+    // Zeros load as ABSENT — the unmeasured state — not as 0px truths.
+    expect(cache.get('a')).toBeUndefined()
+    expect(cache.get('c')).toBeUndefined()
+    expect(cache.get('b')).toBe(120)
+    expect(cache.get('d')).toBe(36)
+  })
+
+  it('an all-zero blob loads as an empty cache, not a 0px transcript', () => {
+    window.localStorage.setItem(
+      'vc_heights_allzero',
+      JSON.stringify({ a: 0, b: 0, c: 0 }),
+    )
+    const cache = new HeightCache('allzero')
+    expect(cache.get('a')).toBeUndefined()
+    expect(cache.get('b')).toBeUndefined()
+    expect(cache.get('c')).toBeUndefined()
   })
 })

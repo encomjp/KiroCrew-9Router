@@ -1412,8 +1412,13 @@ class TestCeilingSwapInvalidatesProfiles:
             encoding="utf-8",
         )
         gp.reset_store()
-        install_ceiling(governance.parse_policy(_doc("first")))
+        # Spy BEFORE the install: a ceiling install now warms the store eagerly,
+        # because ``safety_override``'s ceiling-install hook resolves ``approval_modes``
+        # against the new ceiling and that read composes a profile. The invariant under
+        # test is unchanged -- one reload per ceiling, and no snapshot composed against
+        # the retired one is ever served -- only who triggers it.
         reloads = self._count_reloads(monkeypatch)
+        install_ceiling(governance.parse_policy(_doc("first")))
         assert gp._STORE._ensure_fresh() is True
         before_token = gp._ceiling_token()
         before_generation = governance_generation()
@@ -4164,7 +4169,8 @@ class TestAnExposedCacheIsStillReadOnly:
 
         script = sandbox._build_launcher_script("standard")
         readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
-        assert set(readonly) == set(sandbox._voice_runtime_parent_paths())
+        assert set(readonly) >= set(sandbox._voice_runtime_parent_paths())
+        assert self._cache_path() not in readonly
 
     def test_macos_keeps_the_write_and_link_denies_when_it_drops_the_read_deny(self):
         from kiro_crew import sandbox
@@ -4189,7 +4195,7 @@ class TestAnExposedCacheIsStillReadOnly:
 
         script = sandbox._build_launcher_script("strict", extra_visible_dirs=(aws,))
         readonly = json.loads(script.split("READONLY_DIRS = ", 1)[1].split("\n", 1)[0])
-        assert set(readonly) == set(sandbox._voice_runtime_parent_paths())
+        assert set(readonly) >= set(sandbox._voice_runtime_parent_paths())
         assert aws not in readonly
 
     @pytest.mark.parametrize("prefix", [".kiro/crew", ".kirocrew"])

@@ -20,8 +20,6 @@
 9 src/kiro_crew/apps/builtins/auto_improvement/tests/test_pr_recipe.py
 1 src/kiro_crew/apps/builtins/auto_improvement/tests/test_pr_watchers.py
 1 src/kiro_crew/apps/builtins/auto_improvement/tests/test_runner.py
-2 src/kiro_crew/apps/builtins/design_tweak/backend/server.py
-1 src/kiro_crew/apps/builtins/dev_fleet/server.py
 1 src/kiro_crew/apps/builtins/dev_fleet/skills/feature-demo-recording/references/deps.py
 3 src/kiro_crew/apps/builtins/dev_fleet/skills/feature-demo-recording/references/narrate.py
 1 src/kiro_crew/apps/builtins/dev_fleet/skills/feature-demo-recording/references/record_template.py
@@ -35,11 +33,10 @@
 1 src/kiro_crew/builtin_skills/browser-recording/scripts/record_browser.py
 2 src/kiro_crew/builtin_skills/ios-simulator-preview/scripts/sim_mirror.py
 1 src/kiro_crew/cli.py
-5 src/kiro_crew/cli_doctor.py
 1 src/kiro_crew/cli_perf.py
 2 src/kiro_crew/cli_setup.py
 1 src/kiro_crew/cloud/aws.py
-4 src/kiro_crew/cron_script.py
+2 src/kiro_crew/cron_script.py
 1 src/kiro_crew/dashboard/handlers/knowledge.py
 1 src/kiro_crew/dashboard/handlers/terminal.py
 1 src/kiro_crew/dashboard/handlers_system.py
@@ -115,7 +112,6 @@
 2 test/test_prepare_pr_prove.py
 2 test/test_project_git.py
 3 test/test_push_guard.py
-1 test/test_release_macos_fail_closed.py
 6 test/test_sandbox_argv.py
 1 test/test_sandbox_probe.py
 9 test/test_security.py

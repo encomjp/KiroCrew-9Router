@@ -71,11 +71,11 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import uuid
 from pathlib import Path
 from typing import IO, Awaitable, Callable, Protocol
 
 from kiro_crew import platform_compat
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 
 # service.* is import-safe on every platform (it only touches launchctl/systemctl
@@ -89,9 +89,9 @@ from kiro_crew.service.macos import (
     write_live_program,
 )
 
-# (rc, stdout, stderr) — server.py's sandboxed subprocess chokepoint. Injected
+# (rc, stdout, stderr) — live.py's sandboxed subprocess chokepoint. Injected
 # rather than imported so every spawn stays audited through the one seam the
-# tests already patch, and so this module has no import cycle with server.py.
+# tests already patch, and so this module has no import cycle with live.py.
 RunCmd = Callable[..., Awaitable[tuple[int, str, str]]]
 #: ``shutil.which``-shaped tool lookup, injected for the same reason as the
 #: platform string (see :func:`backend`).
@@ -146,17 +146,21 @@ def reject_unsafe(raw: str) -> str:
 
 
 def atomic_write_text(path: Path, content: str) -> None:
-    """Write *content* to *path* atomically (temp sibling + ``os.replace``).
+    """Write *content* to *path* atomically (unique temp sibling + rename).
 
-    ``os.replace`` is an atomic same-filesystem rename, so a crash or partial
-    write never leaves a half-written service definition behind.
+    Thin delegate to :func:`kiro_crew.atomic_write.atomic_write`, kept as a
+    named function because it is the seam Dev Fleet's tests drive the staging
+    failure path through. The shared helper carries the same
+    ``mkstemp``-plus-rename shape this used to hand-roll, plus the Windows
+    sharing-violation rename retry and the ``except BaseException`` temp
+    cleanup that the local ``finally`` provided.
+
+    ``fsync`` stays off and no explicit *mode* is passed, so the drop-in lands
+    at the umask default exactly as ``Path.write_text`` left it. Encoding is
+    now pinned to UTF-8 rather than following the locale, which is what the
+    generated unit text (systemd reads it as UTF-8) always needed.
     """
-    tmp = path.parent / f".{path.name}.tmp-{uuid.uuid4().hex}"
-    try:
-        tmp.write_text(content)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    atomic_write(path, content)
 
 
 class GatewayServiceBackend(Protocol):
@@ -211,7 +215,7 @@ class SystemdBackend:
     adapter existed, including the wire codes the dashboard already maps
     (``no_systemd`` / ``no_user_unit``).
 
-    The drop-in path and renderer are INJECTED from ``server.py`` rather than
+    The drop-in path and renderer are INJECTED from ``live.py`` rather than
     reimplemented here. They are the seam a dozen existing tests patch
     (``monkeypatch.setattr(mod, "_dropin_path", ...)`` /
     ``"_dropin_content"``), and keeping them where the tests already point means
@@ -866,13 +870,13 @@ def backend(run_cmd: RunCmd, *, unit: Callable[[], str],
     ``platform`` and ``which`` are INJECTED rather than read from this module's
     own ``sys`` / ``shutil``. The caller resolves them through its own module
     globals, which keeps the existing test seams working: the dev_fleet tests
-    drive platform detection by patching ``server.sys`` / ``server.shutil``, and
+    drive platform detection by patching ``live.sys`` / ``live.shutil``, and
     a direct read here would silently escape those patches — the Linux paths
     would then be "passing" tests that no longer exercise them.
 
     ``None`` is NOT "everything is fine, just hide the buttons" — callers must
     surface it as an explicit, reasoned unavailability (see
-    ``_gateway_service_state`` in ``server.py``), because a silently hidden
+    ``_gateway_service_reason`` in ``live.py``), because a silently hidden
     Restart control is exactly how the macOS gap went unnoticed.
     """
     if platform == "linux":

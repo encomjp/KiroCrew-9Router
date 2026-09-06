@@ -9,6 +9,10 @@
  *                    pin chip + detail drawer with the shared-memory note
  *   03-mobile        390px viewport, list column
  *   04-roster-light  light theme parity
+ *   06-driving       drawer "Driving sessions": radar's workers by
+ *                    created_by, status dots, fold/expand, empty state (fixer)
+ *   07-dedicated     scout on memory_store 'scout-own': the drawer note uses
+ *                    the store-aware wording, not the default-store sentence
  *
  * Usage:
  *   npx vite --host 127.0.0.1 --port 6831 --strictPort   # in another shell
@@ -23,7 +27,7 @@ mkdirSync(OUT, { recursive: true })
 
 const MEMBERS = [
   { name: 'radar', slug: 'radar', bound: true, slot_key: 'member-radar', running: true, kiro_agent: 'kirocrew-autofix', workspace: 'autofix', memory_store: 'default', model: '', last_active_ts: 1000, last_message: 'Six new issues: four covered by open PRs.' },
-  { name: 'scout', slug: 'scout', bound: false, slot_key: '', running: false, kiro_agent: 'kirocrew-research', workspace: 'default', memory_store: 'default', model: 'claude-opus-5' },
+  { name: 'scout', slug: 'scout', bound: false, slot_key: '', running: false, kiro_agent: 'kirocrew-research', workspace: 'default', memory_store: 'scout-own', model: 'claude-opus-5' },
   { name: 'fixer', slug: 'fixer', bound: true, slot_key: 'member-fixer', running: false, kiro_agent: 'kirocrew', workspace: 'default', memory_store: 'default', model: '', last_active_ts: 900, last_message: 'Two PRs opened for the queue.' },
   { name: 'scribe', slug: 'scribe', bound: false, slot_key: '', running: false, kiro_agent: 'kirocrew-lite', workspace: 'docs', memory_store: 'default', model: '' },
 ]
@@ -48,10 +52,38 @@ async function newPage(theme, viewport = { width: 1280, height: 820 }) {
     if (path === '/api/members') {
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ members: MEMBERS, default_agent: 'kirocrew' }) })
     }
+    if (path === '/api/crons') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ jobs: [
+        { id: 'j1', name: 'nightly-triage', message: '', enabled: true, schedule: '0 2 * * *', last_status: 'ok', agent: 'radar' },
+        { id: 'j2', name: 'queue-scan', message: '', enabled: false, schedule: '*/15 * * * *', last_status: 'ok', agent: 'radar' },
+      ] }) })
+    }
+    if (path === '/api/webhooks') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ tokens: [
+        { id: 'w1', label: 'ci-callback', display_prefix: 'kc_whk_4f2b', last4: 'a9c1', created_at: 0, last_used_at: null, require_signature: true, agent: 'radar', enabled: true },
+      ] }) })
+    }
+    if (path === '/api/agents') {
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ agents: [], default_agent: 'kirocrew' }) })
+    }
     const thread = path.match(/^\/api\/members\/([^/]+)\/thread$/)
     if (thread) {
       const slug = decodeURIComponent(thread[1])
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ slot_key: `member-${slug}`, slug, member: slug, created: false }) })
+    }
+    if (/^\/api\/members\/[^/]+\/activity$/.test(path)) {
+      const now = Date.now() / 1000
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        slug: 'radar',
+        member: 'radar',
+        capped: false,
+        entries: [
+          { ts: now - 180, via: 'chat', project: '' },
+          { ts: now - 2700, via: 'select_crew', project: 'demo-app' },
+          { ts: now - 7200, via: 'chat', project: '' },
+          { ts: now - 86400, via: 'chat', project: 'demo-app' },
+        ],
+      }) })
     }
     if (/^\/api\/chat\/slots\/[^/]+$/.test(path)) {
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
@@ -99,6 +131,21 @@ async function newPage(theme, viewport = { width: 1280, height: 820 }) {
   const drawer = await page.getByTestId('member-drawer').textContent()
   check('02-thread drawer config', /kirocrew-autofix/.test(drawer || ''), 'agent template shown')
   check('02-thread shared-memory note', /share one memory/i.test(drawer || ''), 'disclosure present')
+  // Activity additions: honest counters + the recorded timeline. Four fixture
+  // entries; the routed one carries its project label.
+  await page.getByTestId('member-activity').waitFor()
+  const activityRows = await page.getByTestId('member-activity').locator('li').count()
+  check('02-thread activity timeline', activityRows === 4, `entries=${activityRows}`)
+  const stats = await page.getByTestId('member-stats').textContent()
+  check('02-thread stat cards', /Today/.test(stats || '') && /Past 7 days/.test(stats || ''), 'both honest counters labeled')
+  const status = await page.getByTestId('member-drawer-status').textContent()
+  check('02-thread drawer status', /Working/.test(status || ''), `status=${(status || '').trim()}`)
+  // Wake sources: two schedules (one paused) + one webhook bound to radar.
+  await page.getByTestId('member-wake-sources').waitFor()
+  const wakeRows = await page.getByTestId('member-wake-sources').locator('li').count()
+  const wakeText = await page.getByTestId('member-wake-sources').textContent()
+  check('02-thread wake sources', wakeRows === 3, `rows=${wakeRows}`)
+  check('02-thread wake content', /nightly-triage/.test(wakeText || '') && /ci-callback/.test(wakeText || '') && /paused/.test(wakeText || ''), 'schedule + webhook + paused marker present')
   await page.screenshot({ path: `${OUT}/02-thread-drawer-dark.png` })
   await page.close()
 }
@@ -135,6 +182,92 @@ async function newPage(theme, viewport = { width: 1280, height: 820 }) {
   await page.getByText('radar', { exact: true }).first().click()
   await page.getByTestId('member-drawer').waitFor()
   await page.screenshot({ path: `${OUT}/04-thread-light.png` })
+  await page.close()
+}
+
+// 06 — "Driving sessions": the worker sessions this member opened and steers,
+// read off the live slots frame by `created_by`. The entry seeds seven radar
+// workers (one per status the dot distinguishes, plus overflow) and one
+// scribe worker that must stay out. Folded at five, Show all expands; a row
+// is a jump into that session (MemoryRouter here, so we assert the intent by
+// the row being a button, not by navigation).
+{
+  const page = await newPage('dark')
+  await page.getByText('radar', { exact: true }).first().click()
+  await page.getByTestId('member-driving-sessions').waitFor()
+  const rows = page.getByTestId('member-driving-row')
+  check('06-driving folded at five', (await rows.count()) === 5, `rows=${await rows.count()}`)
+  const statuses = await rows.evaluateAll((els) => els.map((e) => e.getAttribute('data-status')))
+  check(
+    '06-driving status order newest-first',
+    statuses.join(',') === 'permission,running,question,idle,idle',
+    `statuses=${statuses.join(',')}`,
+  )
+  const text = await page.getByTestId('member-driving-sessions').textContent()
+  check('06-driving excludes other members', !/release notes/.test(text || ''), 'scribe worker absent')
+  check('06-driving titles present', /sidebar drop/.test(text || '') && /seven fresh/.test(text || ''), 'worker titles rendered')
+  const toggle = page.getByTestId('member-driving-toggle')
+  check('06-driving toggle label', /Show all \(7\)/.test((await toggle.textContent()) || ''), `toggle=${await toggle.textContent()}`)
+  await page.screenshot({ path: `${OUT}/06-driving-sessions-dark.png` })
+  await toggle.click()
+  check('06b-driving expanded', (await rows.count()) === 7, `rows=${await rows.count()}`)
+  check('06b-driving toggle collapses', /Show less/.test((await toggle.textContent()) || ''), 'toggle flipped')
+  await page.screenshot({ path: `${OUT}/06b-driving-sessions-expanded-dark.png` })
+  await page.close()
+}
+
+// 06c — the empty state: a member with no workers reads one honest sentence.
+{
+  const page = await newPage('dark')
+  await page.getByText('fixer', { exact: true }).first().click()
+  await page.getByTestId('member-drawer').waitFor()
+  await page.getByTestId('member-driving-empty').waitFor()
+  const empty = await page.getByTestId('member-driving-empty').textContent()
+  check('06c-driving empty state', /Not driving any sessions/.test(empty || ''), `empty=${(empty || '').trim()}`)
+  await page.screenshot({ path: `${OUT}/06c-driving-sessions-empty-dark.png` })
+  await page.close()
+}
+
+// 05 — wide viewport: the DM transcript carries the main chat's reading
+// measure — the user's Content width setting resolved through CONTENT_WIDTH;
+// a fresh profile is the compact default, 800px. Only visible on a wide
+// column, hence the 1920px frame; the assertion reads the computed style so
+// a silently dropped prop cannot pass.
+{
+  const page = await newPage('dark', { width: 1920, height: 900 })
+  await page.getByText('radar', { exact: true }).first().click()
+  await page.getByTestId('chat-pane-stub').waitFor().catch(() => {})
+  await page.getByText('What did you triage tonight?').waitFor()
+  const cap = await page.evaluate(() => {
+    const row = document.querySelector('[data-chat-pane] .mx-auto.w-full')
+    return row ? getComputedStyle(row).maxWidth : ''
+  })
+  check('05-wide transcript reading width', cap === '800px', `maxWidth=${cap}`)
+  // Both halves of the measure: the composer follows the setting's input
+  // width too (compact = 816px), not its 900px CSS-var fallback.
+  const inputCap = await page.evaluate(() => {
+    const el = document.querySelector('[data-chat-pane] .input-area')
+    return el ? getComputedStyle(el).maxWidth : ''
+  })
+  check('05-wide composer input width', inputCap === '816px', `maxWidth=${inputCap}`)
+  await page.screenshot({ path: `${OUT}/05-thread-wide-1920.png` })
+  await page.close()
+}
+
+// 07 — dedicated-store member: scout reads its markdown memory from
+// memory_store 'scout-own', so the drawer's disclosure switches to the
+// store-aware wording (markdown separate, conversation memory still shared)
+// instead of the default-store sentence. Frame 02 (radar, default store) is
+// the counterpart showing the default wording where it applies.
+{
+  const page = await newPage('dark')
+  await page.getByText('scout', { exact: true }).first().click()
+  await page.getByTestId('member-drawer').waitFor()
+  const drawer = await page.getByTestId('member-drawer').textContent()
+  check('07-dedicated-store store shown', /scout-own/.test(drawer || ''), 'memory store row present')
+  check('07-dedicated-store store-aware note', /from the scout-own store/.test(drawer || '') && /not separated yet/.test(drawer || ''), 'store-aware wording rendered')
+  check('07-dedicated-store default wording absent', !/share one memory/i.test(drawer || ''), 'default-store sentence absent')
+  await page.screenshot({ path: `${OUT}/07-dedicated-store-dark.png` })
   await page.close()
 }
 

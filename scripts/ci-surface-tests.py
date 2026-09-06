@@ -57,6 +57,7 @@ _BACKEND_FOREIGN = re.compile(
     | \.tsx?\b             # a TypeScript filename appearing in an assertion
     | \.mjs\b
     | \.plist\b
+    | tsconfig\.json       # the frontend's config file, referenced by bare name
     | entitlements
     | \bnpm\b
     | vitest
@@ -72,6 +73,13 @@ _BACKEND_FOREIGN = re.compile(
 # eyeball grep kept missing:
 #   1. string literals   -- '../../../src/kiro_crew/connections/registry.json'
 #   2. path segments     -- path.resolve(__dirname, '..', '..', '..', 'test')
+#
+# Backend-owned config extensions close the last bare-name gap: a spec reads
+# pyproject.toml / setup.cfg / a workflow .yml through a pre-computed root
+# constant, so neither the escape forms nor a package name appear on the
+# referencing line. .yaml is almost backend-owned (workflows, compose);
+# website/AUTOSDE.yaml is the one frontend-owned exception, and per the
+# header above over-matching it only costs CI time.
 # ---------------------------------------------------------------------------
 _FRONTEND_FOREIGN = re.compile(
     r"""
@@ -84,6 +92,9 @@ _FRONTEND_FOREIGN = re.compile(
     | test[\\/]fixtures                               # shared parity fixtures
     | \bdocker\b
     | \.py\b                                          # a Python file in an assertion
+    | \.toml\b                                        # backend-owned config extensions
+    | \.cfg\b
+    | \.ya?ml\b
     """,
     re.VERBOSE,
 )
@@ -189,11 +200,20 @@ def collect(surface: str) -> list[str]:
         # protect this path, and emitting a POSIX-only suite here collects it and
         # fails the Windows shards on any diff that takes the reduced scope.
         #
-        # Split the string rather than going through pathlib: these are already
+        # Rebuild the entries as `test/`-relative paths rather than matching on
+        # the bare filename. The list is consumed by `test/conftest.py`, and
+        # pytest resolves `collect_ignore` relative to the conftest's own
+        # directory -- so the exclusion covers `test/<name>` and nothing else.
+        # A basename match would also drop a same-named suite under `transfer/`
+        # or the apps-builtins tree, which no conftest excludes and Windows
+        # collects fine: a silently skipped guard, the one outcome this
+        # selector's deny-by-default contract forbids.
+        #
+        # Join the string rather than going through pathlib: these are already
         # `as_posix()` forms, so the separator is known, and it keeps the filter
         # independent of which Path flavour the host provides.
-        ignored = _windows_collect_ignore(root)
-        must_run = [rel for rel in must_run if rel.rsplit("/", 1)[-1] not in ignored]
+        excluded = {f"test/{name}" for name in _windows_collect_ignore(root)}
+        must_run = [rel for rel in must_run if rel not in excluded]
 
     return sorted(set(must_run))
 

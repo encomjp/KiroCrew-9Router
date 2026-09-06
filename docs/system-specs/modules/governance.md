@@ -669,7 +669,13 @@ caller cannot re-open the hole by passing the path:
   launcher binds over itself and then **remounts** `MS_RDONLY`. Both mounts are
   load-bearing — `MS_RDONLY` is ignored on the initial `MS_BIND` — and both go through
   `_mount_or_die`, so a seal that does not land refuses the spawn rather than silently
-  granting write. `test_sandbox_mount_checked.py` pins all six mount sites.
+  granting write. The sealing remount also **re-asserts the target's locked mount
+  flags** (`nosuid`/`nodev`/`noexec`, read off the fresh bind via `statvfs`): inside an
+  unprivileged user namespace the kernel rejects a remount that would drop a locked
+  bit, so on hosts whose `/tmp` or `/home` is mounted `nosuid,nodev` the plain
+  `MS_RDONLY` remount got EPERM and every spawn refused (#8386). Re-asserting bits
+  already in force only keeps restrictions. `test_sandbox_mount_checked.py` pins all
+  six mount sites; `test_sandbox_seal_locked_flags.py` pins the flag re-assertion.
 - **macOS** keeps the `file-write*` and `file-link` denies and drops only `file-read*`.
 
 On a host running **unconfined** — no sandbox backend, or `agent.sandbox='off'` with the
@@ -1240,9 +1246,10 @@ without re-implementing it.
 **`host` surface (in-process host actions).** A governance check that is not
 driven by a user-facing surface — app activation
 (`apps.manager._app_activation_denied`), Slack workspace admission
-(`slack.enterprise`), and non-Slack transport startup
-(`slack.gateway._channel_transport_permitted`) — runs under the `_host` sentinel
-session key, which classifies to surface `host`. Operators can bind a
+(`slack.enterprise`), non-Slack transport startup
+(`slack.gateway._channel_transport_permitted`), and the selectable-ACP-harness
+narrowing (`agent_backend_governance.narrow_selectable_backends`) — runs under
+the `_host` sentinel session key, which classifies to surface `host`. Operators can bind a
 `surface:host` profile to narrow these on top of the policy ceiling (e.g. an
 `apps` allowlist that further restricts which apps may activate, or a `channels`
 allowlist that narrows which transports may connect below what the ceiling
@@ -2063,7 +2070,9 @@ command body + the enterprise force-pin for built-in denied-command rules, see
 below), `filesystem.read` / `filesystem.write` / `folders.*` and
 `network.egress` (host gate via tool kind + args), `channels` (per-transport at
 the messaging chokepoint AND at non-Slack transport startup), `apps` (app
-activation), `sandbox.min_level` (ordinal
+activation), `agent_backend` (which ACP harness a deployment may select —
+materialised by narrowing the `acp_backends` registry at boot and on every
+runtime ceiling install, see below), `sandbox.min_level` (ordinal
 floor at `wrap_argv`), `approval_mode` (boot floor only), and every capability
 gate — `capabilities.spawn`, `capabilities.messaging`, `capabilities.cron`,
 `capabilities.memory_writes`, `capabilities.script_hooks`,
@@ -2073,9 +2082,32 @@ default on; a deny makes the tool refuse outright, and it does NOT fall back to
 the `commands` scope, so denying browsing wholesale means denying both this
 capability AND the `playwright-cli` command),
 `capabilities.publish` (artifact publish chokepoint — see below),
-`capabilities.theme_persona` / `capabilities.theme_install`, and
+`capabilities.agentcore` (opt-in agent workload identity + Gateway MCP —
+see below),
+`capabilities.theme_persona` / `capabilities.theme_install`,
+`capabilities.mobile_connect` (phone-connection methods: filters the
+`GET /api/mobile-connect/methods` listing AND is re-checked fail-closed inside
+both credential-mint endpoints — `/api/tailnet/mobile/qr` and
+`/api/auth/mobile-link` — via `mint_denied_reason`, because a filtered list is
+presentation, never the control. The mint re-check enforces TWO controls
+fail-closed: the method must exist in the active `mobile_connect` provider's
+set (an edition that removed a method disabled it — a direct POST does not
+out-rank the seam), and governance must permit it. Default-allow standalone; a `methods` ruleset
+narrows to individual method ids — `methods:tailnet_qr`, `methods:login_link`.
+The default methods deliberately use ONE spelling for id and kind
+(`tailnet_qr`, `login_link`), so a ruleset written against either binds; an
+edition contributing its own method must keep that property or document its
+ids. The built-in mint endpoints ARE the built-in methods — an edition adding
+a new method ships its own mint endpoint and frontend renderer alongside its
+descriptor. Every decision, list and mint alike, is SEL-audited through
+`vet_and_audit`. Denying everything hides the dashboard's "Connect your phone"
+entry; the method rows themselves come from the `mobile_connect` CPP seam —
+see `platform-context.md`), and
 `capabilities.telemetry` (the anonymous beacon: send gate + both write
-chokepoints — **policy layer only**, see below). Only the live `approval_mode`
+chokepoints — **policy layer only**, see below), and
+`capabilities.social_share` (the dashboard's "Share as image" entry — read
+through `GET /api/dashboard/config`, every layer honoured, every decision
+audited; see below). Only the live `approval_mode`
 clamp remains reserved.
 
 The `commands` scope now **doubles as the enterprise force-pin** for built-in
@@ -2113,6 +2145,48 @@ surface-agnostic Settings > Security snapshot + the builtin-toggle 409 check, so
 a rule pinned by any profile renders locked and rejects a disable rather than
 surfacing a no-op opt-out (UI success while the bound-profile gate still denies).
 Display-only union — it does not widen enforcement.
+
+`capabilities.agentcore` is a `CapabilityGate` (opt-in: `capability_default=False`,
+like `capabilities.publish` / `capabilities.messaging`). It is a catalog data row
+only — the evaluator is untouched. The inner `posture` field is policy data, not
+a second scope and not a `CapabilityGate` field (`additionalProperties: false`
+stays `enabled` + `scopes`): `workload` or `login`. An `enabled: true` document
+with a missing or unknown `posture` fails closed — the row is treated as
+disabled, or boot aborts when `boot.fail_closed`. A disabled or omitted row
+does not require `posture`.
+
+`CapabilityGate.from_dict` rejects a non-boolean `enabled` the same way
+`ScopedRuleset.mode` rejects an unknown mode: `enabled: "false"` is not
+coerced with `bool()`, and a present `enabled: null` is not treated as
+absent. The default applies only when the key is omitted. The raise is
+unconditional (including `boot.fail_closed=false`) and applies to every
+capability row, not just `agentcore` — six catalog scopes default ON, so
+a stringly-typed or null disable must not turn into a permit.
+
+The composed posture is a **policy-only** ceiling side field
+(`GovernanceCeiling.agentcore_identity_posture`, Rule 6 — same shape as Slack
+`channels.posture` and `updates`). A profile may enable or disable the
+capability (tightest-wins on `enabled`) but cannot carry `posture`,
+`gateway_url`, or `workload_name`: those keys are rejected at parse, the same
+fail-closed raise as `ScopedMap.posture` / `updates` / `fallback`.
+Enable-without-posture is the legal profile shape; it cannot turn the seam on
+alone, because an omitted policy has no stored posture. Read the composed
+value through the public helper
+`agentcore_posture(ceiling) -> "workload" | "login" | None` — do not re-parse
+raw policy JSON. The helper returns the stored posture only when the
+capability is enabled with a known value; `None` when the ceiling is missing,
+the capability is omitted, disabled, or fail-closed-disabled.
+
+`gateway_url` (https MCP URL, no credentials, no fragment, no internal
+whitespace) and `workload_name`
+(3–255 of `[A-Za-z0-9_.-]`) are the same policy-only shape. Validators live
+in `platform/agentcore_schema.py` so policy parse does not import AWS.
+Consumption ANDs three conjuncts: the `agent_identity` adapter is on,
+governance permits `capabilities.agentcore`, and `agentcore_posture(ceiling)`
+is a known value. The public `DefaultAgentIdentityProvider` is disabled, so a
+standalone host with no policy is unchanged. Later stack PRs consult this row
+at rebuild / Gateway injection; naming it here is what lets a policy pin the
+capability before those chokepoints land.
 
 `capabilities.publish` is a `CapabilityGate` (opt-in: `capability_default=False`)
 with an inner `destinations` `ScopedRuleset` (`identifier` matcher) bounding
@@ -2404,6 +2478,381 @@ switch off" (flippable) from "off because an administrator pinned it" (a config
 write returns 403), since offering a working-looking toggle for the second is the
 half-control this row exists to avoid.
 
+### "Share as image" — `capabilities.social_share`
+
+The chat's *More actions → Share as image* turns an assistant reply into a branded
+PNG card with a prefilled caption and offers to post it to X or LinkedIn
+(`website/src/pages/chat/share/`). The card is rendered and exported **in the
+browser** — copy and download never leave the machine, and there is no upload — but
+the intent buttons hand the caption text to a third-party site inside a URL. That
+makes the entry an egress path for agent output, which a managed fleet may forbid
+wholesale. Governed by the `capabilities.social_share` `SCOPE_CATALOG` capability
+row (`capability_default=True`, data-only shape — no `CONTRACT_VERSION` or evaluator
+change, mirroring the rows above).
+
+**Why the chokepoint is a read.** There is no server-side share action to refuse:
+nothing is rendered, stored or posted by the gateway. The control is the dashboard
+entry itself, and the only way the dashboard can learn the ceiling's answer is the
+endpoint it already fetches — `GET /api/dashboard/config` reports a read-only
+`social_share_enabled` (`dashboard/social_share.py`), and the frontend draws the
+menu item only when it is `true`. The entry stays hidden until the server has
+answered — the endpoint is the authority, the frontend never guesses (the same
+posture as the mobile-connect rail row). When Share was the menu's only item (a
+loaded window keeps fork/plan as row buttons), the trigger is withdrawn with it
+rather than opening an empty menu. A swap that lands while the share dialog is
+already open does **not** unmount it: the dialog stays with the user's edited
+caption in place, its four share actions are disabled, a notice names the cause and
+tells the user to copy their text now (it is not saved on close), and a plain-text
+Copy affordance — the caption plus the card's editable text, local clipboard, no
+image, no site — stays available so closing
+never means silent loss; when the clipboard refuses, the button says so and
+selects the caption for a keyboard copy rather than looking like success. The
+notice does not name who set the policy (a fleet ceiling and an operator's own
+profile pin both land here). In the Security panel's ceiling viewer the scope's row
+is labelled after the menu entry it withdraws ("Share as image", translated), so a
+user who lost the entry can connect the row to the feature. The field is dropped
+from the `PUT` body (both settings surfaces round-trip the whole `GET`), so it can
+never be written: governance, not config, owns the answer.
+
+**Shape: the mobile-connect listing, not the startup probes.** The evaluation runs
+through `vet_and_audit` on the pinned `dashboard:ui` surface key — never a
+caller-controlled header, which would let a request dodge a profile bound to the
+dashboard surface — and **every denied decision is honoured**, whichever layer
+produced it. This is a per-request dashboard question, so unlike `telemetry` and
+`tailnet_origin` (process-wide, session-less, evaluated once at boot) there is no
+policy-layer-only carve-out: a Level-2 profile narrowing the dashboard can withdraw
+the entry.
+
+**Fails CLOSED** (`fail_closed=True`), joining `capabilities.publish` /
+`theme_install` / `telemetry` / `tailnet_origin`: a wrong-DENY hides a convenience
+menu item, a wrong-PERMIT offers a "post this to a third-party site" button on a
+fleet that forbade it. An unevaluable ceiling is recorded as `denied` with a
+`fail-closed` reason.
+
+**Every decision is audited.** Each evaluation the dashboard acts on leaves a
+`governance_decision` SEL row (tool `dashboard_config_social_share`), grant and
+denial alike, through the shared seam — the read *is* the enforcement here, so it
+is not an inspection to leave unrecorded. The endpoint is not polled: the client
+fetches it on mount, focus and after its stale window, and otherwise only when the
+WS `slots` frame reports a generation change (below).
+
+**Follows a mid-session ceiling swap.** `policy_distribution.apply_ceiling` can
+replace the ceiling without a restart. The WS `slots` frame carries the process-local
+`governanceGeneration` alongside `gitlabHostsGeneration`; every dashboard-user
+socket's existing 5-second status pusher (`ws.py`, `_push_status`) compares the
+counter on each tick and asks for a coalesced slots push when it moves — no task of
+its own, and deliberately separate from the owner-only credential-refresh driver, so
+a fleet that tightened policy while only a non-owner window was open still reaches
+that window; the initial frame and the tick's baseline come from one read, so a swap
+during connection setup registers as a change. The client invalidates its cached
+`dashboardConfig` on a change (and on each connection's first frame, since the
+counter restarts with the process) — so a withdrawn entry disappears within one
+status tick rather than waiting out the cache's stale window.
+
+**And follows a profile-layer edit.** The value in that frame is
+`governance_profiles.governance_answer_generation()`, which is
+`context.governance_generation()` plus a module-private `_profile_generation()`
+bumped whenever `ProfileStore._ensure_fresh` publishes a new snapshot. The field's
+contract is unchanged — it stays an opaque, comparison-only integer, so combining two
+monotonic counters is not a change of meaning and no consumer needs to know. This
+exists because the ceiling counter alone missed Level-2 edits: a profile file
+tightening a capability is enforced on the very next decision (the authorization
+path calls `_ensure_fresh`), while the dashboard's cached answer kept the withdrawn
+entry until its 30-second stale window, focus, or an unrelated slot mutation.
+
+Detecting the edit needs the profiles directory re-stat'd, and on an idle dashboard
+nothing else would touch the store, so the watcher has to be what looks. That walk
+lives in a separate `poll_profiles_fresh()`, which the watcher offloads with
+`asyncio.to_thread`: `_dir_fingerprint` is an `iterdir` plus a `stat` per file, and
+AUTOSDE's `no-blocking-call-on-event-loop` names filesystem walks as the prohibited
+class, so a slow or large profile store must delay one socket's tick rather than
+stall chat turns and heartbeats for every session. `governance_answer_generation()`
+itself is two locked integer reads with no filesystem access, which is why the
+synchronous slots broadcast may call it inline. Measured walk cost on one host: 57us
+at 5 profile files, 107us at 15, 303us at 50, 1.12ms at 200 — small at a realistic
+count and unbounded in principle, hence offloaded rather than defended by the number.
+
+`_profile_generation()` is an OUTPUT of the profile store and must never become an
+input to it. Folding it into `_ceiling_token()` — the obvious-looking symmetry with
+the ceiling half described below — would make the store reload on every access
+forever, because `_ensure_fresh` computes its fingerprint *before* reloading and so
+would commit a pre-bump value that the next read can never match.
+
+The Security panel picks the row up automatically (`api_governance_policy` iterates
+`SCOPE_CATALOG`; its label is the humanised leaf, "Social share").
+
+### Which ACP harness a deployment may select — `agent_backend`
+
+`agent.acp_backend` chooses the harness a session runs on (kiro-cli, KAS, and
+whatever an edition registered — see [harness-parity.md](harness-parity.md)).
+Two different questions decide whether a value is usable, and keeping them apart
+is what this row is for:
+
+- **Can this build serve it?** `acp_backends.selectable_backends()` — a
+  capability fact contributed by the edition that called
+  `register_selectable_backend`. Not governable: no policy can conjure a harness
+  the build has no code for.
+- **May THIS DEPLOYMENT select it?** the `agent_backend` `SCOPE_CATALOG` row
+  (a `ScopedRuleset` on the `identifier` matcher; data-only shape — no
+  `CONTRACT_VERSION` or evaluator change, mirroring the rows above), so a managed
+  fleet can qualify one harness and bound the rest.
+
+**Members are POLICY ids, not the code's spelling** — `kiro` / `kas` / `claude`,
+translated by `acp_backends.POLICY_ID_BY_BACKEND`. `ACP_BACKEND_KIRO` is the
+empty string internally, which no identifier matcher can carry: an empty
+allow/deny entry is indistinguishable from a typo'd blank a JSON linter would
+keep. The wire vocabulary is therefore owned in one place rather than translated
+at each reader.
+
+**Additive over a floor — the semantics ruling that unblocked
+[issue #6622](https://github.com/kirodotdev/KiroCrew/issues/6622).**
+
+```json
+{"agent_backend": {"mode": "allow", "allow": ["claude"]}}
+```
+
+means **also allow claude**, not **only claude**: `kiro` stays selectable because
+`acp_backends.GOVERNANCE_FLOOR_BACKEND` is never submitted to the scope at all,
+so no rule can remove it. The exclusive reading was rejected because it can empty
+the selectable set, and an install with **no startable harness cannot be repaired
+from the dashboard** — the trust-root `security_policy.json` is the one file the
+dashboard may not write (see
+[Self-protection](#self-protection-the-keystone)). The guarantee does not rest on
+the governance caller being careful either: `apply_selectable_denials` force-keeps
+the floor even when a caller names it in `denied`. Issue #6622 remains open for
+the wider enforcement question; only the semantics is settled here.
+
+kiro-cli is the floor rather than KAS deliberately. KAS is not an independent
+harness — it is served by kiro-cli's own ACP relay
+(`acp/kas_transport.build_kas_argv`) — so a KAS floor would rest on the same
+binary while adding a second thing that can be absent. The floor has to be the
+member with the fewest preconditions of its own; revisit if KAS ever ships a
+binary of its own.
+
+**Enforced by RECOMPUTING the registry, not by a per-decision read.** This is the
+one scope here whose answer is materialised instead of resolved at each decision.
+`agent_backend_governance.narrow_selectable_backends()` iterates the BASELINE
+(`registered_backends()`), asks the scope about every non-floor member, and
+assigns `baseline - denied` whole via `apply_selectable_denials`. One call site,
+**outside** `KiroCrewConfig.load()`:
+
+| Call site | When | Why it is needed |
+|---|---|---|
+| `platform/bootstrap.py::bootstrap_context` | after `set_context`, and after every edition's `register_acp_backends` | the first session already sees the policy, and nothing an edition registers later escapes it |
+
+**When a policy change binds: the next gateway start.** `apply_ceiling` replaces
+`current_context().governance` mid-process — the poll thread reaches it through
+`refresh_now()` — and every other scope on this page picks that up on its next
+decision. This one does not, deliberately.
+
+Re-deriving the registry there would bind the new ceiling for backend SELECTION only.
+Sessions already running the now-denied harness, and providers already in the warm
+pool, keep going: nothing in this scope can retire them, because retiring live work is
+a session-lifecycle capability that does not exist yet. The operator-visible result
+would be the worst of both — the option disappears from the panel while the harness is
+still in use, which reads as "it stopped being used". A narrow promise kept beats a
+broad one that quietly holds only for new sessions, so the contract is stated plainly
+instead: the set is decided at gateway start, and editing policy takes effect on the
+next start. The dashboard panel says exactly that
+(`set_is_fixed_at_gateway_start`), and
+`test_apply_ceiling_does_not_renarrow_the_registry` pins it so the omission cannot be
+mistaken for an oversight and quietly "fixed" without the retirement half.
+
+Assigning rather than subtracting still earns its place at one call site: the recompute
+is idempotent, order-independent and reversible, so adding the runtime call site once
+retirement exists is a one-line change rather than a redesign of the primitive.
+
+**Why it cannot be a per-decision read like every other scope.** Three
+harness-parity invariants rule out each of the otherwise-obvious positions:
+
+- **H3** — the single selectability gate `resolve_selected_backend` runs inside
+  `KiroCrewConfig.load()` and must never read the platform context:
+  `current_context()`'s lazy branch loads config, so resolving a ceiling there
+  re-enters the load that called it. The gate cannot ask.
+- **H4** — selectability has exactly ONE gate. A second derivation (an
+  intersection in the dashboard handler, say) is the drift the registry replaced.
+- **H13** — the Kiro construction path gains no conditional in service of an
+  adapter, which rules out `create_provider_factory`; a test asserts no governance
+  call appears there.
+
+Narrowing the registry satisfies all three: the context is installed at both call
+sites (so no re-entrant load), the registry stays the single source, and no call
+site changes. Everything downstream inherits the narrowed answer with no code of
+its own — `resolve_selected_backend` degrades a now-denied persisted value to the
+floor with a logged reason on the next load, and the `PATCH
+/api/config/kirocrew` allowlist, `GET /api/config/schema`, `GET /api/acp-backends`
+and the provider factory all read the one derivation
+(`handlers/core.py::_selectable_acp_backends`). `bootstrap_context` additionally
+re-runs that SAME gate over the config instance it is holding — that instance was
+normalised before the narrowing — rather than adding a second gate anywhere.
+
+**`GET /api/acp-backends`** is the operator-facing view of the outcome: one
+owner-only row per backend in `ACP_BACKENDS_KNOWN`, carrying `selectable` (build
+capability ∩ this deployment's policy, from the derivation above) beside
+`installed` (is the harness on THIS machine, from `agent_sdk.probe_backends`).
+The two facts are deliberately not conflated: a policy-denied harness and an
+uninstalled
+one need different operator remedies, and the dashboard must not offer an install
+instruction for a backend an administrator pinned off.
+
+**Fails CLOSED to the floor, which is what keeps fail-closed from meaning
+bricked.** `governance_permits(..., fail_closed=True)` denies for an error raised
+inside it, and `_scope_permits` additionally denies for what that helper does not
+swallow (an absent platform context, an import failure) — so an unqualified
+harness never becomes selectable on an unreadable policy. Without the floor,
+closed and bricked would be the same state. `narrow_selectable_backends` itself
+never raises: a boot that aborts because a policy could not be evaluated is worse
+than one that starts on the floor alone, and the same holds for a runtime refresh
+whose caller keeps serving traffic either way (it leaves the registry as it was,
+plus a logged warning).
+
+**Audited in BOTH directions**, unlike the publish gate which audits denials
+only. Every decision lands a `governance_decision` SEL record through
+`log_governance_decision` with `outcome` `"allowed"` / `"denied"` — the vocabulary
+`sel.py` pins and `governance_profiles` emits, so a log query for allowed
+decisions cannot miss this scope. The full record is affordable precisely because
+the decision is materialised: it runs once per gateway start and once per pushed
+ceiling, not per panel open — and *which harnesses did this deployment admit* is
+the question an operator actually reconstructs afterwards, which a denials-only
+log cannot answer. Audit failure is swallowed: an unwritable log must not decide
+which harness starts.
+
+Every decision is bound to `HOST_SESSION_KEY` (`_host`), **not** an empty session
+key, and that is load-bearing rather than cosmetic: an empty key classifies to
+surface `unknown` and matches no profile, so a `surface:host` profile would be
+silently ignored and the harness it denies would stay selectable. It is the same
+binding app activation and the messaging host gates use — see
+[`host` surface](#profile-resolution--binding).
+
+The Security panel picks the row up automatically — `api_governance_policy`
+iterates `SCOPE_CATALOG`.
+
+### Which tool-approval modes a deployment may select — `approval_modes`
+
+The dashboard approval-mode picker offers four modes: `normal` (interactive —
+ask for every tool), `trust_reads` (auto-approve reads), `trust` (auto-approve
+the active slot), and `yolo` (auto-approve every tool everywhere). The
+`approval_modes` `SCOPE_CATALOG` row (a `ScopedRuleset` on the `identifier`
+matcher — data-only shape, no evaluator change, mirroring `agent_backend`
+above) lets a managed fleet forbid an auto-approve mode and force interactive
+approval.
+
+**Today the scope governs exactly one mode: `yolo`.**
+
+```json
+{"approval_modes": {"mode": "deny", "deny": ["yolo"]}}
+```
+
+This is distinct from the ordinal `approval_mode` scale
+(`yolo < auto < interactive`) documented under the archetypes: that clamps a
+single ceiling, whereas `approval_modes` denies a named mode.
+
+**Three modes are non-deniable, for two different reasons.** Both are declared as
+catalog DATA — `ScopeSpec(..., always_permitted=("normal", "trust", "trust_reads"))`
+— and `_parse_control` refuses any ruleset that forbids one, whether directly
+(`deny: ["trust"]`) or by an allow-list that omits it, with
+`PlatformCompositionError`. Data rather than a scope-name branch, so a second scope
+with a non-deniable member is a catalog entry and not another `if` in the loader:
+
+- **`normal` is the interactive floor.** Denying it would leave no selectable mode
+  and brick tool approval, and the trust-root `security_policy.json` is the one file
+  the dashboard may not write to repair it (see
+  [Self-protection](#self-protection-the-keystone)).
+- **`trust` and `trust_reads` are not yet governed.** Their grants are honoured by
+  consumption predicates this scope does not reach — the in-memory trusted set, and
+  the session `approval_policy` a spawned subagent inherits — spread across the
+  messaging, Slack, Telegram and subagent-admission paths. Accepting a deny for them
+  would advertise a control that does not hold, so the policy is refused **loudly at
+  parse time** instead. Governing those read paths is tracked separately.
+
+The refusal happens at parse time in both cases, because a policy that misdescribes
+the posture is worse than one that fails to load.
+
+**Enforced at every `yolo` surface**, because a mode is only actually off if every
+path that can arm it — and every path that HONOURS an existing grant — refuses:
+
+- `dashboard/chat_handlers.py::api_chat_mode` — the explicit mode switch. Refuses
+  with `403` + `mode_disabled_by_policy` **before any mutation**.
+- `safety_override` arming — `_commit_activation` and `activate_scoped`,
+  fail-closed, so YOLO stays blocked however it is armed (dashboard, Slack `!yolo`,
+  the `/yolo` slash handler, config).
+- `safety_override.is_active` / `is_scope_active` / `renew_scoped` — the consult
+  points that honour a LIVE grant. Gating only at arming left an already-armed grant
+  running to its own TTL, so an admin who denied `yolo` mid-session kept
+  auto-approving every tool for up to 24h.
+
+**A denial REVOKES the grant; it does not merely mask it.** This matters because the
+same predicate answers two different questions. `is_active` is both "may this tool
+auto-approve?" and, for every caller that asks "is there a grant to clear?", the
+liveness test — Slack's `!yolo off` is `if is_yolo_mode(): disable_yolo()`. An earlier
+revision left `_active` set and only reported `False`, so inside a denial window that
+branch reported "already off" and cleared nothing, and a later policy relaxation
+resurrected auto-approve the operator had explicitly revoked. Tearing the grant down
+makes both readings agree. The cost is that a policy which denies and then relaxes
+requires a fresh arm, which is the honest outcome anyway.
+
+The teardown runs at the moment the denying ceiling is INSTALLED, not on the next
+`is_active()` call — `safety_override.revoke_for_policy` drops the session-wide grant
+and every scoped grant, then fires `_on_expired("policy")`. That callback is the rest
+of the revocation, and it is not optional: a dashboard grant also writes
+`approval_policy="auto"` onto the slots and into the shared channel-trust mapping, and
+`subagent_manager.admission.parent_trusted` reads *that policy* rather than any flag in
+`safety_override` — so a revocation that stopped at the flag left `spawn_run`
+auto-approved. `is_active` / `is_scope_active` / `renew_scoped` keep their policy check
+as the fail-closed mask if that teardown was partial.
+
+**Every refusal is SEL-audited.** A governance denial that leaves no trace is
+indistinguishable from the request never having been made, which is exactly the
+record an operator needs after an attempted escalation. The audit is best-effort at
+each site: an SEL write failure never turns a refusal into a grant.
+
+**The verdict is PUSHED at ceiling install, never polled.** Resolving the scope walks
+the profiles dir (`iterdir` + per-file `stat`), and every consumer is on a path that
+must not do that: `status_snapshot` is emitted on the 5s WebSocket push, `is_active` is
+the predicate every transport hands to `TurnDriver` (so it runs per *tool call*), and
+arming reaches the module from the event loop through synchronous callers. So
+`approval_mode_permitted("yolo")` is resolved **once per ceiling**, by a hook
+`safety_override` registers with `platform.context.register_ceiling_install_hook`.
+`platform.context._install` is the single writer of the active context — central
+distribution (`policy_distribution.apply_ceiling`), boot, the lazy default and the test
+reset all go through it — so no ceiling escapes the hook. Every consumer
+(`yolo_policy_permits()`, and `cached_disabled_approval_modes()` on top of it) is then a
+bare attribute read: no TTL, no lock, no thread.
+
+A governance-evaluation error at install time resolves to **denied**, and a process
+that reads the verdict before any ceiling was installed resolves once through
+`current_context()` — which composes and installs the standalone default, firing the
+same hook. A host whose context refuses to compose (a governed profile whose boot did
+not run) leaves the verdict denied, which is the fail-closed direction.
+
+This replaced a pull-based cache — a 5s TTL plus a governance-generation stamp,
+refreshed on a worker thread — and the reason is worth recording. Polling a value that
+only changes on a discrete event needs a freshness key, a third
+`unknown` verdict for the window before a refresh lands, and a per-caller rule for
+collapsing that third state (approval had to fail closed on it; revocation had to *not*
+fire, or an unrelated ceiling install would destroy a live grant permanently). Each of
+those is a window in which a permit resolved under a retired ceiling is still served,
+and the windows — not the scope, the arming gate or the audits — were where every
+security finding against that design landed. Pushing removes them instead of shortening
+them.
+
+The denied set rides the shared `state.status_snapshot()` as
+`disabled_approval_modes`. The picker **hides** each denied mode rather than showing
+it disabled — a mode that cannot be chosen is simply absent, and `normal` keeps the
+list from ever being empty. The one exception is a denied mode that is STILL THE
+ACTIVE one: the trigger renders the active mode regardless, so hiding its row too
+would put a label on the button with no matching row in the menu. That row stays,
+disabled and labelled with the reason, until the user picks something else. The
+Security panel lists the scope and its deny-list automatically —
+`api_governance_policy` iterates `SCOPE_CATALOG` — so an operator can always see
+which modes a policy removed.
+
+**Not yet reached.** Auto-approval also enters through cron
+`approval_mode: "auto"`, the messaging API's approval-mode field, subagent spawn, and
+config `agent.approval_mode`. Those carry their own vocabulary and are tracked
+separately from this scope — see the reserved `approval_mode` ordinal's
+still-reserved note.
+
 ### Computer use is NOT governed (deliberately)
 
 Computer use (see [computer-use.md](computer-use.md)) has **no scope rows in
@@ -2495,6 +2944,16 @@ carve-out stay as code. It expects `CONTRACT_VERSION == 1` (pinned pre-launch).
   `GOVERNANCE_ERROR_REASON` (the eval-error marker consumers match on),
   `vet_and_audit`.
 - `security.py` — `_SENSITIVE_HOME_DIRS` keystone entries.
+- `agent_backend_governance.py` — the `agent_backend` scope: `SCOPE`,
+  `narrow_selectable_backends` (the registry recompute, plus its host-bound,
+  both-directions audit), driven from `platform/bootstrap.py::bootstrap_context`
+  and `platform/policy_distribution.py::apply_ceiling`.
+- `acp_backends.py` — the selectable registry the scope narrows:
+  `GOVERNANCE_FLOOR_BACKEND`, `POLICY_ID_BY_BACKEND`, the baseline/effective
+  split (`registered_backends` / `selectable_backends`) and
+  `apply_selectable_denials`.
+- `dashboard/handlers/acp_backend_status.py` — `GET /api/acp-backends`
+  (selectability ∩ install state, owner-only).
 - `hooks.py` — Plane A gate threading + the computer-use read-only auto-approve
   (`_cu_read_only_auto_approve`, which reads the action-class table rather than a
   governance row).
@@ -2538,5 +2997,10 @@ controls on the cache itself — `TestAnExposedCacheIsStillReadOnly`,
 read-only bind and its sealing remount, refuse the spawn when they fail),
 `test_governance_updates.py` (the
 `updates` pins, the shared seam's fail-open-on-error disposition, and the
-tracked-remote resolution), and `test_computer_use_gate.py` (that the
+tracked-remote resolution), `test_agent_backend_governance.py` (the
+`agent_backend` scope: the additive-over-floor semantics, the registry recompute
+and its restore-on-loosening behaviour, the gateway-start binding contract and that
+a runtime ceiling install deliberately does not re-derive the set, the
+host-session binding, the both-directions audit, the fail-closed disposition, and
+that no second gate exists), and `test_computer_use_gate.py` (that the
 computer-use gate is audit-only and permits — see the section above).

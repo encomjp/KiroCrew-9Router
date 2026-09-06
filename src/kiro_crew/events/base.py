@@ -148,10 +148,14 @@ def register(cls: type[Event]) -> type[Event]:
     a programming error, not a runtime condition.
     """
     kind = cls.KIND
-    domain, sep, action = kind.partition("/")
-    valid = (
-        bool(sep) and bool(domain) and bool(action) and "/" not in action and kind == kind.lower()
-    )
+    # ``bool(action)`` already carries "a separator was present": with no "/"
+    # in *kind*, partition puts the whole string in domain and leaves BOTH the
+    # separator and the tail empty, so a non-empty action is only reachable
+    # once the slash was found. ``"/" not in action`` is a different and still
+    # necessary test — it is what forbids a SECOND slash, since partition
+    # splits at the first one.
+    domain, _, action = kind.partition("/")
+    valid = bool(domain) and bool(action) and "/" not in action and kind == kind.lower()
     if not valid:
         raise ValueError(f"event KIND must be lowercase 'domain/action', got {kind!r}")
     existing = REGISTRY.get(kind)
@@ -176,8 +180,8 @@ def serialize(event: Event, *, src: str) -> str:
         "src": src,
         "key": event.key,
         "ts_ms": event.ts_ms,
+        "data": event.data(),
     }
-    rec["data"] = event.data()
     return json.dumps(rec, separators=(",", ":"), ensure_ascii=False, default=str)
 
 
@@ -195,9 +199,10 @@ def parse(line: str) -> Parsed | None:
     """Parse one log line. Returns ``None`` only for non-JSON / non-object input.
 
     Guarantees for well-formed envelopes: never raises. A ``kind`` this build
-    does not know — or a known kind whose required fields are absent — yields
-    a :class:`RawEvent` carrying the payload verbatim. Unknown fields inside
-    ``data`` for a known kind are ignored (additive evolution).
+    does not know — or a known kind whose payload violates a field's declared
+    type, or leaves a required field absent — yields a :class:`RawEvent`
+    carrying the payload verbatim. Unknown fields inside ``data`` for a known
+    kind are ignored (additive evolution).
     """
     try:
         rec = json.loads(line)
@@ -222,34 +227,32 @@ def parse(line: str) -> Parsed | None:
     v_val = rec.get("v")
     v = v_val if isinstance(v_val, int) and not isinstance(v_val, bool) else 0
     # An ABSENT data key is a legitimately empty payload; a PRESENT non-dict
-    # value — explicit null included, which rec.get() cannot distinguish
-    # from absence — violates the envelope contract (the serializer always
-    # writes a dict), and substituting {} would hand consumers a typed
-    # event with invented defaults. Corrupt like a bad ts_ms.
-    if "data" not in rec:
-        data: dict[str, Any] = {}
-    else:
-        data_val = rec.get("data")
-        if isinstance(data_val, dict):
-            data = data_val
-        else:
-            return None
+    # value — explicit null included — violates the envelope contract (the
+    # serializer always writes a dict), and substituting {} would hand
+    # consumers a typed event with invented defaults. Corrupt like a bad
+    # ts_ms. The get() default fires only on absence, which is what keeps
+    # those two cases apart.
+    data_val = rec.get("data", {})
+    if not isinstance(data_val, dict):
+        return None
+    data: dict[str, Any] = data_val
     cls = REGISTRY.get(kind)
-    event: Event
+    typed: Event | None = None
     if cls is not None:
         allowed = {f.name for f in dc_fields(cls)} - _BASE_FIELDS
         kwargs = {k: val for k, val in data.items() if k in allowed}
         # A retained value that violates the field's declared type must not
         # reach consumers as a typed event — that would make the dataclass
         # schema a lie. Such lines degrade to RawEvent like unknown kinds.
-        if not _payload_matches(cls, kwargs):
-            event = RawEvent(key=key, ts_ms=ts_ms, kind=kind, payload=data)
-        else:
+        if _payload_matches(cls, kwargs):
             try:
-                event = cls(key=key, ts_ms=ts_ms, **kwargs)
+                typed = cls(key=key, ts_ms=ts_ms, **kwargs)
             except TypeError:
-                # Required typed field missing — fall back rather than fail.
-                event = RawEvent(key=key, ts_ms=ts_ms, kind=kind, payload=data)
-    else:
-        event = RawEvent(key=key, ts_ms=ts_ms, kind=kind, payload=data)
+                # Required typed field missing — leave ``typed`` at ``None`` so
+                # the fallback below applies, rather than failing the parse.
+                pass
+    # One fallback for all three degrade paths: unknown kind, a payload whose
+    # value violates the field's declared type, and a payload missing a
+    # required typed field.
+    event = typed if typed is not None else RawEvent(key=key, ts_ms=ts_ms, kind=kind, payload=data)
     return Parsed(event=event, kind=kind, src=src, v=v)

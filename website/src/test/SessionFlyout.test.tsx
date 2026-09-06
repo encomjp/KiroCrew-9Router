@@ -15,18 +15,28 @@
  *  (7) The flyout occupies the panel rect's origin and width, so expanding
  *      moves only its bottom edge and the corner stays pinned.
  */
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, fireEvent, within } from '@testing-library/react'
 import type { ChatSlot } from '../types'
-import SessionFlyout, { FLYOUT_MAX_ROWS, TOGGLE_RECT, toggleClip, FULL_CLIP } from '../pages/chat/SessionFlyout'
+import SessionFlyout, { FLYOUT_MAX_ROWS, toggleClip, FULL_CLIP } from '../pages/chat/SessionFlyout'
+import { PINNED_SESSION_ORDER_CHANGED_EVENT, PINNED_SESSION_ORDER_KEY } from '../utils/pinnedSessionOrder'
+
+/** The framer-motion props this mock READS; every other prop is copied through
+ *  to the plain DOM element untouched, which is what the index signature is for. */
+interface MotionMockProps {
+  [prop: string]: unknown
+  children?: React.ReactNode
+  animate?: { clipPath?: string | string[] }
+  transition?: { duration?: number }
+}
 
 // Render framer-motion elements as plain DOM (jsdom can't run projection).
 vi.mock('framer-motion', async () => {
   const React = await import('react')
   const FRAMER_PROPS = new Set(['layout', 'layoutId', 'initial', 'animate', 'exit', 'transition', 'variants'])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: MotionMockProps, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children' || FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
@@ -43,7 +53,7 @@ vi.mock('framer-motion', async () => {
     })
   return {
     motion: new Proxy({}, { get: (_t, tag: string) => make(tag) }),
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
     useReducedMotion: () => false,
   }
 })
@@ -79,6 +89,8 @@ function mount(over: Partial<React.ComponentProps<typeof SessionFlyout>> = {}) {
 const rowKeys = (c: HTMLElement) =>
   Array.from(c.querySelectorAll('[data-slot-key]')).map(el => el.getAttribute('data-slot-key'))
 
+beforeEach(() => localStorage.clear())
+
 describe('SessionFlyout ordering', () => {
   it('lists sessions most-recent-first', () => {
     const { container } = mount()
@@ -87,9 +99,20 @@ describe('SessionFlyout ordering', () => {
 
   it('puts a pinned session first even when it is the least recent', () => {
     const { container } = mount({
-      slots: [...SLOTS.slice(0, 2), slot({ ...SLOTS[2], pinned: true } as any)],
+      slots: [...SLOTS.slice(0, 2), slot({ ...SLOTS[2], pinned: true })],
     })
     expect(rowKeys(container)).toEqual(['k-mid', 'k-new', 'k-old'])
+  })
+
+  it('uses persisted manual rank for pinned rows and refreshes on same-tab reorder', () => {
+    const pins = SLOTS.map(item => slot({ ...item, pinned: true }))
+    localStorage.setItem(PINNED_SESSION_ORDER_KEY, JSON.stringify(['k-old', 'k-mid', 'k-new']))
+    const { container } = mount({ slots: pins })
+    expect(rowKeys(container)).toEqual(['k-old', 'k-mid', 'k-new'])
+
+    localStorage.setItem(PINNED_SESSION_ORDER_KEY, JSON.stringify(['k-new', 'k-old', 'k-mid']))
+    fireEvent(window, new Event(PINNED_SESSION_ORDER_CHANGED_EVENT))
+    expect(rowKeys(container)).toEqual(['k-new', 'k-old', 'k-mid'])
   })
 
   it('ranks a slot with only `created` behind slots with real activity', () => {

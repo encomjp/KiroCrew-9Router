@@ -7,7 +7,6 @@ import importlib.util
 import json
 import logging
 import os
-import shlex
 import sys
 import sysconfig
 import time
@@ -17,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 import aiohttp
 from aiohttp import web
 
-from kiro_crew import platform_compat
+from kiro_crew import extras, platform_compat
 from kiro_crew.agent_discovery import (
     SKILL_URI_PREFIX,
     expand_skill_uri,
@@ -65,6 +64,23 @@ def _redact_memory_field(val: object) -> object:
     return val
 
 
+#: The session-search row fields carrying LLM-authored or peer-supplied prose,
+#: which every pass returning such a row must put through
+#: :func:`kiro_crew.security.redact` before egress.
+#:
+#: Three passes return these rows -- ``api_sessions_search``, and
+#: ``api_instances_search_sessions``' local-row and peer-row passes -- and each
+#: used to hand-copy both the redaction chain AND this field list. The chain
+#: already had an owner (``security.redact`` composes the exfiltration-URL and
+#: credential passes in that order); this tuple gives the field list one too, so
+#: a caller cannot redact ``title`` and quietly forget ``snippet``. That is the
+#: drift half of #3940 follow-up 3, and the quieter half: a missing field reads
+#: as correct at the call site.
+#:
+#: Order is irrelevant; membership is the contract.
+SESSION_SEARCH_TEXT_FIELDS: tuple[str, ...] = ("title", "snippet")
+
+
 # Shared body cap for the small JSON-object endpoints that must bound the
 # request BEFORE decoding (the strict-internal notification routes). Kept
 # module-level and in one place so the security-relevant cap cannot drift
@@ -74,39 +90,101 @@ _MAX_BODY_BYTES = 64 * 1024
 
 
 async def read_bounded_json(
-    request: web.Request, max_bytes: int = _MAX_BODY_BYTES
+    request: web.Request,
+    max_bytes: int | None = _MAX_BODY_BYTES,
+    *,
+    allow_absent: bool = False,
 ) -> tuple[dict[str, Any] | None, web.Response | None]:
     """Read and parse a JSON *object* request body, capped at *max_bytes*.
 
     Returns ``(body, None)`` on success, or ``(None, error_response)`` when the
-    caller should return early. The cap is enforced BEFORE decoding: a
-    Content-Length precheck rejects an oversized declared body, and the stream
-    is then read incrementally so a chunked body (which carries no
-    Content-Length) cannot buffer past ``max_bytes + one chunk`` on the
-    event-loop thread. Consolidates the previously-duplicated block in
-    ``messaging.api_notification_agent_push`` and
-    ``notifications_push.api_push_notification`` so the cap and the 413/400
-    contract stay identical across both (issue #490).
+    caller should return early. This owns the parse-and-shape guard for the
+    endpoints routed through it: ``await request.json()`` happily returns a
+    list, string, or number for a body that is valid JSON but not an object, and
+    a handler that then calls ``.get()`` on the result turns a client mistake
+    into a 500 (issue #5587).
+
+    NOT yet the dashboard's only such guard. Four siblings survive and diverge:
+    ``handlers_channel._json_object`` (same ``invalid_json``/``body_not_object``
+    codes, but raises ``HTTPBadRequest`` instead of returning the response),
+    ``handlers/hooks.py::_json_object`` (``default_empty=True`` collapses a
+    MALFORMED body to defaults -- the defect this issue fixed in
+    ``api_memory_promote``), ``handlers/session_storage.py::_json_body``
+    (deliberately different: an empty body is legitimate there, and it
+    documents why), and ``handlers/artifacts.py::_read_json_body`` (raises
+    ``ArtifactValidationError``, carries its own cap). Folding or narrowing each
+    is tracked on issue #5587 alongside the remaining handler sweep -- claiming
+    one owner before that is done would be a claim the tree does not support.
+
+    The cap is enforced BEFORE decoding: a Content-Length precheck rejects an
+    oversized declared body, and the stream is then read incrementally so a
+    chunked body (which carries no Content-Length) cannot buffer past
+    ``max_bytes + one chunk`` on the event-loop thread. That bound is the point
+    of the helper for the strict-internal notification routes (issue #490).
+
+    ``max_bytes=None`` reads the body whole with no pre-decode ceiling, for the
+    endpoints that have no principled byte limit today (a knowledge bundle
+    import has no defensible maximum size). It is deliberately explicit rather
+    than the default: an endpoint opting out of the cap should say so at the
+    call site, and giving one of those endpoints a real ceiling later is then a
+    one-argument change here instead of a re-plumb.
+
+    Which one a converting caller wants is a real choice, not a default to
+    inherit: take the cap when the body is a fixed set of control fields (an
+    identifier, a flag, a number), and ``None`` only when the body legitimately
+    carries user content of unbounded size (file contents, an export, a fetched
+    document). Note that switching a site TO the cap also moves it off
+    ``request.json()`` onto the streaming read, so that handler's unit tests
+    must feed ``content``/``content_length`` rather than mocking ``json``.
+
+    *allow_absent* treats a request with no readable body as an empty object,
+    for endpoints whose fields all have defaults. A body that is *present but
+    malformed* is still a 400 -- "the client sent nothing" and "the client sent
+    garbage" are different facts, and only the first one can be defaulted.
+
+    Decoding matches ``request.json()`` on both paths -- ``decode(charset or
+    utf-8)`` then ``loads`` -- so the two differ only in whether the read is
+    bounded, and the declared ``charset=`` is honoured either way. The uncapped
+    path calls ``request.json()`` itself rather than reimplementing it, which is
+    what makes converting a ``try: await request.json()`` site a drop-in: no
+    handler and no test harness sees a different read.
+
+    The catch is narrowed to the three client-input failures -- ``ValueError``
+    (which covers ``json.JSONDecodeError`` and ``UnicodeDecodeError``),
+    ``LookupError`` (an unknown ``charset=`` codec), and ``RecursionError`` (a
+    deeply nested document blowing the parser's stack). Transport failures (a
+    disconnect mid-body, a read timeout) deliberately propagate: they are not a
+    client JSON mistake and keep their 500 status class.
     """
-    if request.content_length and request.content_length > max_bytes:
-        return None, web.json_response(
-            {"error": "payload too large", "code": "payload_too_large"}, status=413
-        )
-    chunks: list[bytes] = []
-    received = 0
-    async for chunk in request.content.iter_chunked(8192):
-        received += len(chunk)
-        if received > max_bytes:
+    if allow_absent and not request.can_read_body:
+        return {}, None
+    if max_bytes is None:
+        try:
+            body = await request.json()
+        except (LookupError, RecursionError, ValueError):
+            return None, web.json_response(
+                {"error": "invalid JSON", "code": "invalid_json"}, status=400
+            )
+    else:
+        if request.content_length and request.content_length > max_bytes:
             return None, web.json_response(
                 {"error": "payload too large", "code": "payload_too_large"}, status=413
             )
-        chunks.append(chunk)
-    try:
-        body = json.loads(b"".join(chunks))
-    except Exception:
-        return None, web.json_response(
-            {"error": "invalid JSON body", "code": "invalid_json"}, status=400
-        )
+        chunks: list[bytes] = []
+        received = 0
+        async for chunk in request.content.iter_chunked(8192):
+            received += len(chunk)
+            if received > max_bytes:
+                return None, web.json_response(
+                    {"error": "payload too large", "code": "payload_too_large"}, status=413
+                )
+            chunks.append(chunk)
+        try:
+            body = json.loads(b"".join(chunks).decode(request.charset or "utf-8"))
+        except (LookupError, RecursionError, ValueError):
+            return None, web.json_response(
+                {"error": "invalid JSON", "code": "invalid_json"}, status=400
+            )
     if not isinstance(body, dict):
         return None, web.json_response(
             {"error": "body must be a JSON object", "code": "body_not_object"}, status=400
@@ -1430,7 +1508,6 @@ def list_skill_tree(skill_root: Path) -> list[dict[str, Any]]:
     real path escapes *skill_root* are omitted.
     """
     out: list[dict[str, Any]] = []
-    skipped = 0
     for dirpath, dirnames, filenames in os.walk(skill_root, followlinks=False):
         # Stable order — reproducible across runs / tests.
         dirnames.sort()
@@ -1447,18 +1524,15 @@ def list_skill_tree(skill_root: Path) -> list[dict[str, Any]]:
         for f in filenames:
             full = Path(dirpath) / f
             if is_sensitive_path(str(full)):
-                skipped += 1
                 continue
             try:
                 if full.is_symlink():
                     real = full.resolve(strict=True)
                     real.relative_to(skill_root.resolve(strict=True))
                     if is_sensitive_path(str(real)):
-                        skipped += 1
                         continue
                 stat = full.stat()
             except (OSError, ValueError):
-                skipped += 1
                 continue
             rel = full.relative_to(skill_root).as_posix()
             out.append({"path": rel, "type": "file", "size": int(stat.st_size)})
@@ -1836,17 +1910,15 @@ async def require_owner_dashboard_request(
     """Owner gate shared across dashboard handler modules.
 
     Returns ``None`` when the caller IS the dashboard owner, allowing the
-    request to proceed.  Otherwise audits the denial via SEL (off-thread so a
-    first-process SEL construction cannot stall the event loop), checks for
-    a stale pre-owner bootstrap subject (relabelling the denial to a 401), and
-    falls back to a 403 with the standard ``owner_only`` code.
+    request to proceed.  Otherwise audits the denial via SEL (an enqueue —
+    the singleton is warmed at startup, see ``sel.warm_sel_singleton``),
+    checks for a stale pre-owner bootstrap subject (relabelling the denial
+    to a 401), and falls back to a 403 with the standard ``owner_only`` code.
 
     Imports ``is_owner_dashboard_request`` and ``stale_owner_session_response``
     inside the function body to avoid a circular import: ``source_providers``
     imports chat-state helpers that reach back into sibling handler modules.
     """
-    import asyncio
-
     from kiro_crew.dashboard.handlers.source_providers import (
         is_owner_dashboard_request,
     )
@@ -1854,21 +1926,20 @@ async def require_owner_dashboard_request(
     if is_owner_dashboard_request(request):
         return None
 
-    # Off the loop: the FIRST sel() of a process CONSTRUCTS the log (trust-dir
-    # creation, key validation — blocking file IO), so on a fresh gateway whose
-    # first mutating request is non-owner this would stall every other request.
+    # SEL is warmed at gateway startup (sel.warm_sel_singleton), so this
+    # ``log_api_access`` only enqueues to the writer thread — no thread hop
+    # needed (#8608). Guarded because a FAILED warm leaves construction to
+    # retry here and possibly raise.
     caller = str(request.get("user") or "unknown")
     try:
         from kiro_crew.sel import sel as _sel
 
-        await asyncio.to_thread(
-            lambda: _sel().log_api_access(
-                caller=caller,
-                operation=operation,
-                outcome="denied",
-                source="dashboard",
-                resources="non_owner_block",
-            )
+        _sel().log_api_access(
+            caller=caller,
+            operation=operation,
+            outcome="denied",
+            source="dashboard",
+            resources="non_owner_block",
         )
     except Exception:  # pragma: no cover - audit must never change the outcome
         logger.debug("SEL audit for non-owner %s failed", operation, exc_info=True)
@@ -1973,31 +2044,16 @@ def _pip_install_channel_available() -> bool:
 
 
 def pip_extra_install_command(extra: str) -> str:
-    r"""The command that installs ``kirocrew[extra]`` into THIS gateway's python.
+    """The command that installs *extra*'s dependencies into THIS gateway's python.
 
-    The interpreter is spelled out rather than left as a bare ``pip`` because
-    "which python" is the failure this string exists to prevent: a gateway run
-    from one venv while the user installs into another leaves the feature
-    missing, and nothing in the UI says the install landed somewhere else. The
-    extra is imported by the gateway process itself, so a system python or a
-    ``--user`` install is not importable here.
+    Thin wrapper over :func:`kiro_crew.extras.pip_install_command`, which owns
+    the two things that make this string correct: it names the extra's real
+    distributions rather than ``kirocrew[extra]`` (this project is not on any
+    index, so that form cannot resolve for anyone), and it spells out the
+    interpreter so the install cannot land in a different environment than the
+    one that has to import it.
 
-    On Windows the user's shell is unknowable here (they may paste this into
-    PowerShell OR cmd), so the form must be SILENT-CORRUPTION-FREE in both, and
-    PowerShell is the harder shell: a double-quoted string still expands
-    ``$name`` and honours backtick escapes, and so does a bare unquoted token —
-    both are legal path characters, so either form silently rewrites an
-    interpreter under e.g. ``C:\tools\$python\...`` into a path that does not
-    exist. Single quotes are PowerShell's LITERAL form (no expansion, no
-    escapes, spaces included), with ``&`` invoking the quoted path, so the
-    interpreter reaches pip byte-for-byte — including the all-users
-    ``C:\Program Files\...`` layout an unquoted form cannot express. cmd performs
-    no ``$`` or backtick processing at all and rejects the leading ``&`` loudly
-    ("... was unexpected"), so a cmd user gets a clear error to re-quote for,
-    never a corrupted install. A literal single quote in the path is escaped by
-    doubling, PowerShell's own rule.
+    Empty for an extra this build does not declare -- callers already treat an
+    empty command as "no install channel" and show the unsupported notice.
     """
-    if os.name == "nt":
-        exe = sys.executable.replace("'", "''")
-        return f"& '{exe}' -m pip install kirocrew[{extra}]"
-    return f"{shlex.quote(sys.executable)} -m pip install 'kirocrew[{extra}]'"
+    return extras.pip_install_command(extra)

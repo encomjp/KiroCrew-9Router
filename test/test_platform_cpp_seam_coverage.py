@@ -28,6 +28,14 @@ individual methods on fields that are otherwise live (today: the unread
 Consumption sites are discovered by **static analysis of the real source tree**
 (``ast``), not from a hand-maintained list — a list would itself rot. See
 :func:`_find_seam_reads`.
+
+The same shape guards the one accessor that opts OUT of the fail-closed contract.
+``context.installed_context()`` answers ``None`` instead of refusing to compose,
+which is safe only where the caller's no-context answer is already the
+conservative one — a property of the CALLER, so the function cannot check it.
+Every call site must appear in ``context.PEEK_CALLERS`` with that reason
+(:class:`TestInstalledContextPeeks`), and an entry whose call site is gone fails
+too, so the map cannot outlive the callers it permits.
 """
 
 from __future__ import annotations
@@ -36,7 +44,7 @@ import ast
 import dataclasses
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 import pytest
 
@@ -45,14 +53,26 @@ from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.platform import (
     RESERVED_METHODS,
     RESERVED_SLOTS,
+    PlatformCompositionError,
     build_default_context,
+    reset_context,
+    set_context,
 )
 from kiro_crew.platform.context import (
     _RESERVED_DEFAULT_ADAPTERS,
     _RESERVED_WARNED,
+    PEEK_CALLERS,
     PlatformContext,
     _reserved_slot_is_default,
 )
+from kiro_crew.platform.governance import (
+    CAPABILITY,
+    SCOPE_CATALOG,
+    parse_policy,
+    parse_profile,
+    resolve,
+)
+from kiro_crew.platform.interfaces import InboundToken, SessionPrincipal
 
 # ── Static-analysis configuration ──
 
@@ -186,6 +206,100 @@ def _find_method_reads(field_names: Set[str]) -> Dict[str, List[str]]:
                     f"{_rel(path)}:{node.lineno}"
                 )
     return method_reads
+
+
+# ── installed_context() peek discovery ──
+#
+# The peek scan differs from the seam scan above in one deliberate way: it does
+# NOT exclude ``platform/``. A seam READ inside the platform package is plumbing,
+# but a peek inside it is a real bypass of the module's own fail-closed contract
+# (``redact_log_via_context`` and ``governance.active_policy_distribution`` are
+# both in there), so excluding the directory would hide two of today's three
+# callers and make the gate pass while permitting exactly what it forbids.
+_PEEK_FUNC = "installed_context"
+
+
+def _peek_scanned_files() -> List[Path]:
+    """Every ``.py`` under ``src/kiro_crew`` except vendored third-party source."""
+    return [
+        path
+        for path in sorted(_SRC_ROOT.rglob("*.py"))
+        if "_vendor" not in path.relative_to(_SRC_ROOT).parts
+    ]
+
+
+def _module_key(path: Path) -> str:
+    """``src/kiro_crew/platform/context.py`` → ``platform/context.py``."""
+    return path.relative_to(_SRC_ROOT).as_posix()
+
+
+def _calls_with_scope(tree: ast.AST) -> Iterator[Tuple[str, ast.Call]]:
+    """Yield ``(enclosing-scope-qualname, Call)`` for every call in *tree*.
+
+    The scope is the dotted chain of enclosing ``def``/``class`` names, so a peek
+    is attributed to the function a reader would name it by. Manual descent rather
+    than ``ast.walk`` because ``walk`` discards the nesting the attribution needs.
+    """
+
+    def _descend(node: ast.AST, scope: Tuple[str, ...]) -> Iterator[Tuple[str, ast.Call]]:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                yield from _descend(child, scope + (child.name,))
+                continue
+            if isinstance(child, ast.Call):
+                yield ".".join(scope), child
+            yield from _descend(child, scope)
+
+    yield from _descend(tree, ())
+
+
+def _is_peek_call(node: ast.Call) -> bool:
+    """True for ``installed_context()`` and ``<module>.installed_context()``."""
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id == _PEEK_FUNC
+    if isinstance(func, ast.Attribute):
+        return func.attr == _PEEK_FUNC
+    return False
+
+
+def _peeks_in_source(source: str, module: str) -> Dict[str, List[str]]:
+    """Map ``"<module>::<function>"`` → ``["<module>:LINE", ...]`` for one file.
+
+    Split out from :func:`_find_installed_context_peeks` so the scanner can be
+    exercised against a synthetic source string — the coherence guard that keeps
+    the gate from passing because it silently found nothing.
+    """
+    peeks: Dict[str, List[str]] = {}
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, UnicodeDecodeError):  # pragma: no cover - defensive
+        return peeks
+    for scope, node in _calls_with_scope(tree):
+        if not _is_peek_call(node):
+            continue
+        peeks.setdefault(f"{module}::{scope or '<module>'}", []).append(f"{module}:{node.lineno}")
+    return peeks
+
+
+def _find_installed_context_peeks() -> Dict[str, List[str]]:
+    """Every ``installed_context()`` call site in the package, keyed by caller."""
+    peeks: Dict[str, List[str]] = {}
+    for path in _peek_scanned_files():
+        try:
+            source = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:  # pragma: no cover - defensive
+            continue
+        if _PEEK_FUNC not in source:  # cheap pre-filter before the parse
+            continue
+        for key, sites in _peeks_in_source(source, _module_key(path)).items():
+            peeks.setdefault(key, []).extend(sites)
+    return peeks
+
+
+@pytest.fixture(scope="module")
+def peek_sites() -> Dict[str, List[str]]:
+    return _find_installed_context_peeks()
 
 
 @pytest.fixture(scope="module")
@@ -405,6 +519,94 @@ class TestReservedMethodCoverage:
                 )
 
 
+# ── The peek gate: installed_context() callers are declared, or the build fails ──
+
+
+class TestInstalledContextPeeks:
+    """``installed_context()`` opts out of the fail-closed contract; its callers
+    must say why that is safe for them, in a map a reviewer sees."""
+
+    def test_scanner_detects_a_synthetic_peek(self) -> None:
+        """Guard against a vacuous gate.
+
+        Both arms below pass trivially if the scanner finds nothing, so pin the
+        two call shapes and the scope attribution against source we control.
+        """
+        found = _peeks_in_source(
+            "\n".join(
+                (
+                    "from kiro_crew.platform.context import installed_context",
+                    "def outer():",
+                    "    return installed_context()",
+                    "class C:",
+                    "    def m(self):",
+                    "        return pc.installed_context()",
+                    "def unrelated():",
+                    "    return current_context()",
+                )
+            ),
+            "synthetic.py",
+        )
+        assert set(found) == {"synthetic.py::outer", "synthetic.py::C.m"}, found
+
+    def test_scanner_finds_the_real_call_sites(self, peek_sites) -> None:
+        """The scan must see the live tree, not an empty one."""
+        assert peek_sites, "peek scanner found no installed_context() call site at all"
+        assert "security.py::_exempt_exact_hosts" in peek_sites, sorted(peek_sites)
+
+    def test_scanner_does_not_count_the_definition(self, peek_sites) -> None:
+        """``def installed_context()`` is not a call — the accessor is not its own
+        caller, and counting it would let the map self-justify."""
+        assert f"platform/context.py::{_PEEK_FUNC}" not in peek_sites
+
+    def test_every_peek_is_declared(self, peek_sites) -> None:
+        """An undeclared peek fails HERE.
+
+        Adding a caller now costs a ``PEEK_CALLERS`` entry stating why ITS
+        no-context answer is the conservative one — the question that decides
+        whether skipping the fail-closed path is safe, and the one a docstring
+        could only ask politely.
+        """
+        undeclared = {key: sites for key, sites in peek_sites.items() if key not in PEEK_CALLERS}
+        assert not undeclared, (
+            f"undeclared installed_context() caller(s): {undeclared}. This accessor "
+            "answers None instead of refusing to compose, so it is safe ONLY where "
+            "the no-context answer is already the conservative one. Add an entry to "
+            "kiro_crew.platform.context.PEEK_CALLERS stating why that holds for this "
+            "caller, or use current_context() and take the fail-closed error."
+        )
+
+    def test_declared_peeks_still_have_a_call_site(self, peek_sites) -> None:
+        """A permission must not outlive the caller it was written for.
+
+        Without this arm a deleted or renamed caller leaves behind an entry that
+        reads as a reviewed decision, and the next author points at it as
+        precedent for a call site nobody examined.
+        """
+        stale = sorted(key for key in PEEK_CALLERS if key not in peek_sites)
+        assert not stale, (
+            f"PEEK_CALLERS entries with no matching call site: {stale}. The caller was "
+            "removed or renamed — delete the entry (or re-key it) so the map keeps "
+            f"describing the real callers. Live sites: {sorted(peek_sites)}"
+        )
+
+    def test_peek_justifications_answer_the_question(self) -> None:
+        """Each reason must actually address the no-context answer, greppably."""
+        for key, reason in PEEK_CALLERS.items():
+            assert "no-context answer" in reason, (
+                f"PEEK_CALLERS[{key!r}] must state what the 'no-context answer' is, "
+                "so the justification addresses the contract it bypasses"
+            )
+            assert len(reason) > 60, f"PEEK_CALLERS[{key!r}] reason is too terse"
+
+    def test_peek_keys_name_real_modules(self) -> None:
+        """A key that names no file could never match a site, in either arm."""
+        missing = sorted(
+            key for key in PEEK_CALLERS if not (_SRC_ROOT / key.split("::", 1)[0]).is_file()
+        )
+        assert not missing, f"PEEK_CALLERS keys naming non-existent module(s): {missing}"
+
+
 # ── The runtime signal: composing into a reserved slot is loud ──
 
 
@@ -560,3 +762,266 @@ class TestReservedDefaultAdapterMap:
         ctx = build_default_context(KiroCrewConfig())
         for field in RESERVED_SLOTS:
             assert _reserved_slot_is_default(field, getattr(ctx, field)) is True
+
+
+# ── Agent identity CPP slot + capabilities.agentcore (public no-ops) ──
+
+_TOKEN_LIKE_STATUS_NEEDLES = (
+    "token",
+    "jwt",
+    "bearer",
+    "authorization",
+    "secret",
+    "password",
+    "credential",
+)
+
+
+def _agentcore_policy_body(
+    *,
+    fail_closed: bool = True,
+    agentcore: Optional[dict] = None,
+) -> dict:
+    body: dict = {
+        "version": 1,
+        "boot": {"fail_closed": fail_closed},
+    }
+    if agentcore is not None:
+        body["capabilities"] = {"agentcore": agentcore}
+    return body
+
+
+class TestAgentIdentitySeam:
+    """Public no-op slot: disabled Default + opt-in catalog row + fail-closed posture."""
+
+    def test_platform_context_has_agent_identity_slot(self) -> None:
+        names = {f.name for f in dataclasses.fields(PlatformContext)}
+        assert "agent_identity" in names
+        ctx = build_default_context(KiroCrewConfig())
+        assert hasattr(ctx, "agent_identity")
+
+    def test_default_agent_identity_is_disabled(self) -> None:
+        ctx = build_default_context(KiroCrewConfig())
+        adapter = ctx.agent_identity
+        assert adapter.enabled() is False
+        assert adapter.workload_identity() is None
+        assert adapter.gateway_mcp_spec() is None
+        status = adapter.status()
+        assert isinstance(status, dict)
+        for key in status:
+            lowered = str(key).lower()
+            assert not any(
+                needle in lowered for needle in _TOKEN_LIKE_STATUS_NEEDLES
+            ), f"agent_identity.status() must not expose token-like key {key!r}"
+
+    def test_bearer_fields_are_omitted_from_repr(self) -> None:
+        principal = SessionPrincipal(
+            surface="dashboard",
+            subject="user-1",
+            session_key="dashboard:main",
+            user_jwt="secret.jwt.token",
+        )
+        inbound = InboundToken(
+            scheme="Bearer",
+            token="secret-inbound",
+            expires_at=0.0,
+            audience="gateway",
+        )
+        assert "secret.jwt.token" not in repr(principal)
+        assert "secret-inbound" not in repr(inbound)
+        assert principal.user_jwt == "secret.jwt.token"
+        assert inbound.token == "secret-inbound"
+
+    def test_agent_identity_capability_is_opt_in(self) -> None:
+        spec = SCOPE_CATALOG["capabilities.agentcore"]
+        assert spec.kind == CAPABILITY
+        assert spec.capability_default is False
+
+    def test_agent_identity_enabled_without_posture_aborts_when_fail_closed(self) -> None:
+        with pytest.raises(PlatformCompositionError, match="posture"):
+            parse_policy(_agentcore_policy_body(agentcore={"enabled": True}))
+
+    def test_agent_identity_enabled_unknown_posture_aborts_when_fail_closed(self) -> None:
+        with pytest.raises(PlatformCompositionError, match="posture"):
+            parse_policy(
+                _agentcore_policy_body(agentcore={"enabled": True, "posture": "federated"})
+            )
+
+    def test_agent_identity_non_boolean_enabled_aborts_when_fail_closed(self) -> None:
+        with pytest.raises(PlatformCompositionError, match="boolean"):
+            parse_policy(
+                _agentcore_policy_body(
+                    agentcore={"enabled": "false", "posture": "workload"},
+                )
+            )
+
+    def test_agent_identity_null_enabled_aborts_when_fail_closed(self) -> None:
+        """A present ``enabled: null`` must not default the row on."""
+        with pytest.raises(PlatformCompositionError, match="boolean"):
+            parse_policy(
+                _agentcore_policy_body(
+                    agentcore={"enabled": None, "posture": "workload"},
+                )
+            )
+
+    def test_agent_identity_non_boolean_enabled_raises_when_not_fail_closed(
+        self,
+    ) -> None:
+        # CapabilityGate.from_dict rejects unconditionally; fail_closed
+        # cannot salvage a stringly-typed enabled into a disabled row.
+        with pytest.raises(PlatformCompositionError, match="boolean"):
+            parse_policy(
+                _agentcore_policy_body(
+                    fail_closed=False,
+                    agentcore={"enabled": "false", "posture": "workload"},
+                )
+            )
+
+    def test_agent_identity_enabled_without_posture_disables_when_not_fail_closed(
+        self,
+    ) -> None:
+        ceiling = parse_policy(
+            _agentcore_policy_body(fail_closed=False, agentcore={"enabled": True})
+        )
+        decision = resolve(ceiling, None, "capabilities.agentcore", "")
+        assert not decision.permitted
+
+    def test_agent_identity_enabled_with_known_posture_parses(self) -> None:
+        for posture in ("workload", "login"):
+            ceiling = parse_policy(
+                _agentcore_policy_body(
+                    agentcore={"enabled": True, "posture": posture},
+                )
+            )
+            decision = resolve(ceiling, None, "capabilities.agentcore", "")
+            assert decision.permitted, f"posture={posture!r} must remain enabled"
+
+    def test_agent_identity_known_posture_is_stored_on_ceiling(self) -> None:
+        from kiro_crew.platform.governance import agentcore_posture
+
+        for posture in ("workload", "login"):
+            ceiling = parse_policy(
+                _agentcore_policy_body(agentcore={"enabled": True, "posture": posture})
+            )
+            assert agentcore_posture(ceiling) == posture
+
+    def test_agent_identity_omitted_capability_has_no_stored_posture(self) -> None:
+        from kiro_crew.platform.governance import agentcore_posture
+
+        ceiling = parse_policy(_agentcore_policy_body())
+        assert agentcore_posture(ceiling) is None
+        assert agentcore_posture(None) is None
+
+    def test_agent_identity_disabled_row_does_not_require_posture(self) -> None:
+        from kiro_crew.platform.governance import agentcore_posture
+
+        ceiling = parse_policy(_agentcore_policy_body(agentcore={"enabled": False}))
+        assert not resolve(ceiling, None, "capabilities.agentcore", "").permitted
+        assert agentcore_posture(ceiling) is None
+
+    def test_agent_identity_fail_closed_disabled_has_no_stored_posture(self) -> None:
+        from kiro_crew.platform.governance import agentcore_posture
+
+        ceiling = parse_policy(
+            _agentcore_policy_body(fail_closed=False, agentcore={"enabled": True})
+        )
+        assert agentcore_posture(ceiling) is None
+
+    def test_agent_identity_profile_enabled_without_posture_parses(self) -> None:
+        """A profile may toggle enabled; posture is policy-only and not required."""
+        from kiro_crew.platform.governance import CapabilityGate
+
+        profile = parse_profile({"name": "host", "capabilities": {"agentcore": {"enabled": True}}})
+        gate = profile.controls["capabilities.agentcore"]
+        assert isinstance(gate, CapabilityGate)
+        assert gate.enabled is True
+
+    def test_agent_identity_profile_non_boolean_enabled_is_rejected(self) -> None:
+        """``enabled: "false"`` must not coerce to a permit through ``bool()``."""
+        with pytest.raises(PlatformCompositionError, match="boolean"):
+            parse_profile({"name": "host", "capabilities": {"agentcore": {"enabled": "false"}}})
+
+    def test_agent_identity_profile_carrying_posture_is_rejected(self) -> None:
+        """Carrying posture on a profile is a silent lie — reject like ScopedMap.posture."""
+        with pytest.raises(PlatformCompositionError, match="posture"):
+            parse_profile(
+                {
+                    "name": "host",
+                    "capabilities": {
+                        "agentcore": {"enabled": True, "posture": "login"},
+                    },
+                }
+            )
+
+    def test_agent_identity_policy_gateway_url_is_stored(self) -> None:
+        from kiro_crew.platform.governance import agentcore_gateway_url
+
+        ceiling = parse_policy(
+            _agentcore_policy_body(
+                agentcore={
+                    "enabled": True,
+                    "posture": "workload",
+                    "gateway_url": "https://gw.example.test/mcp",
+                }
+            )
+        )
+        assert agentcore_gateway_url(ceiling) == "https://gw.example.test/mcp"
+
+    def test_agent_identity_policy_rejects_http_gateway_url(self) -> None:
+        with pytest.raises(PlatformCompositionError, match="https"):
+            parse_policy(
+                _agentcore_policy_body(
+                    agentcore={
+                        "enabled": True,
+                        "posture": "workload",
+                        "gateway_url": "http://insecure.example/mcp",
+                    }
+                )
+            )
+
+    def test_agent_identity_profile_carrying_gateway_url_is_rejected(self) -> None:
+        with pytest.raises(PlatformCompositionError, match="gateway_url"):
+            parse_profile(
+                {
+                    "name": "host",
+                    "capabilities": {
+                        "agentcore": {
+                            "enabled": True,
+                            "gateway_url": "https://gw.example.test/mcp",
+                        },
+                    },
+                }
+            )
+
+    def test_agent_identity_profile_disabled_row_does_not_require_posture(self) -> None:
+        profile = parse_profile({"name": "host", "capabilities": {"agentcore": {"enabled": False}}})
+        gate = profile.controls["capabilities.agentcore"]
+        assert gate.enabled is False
+
+    def test_agent_identity_seam_stays_off_when_capability_is_off(self) -> None:
+        """Adapter-on is not enough: capability off / no posture keeps the seam off."""
+        from kiro_crew.agent import _agent_identity_enabled
+        from kiro_crew.platform.defaults import DefaultAgentIdentityProvider
+
+        class _ForcedOn(DefaultAgentIdentityProvider):
+            def enabled(self) -> bool:
+                return True
+
+        base = build_default_context(KiroCrewConfig())
+        off_ceiling = parse_policy(_agentcore_policy_body(agentcore={"enabled": False}))
+        on_ceiling = parse_policy(
+            _agentcore_policy_body(agentcore={"enabled": True, "posture": "workload"})
+        )
+        try:
+            set_context(dataclasses.replace(base, agent_identity=_ForcedOn(), governance=None))
+            assert _agent_identity_enabled() is False
+            set_context(
+                dataclasses.replace(base, agent_identity=_ForcedOn(), governance=off_ceiling)
+            )
+            assert _agent_identity_enabled() is False
+            set_context(
+                dataclasses.replace(base, agent_identity=_ForcedOn(), governance=on_ceiling)
+            )
+            assert _agent_identity_enabled() is True
+        finally:
+            reset_context()

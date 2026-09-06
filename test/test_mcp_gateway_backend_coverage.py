@@ -38,7 +38,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kiro_crew.mcp_caller import CALLER_META_KEY, CallerContext
+from kiro_crew.mcp_caller import (
+    CALLER_META_KEY,
+    TENANT_META_KEY,
+    CallerContext,
+    tenant_nonce_from_meta,
+)
 from kiro_crew.mcp_gateway import backend as backend_mod
 from kiro_crew.mcp_gateway.backend import (
     HEARTBEAT_PING_ID,
@@ -49,6 +54,7 @@ from kiro_crew.mcp_gateway.backend import (
     BackendGone,
     _inject_caller_meta,
     _inject_client_extensions,
+    _inject_tenant_meta,
     _is_heartbeat_id,
     _mcp_apps_enabled,
     _PendingRequest,
@@ -217,6 +223,66 @@ class TestFrameHelpers:
         assert out["params"]["_meta"]["progressToken"] == 7
         assert out["params"]["name"] == "t"
         assert "_meta" in msg["params"] and CALLER_META_KEY not in msg["params"]["_meta"]
+
+    def test_strip_caller_meta_also_removes_a_forged_TENANT_block(self) -> None:
+        """The nonce decides which namespace an unnamed co-tenant lands in.
+
+        A stub allowed to supply its own would pick a PEER's namespace — #5322's
+        collision chosen instead of accidental — so the nonce is stripped on the
+        same trust boundary as the identity, by the same function, on every
+        forwarded frame.
+        """
+        msg: dict[str, Any] = {
+            "method": "tools/call",
+            "params": {
+                "_meta": {
+                    TENANT_META_KEY: {"schemaVersion": 1, "nonce": "peer-nonce"},
+                    "progressToken": "pt",
+                }
+            },
+        }
+        out = _strip_caller_meta(msg)
+        assert TENANT_META_KEY not in out["params"]["_meta"]
+        assert out["params"]["_meta"]["progressToken"] == "pt"
+        assert TENANT_META_KEY in msg["params"]["_meta"]
+
+    def test_strip_caller_meta_removes_BOTH_blocks_at_once(self) -> None:
+        """One forged block must not shield the other."""
+        msg: dict[str, Any] = {
+            "method": "tools/call",
+            "params": {
+                "_meta": {
+                    CALLER_META_KEY: {"sessionKey": "forged"},
+                    TENANT_META_KEY: {"schemaVersion": 1, "nonce": "forged"},
+                }
+            },
+        }
+        out = _strip_caller_meta(msg)
+        assert "_meta" not in out["params"]
+
+    def test_inject_tenant_meta_carries_the_nonce_without_an_identity(self) -> None:
+        """The shape an UNNAMED co-tenant receives.
+
+        A nonce block and no caller block: the separator arrives, the identity does
+        not, and ``CallerContext.from_meta`` must still find nothing — otherwise a
+        connection name would be laundered into a session identity.
+        """
+        out = _inject_tenant_meta({"method": "tools/call"}, "n0nce")
+        meta = out["params"]["_meta"]
+        assert meta[TENANT_META_KEY]["nonce"] == "n0nce"
+        assert CALLER_META_KEY not in meta
+        assert CallerContext.from_meta(meta) is None
+        assert tenant_nonce_from_meta(meta) == "n0nce"
+
+    def test_inject_tenant_meta_preserves_other_meta(self) -> None:
+        msg: dict[str, Any] = {
+            "method": "tools/call",
+            "params": {"_meta": {"progressToken": 7}, "name": "t"},
+        }
+        out = _inject_tenant_meta(msg, "n0nce")
+        assert out["params"]["_meta"]["progressToken"] == 7
+        assert out["params"]["name"] == "t"
+        assert TENANT_META_KEY not in msg["params"]["_meta"]
 
     def test_is_heartbeat_id_accepts_int_and_string(self) -> None:
         assert _is_heartbeat_id(HEARTBEAT_PING_ID)

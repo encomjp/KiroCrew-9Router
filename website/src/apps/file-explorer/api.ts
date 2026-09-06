@@ -1,11 +1,11 @@
 import { API_BASE } from './constants'
+import { toApiError } from '../../api/apiError'
 import type { TreeEntry, FileMeta, SearchResult } from './types'
 
 async function get<T>(path: string): Promise<T> {
   const r = await fetch(path, { credentials: 'same-origin' })
   if (!r.ok) {
-    const body = await r.text().catch(() => '')
-    throw new Error(body || `HTTP ${r.status}`)
+    throw await toApiError(r)
   }
   return r.json()
 }

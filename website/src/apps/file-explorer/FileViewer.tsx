@@ -1,15 +1,16 @@
-import { FileText, AlertTriangle, FileQuestion, RefreshCw, Download, Copy, ExternalLink, MoreHorizontal, ShieldAlert } from 'lucide-react'
+import { FileText, FileQuestion, RefreshCw, Download, Copy, ExternalLink, FolderOpen, MoreHorizontal, ShieldAlert } from 'lucide-react'
 import { useIsMobile } from '../../hooks/useIsMobile'
 import MarkdownRenderer, { BasePathCtx } from '../../components/MarkdownRenderer'
 import { EmptyState, Skeleton } from '../../components/ui'
+import ErrorNotice from '../../components/ErrorNotice'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '../../components/ui/dropdown-menu'
 import { IMAGE_EXTS, LANG_BY_EXT } from './constants'
 import { extOf, basename, formatBytes, formatTime, isSensitivePath } from './utils'
 import { copyToClipboard } from '../../utils/clipboard'
-import { api } from '../../api/client'
-import { useGatewayPlatform } from '../../hooks/useGatewayPlatform'
+import { revealOrOpen, useRevealFailure, useRevealLabel, useCanOpenFile } from '../../components/FilePathMenu'
+import { useBranding } from '../../hooks/useBranding'
 import type { FileMeta } from './types'
 
 import { i18nT } from '../../i18n/t'
@@ -21,29 +22,6 @@ interface FileViewerProps {
   error: string | null
   onReload: () => void
   onDownload: () => void
-}
-
-/**
- * Select the open file in the host's file manager (Finder, Explorer, or the
- * Linux equivalent), which is what makes the enclosing folder reachable from a
- * path the dashboard only shows as text. The label stays platform-neutral
- * because the endpoint serves all three.
- *
- * A headless host has no file manager, and the backend says so by answering
- * with `copy` rather than an error — `api.revealPath` puts the path on the
- * clipboard in that case, so the alert tells the user why nothing appeared on
- * screen instead of leaving the click looking broken. A refusal (the SEL guard
- * treats the path as sensitive) surfaces the server's own message.
- */
-async function revealFile(filePath: string) {
-  try {
-    const res = await api.revealPath(filePath)
-    if (res?.copy) alert(i18nT('apps.fileExplorer.fileViewer.path_copied_to_clipboard_no_desktop_available'))
-  } catch (err) {
-    // eslint-disable-next-line no-console -- surface reveal failures for diagnostics
-    console.error('revealPath failed', err)
-    alert((err as Error).message)
-  }
 }
 
 function renderViewerBody({ ext, fileMeta, content, openFile }: { ext: string; fileMeta: FileMeta; content: string; openFile: string }) {
@@ -67,28 +45,34 @@ function renderViewerBody({ ext, fileMeta, content, openFile }: { ext: string; f
 export default function FileViewer({ filePath, fileMeta, content, loading, error, onReload, onDownload }: FileViewerProps) {
   const isMobile = useIsMobile()
   // Before the early returns: a hook cannot sit behind a conditional.
-  const gatewayPlatform = useGatewayPlatform()
+  // directLocal gates the Open/Reveal pair — they shell out on the gateway, so a
+  // remote/tunneled browser sees Download only (matching the shared FilePathMenu
+  // and MarkdownPanel's overflow). revealLabel is the shared platform-aware wording.
+  const { directLocal } = useBranding()
+  // Open uses the shared gate (directLocal + non-Windows); the viewer only shows
+  // files, so no kind is passed. Reveal keeps the laxer directLocal-only gate.
+  const canOpen = useCanOpenFile()
+  const revealLabel = useRevealLabel()
+  // A failed open/reveal from the ⋯ menu renders under the viewer bar;
+  // askAgent on — the viewer is read-only.
+  const reveal = useRevealFailure(filePath ?? undefined)
   if (!filePath) {
     return <EmptyState icon={<FileText size={28} />} title={i18nT('apps.fileExplorer.fileViewer.select_a_file_to_view')} subtitle={isMobile ? undefined : i18nT('apps.fileExplorer.fileViewer.tip_ctrl_cmd_f_to_search')} />
   }
   if (loading) return <Skeleton className="h-full w-full" />
   if (error) {
-    return <EmptyState icon={<AlertTriangle size={22} style={{ color: 'var(--danger)' }} />} title={error} />
+    // A read failure, not an empty state: the viewer holds nothing to lose.
+    return (
+      <div className="p-4">
+        <ErrorNotice message={error} askAgent />
+      </div>
+    )
   }
   if (!fileMeta) return null
 
   const ext = extOf(filePath)
   const fileName = basename(filePath)
   const copyPath = () => { copyToClipboard(filePath) }
-  // Name the real application where the platform HAS one — Finder, File
-  // Explorer — and fall back to the generic term for Linux and for a gateway
-  // whose platform we could not read. The platform is the GATEWAY's, not the
-  // browser's: the reveal shells out on the host.
-  const revealLabel = gatewayPlatform === 'darwin'
-    ? i18nT('apps.fileExplorer.fileViewer.open_in_finder')
-    : gatewayPlatform === 'windows'
-      ? i18nT('apps.fileExplorer.fileViewer.open_in_file_explorer')
-      : i18nT('apps.fileExplorer.fileViewer.show_in_file_manager')
 
   return (
     <>
@@ -114,10 +98,23 @@ export default function FileViewer({ filePath, fileMeta, content, loading, error
               <button className="mc-fe-iconbtn" title={i18nT('apps.fileExplorer.fileViewer.more_options')} aria-label={i18nT('apps.fileExplorer.fileViewer.more_options')}><MoreHorizontal size={12} /></button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-[190px]">
-              <DropdownMenuItem onSelect={() => { void revealFile(filePath) }}>
-                <ExternalLink size={13} className="shrink-0 text-muted" />
-                <span>{revealLabel}</span>
-              </DropdownMenuItem>
+              {/* Open uses the shared canOpen gate (directLocal + non-Windows);
+                  Reveal uses directLocal alone. A remote session gets Download
+                  only, so it never sees a "reveal" that would open Finder on a
+                  host it is not looking at. Failures funnel through the shared
+                  i18n path. */}
+              {canOpen && (
+                <DropdownMenuItem onSelect={() => { void revealOrOpen(filePath, 'open', reveal) }}>
+                  <ExternalLink size={13} className="shrink-0 text-muted" />
+                  <span>{i18nT('components.markdownPanel.open_with_default_app')}</span>
+                </DropdownMenuItem>
+              )}
+              {directLocal && (
+                <DropdownMenuItem onSelect={() => { void revealOrOpen(filePath, 'reveal', reveal) }}>
+                  <FolderOpen size={13} className="shrink-0 text-muted" />
+                  <span>{revealLabel}</span>
+                </DropdownMenuItem>
+              )}
               <DropdownMenuItem onSelect={onDownload}>
                 <Download size={13} className="shrink-0 text-muted" />
                 <span>{i18nT('apps.fileExplorer.fileViewer.download')}</span>
@@ -126,6 +123,11 @@ export default function FileViewer({ filePath, fileMeta, content, loading, error
           </DropdownMenu>
         </div>
       </div>
+      {reveal.error && (
+        <div style={{ padding: '6px 12px', borderBottom: '1px solid var(--border)' }}>
+          <ErrorNotice variant="inline" className="whitespace-normal" message={reveal.error} askAgent onDismiss={reveal.clear} testId="file-viewer-reveal-error" />
+        </div>
+      )}
       {isSensitivePath(filePath) && (
         <div style={{ padding: '6px 12px', background: 'color-mix(in srgb, var(--warn) 12%, transparent)', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--warn)' }}>
           <ShieldAlert size={13} /> {i18nT('apps.fileExplorer.fileViewer.sensitive_file_avoid_sharing_your_screen_while_v')}

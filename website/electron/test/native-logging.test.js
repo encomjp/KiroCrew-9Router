@@ -56,16 +56,40 @@ describe("nativeLoggingSwitches", () => {
   // than rejected — so a typo turns logging silently off and this assertion is
   // the only thing standing between that and a shipped no-op.
   it("uses the exact Chromium switch names", () => {
-    assert.deepEqual(nativeLoggingSwitches("/tmp/c.log"), [
+    assert.deepEqual(nativeLoggingSwitches("/tmp/c.log", { KIROCREW_DEBUG: "1" }), [
+      ["enable-logging", "file"],
+      ["log-file", "/tmp/c.log"],
+      // Value-less switch, so the empty string is the whole argument. It makes
+      // performance.memory exact and uncached, which is what the renderer memory
+      // trajectory reads -- without it those values are bucketized and cached for
+      // 20 minutes, and a memory probe reading them returns a plausible constant.
+      ["enable-precise-memory-info", ""],
+    ]);
+  });
+
+  // The bucketization this switch removes is a PRIVACY control, and removing it
+  // applies to every renderer in the process — browser panels showing untrusted
+  // pages included. A normal install must not widen that side channel just to
+  // capture crash logs, so the switch rides the KIROCREW_DEBUG opt-in while the
+  // two logging switches (the reason this module exists) stay unconditional.
+  it("leaves precise memory info OFF without the debug opt-in", () => {
+    assert.deepEqual(nativeLoggingSwitches("/tmp/c.log", {}), [
       ["enable-logging", "file"],
       ["log-file", "/tmp/c.log"],
     ]);
   });
 
+  // Same gate spelling as the profiler: an explicit falsey value is OFF, not
+  // "the variable is set, so on".
+  it("treats an explicit falsey debug value as off", () => {
+    const names = nativeLoggingSwitches("/tmp/c.log", { KIROCREW_DEBUG: "0" }).map(([n]) => n);
+    assert.equal(names.includes("enable-precise-memory-info"), false);
+  });
+
   // `--enable-logging` without `=file` leaves output on stderr, which the GUI
   // launch this module exists to compensate for discards again.
   it("routes to the file sink, not stderr", () => {
-    const [[, value]] = nativeLoggingSwitches("/tmp/c.log");
+    const [[, value]] = nativeLoggingSwitches("/tmp/c.log", {});
     assert.equal(value, "file");
   });
 });
@@ -129,22 +153,37 @@ describe("initNativeLogging", () => {
       appendSwitch: (n, v) => applied.push([n, v]),
       startCrashReporter: (o) => started.push(o),
       log: (m) => lines.push(m),
+      // Explicit rather than inherited: these assertions pin the switch SET, so
+      // they must not depend on whether the runner's own environment happens to
+      // carry KIROCREW_DEBUG.
+      env: { KIROCREW_DEBUG: "1" },
       ...over,
       fs,
     });
     return { applied, started, lines, result, fs };
   }
 
-  it("applies both switches and starts the crash reporter", () => {
+  it("applies every switch and starts the crash reporter", () => {
     const { applied, started, result } = harness();
     assert.deepEqual(applied, [
       ["enable-logging", "file"],
       ["log-file", LIVE],
+      ["enable-precise-memory-info", ""],
     ]);
     assert.equal(started.length, 1);
     assert.equal(result.crashReporter, true);
     assert.equal(result.rotated, true);
     assert.equal(result.previousPath, PREV);
+    assert.deepEqual(result.switches, ["enable-logging", "log-file", "enable-precise-memory-info"]);
+  });
+
+  // The default install: crash logging armed, privacy control intact.
+  it("arms logging without the memory switch when debug is off", () => {
+    const { applied, result } = harness({ env: {} });
+    assert.deepEqual(applied, [
+      ["enable-logging", "file"],
+      ["log-file", LIVE],
+    ]);
     assert.deepEqual(result.switches, ["enable-logging", "log-file"]);
   });
 
@@ -170,7 +209,7 @@ describe("initNativeLogging", () => {
         if (n === "enable-logging") throw new Error("refused");
       },
     });
-    assert.deepEqual(result.switches, ["log-file"]);
+    assert.deepEqual(result.switches, ["log-file", "enable-precise-memory-info"]);
     assert.ok(lines.some((l) => /refused/.test(l)));
   });
 
@@ -181,7 +220,7 @@ describe("initNativeLogging", () => {
       },
     });
     assert.equal(result.crashReporter, false);
-    assert.deepEqual(result.switches, ["enable-logging", "log-file"]);
+    assert.deepEqual(result.switches, ["enable-logging", "log-file", "enable-precise-memory-info"]);
     assert.ok(lines.some((l) => /no dump dir/.test(l)));
   });
 
@@ -189,7 +228,7 @@ describe("initNativeLogging", () => {
     const { result, started } = harness({ startCrashReporter: undefined });
     assert.equal(result.crashReporter, false);
     assert.equal(started.length, 0);
-    assert.deepEqual(result.switches, ["enable-logging", "log-file"]);
+    assert.deepEqual(result.switches, ["enable-logging", "log-file", "enable-precise-memory-info"]);
   });
 
   it("skips rotation when no fs is supplied", () => {
@@ -197,7 +236,7 @@ describe("initNativeLogging", () => {
     assert.equal(result.rotated, false);
     assert.equal(result.blocked, false);
     assert.equal(result.previousPath, null);
-    assert.deepEqual(result.switches, ["enable-logging", "log-file"]);
+    assert.deepEqual(result.switches, ["enable-logging", "log-file", "enable-precise-memory-info"]);
   });
 
   // THE fail-safe. A blocked rotation leaves the un-rotated live log holding the

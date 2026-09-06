@@ -33,7 +33,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from kiro_crew.acp.types import STOP_REASON_COMPACTION_FAILED
 from kiro_crew.executors import run_in_embed_pool
-from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY
+from kiro_crew.hooks import HOOK_REPLY, TOOL_AUTO_APPROVE, TOOL_DENY, event_is_spawn_run
 from kiro_crew.messaging.driver import DirectiveConsumer, TurnDriver
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
@@ -46,6 +46,12 @@ from kiro_crew.messaging.link import (
 from kiro_crew.messaging.renderer import SilentRenderer
 from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
+
+# Imported from the leaf that DEFINES it rather than through kiro_crew.session:
+# this module deliberately types ``sessions`` as ``Any`` to stay off the session
+# package's import graph, and session_allocation imports nothing from messaging,
+# so this direction cannot cycle.
+from kiro_crew.session_allocation import SessionClosingError
 
 logger = logging.getLogger(__name__)
 
@@ -300,15 +306,21 @@ def build_tool_gate(ctx_builder: Any, *, session_key: str, agent: str) -> Callab
     return _tool_gate
 
 
-def build_auto_approve(ctx_builder: Any) -> Callable[[str], bool]:
-    """Preserve the ``auto_approve_subagent_spawn`` hook for ``spawn_run``."""
+def build_auto_approve(ctx_builder: Any) -> Callable[[Any], bool]:
+    """Preserve the ``auto_approve_subagent_spawn`` hook for ``spawn_run``.
 
-    def _auto_approve(title: str) -> bool:
+    The predicate takes the PERMISSION EVENT, not the title: the title is
+    model-authored, so the spawn check keys on ``event_is_spawn_run``'s
+    canonical identity (``tool_name`` from ``_meta.kiro``; without it the
+    rung does not fire and the request falls to the approval ladder).
+    """
+
+    def _auto_approve(event: Any) -> bool:
         return bool(
             ctx_builder
             and ctx_builder.hooks
             and ctx_builder.hooks.auto_approve_subagent_spawn
-            and title == "spawn_run"
+            and event_is_spawn_run(event)
         )
 
     return _auto_approve
@@ -630,6 +642,7 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             directive_consumer=turn.directive_consumer,
             audit_session_key=session_key,
             audit_agent=turn.agent or "kirocrew",
+            closing_gate=lambda: sessions.begin_turn(session_key),
         )
         accumulated = await driver.run(full_message)
 
@@ -707,6 +720,22 @@ async def drive_turn(turn: ChannelTurn, *, sessions: Any, ctx_builder: Any) -> N
             )
         except Exception:
             logger.debug("%s: success audit failed", turn.channel_type, exc_info=True)
+    except SessionClosingError:
+        # The gateway began shutting down between the claim and the dispatch, so
+        # this turn never opened. Terminal for the message, but NOT a fault of
+        # the session — which is why it is caught ahead of the generic handler
+        # below and deliberately skips `record_failure`: charging a restart to
+        # the circuit breaker would count toward tripping a reset on a session
+        # that never misbehaved, and `logger.exception` would file a routine
+        # shutdown as an error with a full traceback.
+        #
+        # The `finally` still runs, so the renderer is finalized (the user gets
+        # this channel's notice rather than silence) and the lease is released.
+        logger.info(
+            "%s: aborting dispatch for %s — gateway is shutting down",
+            turn.channel_type,
+            session_key,
+        )
     except Exception:
         logger.exception("%s transport_dispatch: error handling message", turn.channel_type)
         if _acquired:

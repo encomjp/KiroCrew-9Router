@@ -10,6 +10,7 @@
 // route moves), and query strings go through `URLSearchParams` rather than
 // string templates, so an id containing `&` or `#` cannot smuggle a parameter.
 
+import { toApiError } from '../../api/apiError'
 import type {
   AddProjectResponse, ChatSlotResponse, DeleteCommentResponse,
   DetectDevServerResponse, DevServerStartResponse, HealthResponse, HistoryResponse,
@@ -19,8 +20,7 @@ import type {
 
 async function parse<T>(r: Response): Promise<T> {
   if (!r.ok) {
-    const body = await r.text().catch(() => '')
-    throw new Error(body || `HTTP ${r.status}`)
+    throw await toApiError(r)
   }
   const text = await r.text()
   return (text ? JSON.parse(text) : null) as T
@@ -230,7 +230,7 @@ async function chatApi<T = unknown>(url: string, method: string, body?: unknown)
     headers: body ? { 'Content-Type': 'application/json' } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   })
-  if (!r.ok) throw new Error(`chat API ${r.status}`)
+  if (!r.ok) throw await toApiError(r)
   const t = await r.text()
   // POST /api/chat answers with an SSE STREAM unless ?ws=1 is set, so the body can
   // legitimately be `data: {...}` rather than JSON. Parsing that threw, and the

@@ -23,6 +23,7 @@ import contextlib
 import inspect
 import json
 import os
+import pkgutil
 import re
 import sys
 import textwrap
@@ -36,7 +37,14 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from kiro_crew.apps.builtins.spec_builder.backend import routes
+from kiro_crew.apps.builtins.spec_builder import backend as backend_package
+from kiro_crew.apps.builtins.spec_builder.backend.handlers import _ClientClaim
+from kiro_crew.apps.builtins.spec_builder.tests.routes_facade import (
+    BACKEND_MODULES,
+    backend_namespace,
+    routes,
+    routes_source,
+)
 
 _BASE = "/api/apps/spec-builder"
 _REAL_DECISIONS_PATH: Path | None = None
@@ -55,6 +63,21 @@ _SERIALIZED_EFFECTS = (
     "authorize_and_add_nudge(",  # arms an autonomous timer that will dispatch later
     "_dispatch_turn(",  # starts a turn now
 )
+
+
+def test_route_facade_covers_every_backend_module() -> None:
+    """Keep aggregate source guards complete when the backend gains a module."""
+    discovered = {
+        info.name
+        for info in pkgutil.walk_packages(
+            backend_package.__path__,
+            prefix=f"{backend_package.__name__}.",
+        )
+    }
+    listed = {module.__name__ for module in BACKEND_MODULES}
+    assert (
+        listed == discovered
+    ), f"missing={sorted(discovered - listed)}, extra={sorted(listed - discovered)}"
 
 
 # ── HTTP harness ─────────────────────────────────────────────────────────────
@@ -724,7 +747,7 @@ def test_security_helper_is_imported_at_module_scope():
     the top-level-imports rule. It is now module scope with a fail-closed
     fallback if the security module is unavailable."""
 
-    src = inspect.getsource(routes)
+    src = routes_source()
     assert "    from kiro_crew.security import is_sensitive_path" not in src
     assert callable(routes.is_sensitive_path)
 
@@ -791,7 +814,7 @@ def test_app_never_grants_worker_trust():
     mechanism, where it is auditable as their choice.
     """
 
-    src = inspect.getsource(routes)
+    src = routes_source()
     assert "slot._trust = True" not in src
     # And no revive-by-another-name.
     assert "_trust = True" not in src
@@ -802,7 +825,7 @@ def test_no_poll_dependent_ttl_machinery_remains():
     a browser tab is open is not enforcement, and keeping it would imply a bound
     that does not hold."""
 
-    src = inspect.getsource(routes)
+    src = routes_source()
     for gone in ("_enforce_trust_ttl", "_mark_trust_granted", "_TRUST_TTL_SECS"):
         assert gone not in src, f"{gone} still referenced"
 
@@ -1873,7 +1896,7 @@ def test_no_handler_writes_the_index_from_a_stale_snapshot():
     sanctioned writers are the re-reading mutator, startup recovery, and the
     discovery loader."""
 
-    src = inspect.getsource(routes)
+    src = routes_source()
     writers = [
         ln.strip()
         for ln in src.splitlines()
@@ -2182,7 +2205,7 @@ def test_gateway_helpers_are_imported_at_module_scope():
     stay deferred, because dashboard.server imports THIS module (documented
     circular-import exception)."""
 
-    tree = ast.parse(inspect.getsource(routes))
+    tree = ast.parse(routes_source())
     local_imports: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2666,7 +2689,7 @@ def test_every_slot_acquisition_goes_through_the_scoping_chokepoint():
     """Source guard: no handler may call get_or_create_slot directly, or a future
     endpoint reintroduces an unscoped slot."""
 
-    src = inspect.getsource(routes)
+    src = routes_source()
     sites = [
         ln.strip()
         for ln in src.splitlines()
@@ -2695,7 +2718,7 @@ def test_no_handler_reads_the_index_on_the_event_loop():
     Handlers read through _aload_index; the sync primitive stays for the
     transaction helpers, which already run on a worker thread."""
 
-    module_src = inspect.getsource(routes)
+    module_src = routes_source()
     tree = ast.parse(module_src)
     offenders: list[str] = []
     # Only the off-loop helpers may call the sync reader. Iterate TOP-LEVEL
@@ -3272,7 +3295,7 @@ def test_no_async_function_touches_the_filesystem_inline():
     write directly — every one must sit in a helper marked BLOCKING and be
     invoked through asyncio.to_thread."""
 
-    tree = ast.parse(inspect.getsource(routes))
+    tree = ast.parse(routes_source())
     fs_attrs = {
         "exists",
         "is_dir",
@@ -4175,7 +4198,7 @@ async def test_pause_refuses_an_unscoped_slot():
 def test_every_ownership_check_is_exact():
     """Source guard for the class: no ownership comparison may treat an unscoped
     slot as ours."""
-    src = inspect.getsource(routes)
+    src = routes_source()
     for line in src.splitlines():
         stripped = line.strip()
         if "_app" not in stripped or stripped.startswith("#"):
@@ -4874,7 +4897,7 @@ def test_opt_in_flags_require_a_real_boolean():
     assert routes._opted_in({}, "import_existing") is False
 
     # Source guard: no handler may go back to coercing these flags with bool().
-    src = inspect.getsource(routes)
+    src = routes_source()
     for field in ("use_worktree", "import_existing"):
         assert f'bool(body.get("{field}"))' not in src, f"{field} is coerced with bool() again"
 
@@ -5478,7 +5501,7 @@ def test_both_sentinel_helpers_pin_the_directory():
         assert "O_DIRECTORY" in src and "dir_fd" in src, fn.__name__
     # The probe spans several lines, so slice to the closing paren of the
     # expression rather than the first ")" inside it.
-    src = inspect.getsource(routes)
+    src = routes_source()
     probe = src.split("_CAN_PIN_DIR = ", 1)[1].split("\n)", 1)[0]
     for op in ("os.open", "os.unlink", "os.rename"):
         assert op in probe, f"{op} is not covered by the pin capability probe"
@@ -5497,7 +5520,7 @@ def test_redirect_state_covers_every_path_the_app_writes():
     """
     written = {
         n
-        for n, v in vars(routes).items()
+        for n, v in backend_namespace().items()
         if n.endswith("_PATH") and isinstance(v, Path) and n != "SPEC_STATE_PATH"
     }
     redirected = set(
@@ -5574,7 +5597,7 @@ def test_slot_key_is_the_deciding_identity(tmp_path, monkeypatch):
 async def test_client_claim_reads_body_and_query(tmp_path, monkeypatch):
     """Both fields travel in the body for POSTs and the query string for DELETE."""
     client = _make_client(monkeypatch, tmp_path)
-    seen: list[routes._ClientClaim] = []
+    seen: list[_ClientClaim] = []
 
     async def _probe(request):
         seen.append(await routes._client_claim(request))
@@ -6170,7 +6193,7 @@ def test_every_error_response_carries_a_machine_readable_code():
     the contract and the prose is advisory. This app-local guard keeps the file at
     zero rather than relying on the repo-wide ratchet, which only fails when the
     per-file count grows."""
-    src = Path(routes.__file__).read_text(encoding="utf-8")
+    src = routes_source()
     tree = ast.parse(src)
     offenders: list[str] = []
     codes: set[str] = set()
@@ -6964,7 +6987,7 @@ def test_git_kills_the_process_on_every_exceptional_exit():
     """Source guard: the teardown is wired into the arm that re-raises, so a future
     exception class added to _git cannot silently reintroduce the orphan. Asserts on
     the CALL, not on a comment."""
-    tree = ast.parse(inspect.getsource(routes))
+    tree = ast.parse(routes_source())
     target = next(
         node
         for node in ast.walk(tree)
@@ -7822,7 +7845,7 @@ def test_no_index_mutation_is_pinned_on_the_directory_alone():
     """Class guard. Every _touch_spec call that pins spec_dir must also pin
     slot_key -- the two are one identity, and rounds 62 and 68 were both a
     caller passing only half of it."""
-    src = inspect.getsource(routes)
+    src = routes_source()
     for match in re.finditer(r"_touch_spec\(", src):
         depth, i = 0, match.end() - 1
         while i < len(src):
@@ -7926,9 +7949,7 @@ def test_no_index_write_path_admits_on_the_grammar_alone():
     _valid_name caller: its name always comes from an already-admitted index
     key, so the predicates agree there.
     """
-    import inspect
-
-    src = inspect.getsource(routes)
+    src = routes_source()
     allowed = {"_owns_slot_key", "_usable_name"}
     offenders = []
     for match in re.finditer(r"^(?:async )?def (\w+)\(", src, re.M):
@@ -8139,15 +8160,13 @@ def test_queued_append_is_redacted_before_it_is_broadcast(monkeypatch):
 
 def test_no_broadcast_eligible_append_passes_raw_caller_text():
     """Class guard: every slot.append whose role is NOT in the host's skip set
-    must route its content through _redact.
+    must route its content through the app's scrubber.
 
     The `user` append is deliberately exempt -- `user` IS skipped, and the host's
     own send path stores raw for the same reason (the author is the only reader;
     redaction happens at the emit sites).
     """
-    import inspect
-
-    src = inspect.getsource(routes)
+    src = routes_source()
     tree = ast.parse(src)
     offenders = []
     for node in ast.walk(tree):
@@ -8164,16 +8183,16 @@ def test_no_broadcast_eligible_append_passes_raw_caller_text():
         if role in _NON_BROADCAST_ROLES:
             continue
         arg = node.args[1]
-        redacted = (
+        scrubbed = (
             isinstance(arg, ast.Call)
             and isinstance(arg.func, ast.Name)
             and arg.func.id == "_redact"
         )
-        if not redacted:
+        if not scrubbed:
             offenders.append(f"{role} at line {node.lineno}")
     assert not offenders, (
         "these appends are broadcast to every dashboard client but pass content "
-        f"that did not go through _redact: {offenders}"
+        f"that did not go through the app scrubber: {offenders}"
     )
 
 
@@ -8219,9 +8238,7 @@ def test_every_handler_that_returns_settings_redacts_it():
     path. So the rule is: a handler that reads settings AND returns a response must
     redact. Asserts on the calls, not on a comment.
     """
-    import inspect
-
-    src = inspect.getsource(routes)
+    src = routes_source()
     tree = ast.parse(src)
     offenders = []
     for node in tree.body:
@@ -8237,7 +8254,7 @@ def test_every_handler_that_returns_settings_redacts_it():
         if "_redact(" not in body_src:
             offenders.append(node.name)
     assert not offenders, (
-        "these handlers return agent-writable settings without _redact, so a "
+        "these handlers return agent-writable settings without the app scrubber, so a "
         f"credential in the file reaches the dashboard raw: {offenders}"
     )
 
@@ -12107,7 +12124,7 @@ def test_the_decision_ledger_is_not_in_the_agent_writable_index():
     field on it could be erased to re-open a settled decision or forged to lock one
     the user never answered -- and a forged entry also puts an answer on screen
     that nobody chose."""
-    src = inspect.getsource(routes)
+    src = routes_source()
     assert (
         "answered_decisions" not in src
     ), "the ledger is back on an index entry, where the agent can rewrite it"
@@ -16395,7 +16412,7 @@ def test_no_path_evicts_a_turn_lock():
     global rather than per-handler -- a future cleanup that reintroduces it here
     would silently reopen concurrent turns.
     """
-    src = inspect.getsource(routes)
+    src = routes_source()
     assert "_TURN_LOCKS.pop(" not in src, "a turn lock is evicted somewhere"
     assert "del _TURN_LOCKS[" not in src, "a turn lock is deleted somewhere"
     assert "_TURN_LOCKS.clear()" not in src, "the turn lock registry is cleared somewhere"

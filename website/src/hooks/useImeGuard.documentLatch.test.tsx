@@ -103,4 +103,38 @@ describe('useDocumentImeLatch', () => {
     expect(latch().claimKey(clear)).toBe(true)
     expect(clear.defaultPrevented).toBe(false)
   })
+
+  /*
+   * `claimSyntheticKey` is the claim for a React `onKeyDown` on the dialog
+   * panel. A synthetic handler used to reach `claimKey(e.nativeEvent)` and
+   * then remember `e.stopPropagation()` itself, because the native call
+   * cannot set React's own propagation flag — four sites carried that pair by
+   * hand and each was a place one half could be dropped (#5542). These pin
+   * that the one call now owns both.
+   */
+  it('claimSyntheticKey stops the SYNTHETIC propagation flag too when it declines', () => {
+    const { latch, field } = mount()
+    fireEvent.compositionStart(field)
+    fireEvent.compositionEnd(field)
+    const native = new KeyboardEvent('keydown', { key: 'Tab', cancelable: true, bubbles: true })
+    let syntheticStopped = false
+    const synthetic = { nativeEvent: native, stopPropagation: () => { syntheticStopped = true } }
+    expect(latch().claimSyntheticKey(synthetic as unknown as React.KeyboardEvent)).toBe(false)
+    // Both halves: the native event is consumed AND React's flag is stopped.
+    expect(native.defaultPrevented).toBe(true)
+    expect(syntheticStopped).toBe(true)
+  })
+
+  it('claimSyntheticKey leaves an accepted key entirely alone', () => {
+    // An accepted key's default belongs to the caller — a boundary-Tab site
+    // consumes only the wrap it owns — and nothing is stopped, or a dialog
+    // that dismisses on an ancestor listener would stop dismissing.
+    const { latch } = mount()
+    const native = new KeyboardEvent('keydown', { key: 'Tab', cancelable: true, bubbles: true })
+    let syntheticStopped = false
+    const synthetic = { nativeEvent: native, stopPropagation: () => { syntheticStopped = true } }
+    expect(latch().claimSyntheticKey(synthetic as unknown as React.KeyboardEvent)).toBe(true)
+    expect(native.defaultPrevented).toBe(false)
+    expect(syntheticStopped).toBe(false)
+  })
 })

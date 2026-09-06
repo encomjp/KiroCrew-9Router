@@ -1,13 +1,41 @@
-# KiroCrew Backend AutoSDE Rules
+# Kiro Crew AutoSDE Rules
 #
-# Backend (Python) counterpart to website/AUTOSDE.yaml (React/TypeScript
-# frontend rules). Rules here govern the Python package under src/kiro_crew/.
-# Both files are enforced by the Claude and Codex PR reviewers.
+# Root rules cover backend Python plus cross-stack invariants whose file patterns
+# span backend, frontend, and docs. Frontend-only rules live in
+# website/AUTOSDE.yaml. Both files are enforced by the Claude and Codex PR
+# reviewers.
 #
 # De-Amazoned from the internal package rule set (internal links removed).
 # Blocking rules are backed by real vulnerabilities/incidents in this codebase.
 
 custom-rules:
+  - id: feature-map-correctness
+    blocking: true
+    file-patterns:
+      - "docs/feature-map/README.md"
+      - "website/src/pages/**"
+      - "src/kiro_crew/dashboard/handlers/**"
+      - "website/src/App.tsx"
+    rule: |
+      Keep the feature map semantically aligned with every structural dashboard
+      change in the pull request. The mechanical gate proves only that the map
+      was touched; this rule judges whether that edit is true.
+
+      - For every dashboard page or backend handler added or deleted in the
+        diff, and every `<Route>` registration added or removed in
+        `website/src/App.tsx`, require the corresponding map row to be added,
+        removed, or updated. A new feature needs a new or updated row; a removed
+        feature needs its row removed or updated.
+      - Verify every changed map row against the code in the diff. Its user
+        navigation path, frontend page, backend handler, and representative
+        endpoints must exist and identify the feature's real ownership.
+      - Reject unrelated map churn. A whitespace-only, reflow-only, or cosmetic
+        map edit beside a real structural change is a token touch made only to
+        satisfy `scripts/check_feature_map.py`, not evidence the map was reviewed.
+      - The map's net additions, removals, and row edits must match the scope the
+        pull request claims. Do not accept rows for unrelated features or omit
+        a structural feature because the map file changed somewhere else.
+
   - id: backend-security-controls
     blocking: true
     file-patterns:
@@ -238,7 +266,9 @@ custom-rules:
         host service mutation, pins KIROCREW_HOME per test (with
         `config.paths._resolved_home` reset, since resolving the home CREATES it
         and can run the legacy migration), pins the import-time `~/.kiro`
-        bindings via `_isolate_shared_kiro_paths`, pins the SEL default dir
+        bindings via `_isolate_shared_kiro_paths`, scrubs the inherited
+        shell-preload and exported-function variables `name_grant` refuses on
+        (`BASH_ENV`/`ENV`/..., `BASH_FUNC_*`), pins the SEL default dir
         session-wide, redirects `tempfile`'s base with residue reported, and
         fails the run on residue at the repository root.
       - `test/conftest.py` adds ~20 MORE autouse fixtures, and it applies ONLY to
@@ -382,7 +412,7 @@ custom-rules:
     rule: |
       CHANGELOG.md is written ONLY when a version is bumped, and released
       history in it is immutable. The spec for the section itself is
-      AGENTS.md -> "Release Changelog".
+      docs/build/changelog.md.
 
       This rule exists because the file has already been destroyed once: a
       docs commit on a release branch replaced CHANGELOG.md instead of
@@ -415,7 +445,8 @@ custom-rules:
         (see commit log)". That is not a changelog entry; it is the thing a
         changelog entry exists to replace, and nobody reads it. A curated
         `### Notable fixes` list of individually-named user-observable outcomes
-        is NOT a dump and is allowed — see AGENTS.md for the line between them.
+        is NOT a dump and is allowed — see docs/build/changelog.md for the line
+        between them.
       - FLAG a heading that is not a plain release: `## [0.3.0-insider.9]`,
         `## [0.3.0-rc.2]` and similar prerelease spellings must not appear.
         A prerelease is a draft of its base version and is folded onto it by
@@ -425,10 +456,70 @@ custom-rules:
         its section once, under the release's final heading.
 
       Allowed (do NOT flag):
-      - A release PR that prepends one new `## [X.Y.Z] — YYYY-MM-DD` section
+      - A release PR that prepends one new `## [X.Y.Z] - YYYY-MM-DD` section
         and, in the same commit, bumps src/kiro_crew/__init__.py.
       - Correcting a genuine factual error inside an already-shipped section,
         when the PR body says that is what it is doing. Say it out loud; an
         unexplained edit to shipped history is the defect this rule exists for.
       - Porting an already-written section verbatim between main and a release
         branch, where the diff adds a section and removes nothing.
+
+  - id: recurring-defect-patterns
+    blocking: false
+    file-patterns:
+      - "src/kiro_crew/**/*.py"
+    rule: |
+      Defect patterns harvested from this repository's own fix history (each
+      appeared as a SERIES of shipped bugs, not a one-off). Flag a changed
+      line that re-introduces one of these classes as an advisory FINDING:
+
+      - A user-supplied or config-sourced STRING used directly in a boolean
+        context, especially for a security-relevant toggle: `bool("false")`
+        is True, so `if config.get("dangerously_skip_permissions"):` passes
+        for the string "false". Require an explicit typed comparison or a
+        real bool before the branch.
+      - A docstring or comment that CONTRADICTS the code below it (an
+        allowlist entry the docstring names but the code omits, a comment
+        saying "denies by default" above a loader that permits). Either the
+        prose or the code is wrong; both shipped as bugs here. Flag the
+        contradiction itself — do not guess which side is intended.
+      - A documented allowlist/denylist whose entries have no round-trip
+        assertion: when a diff adds or edits such a list alongside prose
+        (docstring, spec, comment) enumerating its members, expect a test
+        asserting each documented member is actually in the list.
+
+      This rule is maintained by the pattern-harvest loop (fix PRs propose
+      candidates in their "Pattern harvest" section; accepted ones land
+      here or in semgrep/). Sentinel-return misuse (str.find/rfind -1 in a
+      boolean context) is deliberately NOT listed: semgrep owns it
+      (semgrep/find-sentinel-truthiness.yaml).
+
+  - id: no-new-builtin-apps
+    blocking: true
+    file-patterns:
+      - "src/kiro_crew/apps/builtins/**"
+    rule: |
+      The set of built-in apps is CLOSED. A new app ships as an EXTERNAL app
+      published through the KiroCrewApps registry (what the App Store's
+      Discover page lists), never as a new built-in in this repo. A built-in
+      rides the wheel: it grows every user's install footprint, cannot be
+      uninstalled (only disabled), and couples the app's release and fix
+      cadence to Kiro Crew releases — the registry exists precisely so an app
+      can be listed, updated, and corrected with a catalog publish instead of
+      a client ship.
+
+      - FLAG any PR that adds a new app directory under
+        src/kiro_crew/apps/builtins/ (a new app.json). The publishing path is
+        the KiroCrewApps registry; point the author there. An explicit
+        maintainer decision recorded on the PR (the /ai-review override flow)
+        is the only exception — the default is closed.
+      - FLAG restoring a withdrawn built-in (the Board app) or un-hiding the
+        Channels app from the App Store (flipping "hidden": true in
+        src/kiro_crew/apps/builtins/channels/app.json). Both are deliberate
+        fork divergences an upstream sync must not undo.
+
+      Allowed (do NOT flag):
+      - Changes inside an EXISTING built-in app directory: fixes, features,
+        tests, i18n, refactors.
+      - Deleting an existing built-in, or moving one OUT of the repo to the
+        registry — that is the direction this rule pushes.

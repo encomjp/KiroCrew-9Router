@@ -26,6 +26,7 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -48,6 +49,11 @@ from kiro_crew.agent_files import KNOWLEDGE_AGENT_FILENAME as _KNOWLEDGE_AGENT_F
 from kiro_crew.agent_files import LITE_AGENT_FILENAME as _LITE_AGENT_FILENAME
 from kiro_crew.agent_files import (
     OWNED_KIRO_AGENT_FILES,
+)
+from kiro_crew.agent_files import (
+    PIPELINE_CONDUCTOR_AGENT_FILENAME as _PIPELINE_CONDUCTOR_AGENT_FILENAME,
+)
+from kiro_crew.agent_files import (
     REQUIRED_KIRO_AGENT_FILES,
 )
 from kiro_crew.agent_files import RESEARCH_AGENT_FILENAME as _RESEARCH_AGENT_FILENAME
@@ -69,19 +75,29 @@ from kiro_crew.env import (
     describe_search_path,
     emit_env,
     mcp_search_path,
+    sanitize_spec_env,
     spec_path_key,
 )
 from kiro_crew.mcp_cleanup import purge_deleted_proxy_from_config
-from kiro_crew.mcp_provenance import without_marker
+from kiro_crew.mcp_provenance import (
+    DERIVED_KEY,
+    command_is_ours,
+    record_derived,
+    recorded_source,
+    source_view,
+    without_marker,
+)
 from kiro_crew.mcp_utils import kiro_oauth_wire_entry, mcp_server_alias
 from kiro_crew.platform import current_context
 from kiro_crew.platform import redact_via_context as redact
 from kiro_crew.platform import safe_context_call
 from kiro_crew.platform.governance import (
     CU_MCP_SERVER,
+    agentcore_posture,
     may_skip_gate_now,
     strip_ungoverned_auto_approve,
 )
+from kiro_crew.platform.governance_profiles import governance_permits
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import (  # circular import: sel imports config which imports agent
     SecurityEvent,
@@ -90,6 +106,62 @@ from kiro_crew.sel import (  # circular import: sel imports config which imports
 from kiro_crew.validation import _AGENT_NAME_RE
 
 logger = logging.getLogger(__name__)
+
+
+def _agentcore_capability_permitted() -> bool:
+    """Whether the governance ceiling permits ``capabilities.agentcore``.
+
+    Independent of the CPP adapter. An omitted capability is ungoverned
+    (permitted); a transient lookup degrades to False. Used by the
+    three-conjunct identity probe (adapter AND this AND known posture).
+    """
+    return bool(
+        safe_context_call(
+            lambda: getattr(
+                governance_permits(
+                    "capabilities.agentcore",
+                    "",
+                    fail_closed=True,
+                    log_warning=False,
+                ),
+                "permitted",
+                False,
+            ),
+            fallback=False,
+            log_message="agentcore governance lookup failed; treating as disabled",
+        )
+    )
+
+
+def _agent_identity_enabled() -> bool:
+    """Whether the composed agent-identity seam is on.
+
+    True only when the adapter is on AND governance permits
+    ``capabilities.agentcore`` AND the ceiling stores a known posture.
+    Standalone Default returns False without consulting governance, so
+    Gateway/token work stays off. An omitted capability is ungoverned
+    (permitted), so the known-posture conjunct is what keeps a forced-on
+    adapter off when no row is present. A transient adapter/governance
+    error degrades to False (never to enabled) via ``safe_context_call``.
+    """
+    adapter_on = bool(
+        safe_context_call(
+            lambda: current_context().agent_identity.enabled(),
+            fallback=False,
+            log_message="agent_identity.enabled lookup failed; treating as disabled",
+        )
+    )
+    if not adapter_on:
+        return False
+    if not _agentcore_capability_permitted():
+        return False
+    return bool(
+        safe_context_call(
+            lambda: agentcore_posture(current_context().governance) is not None,
+            fallback=False,
+            log_message="agentcore posture lookup failed; treating as disabled",
+        )
+    )
 
 
 def _atomic_json_write(path: Path, data: dict) -> None:
@@ -216,8 +288,10 @@ _BACKGROUND_CC_MODEL = "claude-sonnet-4.6"
 def _background_agent_model() -> str:
     """Kiro-spec model for background worker agents (lite / heartbeat).
 
-    Resolves ``agent.role_models['background']`` -> ``agent.model`` -> ``"auto"``
-    (see :meth:`AgentConfig.resolve_model`). Defaults to ``"auto"`` — which the
+    Resolves ``agent.role_models['background']`` -> ``"auto"``, deliberately NOT
+    inheriting ``agent.model`` (see :meth:`AgentConfig.resolve_model`), so a user's
+    chat model never silently becomes the price of every background task.
+    Defaults to ``"auto"`` — which the
     provider resolves server-side against the account's entitlement — so a
     background agent stays usable on every subscription tier unless an operator
     deliberately pins a (cheaper) model. Never raises: a config hiccup falls
@@ -587,6 +661,10 @@ def _managed_mcp_env() -> dict[str, str]:
 
     Returns ``{}`` on a default install, which keeps the emitted spec
     byte-for-byte what it is today (``_prune_empty`` drops an empty ``env``).
+    That is safe only because a default-install child DERIVES the same home the
+    gateway did, from an inherited ``HOME``. Preserving a user's ``env`` puts
+    that inheritance in reach of a config, so the companion control lives in
+    ``_enforce_managed_mcp_ownership``: see ``_HOME_DERIVING_ENV_KEYS``.
     """
     override = _valid_override_home()
     return {"KIROCREW_HOME": str(override)} if override else {}
@@ -596,6 +674,133 @@ def _managed_mcp_env() -> dict[str, str]:
 # NOT a transport: a `registry` entry is a POINTER into the admin's catalog,
 # carrying only env/headers/timeout overrides, and its command/url are ignored.
 _MCP_REGISTRY_TYPE = "registry"
+
+# Every key a managed MCP server's entry may carry. Derived from kiro-cli's
+# documented local-server schema rather than assembled by hand, so it can be
+# reviewed against an external source instead of against someone's memory:
+# docs/reference/kiro-cli/mcp/configuration.md lists command, args, env,
+# disabled, autoApprove and disabledTools for a local (stdio) server, and
+# url/headers for a REMOTE one. The remote pair is deliberately absent -- these
+# servers are stdio-only, a leftover ``url`` would shadow the command, and older
+# builds left both behind -- so they are dropped by the rule below rather than by
+# name. ``timeout`` is the one addition: not in that table, but emitted by base
+# and one of the customizations #3594 is about, so dropping it would re-introduce
+# the very bug this fixes.
+#
+# ``type`` is here, and only the ``registry`` VALUE is ours. A transport hint the
+# user wrote (``"type": "stdio"``) is theirs and kiro-cli tolerates it, which
+# ``test_refresh_preserves_a_user_transport_hint`` pins deliberately -- so this
+# key is carried and the registry marker is re-derived from the signed-in account
+# below, rather than the whole key being treated as ours.
+#
+# Of the rest, three are OURS and are set on each pass (``command``, ``args``,
+# ``autoApprove``); the other four are the customizations a user may declare and
+# this fix exists to preserve. ``disabledTools`` is a user GUARD, not a
+# preference: dropping it would silently re-expose tools the user turned off,
+# which is why it is carried rather than re-derived (the custom-server PUT
+# endpoint round-trips it for the same reason).
+_MANAGED_MCP_ENTRY_KEYS: frozenset[str] = frozenset(
+    {"command", "args", "type", "autoApprove", "timeout", "env", "disabled", "disabledTools"}
+)
+
+# The type each USER-AUTHORED key must have, from the same schema table as the set
+# above. A right key with a wrong-typed value is rejected by kiro-cli exactly like
+# an unknown field -- and it rejects the whole agent -- so these are checked and
+# dropped in ``_enforce_managed_mcp_ownership`` rather than trusted.
+#
+# ``command`` and ``args`` are absent because both callers set them before the
+# enforcer runs, so their types are ours rather than input. ``env`` is absent
+# because it needs more than a type check: ``sanitize_spec_env`` already validates
+# it per ENTRY, which is the finer-grained version of this same rule.
+_MANAGED_MCP_ENTRY_VALUE_TYPES: dict[str, type | tuple[type, ...]] = {
+    "type": str,
+    "timeout": (int, float),
+    "disabled": bool,
+    "autoApprove": list,
+    "disabledTools": list,
+}
+
+# The ITEM type for each list-valued key above. Both are documented as arrays of
+# tool NAMES, so validating only the container leaves ``disabledTools: [1]``
+# emitting a spec kiro-cli refuses. Kept as its own mapping rather than folded
+# into the one above because the two answer different questions -- is this field
+# the right shape, and are its contents the right shape -- and the second is
+# applied per ITEM so one malformed name cannot discard the ones beside it.
+_MANAGED_MCP_ENTRY_ITEM_TYPES: dict[str, type] = {
+    "autoApprove": str,
+    "disabledTools": str,
+}
+
+# Env keys a managed MCP server's spec must never carry through from
+# agent.json are NOT enumerated here. agent.json is agent-writable (not in
+# _SENSITIVE_HOME_DIRS / _WRITE_PROTECTED_HOME_PATHS) and every managed
+# server's ``env`` is launched verbatim by kiro-cli as the child process's
+# environment, so the filter has to be exactly the one env.sanitize_spec_env
+# already applies for the probe: PREFIX-matched, case-insensitively, over
+# Kiro Crew's whole reserved namespace plus the loader/interpreter channels.
+#
+# Delegating rather than restating is the point. This function exists because
+# two hand-synced copies of the ownership rules drifted (#3594); a local
+# frozenset of reserved NAMES would be a third copy of a rule env.py already
+# owns, and a name list fails open for the next KIROCREW_ variable somebody
+# adds -- the reachable case GPT found on this PR was KIROCREW_CLI, which
+# mcp_cron._caller_is_cli() reads as "skip per-session ownership entirely".
+# env.py states the reviewable property instead: a config cannot author our
+# namespace. KIROCREW_HOME is stripped by that same namespace rule and then
+# re-pinned below to the gateway's actual override, so ours is the only value
+# that can reach the child.
+
+
+# Env keys that decide where ``Path.home()`` points, and therefore where a
+# managed shim resolves its data home when no ``KIROCREW_HOME`` pin is present.
+# Stripped from a MANAGED entry only -- this is not a deny rule for specs in
+# general, and env.sanitize_spec_env deliberately lets ``HOME`` through because a
+# user's own MCP server legitimately needs it.
+#
+# The population is what makes stripping correct here. A managed server is ours:
+# its command and args are ours, and it resolves OUR data home through
+# config_dir() -> Path.home(). On a default install that inheritance is exactly
+# right, which is why _managed_mcp_env() emits nothing there. Letting a
+# config-declared HOME override it would relocate the shim's whole data home:
+# cron_add would report success into a store the gateway never reads and the job
+# would never run -- the same silent split _managed_mcp_env documents, arriving
+# through a door that only opened once user env survived a clean rebuild.
+#
+# Both spellings are listed because Path.home() consults HOME on POSIX and
+# USERPROFILE on Windows, and a spec is portable across both.
+#
+# Held upper-cased and compared against key.upper(), because sanitize_spec_env
+# preserves each key's ORIGINAL case (out[key] = value) -- so a spec declaring
+# "userprofile" arrives with that spelling and an exact-case pop would miss it
+# while Windows, whose env names are case-insensitive, would still honour it.
+# This mirrors the folding sanitize_spec_env already does for its own prefixes;
+# the rest of the tree folds case at every one of these boundaries.
+_HOME_DERIVING_ENV_KEYS: frozenset[str] = frozenset({"HOME", "USERPROFILE"})
+
+# Env names that decide WHAT a managed shim executes, rather than how it behaves
+# once running. Stripped from a MANAGED entry only, for the same reason as the
+# home-deriving pair above and matched the same way (upper-cased, compared against
+# key.upper()): a user's own MCP server may legitimately need any of these, and
+# ``env.sanitize_spec_env`` therefore does not refuse them globally.
+#
+# A managed shim is OURS, and some of them are scripts whose shebang resolves
+# their interpreter by NAME at exec time (``#!/usr/bin/env node`` -- see the note
+# in ``name_grant``). So a config-authored value here does not tune our process,
+# it chooses a different program for us to run:
+#
+# * ``PATH`` picks which ``node``/``python``/binary the shebang resolves to.
+# * ``BASH_ENV`` and ``ENV`` name a file a non-interactive shell SOURCES first.
+# * ``SHELLOPTS``/``BASHOPTS`` inject shell options the launcher never set.
+# * ``NODE_OPTIONS`` carries ``--require``, and ``NODE_PATH`` redirects resolution.
+#
+# Grouped as one class deliberately. The interpreter half of this problem is
+# already stated as a namespace in env.py (``PYTHON`` by prefix) because that
+# population is unbounded; these have no shared prefix to key on, so they are
+# enumerated -- and the enumeration is scoped to the launchers a managed shim
+# actually uses (a shell, and node) rather than trying to cover every runtime.
+_LAUNCHER_EXEC_ENV_KEYS: frozenset[str] = frozenset(
+    {"PATH", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "NODE_OPTIONS", "NODE_PATH"}
+)
 
 
 def _mcp_registry_mode() -> bool:
@@ -752,6 +957,88 @@ def _computer_use_spec_gate() -> bool:
         return False
 
 
+def _mcp_spec_gate_open(name: str, spec: dict) -> bool:
+    """Whether *spec*'s ``spec_gate`` permits emission RIGHT NOW (absent = open).
+
+    The single place a gate is called. A gate that raises is reported CLOSED, for
+    the same fail-closed reason the computer-use gate itself is: emitting the
+    entry is what makes kiro-cli spawn the backend, and a keystone we could not
+    read is not evidence that the capability is on.
+    """
+    gate = spec.get("spec_gate")
+    if gate is None:
+        return True
+    try:
+        return bool(gate())
+    except Exception:
+        logger.debug("spec gate for %s raised; treating as closed", name, exc_info=True)
+        return False
+
+
+def _mcp_server_emission_eligible(
+    name: str, spec: object, *, gated_off: "frozenset[str] | None" = None
+) -> bool:
+    """Whether a FRESH spec build would EMIT this MCP server entry.
+
+    THE single definition of "the rebuild re-adds this", and it has exactly two
+    disqualifiers, both owned by the entry's own spec:
+
+    * ``opt_in`` — an assignable set, never auto-emitted. ``build_agent_config``
+      skips it outright and ``_refresh_dynamic_fields`` keeps an EXISTING grant
+      current without ever re-introducing one, so nothing re-adds a grant the
+      user removed.
+    * a CLOSED ``spec_gate`` — both writers ``pop`` the entry while the gate is
+      shut, so the rebuild actively withholds it rather than merely skipping it.
+
+    Both spec writers consult this, and so does the dashboard PUT's merge-on-write
+    host set (``handlers/agents.py::_app_or_host_owned``). That co-tenancy is the
+    whole point of the helper rather than a convenience: the merge preserves an
+    absent managed entry *because* a rebuild would re-add it, so if the two ever
+    disagreed the merge would resurrect entries the rebuild withholds — an
+    ``opt_in`` grant the user revoked through the only surface that can revoke it,
+    or a gate-closed server whose backend the gate exists to keep unspawned.
+
+    *gated_off* is a caller's ONE-PER-REBUILD gate snapshot
+    (:func:`_gated_off_servers`); passing it keeps a rebuild's emit path and its
+    withhold audit agreeing on one reading, which is why that snapshot exists.
+    Omitted (the merge's case, which audits nothing), the gate is read live.
+
+    A spec that is not a mapping at all is reported ELIGIBLE. Only the host can
+    produce that shape — the managed map is a module constant and the extras come
+    from an edition adapter — the name is host-owned either way, and this keeps
+    the merge's pre-existing verdict for it instead of raising ``AttributeError``
+    out of a commit unit contracted to leave its targets byte-identical.
+    """
+    if not isinstance(spec, dict):
+        return True
+    if spec.get("opt_in"):
+        return False
+    if gated_off is not None:
+        return name not in gated_off
+    return _mcp_spec_gate_open(name, spec)
+
+
+def emission_eligible_mcp_servers() -> frozenset[str]:
+    """Every MCP server name a fresh spec build would emit right now.
+
+    Managed servers and the edition's extras under ONE predicate — extras get no
+    exemption, so an extra that ever carries ``opt_in`` or a gate is withheld
+    here for the same reason a managed one is. Today they carry neither, so this
+    is every extra plus the always-emitted managed entries.
+
+    Exported (no leading underscore) because ``handlers/agents.py``'s
+    merge-on-write is a legitimate out-of-module consumer: it must preserve
+    exactly the set a rebuild would re-add, and computing that itself is what let
+    the two drift. Read live rather than cached — a keystone flip between two PUTs
+    must change the answer.
+    """
+    return frozenset(
+        name
+        for name, spec in (*_MANAGED_MCP_SERVERS.items(), *_extra_mcp_servers().items())
+        if _mcp_server_emission_eligible(name, spec)
+    )
+
+
 def _gated_off_servers() -> frozenset[str]:
     """Managed servers whose ``spec_gate`` is CLOSED right now.
 
@@ -763,20 +1050,12 @@ def _gated_off_servers() -> frozenset[str]:
     record is read during incident response, against the config it describes.
 
     A gate that raises is treated as closed, for the same fail-closed reason the
-    computer-use gate itself is.
+    computer-use gate itself is — see :func:`_mcp_spec_gate_open`, which is where
+    that call now lives so the merge-on-write host set reads the gate the same way.
     """
-    closed: set[str] = set()
-    for name, spec in _MANAGED_MCP_SERVERS.items():
-        gate = spec.get("spec_gate")
-        if gate is None:
-            continue
-        try:
-            if not gate():
-                closed.add(name)
-        except Exception:
-            logger.debug("spec gate for %s raised; treating as closed", name, exc_info=True)
-            closed.add(name)
-    return frozenset(closed)
+    return frozenset(
+        name for name, spec in _MANAGED_MCP_SERVERS.items() if not _mcp_spec_gate_open(name, spec)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +1132,49 @@ def _extra_mcp_servers() -> dict[str, dict]:
         log_message="extra_mcp_servers lookup failed; using none",
     )
     return dict(extra) if extra else {}
+
+
+def managed_mcp_spec_entry(name: str) -> dict[str, Any] | None:
+    """The kiro-spec ``mcpServers`` entry a fresh build would emit for *name*.
+
+    One entry, resolved live (``invocation_fn`` + the pinned data home), for a
+    consumer that needs a single managed server without rebuilding the whole
+    config. ``None`` when *name* is not managed, when it is ``opt_in`` (an
+    assignable set is granted by a spec, never minted here) or when its
+    ``spec_gate`` is closed — the same predicate the two spec writers use, so a
+    caller cannot resurrect a server emission withholds.
+
+    ``autoApprove`` is deliberately NOT carried, unlike the emit loop in
+    :func:`build_agent_config`. The flag is kiro-cli's local approval, and the
+    one caller here (the claude MCP translation, :mod:`kiro_crew.acp.session_mcp`)
+    targets a backend whose nearest equivalent — a ``permissions.allow`` entry —
+    means Claude never asks, so the call never reaches Crew's gate. Emitting the
+    entry un-approved keeps every call gated.
+
+    Never raises: an invocation that cannot be resolved yields ``None``, because
+    the caller is on a spawn path where no MCP server is better than no session.
+    """
+    spec = _MANAGED_MCP_SERVERS.get(name)
+    if not isinstance(spec, dict):
+        return None
+    if not _mcp_server_emission_eligible(name, spec):
+        return None
+    try:
+        if "invocation_fn" in spec:
+            cmd, args = spec["invocation_fn"]()
+        else:
+            cmd = spec.get("command") or spec["command_fn"]()
+            args = list(spec["args"])
+    except Exception:
+        logger.warning("cannot resolve invocation for managed MCP server %r", name, exc_info=True)
+        return None
+    if not cmd:
+        return None
+    entry: dict[str, Any] = {"command": cmd, "args": list(args)}
+    env = _managed_mcp_env()
+    if env:
+        entry["env"] = env
+    return entry
 
 
 def _extra_mcp_scope_globals() -> list[Path]:
@@ -1975,6 +2297,181 @@ def _apply_user_kiro_hooks(config: dict, mc_cfg: dict) -> None:
         logger.debug("SEL audit for kiro_hooks merge failed", exc_info=True)
 
 
+def _enforce_managed_mcp_ownership(
+    entry: dict,
+    spec: dict,
+    registry_mode: bool,
+    *,
+    auto_approve: str,
+) -> None:
+    """Strip/re-pin the fields Kiro Crew owns on one managed-server entry.
+
+    Applied identically by the fresh-build path (``build_agent_config``) and
+    the existing-config refresh path (``_refresh_dynamic_fields``) so the two
+    can no longer hand-drift: that silent divergence between two copies of
+    this same ownership logic is what let a clean rebuild discard a user's
+    timeout/env in the first place (#3594), and would just as easily reopen a
+    security-relevant strip (e.g. the reserved-env-key scrub below) if only
+    one of the two loops picked it up.
+
+    ``entry["command"]``/``entry["args"]`` are set by the caller beforehand —
+    both loops resolve those slightly differently (build vs. refresh), so
+    ownership of that resolution stays with them.
+
+    ``auto_approve`` names what should happen to ``autoApprove``, as ONE
+    parameter rather than a pair of booleans, so a caller cannot spell a
+    combination that has no meaning. The three values are the three real cases:
+
+    * ``"own"`` (build) -- ``autoApprove`` tracks the spec on every call, like
+      every other field this function owns, so agent- or user-written
+      ``autoApprove`` data never survives a clean build.
+    * ``"seed"`` (refresh, entry absent) -- set it from the spec, because a
+      server the user does not have yet has no preference to respect.
+    * ``"preserve"`` (refresh, entry present) -- leave it alone, so a user who
+      deliberately removed a grant is not silently handed it back on every
+      refresh.
+    """
+    # Entry keys are an ALLOW-LIST, not a list of known-bad names. kiro-cli
+    # rejects a server spec carrying a field it does not know, and it rejects the
+    # WHOLE agent when it does, so a single stray ``cwd`` on a managed entry
+    # takes every Kiro Crew tool down with it. Dropping the key we cannot honour
+    # keeps the agent loadable, which is what the user actually wanted.
+    #
+    # It has to be an allow-list because the deny side is unbounded: ``url`` and
+    # ``headers`` were the two stale fields older builds left behind (these
+    # servers are stdio-only, and a leftover ``url`` would shadow the command and
+    # propagate into the CC config), but naming them one at a time fails open for
+    # the next field anybody hand-writes. Both are absent from the set below, so
+    # they are still dropped -- now as instances of a rule rather than as two
+    # names.
+    #
+    # This became reachable HERE with the fix: the fresh-build path used to
+    # rebuild the entry from scratch and so discarded every unknown key with the
+    # rest, and preserving the user's timeout/env is exactly what put them back
+    # in reach.
+    for stray_key in [k for k in entry if k not in _MANAGED_MCP_ENTRY_KEYS]:
+        entry.pop(stray_key, None)
+        logger.warning(
+            "dropping %r from a managed MCP server's entry: it is not a field a "
+            "managed entry may carry, and kiro-cli rejects the whole agent spec "
+            "over one unknown field",
+            stray_key,
+        )
+    # A right key with a wrong-TYPED value fails exactly the same way: the spec is
+    # schema-checked, so ``"disabled": "false"`` (a string where a boolean belongs)
+    # loses the user every Crew tool just as surely as an unknown field. Dropping
+    # the ill-typed value rather than coercing it is the same call already made one
+    # level down for env ENTRIES in ``sanitize_spec_env``: a value we invent is not
+    # the one the user wrote, and the rest of their entry still survives.
+    #
+    # Only the keys a user may author are checked. ``command``/``args`` are set by
+    # both callers before this runs, so their types are ours, not input. Unlike
+    # the env-NAME case, this list is closed and finite -- exactly the fields
+    # ``_MANAGED_MCP_ENTRY_VALUE_TYPES`` names, with the types the same schema
+    # documents -- so it converges instead of growing a name per round.
+    for typed_key, expected in _MANAGED_MCP_ENTRY_VALUE_TYPES.items():
+        if typed_key not in entry:
+            continue
+        value = entry[typed_key]
+        # ``bool`` is a subclass of ``int``, so a bare isinstance check would let
+        # ``"timeout": true`` through as a number.
+        wrong_type = not isinstance(value, expected) or (
+            expected is not bool and isinstance(value, bool)
+        )
+        # A float can be the right TYPE and still not be representable. Python's
+        # json module accepts bare ``NaN``/``Infinity`` on the way in and writes
+        # them back out verbatim, but neither is JSON, so a strict parser rejects
+        # the file -- and kiro-cli rejects the whole agent with it. isfinite is the
+        # complete test here rather than another name to remember: it covers NaN,
+        # +Infinity and -Infinity, which is every non-finite float there is.
+        if not wrong_type and isinstance(value, float) and not math.isfinite(value):
+            wrong_type = True
+        if wrong_type:
+            entry.pop(typed_key, None)
+            logger.warning(
+                "dropping %r from a managed MCP server's entry: %r is not the "
+                "type kiro-cli's spec schema documents for it, and it would be "
+                "rejected along with the whole agent",
+                typed_key,
+                value,
+            )
+    # A list of the right TYPE can still hold the wrong ITEMS. Both list-valued
+    # keys are documented as arrays of tool NAMES, so ``disabledTools: [1]``
+    # satisfies the check above and still emits a spec kiro-cli refuses -- the
+    # container was validated and its contents were not.
+    #
+    # Filtered per ITEM rather than dropped whole, which is the rule this fix
+    # already applies one level down to env ENTRIES in ``sanitize_spec_env``:
+    # a well-typed sibling survives its neighbour. That matters most for
+    # ``disabledTools``, where discarding the list because one item is malformed
+    # would re-expose every tool the user did name correctly.
+    for list_key in _MANAGED_MCP_ENTRY_ITEM_TYPES:
+        items = entry.get(list_key)
+        if not isinstance(items, list):
+            continue
+        kept = [item for item in items if isinstance(item, str)]
+        for bad_item in [item for item in items if not isinstance(item, str)]:
+            logger.warning(
+                "dropping %r from a managed MCP server's %r: that list carries "
+                "tool names, and a non-string item would be rejected along with "
+                "the whole agent spec",
+                bad_item,
+                list_key,
+            )
+        if len(kept) != len(items):
+            entry[list_key] = kept
+    # Enterprise registry MARKER — the ``registry`` value is ours and tracks the
+    # account the gateway is actually signed in to, so it is set when the
+    # declaration is on and removed (not left stale) when it is off, which stops
+    # a host that leaves an enterprise profile from shipping a marker the inverse
+    # filter would now use to drop these servers. Only that value: a transport
+    # hint the user wrote is theirs and is carried through untouched.
+    if registry_mode:
+        entry["type"] = _MCP_REGISTRY_TYPE
+    elif entry.get("type") == _MCP_REGISTRY_TYPE:
+        entry.pop("type", None)
+    # Env: keep the user's own variables, but only genuine ones. A malformed
+    # (non-dict) override is dropped rather than fed to dict(...), which would
+    # otherwise raise and abort the whole config rebuild over a single bad
+    # agent.json value. sanitize_spec_env then drops Kiro Crew's whole reserved
+    # namespace and the loader/interpreter channels by prefix (see the module
+    # comment above), the home-deriving names are dropped for this population
+    # (see _HOME_DERIVING_ENV_KEYS), and KIROCREW_HOME is re-pinned to the
+    # gateway's actual override afterwards so ours is the value that reaches the
+    # child.
+    existing_env = entry.get("env")
+    env = sanitize_spec_env(existing_env.items()) if isinstance(existing_env, dict) else {}
+    for home_key in [k for k in env if k.upper() in _HOME_DERIVING_ENV_KEYS]:
+        env.pop(home_key, None)
+        logger.warning(
+            "dropping %r from a managed MCP server's env: it would move the "
+            "data home this shim shares with the gateway",
+            home_key,
+        )
+    for exec_key in [k for k in env if k.upper() in _LAUNCHER_EXEC_ENV_KEYS]:
+        env.pop(exec_key, None)
+        logger.warning(
+            "dropping %r from a managed MCP server's env: it would choose what "
+            "this shim executes rather than configure it (see "
+            "_LAUNCHER_EXEC_ENV_KEYS)",
+            exec_key,
+        )
+    env.update(_managed_mcp_env())
+    if env:
+        entry["env"] = env
+    else:
+        entry.pop("env", None)
+    if auto_approve == "own":
+        if "autoApprove" in spec:
+            entry["autoApprove"] = list(spec["autoApprove"])
+        else:
+            # agent.json is agent-writable; it cannot grant auto-approval to a
+            # managed server that does not ship an audited default grant.
+            entry.pop("autoApprove", None)
+    elif auto_approve == "seed" and "autoApprove" in spec:
+        entry["autoApprove"] = list(spec["autoApprove"])
+
+
 def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     """Return the final agent config (shipped defaults + user overrides + dynamic fields).
 
@@ -1985,6 +2482,11 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     hooks.py PreToolUse gate, not via the kiro agent spec. User-defined
     ``kiro_hooks`` from ``~/.kiro/crew/config.json`` are then additively merged;
     bundled hooks always run first and cannot be removed.
+
+    The assembled ``allowedTools`` list is ceiling-filtered before return (see
+    :func:`_apply_allowed_tools_ceiling`), so every spec derived from this
+    template starts governed — an installer no longer has to remember the
+    filter to avoid shipping a blanket auto-approve for a floor-gated builtin.
 
     Args:
         gated_off: Managed servers whose ``spec_gate`` is closed. Pass the
@@ -2020,42 +2522,40 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     if gated_off is None:
         gated_off = _gated_off_servers()
     for name, spec in _MANAGED_MCP_SERVERS.items():
-        if name in gated_off:
-            # The gate is the whole point of this branch: emitting the entry is
-            # what makes kiro-cli spawn the backend, so a closed gate must not
-            # emit one. ``pop`` as well as ``continue`` because the base here is
-            # shipped defaults merged with the user override file, and an entry
-            # arriving from there would otherwise slip past a platform gate that
-            # exists because the capability has no driver on this OS.
-            mcp.pop(name, None)
-            continue
-        # An opt-in server is an assignable set: it belongs to the agents whose
-        # own spec references it, so a freshly built default spec must not carry
-        # it. kiro-cli loads a server only when ``tools`` names it, and the
-        # shipped template names only the always-on ones.
-        if spec.get("opt_in"):
+        if not _mcp_server_emission_eligible(name, spec, gated_off=gated_off):
+            # NOT eligible, and the two reasons part company on one point: a
+            # closed gate must RETRACT the entry, an opt-in one is merely never
+            # introduced.
+            if name in gated_off:
+                # The gate is the whole point of this branch: emitting the entry is
+                # what makes kiro-cli spawn the backend, so a closed gate must not
+                # emit one. ``pop`` as well as ``continue`` because the base here is
+                # shipped defaults merged with the user override file, and an entry
+                # arriving from there would otherwise slip past a platform gate that
+                # exists because the capability has no driver on this OS.
+                mcp.pop(name, None)
+            # An opt-in server is an assignable set: it belongs to the agents whose
+            # own spec references it, so a freshly built default spec must not carry
+            # it. kiro-cli loads a server only when ``tools`` names it, and the
+            # shipped template names only the always-on ones. Left in place rather
+            # than popped: an entry already on disk is a grant the user made.
             continue
         if "invocation_fn" in spec:
             cmd, args = spec["invocation_fn"]()
         else:
             cmd = spec.get("command") or spec["command_fn"]()
             args = list(spec["args"])
-        entry = {"command": cmd, "args": args}
-        # Enterprise registry mode: without this marker the client drops the
-        # entry before launch (see _mcp_registry_mode). command/args stay so the
-        # spec still describes a runnable server for every other consumer —
-        # doctor's handshake probe, the CC sidecar sync, a later un-governed
-        # refresh — none of which route through the registry.
-        if registry_mode:
-            entry["type"] = _MCP_REGISTRY_TYPE
-        # Pin the data home so the shim cannot read a DIFFERENT one than the
-        # gateway that spawned it (see _managed_mcp_env). Omitted entirely on a
-        # default install, so the emitted spec is unchanged there.
-        env = _managed_mcp_env()
-        if env:
-            entry["env"] = env
-        if "autoApprove" in spec:
-            entry["autoApprove"] = list(spec["autoApprove"])
+        # The deep merge above may have supplied user-owned options such as a
+        # timeout or extra environment variables. Keep those on a clean build,
+        # while replacing the invocation and transport fields that define our
+        # trusted managed server. Ownership of every other field is enforced
+        # by the same helper the refresh path uses (_enforce_managed_mcp_ownership),
+        # so the two loops cannot silently diverge on what counts as "ours".
+        existing = mcp.get(name)
+        entry = dict(existing) if isinstance(existing, dict) else {}
+        entry["command"] = cmd
+        entry["args"] = args
+        _enforce_managed_mcp_ownership(entry, spec, registry_mode, auto_approve="own")
         mcp[name] = entry
 
     # Edition-contributed MCP servers (PlatformContext).  ADD-only: standalone
@@ -2070,6 +2570,18 @@ def build_agent_config(*, gated_off: "frozenset[str] | None" = None) -> dict:
     # a kiro-spec key — kiro-cli rejects unknown fields and would drop the whole
     # spec. build_agent_config stays pure (no disk writes) so its many
     # read-only callers don't mutate managed-state as a side effect.
+
+    # Governance ceiling over the assembled ``allowedTools`` — HERE, at the one
+    # constructor every derived-spec installer starts from, so the invariant is
+    # held by the predicate rather than by each installer's author remembering
+    # it (#7401). ``rebuild_agent_config`` keeps its own final pass because its
+    # ``_load_existing_config`` path takes entries from an on-disk spec that
+    # never comes through here; for that caller this filter is idempotent (the
+    # predicate is pure, so filtering twice equals filtering once). A caller
+    # that replaces ``allowedTools`` wholesale (``_install_conductor_agent``)
+    # is unaffected. The SEL audit inside is best-effort and never raises, so
+    # the purity note above still holds for config/managed-state.
+    _apply_allowed_tools_ceiling(config, source="build_agent_config")
     return config
 
 
@@ -2094,7 +2606,8 @@ def _refresh_dynamic_fields(config: dict, *, gated_off: "frozenset[str] | None" 
     if gated_off is None:
         gated_off = _gated_off_servers()
     for name, spec in _MANAGED_MCP_SERVERS.items():
-        if name in gated_off:
+        eligible = _mcp_server_emission_eligible(name, spec, gated_off=gated_off)
+        if not eligible and name in gated_off:
             # RETRACT, not merely skip: an earlier refresh wrote this entry while
             # the gate was open, and leaving it would mean turning the feature
             # off never reclaims the backend process turning it on started.
@@ -2117,8 +2630,12 @@ def _refresh_dynamic_fields(config: dict, *, gated_off: "frozenset[str] | None" 
         is_new = name not in mcp
         # An opt-in server is granted by the spec itself, so a refresh keeps an
         # entry the user put there current but never introduces one: adding it
-        # back would re-grant a set on every gateway start.
-        if is_new and spec.get("opt_in"):
+        # back would re-grant a set on every gateway start. Spelled through the
+        # shared eligibility predicate (the gate half is already spent above, so
+        # what remains of ineligibility here is exactly ``opt_in``) rather than
+        # re-reading the flag, so the rule cannot drift from the emitter's or the
+        # dashboard merge's reading of it.
+        if is_new and not eligible:
             continue
         if not is_new and spec.get("opt_in") and not isinstance(mcp.get(name), dict):
             # A hand-written entry that is not an object at all. Refreshing it
@@ -2141,42 +2658,13 @@ def _refresh_dynamic_fields(config: dict, *, gated_off: "frozenset[str] | None" 
         else:
             entry["command"] = spec.get("command") or spec["command_fn"]()
             entry["args"] = list(spec["args"])
-        # Strip any stale remote-transport fields from older builds: these
-        # servers are stdio-only, and a leftover ``url`` would otherwise
-        # propagate into the CC config and shadow the command. (Root fix for
-        # the downstream stdio-force in cc_agent / acp.client.)
-        entry.pop("url", None)
-        entry.pop("headers", None)
-        # Enterprise registry marker — refreshed like command/args rather than
-        # preserved like ``autoApprove``, because it tracks the account the
-        # gateway is actually signed in to, not a user preference. Removed (not
-        # left stale) when the declaration is off, so a host that leaves an
-        # enterprise profile stops shipping a marker that would now cause the
-        # inverse filter to drop these servers.
-        if registry_mode:
-            entry["type"] = _MCP_REGISTRY_TYPE
-        elif entry.get("type") == _MCP_REGISTRY_TYPE:
-            entry.pop("type", None)
-        # Data-home pin — refreshed like command/args rather than preserved like
-        # ``autoApprove``, because it is OURS, not a user customization: it must
-        # track the home the gateway is actually running under. A config written
-        # under an override and later refreshed on a default install would
-        # otherwise keep pointing the shims at the stale home. Merged into any
-        # existing ``env`` so a user's own variables survive, and the key is
-        # REMOVED (not left stale) when there is no override.
-        pinned = _managed_mcp_env()
-        env = dict(entry.get("env") or {})
-        env.pop("KIROCREW_HOME", None)
-        env.update(pinned)
-        if env:
-            entry["env"] = env
-        else:
-            entry.pop("env", None)
-        # Seed autoApprove only for genuinely new entries; if the user
-        # deliberately removed autoApprove from an existing entry we
-        # must not re-add it on every refresh.
-        if "autoApprove" in spec and is_new:
-            entry["autoApprove"] = list(spec["autoApprove"])
+        # Strip any stale remote-transport fields from older builds, re-pin the
+        # registry marker and data-home env, and seed autoApprove only for a
+        # genuinely new entry — all via the same helper the fresh-build loop
+        # uses, so the two ownership rules can no longer hand-drift.
+        _enforce_managed_mcp_ownership(
+            entry, spec, registry_mode, auto_approve="seed" if is_new else "preserve"
+        )
 
     # Edition-contributed MCP servers (PlatformContext).  ADD-only: only seed a
     # server the user doesn't already have, so user customizations on a refresh
@@ -2352,10 +2840,20 @@ def _norm_mcp_spec(spec: Any) -> Any:
     collapse onto the canonical alias. An empty ``env``/``args`` is a launch
     no-op for kiro-cli (missing == empty), so this is also the cleaner spec to
     persist.
+
+    :data:`~kiro_crew.mcp_provenance.DERIVED_KEY` is excluded for the same reason,
+    and it is load-bearing: the record is our bookkeeping about which field this
+    rebuild computed, not part of how the server launches, so an entry carrying one
+    and an otherwise-identical re-merged copy without one ARE the same server.
+    Comparing it would make them differ and mint the ever-growing suffix this
+    function exists to prevent -- and it would do so asymmetrically, since only the
+    population with no other config source is ever recorded.
     """
     if not isinstance(spec, dict):
         return spec
-    return {k: v for k, v in spec.items() if not (k in ("env", "args") and not v)}
+    return {
+        k: v for k, v in spec.items() if k != DERIVED_KEY and not (k in ("env", "args") and not v)
+    }
 
 
 def _alias_family_base(key: str) -> str:
@@ -3099,18 +3597,17 @@ def _seed_kas_permissions(config: dict[str, Any]) -> None:
     if config.get("permissions") is not None:
         return
 
-    # circular import: `kiro_crew.acp.__init__` pulls in the runtime, which reaches
-    # back into config/agent — and it is also the whole ACP stack, which this
-    # module has no business dragging onto the gateway boot path just to write one
-    # JSON field. The imported module itself depends on nothing in the package.
-    from kiro_crew.acp.kas_permissions import (  # noqa: PLC0415
-        allowed_tools_to_permissions,
+    # Routed through the agent-sdk boundary: ``drivers.acp`` is the one layer
+    # permitted to import ``kiro_crew.acp``, and agent.py's direct-import count
+    # is a shrink-only baseline that must not grow. Function-local for the same
+    # boot-path reason as every import here — this module has no business
+    # dragging the ACP stack onto the gateway boot path just to write one JSON
+    # field.
+    from kiro_crew.agent_sdk.drivers.acp import (  # noqa: PLC0415 - boot path
+        derived_agent_permissions,
     )
 
-    derived = allowed_tools_to_permissions(
-        config.get("allowedTools"), agent_id=Path(AGENT_FILENAME).stem
-    )
-    config["permissions"] = derived if derived is not None else {"rules": []}
+    config["permissions"] = derived_agent_permissions(config.get("allowedTools"), AGENT_FILENAME)
 
 
 def _may_auto_approve(ref: str) -> bool:
@@ -3122,6 +3619,53 @@ def _may_auto_approve(ref: str) -> bool:
     tests without reaching into another module's namespace.
     """
     return may_skip_gate_now(ref)
+
+
+def _apply_allowed_tools_ceiling(config: dict, *, source: str) -> None:
+    """Filter ``config["allowedTools"]`` through the governance ceiling, in place.
+
+    ``allowedTools`` is the ONE path that never reaches the PreToolUse gate, so
+    every entry on it must be approved by :func:`_may_auto_approve`. This runs
+    inside :func:`build_agent_config` so every installer that derives a spec
+    from the template inherits the filter — ``_install_research_agent`` shipped
+    the template's ``fs_read``/``code``/``glob``/``grep`` grants verbatim
+    because the filter lived only in ``rebuild_agent_config``'s final pass,
+    which writes only ``kirocrew.json`` (#7401).
+
+    A withheld ref stays MOUNTED (``tools`` is untouched — mounting a tool is
+    not auto-approving it); its calls go through the gate, where the
+    per-argument rule applies. Non-string entries (a hand-edited config) are
+    dropped: they are not valid tool refs and would crash the predicate.
+
+    Withholding a grant is a permission DECISION, so it leaves the same
+    ``mcp_auto_approve_withheld`` SEL record every other ``allowedTools``
+    writer emits — best-effort, never raising, so an audit failure cannot
+    break a build or an install.
+    """
+    allowed = config.get("allowedTools")
+    if not isinstance(allowed, list):
+        return
+    kept: list[str] = []
+    withheld: list[str] = []
+    for ref in allowed:
+        if not isinstance(ref, str):
+            continue
+        (kept if _may_auto_approve(ref) else withheld).append(ref)
+    config["allowedTools"] = kept
+    if withheld:
+        try:
+            sel().log_api_access(
+                caller="system",
+                operation="mcp_auto_approve_withheld",
+                outcome="ok",
+                source=source,
+                resources=(
+                    f"{', '.join(withheld)} mounted without auto-approve "
+                    "(governance ceiling); calls go through the approval gate"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — the audit must not break the build
+            logger.debug("SEL audit unavailable for withheld auto-approve", exc_info=True)
 
 
 def _ceiling_filtered_spec(ref: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -3622,9 +4166,106 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         if isinstance(_s, dict):
             _store_by_alias.setdefault(mcp_server_alias(_n), []).append(_s)
     _cfg_servers: dict[str, Any] = config.get("mcpServers", {})
+    # One spelling of the scope chain, in priority order, for BOTH consumers below:
+    # the live-value probe that keeps a rebuild-authored field re-derivable, and the
+    # resolution candidate list. The probe's correctness is "this is the value the
+    # chain would have resolved", so two separate spellings could drift apart.
+    _scopes: tuple[tuple[str, dict], ...] = (
+        ("kirocrew", kirocrew_mcp),
+        ("kiro-global", shared_mcp),
+        ("provider-global", extra_shared_mcp),
+    )
     for name, spec in _cfg_servers.items():
         if not isinstance(spec, dict):
             continue
+        # This file is BOTH this function's output and, here, one of its inputs: the
+        # entry is read back so a field the user set and we never model survives. One
+        # field below is ours, not the user's -- the resolved absolute ``command`` --
+        # and reading our own computed value back as if it were authored is what made
+        # it permanent: ``_resolve_command`` takes an absolute path without searching,
+        # so no later change to how commands resolve could rebind one stored once.
+        #
+        # The record applies ONLY to a server no other source declares -- the one
+        # whose sole persisted home is this file, and which therefore has nothing to
+        # lose a conflict to. For a scope-owned server, choosing between the record
+        # and the live declaration correctly means selecting a per-field source AFTER
+        # resolution (the merge picks a winner by which command resolves, then adopts
+        # that winner's args/env as a unit), which is a merge-precedence change rather
+        # than a provenance one; it is tracked separately. Excluding that population
+        # leaves it behaving exactly as it does today.
+        #
+        # The test is deliberately CONSERVATIVE, and compares by alias rather than by
+        # raw key. A scope keys entries by their own raw name while ``name`` here is
+        # the config's, whose slash-containing spellings an earlier pass rewrote to
+        # aliases (see the ``_store_by_alias`` note above), so a raw-key probe would
+        # miss the owner of an aliased entry and wrongly read it as having no other
+        # home. Over-matching only declines to apply the record -- today's behavior,
+        # and safe. Under-matching would let the record shadow a live declaration.
+        #
+        # A scope owns the COMMAND only when it actually supplies one. A dict alone is
+        # not enough: a same-named URL-only entry, or an empty one, declares nothing
+        # about ``command``, so treating it as a competing source would strip the
+        # record off an agent-only stdio server and strand its stale path forever.
+        # A non-dict value supplies nothing either, and the candidate chain below
+        # skips it for the same reason (``isinstance(alt, dict)``).
+        #
+        # This stays a yes/no ownership question -- does any other source declare a
+        # command? -- and never a choice BETWEEN two declared values. Choosing would
+        # need the after-resolution ordering this PR is scoped out of.
+        _alias_here = mcp_server_alias(name)
+        _scope_owned = any(
+            any(
+                mcp_server_alias(k) == _alias_here
+                and isinstance(v, dict)
+                and isinstance(v.get("command"), str)
+                and v["command"]
+                for k, v in _scope.items()
+            )
+            for _label, _scope in _scopes
+        )
+        # Captured BEFORE the view rewrites anything: what the entry carried on the
+        # way in, and the record's own pair. Together they decide what may be
+        # recorded on the way out -- see the emit site below.
+        _owned_in = command_is_ours(spec) if not _scope_owned else False
+        _pre_cmd = spec.get("command")
+        _pair = recorded_source(spec)
+        # PRESERVED, never stripped. A scope-owned server's record is not acted on --
+        # no restoration, see above -- but destroying it would be a decision in its
+        # own right, and the wrong one: a scope command that does not resolve, or a
+        # scope entry that later goes away, would leave the server agent-only again
+        # with its only re-derivation source deleted, so a relocated binary could
+        # never rebind. Keeping it inert costs nothing, because the ownership guard
+        # re-checks the emitted value before anything is ever restored from it, so a
+        # record that has gone stale in the meantime is simply not used.
+        #
+        # Deciding this by which candidate WINS resolution would be the other way to
+        # rule out a non-resolving scope command, and that is the after-resolution
+        # per-field source selection this change is deliberately scoped out of; it
+        # belongs with the agent-config ownership work. Preserving is the part that
+        # needs no ordering at all.
+        _keep_record: tuple[str, str] | None = _pair if _scope_owned else None
+        if not _scope_owned:
+            _viewed = source_view(spec)
+            if not _owned_in or _pair is None:
+                # Nothing of ours to restore; the view only strips the key.
+                spec = _viewed
+            elif _resolve_command(_pair[0], _viewed.get("env"))[0]:
+                # The source still resolves, so re-derive from it: that is the whole
+                # point, and it is what rebinds a moved binary.
+                spec = _viewed
+            else:
+                # It does NOT resolve, and for this population the emitted config is
+                # the entry's only copy -- so re-deriving would drop the server from
+                # the map, the file would be rewritten without it, and the next
+                # rebuild would have nothing to read. A stale-but-working command
+                # beats a deleted server, so keep what we emitted.
+                #
+                # The record is re-recorded VERBATIM below rather than refreshed from
+                # the value we kept: re-deriving must stay possible once whatever
+                # broke the source clears, and recording the emitted path as its own
+                # source would retire the record's only useful fact.
+                _keep_record = _pair
+                spec = {k: v for k, v in spec.items() if k != DERIVED_KEY}
         # Remote Streamable HTTP servers — preserved as-is except for the OAuth
         # hints, which are renamed to the fields kiro-cli actually deserializes.
         # This is the one boundary where the internal spelling (``scopes`` /
@@ -3687,11 +4328,7 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
         # Build candidate specs in priority order: the merged winner first,
         # then the same server from each source as a resolution fallback.
         candidates: list[tuple[str, dict]] = [("winner", spec)]
-        for label, src in (
-            ("kirocrew", kirocrew_mcp),
-            ("kiro-global", shared_mcp),
-            ("provider-global", extra_shared_mcp),
-        ):
+        for label, src in _scopes:
             alt = src.get(name)
             if isinstance(alt, dict) and alt is not spec:
                 candidates.append((label, alt))
@@ -3739,7 +4376,31 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
             spec_env = merged.get("env")
             if isinstance(spec_env, dict):
                 merged["env"] = emit_env(spec_env)
-            valid_servers[name] = merged
+            # Record only for a server with no other source, and only a field this
+            # pass may honestly claim: one the record already proved ours on the way
+            # in, or one whose emitted value DIFFERS from what the entry carried, so
+            # we computed it.
+            #
+            # The excluded case is a value we merely passed through -- a hand edit,
+            # or an already-absolute declaration nothing was derived from. It survives
+            # this rebuild either way, but a record written over it would read as
+            # proof on the NEXT pass, which is how a claim we never earned turns into
+            # a value we overwrite. Unrecorded means it stays the user's.
+            #
+            # Read from the candidate that WON: on a fallback the command came from
+            # ``chosen``, so recording ``spec``'s would name a source this entry was
+            # not derived from. ``None`` records "the source carried no such field".
+            _derived: tuple[str, str] | None = _keep_record
+            if _keep_record is None and not _scope_owned and (_owned_in or resolved != _pre_cmd):
+                _cmd_source = chosen.get("command")
+                # Non-empty by construction -- ``resolved`` is truthy, and it came
+                # from resolving THIS candidate's command -- but assert it in the
+                # type rather than in a comment: a record whose source is blank is
+                # unreadable on the way back, so writing one would silently disable
+                # the fix instead of failing here.
+                if isinstance(_cmd_source, str) and _cmd_source:
+                    _derived = (_cmd_source, resolved)
+            valid_servers[name] = record_derived(merged, _derived)
         elif not had_any_command:
             # No candidate defined a command at all — distinct from a command
             # that was defined but couldn't be resolved.
@@ -3837,7 +4498,7 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     # home for agent-only configuration, so dropping an entry destroys whatever
     # lives only there and stamping ``disabled`` makes ``list_servers`` delete the
     # server's own row. See the follow-up issue linked from
-    # docs/system-specs/features/mcp-probe-quarantine.md.
+    # docs/system-specs/modules/mcp-probe-quarantine.md.
     for name, spec in itertools.chain(
         extra_shared_mcp.items(), shared_mcp.items(), kirocrew_mcp.items()
     ):
@@ -4269,6 +4930,12 @@ def rebuild_agent_config(*, clean: bool = False) -> Path:
     except Exception:
         logger.debug("kirocrew-conductor agent install failed", exc_info=True)
 
+    # Install kirocrew-pipeline-conductor agent (repository pipeline fleet supervision)
+    try:
+        _install_pipeline_conductor_agent()
+    except Exception:
+        logger.debug("kirocrew-pipeline-conductor agent install failed", exc_info=True)
+
     # Bidirectional sync: ensure packages installed for one provider
     # are also available for the other (agents↔plugins, skills).
     sync_aim_packages()
@@ -4627,8 +5294,10 @@ item, which you handle immediately.
 #:   under that target's own grants. The server-side gates bound WHICH target is
 #:   reachable; nothing bounds WHAT is sent.
 #: * ``session_stop`` — WITHHELD. Ends another session's in-flight turn and
-#:   DISCARDS its work (``stop_target``: "A first call cancels cooperatively;
-#:   calling again while that is pending escalates to a hard kill").
+#:   DISCARDS its work (``stop_target``: "A stop cancels cooperatively", and the
+#:   cancelled turn's work is gone either way — the retry de-duplication that
+#:   keeps a re-sent stop from ALSO discarding the queue does not make the verb
+#:   non-destructive).
 #:
 #: Every withheld verb stays MOUNTED (``@kirocrew-dashboard`` is still in
 #: ``tools``) — it just passes through ``hooks.on_tool_call`` like any ungranted
@@ -4641,6 +5310,80 @@ _CONDUCTOR_DASHBOARD_GRANTS: tuple[str, ...] = (
     "@kirocrew-dashboard/chat_folder_create",
     "@kirocrew-dashboard/session_create",
     "@kirocrew-dashboard/session_read_message",
+)
+
+#: The dashboard verbs a CREW MEMBER's DM session may call without an approval
+#: prompt. Superset of the conductor's: the write verbs (``session_send``,
+#: ``session_stop``) join because a member's reach is SERVER-bounded in a way
+#: the conductor's is not — ``authorize_target`` refuses a member caller on any
+#: session it did not itself create (``created_by`` ownership, 403), so the
+#: worst case of an auto-approved write is confined to worker sessions the
+#: member opened, never the person's own conversations. The conductor has no
+#: such ownership fence, which is why its list withholds the writes. Without
+#: these two the dispatch loop this feature exists for (create → seed → patrol
+#: → stop) stalls on an approval prompt at its second step with nobody at the
+#: keyboard.
+_MEMBER_DASHBOARD_GRANTS: tuple[str, ...] = _CONDUCTOR_DASHBOARD_GRANTS + (
+    "@kirocrew-dashboard/session_send",
+    "@kirocrew-dashboard/session_stop",
+)
+
+
+#: The kirocrew-core verbs the goal conductor may call WITHOUT an approval
+#: prompt. Named one by one rather than as the whole ``@kirocrew-core`` server,
+#: which put 74 registered core tools behind a single auto-approve entry. The
+#: reason is the same one ``_CONDUCTOR_DASHBOARD_GRANTS`` states above and
+#: ``_PIPELINE_CONDUCTOR_CORE_GRANTS`` restates below: this agent ingests
+#: content it does not control (goal text, child-session transcripts, web
+#: reads) on nudge-driven cycles with nobody at the keyboard, and a
+#: server-wide grant let that content reach ``task_run``, ``workflow_run`` and
+#: the ``spawn_*`` family — starting persistent work or a fleet of subagents
+#: with no human in the loop.
+#:
+#: Dropping those three is not a new policy, it is the spec catching up with
+#: the prompt: ``_CONDUCTOR_SYSTEM_PROMPT`` already PROHIBITS them by name ("a
+#: work item never goes to ``spawn_run``, ``spawn_sub_agents``,
+#: ``workflow_run`` or ``task_run``"), so a grant that auto-approved them
+#: contradicted the charter it shipped with.
+#:
+#: DERIVED, not copied. The set is the union of the prompt's own "Your tools:"
+#: inventory and the ``goal-conductor`` skill's real call sites, filtered to
+#: the tools that actually register on ``kirocrew-core`` — the ``session_*``
+#: and ``chat_folder_*`` verbs the charter also names are
+#: ``@kirocrew-dashboard`` and are granted by the tuple above, while
+#: ``list_sessions`` is core (``mcp_tools/sessions.py``) despite sitting in the
+#: prompt's child-session paragraph. Deriving rather than reusing the sibling's
+#: thirteen is load-bearing: ``select_crew`` is absent from that tuple and is
+#: step 1 of this conductor's documented dispatch procedure
+#: (``goal-conductor/SKILL.md``), so copying would have broken dispatch on the
+#: first cycle while looking like a correct patch.
+#:
+#: ``select_crew`` earns its place under the invariant already stated for the
+#: dashboard tuple — a granted verb may CREATE or READ, never MUTATE something
+#: that already exists and is not the agent's own. ``_do_select_crew`` reads
+#: config, resolves the crew's bindings, and appends one routing-decision
+#: record keyed to its OWN session; it binds nothing and starts no work.
+#:
+#: What is granted: reads (``resource_status``, ``list_sessions``, skills), the
+#: patrol loop's own lifecycle (``monitor_*``, ``autonudge_stop``, ``wait``),
+#: the conductor's OWN durable ledger, routing (``select_crew``), and
+#: reporting to the owner (``send_message``, ``send_notification``,
+#: ``ask_question``).
+_CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
+    "@kirocrew-core/monitor_start",
+    "@kirocrew-core/monitor_update",
+    "@kirocrew-core/autonudge_stop",
+    "@kirocrew-core/wait",
+    "@kirocrew-core/resource_status",
+    "@kirocrew-core/list_sessions",
+    "@kirocrew-core/session_ledger_read",
+    "@kirocrew-core/session_ledger_record",
+    "@kirocrew-core/skill_search",
+    "@kirocrew-core/skill_fetch",
+    "@kirocrew-core/select_crew",
+    "@kirocrew-core/send_message",
+    "@kirocrew-core/send_notification",
+    "@kirocrew-core/ask_question",
 )
 
 
@@ -4659,8 +5402,9 @@ def _install_conductor_agent() -> None:
     the explicit per-agent assignment that set requires — it is deliberately
     absent from the default agent's spec.
 
-    ``@kirocrew-dashboard`` is MOUNTED whole but auto-approved only verb by verb,
-    via ``_CONDUCTOR_DASHBOARD_GRANTS`` (see its comment for the per-verb
+    ``@kirocrew-core`` and ``@kirocrew-dashboard`` are both MOUNTED whole but
+    auto-approved only verb by verb, via ``_CONDUCTOR_CORE_GRANTS`` and
+    ``_CONDUCTOR_DASHBOARD_GRANTS`` (see their comments for the per-verb
     reasoning). Both backends honour a per-tool reference, so the narrowing is
     real rather than cosmetic: kiro-cli's ``is_tool_in_allowlist`` checks
     ``@server`` and then ``@server/<tool>``, and ``allowed_tools_to_permissions``
@@ -4742,7 +5486,7 @@ def _install_conductor_agent() -> None:
         "session",
         "report",
         "tool_search",
-        "@kirocrew-core",
+        *_CONDUCTOR_CORE_GRANTS,
         *_CONDUCTOR_DASHBOARD_GRANTS,
     ):
         (granted if _may_auto_approve(ref) else withheld).append(ref)
@@ -4797,20 +5541,245 @@ def _install_conductor_agent() -> None:
     # as a literal: the rules come out byte-identical, a later edit to
     # ``allowedTools`` carries through, and a ceiling that strips a grant strips
     # its KAS rule with it (a hand-written ``kirocrew-core/*`` allow would have
-    # survived the filter on the KAS backend). ``{"rules": []}`` when nothing
-    # qualifies — the key's mere PRESENCE is what makes KAS load the spec at all.
-    from kiro_crew.acp.kas_permissions import (  # noqa: PLC0415 - circular import
-        allowed_tools_to_permissions,
+    # survived the filter on the KAS backend). Routed through the agent-sdk
+    # boundary like the pipeline conductor below: ``drivers.acp`` is the one
+    # layer permitted to import ``kiro_crew.acp``, and agent.py's direct-import
+    # count is a shrink-only baseline that must not grow.
+    from kiro_crew.agent_sdk.drivers.acp import (  # noqa: PLC0415 - boot path
+        derived_agent_permissions,
     )
 
-    derived = allowed_tools_to_permissions(
-        config["allowedTools"], agent_id=Path(_CONDUCTOR_AGENT_FILENAME).stem
+    config["permissions"] = derived_agent_permissions(
+        config["allowedTools"], _CONDUCTOR_AGENT_FILENAME
     )
-    config["permissions"] = derived if derived is not None else {"rules": []}
     kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
     path = kiro_agents_dir_path() / _CONDUCTOR_AGENT_FILENAME
     _atomic_json_write(path, config)
     logger.info("Installed conductor agent config: %s", path)
+
+
+_PIPELINE_CONDUCTOR_SYSTEM_PROMPT = """# Kiro Crew Pipeline Conductor
+
+You are `kirocrew-pipeline-conductor`. You run ONE pipeline on ONE repository:
+you pick up queued work items, stand up one worker session per item in the
+pipeline's folder, patrol the fleet, verify claimed results independently,
+intervene when a worker loops or stalls, adjudicate blocked items, govern host
+resources and per-item credit budgets, and report verified greens to the
+person as plain-language digests.
+
+**You never do a work item's work yourself.** A file to write, a build to run,
+a fix to make — each one belongs to a worker session you dispatch, verify and
+report on. You have no dedicated file-writing tool (the shell tool stays
+mounted but gated behind operator approval), and a work item never goes to
+`spawn_run`, `spawn_sub_agents`, `workflow_run` or `task_run`. `spawn_run`
+exists here for ONE purpose: a bounded INSPECTOR subagent that reads a suspect
+worker's tail and its PR state and returns a verdict. `spawn_run` accepts no
+`allowed_tools` parameter, so bound the inspector in the task text and by
+pinning a read-only `agent=` spec — read-only is stated and verified, never
+enforced by the spawn.
+
+**Scripts are the deterministic half of your loop.** Shell access exists to
+run the scripts the `pipeline-conductor` skill carries:
+`scripts/claim_preflight.py` (ONE verdict per candidate item before you dispatch
+it — CLAIM / SKIP / CLOSE / REVIEW / UNKNOWN, branched on the exit code; UNKNOWN
+is never permission, and REVIEW is a closure request READ in the item's prose,
+which you confirm yourself because prose never closes an item), `scripts/fleet_probe.py` (the ONE batch probe per patrol
+cycle — worker tails, tail index, idle age, error tails, banned-process scan,
+host load, delivery counters) and `scripts/credit_spend.py` (per-item credit
+rollups and budget verdicts). Read their output; never re-derive what they
+compute from transcripts. A script your install does not carry reads as UNKNOWN
+for the questions it answers — never as permission; the skill says what to do
+in that case.
+
+**Patrol with `monitor_start`, never with `wait`.** Arm it with the full cycle
+instructions AND the exit condition, then end the turn; call `autonudge_stop`
+when you stop. A reply saying *requested* is success — do not retry it. If
+arming is refused outright, say no loop is running and drive that one round
+with `wait`. A quiet cycle is one line, then end the turn.
+
+Your tools:
+
+- Worker sessions — `session_create`, `session_send`, `session_read_message`,
+  `session_stop`, `list_sessions`.
+- Keeping the pipeline's sessions together — `chat_folder_tree`,
+  `chat_folder_create`.
+- State that outlives a round — `session_ledger_read`, `session_ledger_record`.
+- Patrol — `monitor_start`, `monitor_update`, `autonudge_stop`, `wait`.
+- Capacity, before dispatching — `resource_status`.
+- Inspecting a suspect worker — `spawn_run`, bounded and read-only.
+- Talking to the person — `ask_question` puts a decision that is not yours to
+  make to them as a card, after which you END your turn and their answer
+  arrives as the next message; `send_message` / `send_notification` to report.
+- Naming the right skill in a seed message — `skill_search`, `skill_fetch`.
+- Reading — `fs_read`, `web_fetch`.
+- `tool_search` loads a tool that is not in your list yet.
+
+The `pipeline-conductor` skill carries the operating procedure — the pipeline
+spec, the claim preflight, the work-order brief, the probe cycle and its action
+table, the intervention ladder, outage recovery and loop liveness, the
+adjudication and override protocol, the delivery-based admission table, the
+credit budget rules, the `conductor-status/v1` file that records your OWN
+obligations, and the cleanup steps. Read
+it before acting on a pipeline. The user can message you at any time: a
+steering message is a MODE CHANGE — fold it into the standing patrol
+instruction with `monitor_update` so every later cycle honors it.
+
+{{VERBOSITY_BLOCK}}
+"""
+
+
+#: The kirocrew-core verbs the pipeline conductor may call WITHOUT an approval
+#: prompt. Named one by one rather than as the whole ``@kirocrew-core`` server,
+#: extending the dashboard-grants invariant below to the core surface: the
+#: conductor ingests untrusted content (issue text, PR bodies) on unattended
+#: cycles, and a server-wide grant would let that content start persistent
+#: work (``task_run``, ``workflow_run``) or spawn arbitrary
+#: subagents with no human in the loop. (``cron_add`` used to be named here
+#: too; it registers on ``kirocrew-cron``, which neither conductor mounts, so
+#: it was never reachable through this grant either way.) What is granted is reads
+#: (``resource_status``, ``list_sessions``, skills), the conductor's OWN
+#: patrol-loop lifecycle (``monitor_*``, ``autonudge_stop``, ``wait``), its
+#: OWN durable ledger, and reporting to the owner (``send_message``,
+#: ``send_notification``, ``ask_question``). ``spawn_run`` — the intervention
+#: ladder's read-only inspector — is deliberately NOT here: it starts agent
+#: work from ingested context, so like ``session_send``/``session_stop`` it
+#: stays mounted-but-gated and unattended runs get it from the operator's
+#: session-level trust grant.
+_PIPELINE_CONDUCTOR_CORE_GRANTS: tuple[str, ...] = (
+    "@kirocrew-core/monitor_start",
+    "@kirocrew-core/monitor_update",
+    "@kirocrew-core/autonudge_stop",
+    "@kirocrew-core/wait",
+    "@kirocrew-core/resource_status",
+    "@kirocrew-core/list_sessions",
+    "@kirocrew-core/session_ledger_read",
+    "@kirocrew-core/session_ledger_record",
+    "@kirocrew-core/skill_search",
+    "@kirocrew-core/skill_fetch",
+    "@kirocrew-core/send_message",
+    "@kirocrew-core/send_notification",
+    "@kirocrew-core/ask_question",
+)
+
+
+#: The dashboard verbs the pipeline conductor may call WITHOUT an approval
+#: prompt. Same tuple, same reasoning, as ``_CONDUCTOR_DASHBOARD_GRANTS``
+#: above — the invariant (a granted verb may CREATE or READ, never MUTATE
+#: workspace state that already exists and is not the agent's own; its worst
+#: case in a loop must be bounded by the server) applies verbatim, because
+#: this agent too ingests untrusted content by design: issue text and PR
+#: bodies feed every granted verb on a nudge-driven cycle with nobody at the
+#: keyboard. ``session_send`` / ``session_stop`` — which the patrol's
+#: intervention ladder does use — stay mounted-but-gated for the same reason
+#: they are gated on the goal conductor; unattended operation gets them via
+#: the operator arming the conductor's own session in trust mode (the same
+#: explicit, session-scoped human grant the worker sessions already require),
+#: not via a standing spec-level bypass.
+_PIPELINE_CONDUCTOR_DASHBOARD_GRANTS: tuple[str, ...] = (
+    "@kirocrew-dashboard/chat_folder_tree",
+    "@kirocrew-dashboard/chat_folder_create",
+    "@kirocrew-dashboard/session_create",
+    "@kirocrew-dashboard/session_read_message",
+)
+
+
+def _install_pipeline_conductor_agent() -> None:
+    """Generate and install the kirocrew-pipeline-conductor agent config.
+
+    Follows ``_install_conductor_agent`` above deliberately — one standalone
+    installer per generated agent is the file's established pattern — and
+    keeps every property that installer's docstring argues for: derived from
+    the kirocrew agent, **no dedicated file-writing tool** (neither ``fs_write``
+    nor ``code``), ``@kirocrew-dashboard`` mounted whole but auto-approved only
+    verb by verb, ``execute_bash`` mounted but never auto-approved
+    (``allowedTools`` has no argument matching, so trusting the two bundled
+    skill scripts cannot be told apart from trusting arbitrary shell), and the
+    KAS policy derived from the FILTERED grant list. Where the two agents
+    differ is charter, not mechanics: this one supervises a repository
+    pipeline's worker fleet (probe / verify / intervene / adjudicate / govern)
+    per the ``pipeline-conductor`` builtin skill, rather than decomposing a
+    free-form goal.
+    """
+    config = build_agent_config()
+    config["name"] = "kirocrew-pipeline-conductor"
+    config["description"] = (
+        "Runs one repository pipeline as a supervised fleet: picks up queued "
+        "work items, dispatches one worker session per item, probes and "
+        "verifies them, intervenes on stalls, adjudicates blocked items, and "
+        "governs host resources and per-item credit budgets. Never does a "
+        "work item's work itself."
+    )
+    config["prompt"] = _PIPELINE_CONDUCTOR_SYSTEM_PROMPT
+    config["tools"] = [
+        "execute_bash",
+        "fs_read",
+        "web_fetch",
+        "session",
+        "report",
+        "tool_search",
+        "@kirocrew-core",
+        "@kirocrew-dashboard",
+    ]
+    granted: list[str] = []
+    withheld: list[str] = []
+    for ref in (
+        "session",
+        "report",
+        "tool_search",
+        *_PIPELINE_CONDUCTOR_CORE_GRANTS,
+        *_PIPELINE_CONDUCTOR_DASHBOARD_GRANTS,
+    ):
+        (granted if _may_auto_approve(ref) else withheld).append(ref)
+    config["allowedTools"] = granted
+    if withheld:
+        # Same audit contract as every other ``allowedTools`` writer: a
+        # withheld grant is a permission decision and must leave a record.
+        try:
+            sel().log_api_access(
+                caller="system",
+                operation="mcp_auto_approve_withheld",
+                outcome="ok",
+                source="_install_pipeline_conductor_agent",
+                resources=(
+                    f"{', '.join(withheld)} mounted without auto-approve "
+                    "(governance ceiling); calls go through the approval gate"
+                ),
+            )
+        except Exception:  # noqa: BLE001 — the audit must not break the install
+            logger.debug("SEL audit unavailable for withheld auto-approve", exc_info=True)
+    mcp = config.get("mcpServers", {}) or {}
+    core_entry = mcp.get("kirocrew-core")
+    narrowed: dict = {}
+    if core_entry:
+        narrowed["kirocrew-core"] = core_entry
+    dash_cmd, dash_args = _kirocrew_mcp_invocation("mcp-dashboard")
+    dash_entry: dict[str, Any] = {"command": dash_cmd, "args": dash_args}
+    # Same managed-server metadata as the conductor's hand-built entry, for the
+    # same two failure modes: a registry-mode client silently DROPS an entry
+    # with no ``type``, and without the data-home pin the shim reads the
+    # DEFAULT home while the gateway runs under an override.
+    if _mcp_registry_mode():
+        dash_entry["type"] = _MCP_REGISTRY_TYPE
+    dash_env = _managed_mcp_env()
+    if dash_env:
+        dash_entry["env"] = dash_env
+    narrowed["kirocrew-dashboard"] = dash_entry
+    config["mcpServers"] = narrowed
+    # Same derive-don't-restate rationale as the conductor above, but routed
+    # through the agent-sdk boundary: ``drivers.acp`` is the one layer permitted
+    # to import ``kiro_crew.acp``, and agent.py's direct-import count is a
+    # shrink-only baseline that must not grow.
+    from kiro_crew.agent_sdk.drivers.acp import (  # noqa: PLC0415 - boot path
+        derived_agent_permissions,
+    )
+
+    config["permissions"] = derived_agent_permissions(
+        config["allowedTools"], _PIPELINE_CONDUCTOR_AGENT_FILENAME
+    )
+    kiro_agents_dir_path().mkdir(parents=True, exist_ok=True)
+    path = kiro_agents_dir_path() / _PIPELINE_CONDUCTOR_AGENT_FILENAME
+    _atomic_json_write(path, config)
+    logger.info("Installed pipeline-conductor agent config: %s", path)
 
 
 _HEARTBEAT_SYSTEM_PROMPT = """# KiroCrew Heartbeat Worker

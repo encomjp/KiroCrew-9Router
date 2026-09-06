@@ -49,7 +49,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kiro_crew import mcp_computer
+from kiro_crew import mcp_computer, mcp_core
 from kiro_crew.computer_use import backend as cu_backend
 from kiro_crew.computer_use import index as cu_index
 from kiro_crew.computer_use import policy as cu_policy
@@ -77,6 +77,11 @@ from kiro_crew.computer_use.types import (
     TOOL_SET_VALUE,
     TOOL_TYPE_TEXT,
     AppRef,
+)
+from kiro_crew.mcp_caller import (
+    CallerContext,
+    set_current_caller,
+    set_current_tenant_nonce,
 )
 from kiro_crew.testing.fake_computer_use import (
     FAKE_CREDENTIAL_FIXTURE,
@@ -404,7 +409,7 @@ def test_oversized_text_is_rejected():
 
 
 def test_shim_uses_the_strict_session_resolver_not_the_lenient_one():
-    """``_resolve_session_key_strict`` only.
+    """Strict identity only, routed through the shared reflexive-tool gate.
 
     The lenient resolver walks ``/proc`` ancestors over ``session_pid_<pid>.txt``,
     which ``mcp_core`` itself documents as "agent-writable and therefore
@@ -412,6 +417,7 @@ def test_shim_uses_the_strict_session_resolver_not_the_lenient_one():
     over the module's source so a future edit cannot quietly swap the resolver.
     """
     src = inspect.getsource(mcp_computer)
+    assert "require_strict_session_key" in src
     assert "_resolve_session_key_strict" in src
     # The lenient name must not appear as a CALL. (It is a prefix of the strict
     # name, so compare call forms rather than substrings.)
@@ -429,10 +435,11 @@ def test_an_unresolved_session_key_PROCEEDS_with_an_empty_identity(
 
     * the unattended-surface rule was removed by product decision, so there is no
       longer a surface class to protect;
-    * neither accepted identity source EXISTS for a GUI-launched kiro-cli on macOS.
-      ``KIROCREW_SESSION_KEY`` is injected only by the ACP spawn path and
-      ``KIROCREW_HOST_PID`` only by the Linux sandbox launcher — so the refusal made
-      the feature unusable on its only supported platform, which is how it was found.
+    * neither accepted identity source EXISTS for a GUI-launched kiro-cli on macOS —
+      both come from a launcher above the process, and a GUI launch has none (the
+      ``mcp_computer`` module docstring names which launcher supplies each) — so the
+      refusal made the feature unusable on its only supported platform, which is how
+      it was found.
 
     The call reaches the gateway. What is lost is audit ATTRIBUTION, not a control —
     and the key it carries is a per-PROCESS placeholder rather than the empty string,
@@ -440,7 +447,7 @@ def test_an_unresolved_session_key_PROCEEDS_with_an_empty_identity(
     """
     _enable(keystone)
     posted: list[Any] = []
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: "")
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "")
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: posted.append(a) or {"text": "ok"})
     result = mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
     assert not result.startswith(ERROR_PREFIX), result
@@ -475,7 +482,7 @@ def test_resolved_session_key_is_forwarded_in_body_and_header(
         seen.update({"session_key": session_key, "name": name, "args": args})
         return {"text": "App=…"}
 
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(mcp_computer, "_invoke", _invoke)
     assert mcp_computer._call_tool_inner(TOOL_LIST_APPS, {}) == "App=…"
     assert seen["session_key"] == _SESSION
@@ -491,7 +498,7 @@ def test_non_latin1_session_key_is_refused_with_an_actionable_message(
     surface as a raw ``UnicodeEncodeError`` instead of "rename the tab".
     """
     _enable(keystone)
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: "dashboard:tab—1")
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:tab—1")
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: {"text": "ok"})
     result = mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
     assert result.startswith(ERROR_PREFIX)
@@ -535,7 +542,7 @@ def test_transport_failure_is_reported_as_an_actionable_error(
 ):
     """An unreachable gateway must be diagnosable, not an opaque internal error."""
     _enable(keystone)
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(
         mcp_computer,
         "_invoke",
@@ -555,7 +562,7 @@ def test_gateway_refusal_text_is_relayed_verbatim(keystone: Path, monkeypatch: p
     """
     _enable(keystone)
     refusal = f"{ERROR_PREFIX}Blocked by governance policy: capability disabled"
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: {"text": refusal})
     assert mcp_computer._call_tool_inner(TOOL_CLICK, {}) == refusal
 
@@ -565,7 +572,7 @@ def test_empty_gateway_body_is_an_error_not_a_silent_success(
 ):
     """A body with neither text nor error must not read as success."""
     _enable(keystone)
-    monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: _SESSION)
+    monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: _SESSION)
     monkeypatch.setattr(mcp_computer, "_invoke", lambda *a, **k: {})
     result = mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
     assert result.startswith(ERROR_PREFIX)
@@ -1927,6 +1934,18 @@ class TestTheSkillContractMatchesTheRuntime:
 
     _SPEC = Path(__file__).resolve().parents[1] / "docs/system-specs/modules/computer-use.md"
 
+    def test_the_spec_names_every_screenshot_spool_writer(self):
+        """The security contract must cover every place that persists pixels."""
+        text = self._SPEC.read_text(encoding="utf-8")
+        writers = {
+            "service._persist_image",
+            "capture_macos.persist_jpeg",
+            "capture_windows.persist_jpeg",
+        }
+        missing = {writer for writer in writers if writer not in text}
+        assert not missing, missing
+        assert "invocation-owned partial frame" in text
+
     def test_the_skill_does_not_advertise_an_optional_element_index(self):
         text = self._SKILL.read_text(encoding="utf-8")
         assert "element_index?" not in text
@@ -2032,7 +2051,26 @@ class TestUnresolvedSessionsAreNamespaced:
     spawns one shim process per session, so the shim's own pid separates the
     namespaces precisely as far as the sessions are genuinely separate, and nothing is
     refused. The security posture is unchanged; only the cache key is.
+
+    #5322 is the POOLED half of the same aliasing. "One shim process per session" is
+    the 1:1 topology's premise, and a pooled backend breaks it: one process serves N
+    connections, so the pid separates nothing and every unnamed co-tenant collapsed
+    back onto a single ``unresolved:<pid>`` key. The pid is now joined by the
+    gateway-minted per-CONNECTION nonce, which separates them again — still a
+    separator, still not attribution, and still nothing refused.
     """
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_nonce(self):
+        """No injected nonce unless a test installs one.
+
+        The nonce lives in a ``ContextVar`` the dispatch loop sets and clears, so a
+        test leaving one installed would silently rewrite every later test's
+        expected key.
+        """
+        set_current_tenant_nonce("")
+        yield
+        set_current_tenant_nonce("")
 
     def test_two_unresolved_sessions_do_not_share_a_snapshot_slot(self):
         """The bug, at the layer it actually lived in."""
@@ -2066,6 +2104,99 @@ class TestUnresolvedSessionsAreNamespaced:
         key = mcp_computer._unresolved_session_key()
         assert key == f"{mcp_computer.UNRESOLVED_SESSION_PREFIX}{os.getpid()}"
 
+    def test_two_unnamed_co_tenants_of_ONE_process_do_not_share_a_slot(self, monkeypatch):
+        """#5322, at the layer it lives in — one pid, two connections.
+
+        Both co-tenants run in the SAME shim process, so ``os.getpid()`` is pinned to
+        one value here deliberately: that is the whole premise the pooled topology
+        breaks. Without the nonce half both keys are the same string and the second
+        snapshot answers the first session's lookup — the wrong-target action the
+        fingerprint check cannot catch, because both trees describe the same window.
+        """
+        from kiro_crew.computer_use.index import SnapshotIndex
+        from kiro_crew.computer_use.types import ElementRec, Snapshot
+
+        monkeypatch.setattr(os, "getpid", lambda: 5150)
+        app = AppRef(name="Notes", pid=1, window_id=7)
+
+        def snap(title: str) -> Snapshot:
+            return Snapshot(
+                app=app,
+                elements=(ElementRec(index=0, role="AXButton", title=title),),
+                captured_at=100.0,
+            )
+
+        keys: list[str] = []
+        for nonce in ("aaaa1111", "bbbb2222"):
+            set_current_tenant_nonce(nonce)
+            keys.append(mcp_computer._unresolved_session_key())
+
+        assert keys[0] != keys[1], "one pid, two connections: the keys must differ"
+
+        index = SnapshotIndex()
+        index.put(snap("A"), session_key=keys[0])
+        index.put(snap("B"), session_key=keys[1])
+        for key, expected in zip(keys, ("A", "B")):
+            got = index.get(app.window_key, session_key=key, now=100.0)
+            assert got is not None and got.elements[0].title == expected, key
+
+    def test_the_nonce_half_is_read_at_CALL_time_too(self, monkeypatch):
+        """One process serves many connections in sequence as well as concurrently.
+
+        A nonce captured once per process would namespace by process again, which is
+        the bug. Each call reads the connection the call arrived on.
+        """
+        monkeypatch.setattr(os, "getpid", lambda: 5150)
+        set_current_tenant_nonce("first")
+        assert mcp_computer._unresolved_session_key() == "unresolved:5150#first"
+        set_current_tenant_nonce("second")
+        assert mcp_computer._unresolved_session_key() == "unresolved:5150#second"
+
+    def test_the_nonce_never_becomes_an_IDENTITY(self, monkeypatch):
+        """A separator must not be promoted to attribution.
+
+        The nonce names a connection, not a principal. If the strict resolver ever
+        read it, an unnamed caller would arrive at every consumer of a session key —
+        cron ownership, callback routing, audit — carrying a key that names nobody
+        while LOOKING resolved. So with a nonce installed and no identity source,
+        strict resolution must still come back empty, and the shim must still take
+        the unresolved path.
+        """
+        monkeypatch.delenv("KIROCREW_SESSION_KEY", raising=False)
+        monkeypatch.delenv("KIROCREW_HOST_PID", raising=False)
+        set_current_caller(None)
+        set_current_tenant_nonce("cafebabe")
+
+        assert mcp_core._resolve_session_key_strict() == ""
+        assert mcp_computer._unresolved_session_key().startswith(
+            mcp_computer.UNRESOLVED_SESSION_PREFIX
+        )
+
+    def test_a_named_co_tenant_is_unaffected_by_the_nonce(self, monkeypatch):
+        """The nonce is the fallback's business only.
+
+        A caller the gateway CAN name already has a per-session key; appending a
+        connection nonce to it would split one session's own namespace across a
+        reconnect for no reason.
+        """
+        set_current_caller(CallerContext(session_key="dashboard:main"))
+        set_current_tenant_nonce("cafebabe")
+        try:
+            assert mcp_core._resolve_session_key_strict() == "dashboard:main"
+        finally:
+            set_current_caller(None)
+
+    def test_the_key_survives_an_HTTP_header(self):
+        """The key is sent as ``X-Session-Key``, so the separator must be encodable.
+
+        ``_session_key_header_error`` is the shim's own pre-flight; a key it rejects
+        never reaches the gateway at all.
+        """
+        set_current_tenant_nonce("cafebabe")
+        assert (
+            mcp_computer._session_key_header_error(mcp_computer._unresolved_session_key()) is None
+        )
+
     def test_it_is_read_at_CALL_time_not_captured_at_import(self, monkeypatch):
         """A ``fork``ed child must not inherit the parent's string.
 
@@ -2089,23 +2220,12 @@ class TestUnresolvedSessionsAreNamespaced:
         attribution the strict resolver exists to provide."""
         _enable(keystone)
         posted: list[Any] = []
-        monkeypatch.setattr(mcp_computer, "_resolve_session_key_strict", lambda: "dashboard:main")
+        monkeypatch.setattr(mcp_core, "_resolve_session_key_strict", lambda: "dashboard:main")
         monkeypatch.setattr(
             mcp_computer, "_invoke", lambda *a, **k: posted.append(a) or {"text": "ok"}
         )
         mcp_computer._call_tool_inner(TOOL_LIST_APPS, {})
         assert posted and posted[0][0] == "dashboard:main"
-
-    def test_the_fix_added_no_refusal(self):
-        """The constraint this had to be solved under, asserted directly.
-
-        The obvious fix — and the one prescribed — is ``if not key: refuse``. That
-        line is why the feature did not work on macOS at all, so it must not return
-        under a different justification.
-        """
-        src = inspect.getsource(mcp_computer)
-        assert "could not be identified" not in src
-        assert "ERR_NO_SESSION" not in src
 
 
 class TestTheDriftWalkHonoursTheSnapshotBudget:

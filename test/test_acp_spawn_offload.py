@@ -264,7 +264,7 @@ class TestRuntimeSpawnOffLoop:
         class _StopSpawn(Exception):
             pass
 
-        async def resolve_bin() -> str:
+        async def resolve_bin(*, environ=None, home=None) -> str:
             return "/usr/bin/kiro-cli"
 
         async def stop_spawn(*args, **kwargs):
@@ -361,7 +361,7 @@ class TestSpawnCancellationSandboxCleanup:
     ) -> None:
         sandbox_file = self._sandbox_file(tmp_path)
 
-        async def resolve_bin() -> str:
+        async def resolve_bin(*, environ=None, home=None) -> str:
             return "/usr/bin/kiro-cli"
 
         def _cgroup(argv):
@@ -526,7 +526,7 @@ class TestRuntimeShieldSurvivesAFailedAppend:
 
     @staticmethod
     def _patch_prelude(monkeypatch, tmp_path, mock_proc):
-        async def resolve_bin() -> str:
+        async def resolve_bin(*, environ=None, home=None) -> str:
             return "/usr/bin/kiro-cli"
 
         monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_bin)

@@ -1,6 +1,6 @@
 ---
 name: theme-pack-authoring
-description: Build, validate, and install Kiro Crew theme packs -- pack anatomy, the 54-variable palette, role-tagged fonts, the overrides.css allowlist (what installs vs what actually renders), and the install-verify cycle. Use when the user wants to create or edit a theme pack.
+description: Build, validate, and install Kiro Crew theme packs -- pack anatomy, the 56-variable palette, role-tagged fonts, the overrides.css allowlist (what installs vs what actually renders), and the install-verify cycle. Use when the user wants to create or edit a theme pack.
 triggers: theme pack, custom theme, theme.json, variables.json, overrides.css, install theme, theme font, dashboard theme, build a theme
 ---
 
@@ -8,15 +8,15 @@ triggers: theme pack, custom theme, theme.json, variables.json, overrides.css, i
 
 House rules for building theme packs. The authoritative contract is
 [`website/docs/theming-contract.md`](https://github.com/kirodotdev/KiroCrew/blob/main/website/docs/theming-contract.md);
-this skill is the task-oriented digest, plus the traps that cost real
-debugging time.
+this skill is the self-contained task-oriented digest, plus the traps that cost
+real debugging time.
 
 ## Pack anatomy
 
 ```
 my-theme/
 ├── theme.json          # manifest: slug, name, emoji, level, formatVersion, fonts[]
-├── variables.json      # dark + light palettes (54 allowlisted CSS vars)
+├── variables.json      # dark + light palettes (56 allowlisted CSS vars)
 ├── readme.md           # optional; attribution and notes
 ├── styles/
 │   ├── overrides.css   # optional; scoped structural CSS (see allowlist below)
@@ -37,6 +37,7 @@ a level-0 pack shipping a font is refused.
   "emoji": "🎨",
   "level": 1,
   "formatVersion": 1,
+  "loaderIcons": ["star", "sparkles", "moon", "cloud"],
   "fonts": [
     { "family": "My Sans", "file": "my-sans-400.woff2", "weight": 400, "role": "sans" },
     { "family": "My Sans", "file": "my-sans-500.woff2", "weight": 500, "role": "sans" },
@@ -45,6 +46,12 @@ a level-0 pack shipping a font is refused.
   ]
 }
 ```
+
+`loaderIcons` is optional and requires Level 1 or 2. Supply 4–8 distinct names
+from: `cloud`, `flower`, `heart`, `moon`, `sparkles`, `star`, `sun`, `zap`.
+Kiro Crew maps these names to bundled Lucide symbols and keeps the stock
+cross-fading carousel; packs cannot inject loader code or SVG through this field.
+Omit it to retain the default Kiro ghost poses.
 
 ## Fonts — the role system (the ONLY supported route)
 
@@ -71,10 +78,10 @@ a level-0 pack shipping a font is refused.
 
 ## variables.json — the palette
 
-Two blocks, `dark` and `light`, each holding up to **54 allowlisted variables**.
+Two blocks, `dark` and `light`, each holding up to **56 allowlisted variables**.
 Required minimum per block: `--bg`, `--text`, `--accent`. Unknown keys are
 REJECTED (install fails), so do not invent variables; the allowlist is
-`_THEME_CSS_VARS` in `src/kiro_crew/dashboard/theme_validate.py`.
+`_THEME_CSS_VARS` in `kiro_crew/dashboard/theme_validate.py`.
 
 - To clone a built-in theme's palette, transcribe its block from
   `website/src/index.css` (e.g. `[data-theme="kiro-dark"]`), keeping only
@@ -83,6 +90,10 @@ REJECTED (install fails), so do not invent variables; the allowlist is
   `--json-str`, `--json-num`, `--json-bool`) are allowlisted — set them directly
   in `variables.json` like any other palette entry. No overrides.css workaround
   is needed for them.
+- Two terminal hues (`--term-magenta`, `--term-cyan`) and the seven `--diff-*`
+  vars are allowlisted too. The other fourteen terminal colors are derived from
+  `--bg` / `--text` / `--danger` / `--ok` / `--warn` / `--info`, so a pack that
+  wants its own terminal palette sets only those two.
 
 ## overrides.css — what installs is NOT what renders
 
@@ -100,9 +111,34 @@ Two different filters run, and they disagree by design:
 
 Consequence: a rule can pass install and never render. The browser console
 lists any rules the runtime dropped from the active theme (`[theme]
-overrides.css: dropped …`), and builds with the Settings notice show the same
-list under the theme selector in Settings → Display. If a rule you wrote has no
-effect, check there BEFORE suspecting specificity.
+overrides.css: dropped …`), and Settings → Display shows the same list under the
+theme selector whenever the active theme has any, with a link to the theming
+contract. That notice is condition-derived: it disappears on its own once you fix
+the pack and re-install, and that vanishing IS the confirmation. If a rule you
+wrote has no effect, check there BEFORE suspecting specificity.
+
+A compound on the same base survives, so `.topbar.compact:hover` is fine, and
+the scoping prefix may be written `html[data-theme="…"]` too. One failing
+selector kills the WHOLE comma group, so keep a risky selector in its own rule.
+`@media` wrappers survive — the wrapper is kept and its inner rules filtered by
+the same allowlist — while every other at-rule (`@font-face`, `@supports`,
+`@import`) is dropped at runtime.
+
+Each level also caps the pack as a whole: 32 entries / 256 KB at level 0, 64 /
+2 MB at level 1, 160 / 5 MB at level 2. With 512 KB per font face, the level-1
+total is what a font-heavy pack actually hits — budget the faces against 2 MB,
+not against the count of 6.
+
+Beyond `theme.json`, `variables.json`, `readme.md`, `styles/` and `LICENSE.txt`,
+the classifier also recognizes `branding/logo.{svg,png}`,
+`branding/favicon.{ico,png,svg}`, `branding/wordmark.{svg,png}` and
+`branding/preview.{png,webp}` at level 1, and `persona.md`, `overlays/*.html`,
+`topbar/{dark,light}.html`, `audio/manifest.json` and `audio/*.{mp3,ogg,wav}` at
+level 2. `styles/variables.json` is accepted as an alternative to the top-level
+file. Every path is classified against that fixed table, so an unrecognized file
+fails the install — do not park notes or scratch files in the pack (only VCS and
+LICENSE metadata is tolerated). Level-2 caps: at most 5 overlays, 2000 characters
+of `persona.md`, 48 characters of bot name.
 
 ## Validate and install
 

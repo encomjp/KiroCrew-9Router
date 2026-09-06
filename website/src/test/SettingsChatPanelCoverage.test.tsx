@@ -46,7 +46,7 @@ const BASE_MC = {
     soft_stop_budget_secs: 10,
   },
   dashboard: { user_role: '', user_role_other: '', user_technical_level: '', prevent_sleep: false },
-  knowledge: { auto_ingest_chunk_budget: 200 },
+  knowledge: { embed_rate_limit: 120 },
 }
 
 const {
@@ -249,11 +249,16 @@ describe('ChatPanel — Composer', () => {
     await waitFor(() => expect(storedChat().followUpLayout).toBe('multiline'))
   })
 
-  it('persists Quick Send through the dashboard config, keeping siblings', async () => {
+  it('persists Quick Send through the dashboard config, sending only that key', async () => {
     wrap()
     fireEvent.click(await settledSwitch('Quick Send'))
+    // ONLY the changed key. A full-object body rebuilt from this panel's cached
+    // config would write every other setting back at its cached value, clobbering
+    // one a second tab changed after we cached it. Siblings are preserved by the
+    // handler, which applies only the keys present in the body -- see
+    // test/test_session_card_source_links_knob.py::TestConfigEndpoint.
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, quick_send: true })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ quick_send: true })
     )
   })
 
@@ -262,7 +267,6 @@ describe('ChatPanel — Composer', () => {
     fireEvent.click(await settledSwitch('Merge Queued Messages'))
     await waitFor(() =>
       expect(updateDashboardConfigMock).toHaveBeenCalledWith({
-        ...BASE_DASH,
         merge_queued_messages: true,
       })
     )
@@ -351,7 +355,7 @@ describe('ChatPanel — Messages', () => {
     wrap()
     await pickOption('Widget Density', 1)
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, widget_density: 'less' })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ widget_density: 'less' })
     )
   })
 
@@ -359,7 +363,7 @@ describe('ChatPanel — Messages', () => {
     wrap()
     await pickOption('Response Verbosity', 1)
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, verbosity: 'concise' })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ verbosity: 'concise' })
     )
   })
 
@@ -367,7 +371,7 @@ describe('ChatPanel — Messages', () => {
     wrap()
     fireEvent.click(await settledSwitch('MCP Apps in Side Panel'))
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, mcp_app_panel: true })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ mcp_app_panel: true })
     )
   })
 
@@ -376,7 +380,6 @@ describe('ChatPanel — Messages', () => {
     fireEvent.click(await settledSwitch('Folder suggestions'))
     await waitFor(() =>
       expect(updateDashboardConfigMock).toHaveBeenCalledWith({
-        ...BASE_DASH,
         folder_suggestions_enabled: false,
       })
     )
@@ -402,7 +405,7 @@ describe('ChatPanel — Sessions', () => {
     wrap()
     fireEvent.click(await settledSwitch(label))
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, [key]: expected })
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ [key]: expected })
     )
   })
 
@@ -441,8 +444,6 @@ describe('ChatPanel — Sessions', () => {
     fireEvent.click(opts[2])
     await waitFor(() =>
       expect(updateDashboardConfigMock).toHaveBeenCalledWith({
-        ...BASE_DASH,
-        restore_sessions: true,
         restore_window_minutes: 60,
       })
     )

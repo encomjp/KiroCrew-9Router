@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { SettingsSection, SettingsCard, SettingsToggle } from '../../components/settings'
 import { api } from '../../api/client'
+import { useOptimisticConfigPaths, setConfigPathValue } from './useOptimisticConfigPaths'
 
 import { i18nT } from '../../i18n/t'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -18,40 +19,54 @@ type SkillsCfg = { auto_create_from_sessions?: boolean; approval_required?: bool
 export function SkillsPanel() {
   const qc = useQueryClient()
   const [saveError, setSaveError] = useState('')
+  // Which path produced the current banner: a retry on the SAME path clears
+  // its stale failure, but a save on the other toggle says nothing about
+  // whether this one persisted, so its failure stays up.
+  const saveErrorPathRef = useRef<string | null>(null)
 
   const cfgQ = useQuery<{ skills?: SkillsCfg }>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
   })
   const skills = cfgQ.data?.skills
-  const autoCreate = skills?.auto_create_from_sessions ?? false
+  // Both toggles PATCH the shared ['kirocrewConfig'] object. A whole-object
+  // onMutate snapshot here would capture ANOTHER PANEL's in-flight optimistic
+  // value on the same query key and restore it on failure (the panel's own
+  // two toggles are mutually disabled while a save is pending, so the
+  // within-panel interleave is unreachable). Each toggle instead renders
+  // `shown(path, server)`; lifecycle in useOptimisticConfigPaths.ts.
+  const overlay = useOptimisticConfigPaths(qc)
+  const autoCreate = overlay.shown('skills.auto_create_from_sessions', skills?.auto_create_from_sessions ?? false)
   // approval_required defaults ON — generated skills stay gated behind review.
-  const approvalRequired = skills?.approval_required ?? true
+  const approvalRequired = overlay.shown('skills.approval_required', skills?.approval_required ?? true)
 
-  const patchMut = useMutation({
-    mutationFn: ({ path, value }: { path: string; value: boolean }) =>
-      api.patchConfig(path, value),
-    onMutate: async ({ path, value }) => {
-      await qc.cancelQueries({ queryKey: ['kirocrewConfig'] })
-      const prev = qc.getQueryData<{ skills?: SkillsCfg }>(['kirocrewConfig'])
-      const key = path.split('.')[1]
-      qc.setQueryData<{ skills?: SkillsCfg }>(['kirocrewConfig'], (old) => ({
-        ...(old ?? {}),
-        skills: { ...(old?.skills ?? {}), [key]: value },
-      }))
-      return { prev }
-    },
-    onError: (_err, _vars, ctx) => {
-      if (ctx?.prev) qc.setQueryData(['kirocrewConfig'], ctx.prev)
+  const patchMut = useMutation(overlay.mutationOpts<{ path: string; value: boolean }>({
+    queryKey: ['kirocrewConfig'],
+    mutationFn: ({ path, value }) => api.patchConfig(path, value),
+    path: v => v.path,
+    displayValue: v => v.value,
+    applyToCache: (cached, { path, value }) => setConfigPathValue(cached as { skills?: SkillsCfg }, path, value),
+    onFailure: (_err, { path }) => {
+      saveErrorPathRef.current = path
       setSaveError(i18nT('pages.settings.skillsPanel.failed_to_save_skills_setting'))
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-  })
+    onSupersede: path => {
+      if (saveErrorPathRef.current === path) {
+        saveErrorPathRef.current = null
+        setSaveError('')
+      }
+    },
+  }))
 
-  const disabled = cfgQ.isLoading || patchMut.isPending
+  const disabled = cfgQ.isLoading || cfgQ.isError || patchMut.isPending
 
   return (
     <SettingsSection title={i18nT('pages.settings.skillsPanel.skills')}>
+      {/* Load failure: the toggles below would otherwise show defaults as if they
+          were the stored values. Toggle-only card, nothing to lose → hand-off on. */}
+      {cfgQ.isError && (
+        <ErrorNotice message={i18nT('pages.settings.skillsPanel.config_load_failed')} className="mb-2" askAgent />
+      )}
       <SettingsCard>
         <SettingsToggle
           label={i18nT('pages.settings.skillsPanel.auto_generate_skills_from_sessions')}

@@ -35,6 +35,7 @@ from kiro_crew.hooks import HookResult
 from kiro_crew.messaging import dispatch as D
 from kiro_crew.messaging.dispatch import ChannelTurn, drive_turn
 from kiro_crew.messaging.transport import InboundMessage
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.telegram import commands as tcmd
 
 # ── 1. An unrecognized ``!command`` (and the prose that must not trip it) ───
@@ -343,6 +344,12 @@ class _PipelineSessions:
     async def get_or_create(self, key: str, agent: str = "", channel_id: str = "") -> Any:
         self.created.append(key)
         return object(), False, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns = getattr(self, "begin_turns", 0) + 1
+        if getattr(self, "closing", False):
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key: str, channel_id: str) -> None:
         return None

@@ -316,6 +316,36 @@ def is_active(cfg: PodConfig, name: str) -> bool:
     return _PID_RE.search(cp.stdout or "") is not None
 
 
+def main_pid(cfg: PodConfig, name: str) -> int | None:
+    """PID of this pod's own process, or ``None`` when it is not running.
+
+    The launchd counterpart of systemd's ``MainPID``, and the identity
+    ``runtime.port_owner`` compares a port's listener against. ``launchctl
+    print`` reports the live pid of a running agent; a loaded-but-dead agent
+    prints without one.
+
+    Fails the same way :func:`is_active` does, and for the same reason: a label
+    that is simply not loaded is a real answer (``None``), while an OPERATIONAL
+    failure proves nothing and raises. The distinction is load-bearing for the
+    caller — "asked, and this pod has no process" is what lets a listener be
+    attributed to someone else, whereas "could not ask" must stay undecided.
+    """
+    cp = _print(cfg, name)
+    if cp.returncode != 0:
+        if _service_absent(cp):
+            return None
+        raise LaunchdError(
+            f"launchctl print failed (rc={cp.returncode}) for "
+            f"{pod_label(cfg, name)}; cannot tell which process this pod is, "
+            f"refusing to guess: {(cp.stderr or cp.stdout or '').strip()}"
+        )
+    m = _PID_RE.search(cp.stdout or "")
+    if not m:
+        return None
+    pid = int(m.group(1))
+    return pid if pid > 0 else None
+
+
 def unit_state(cfg: PodConfig, name: str) -> tuple[str, int]:
     """``(state, restarts)`` shaped like the systemd backend's return.
 

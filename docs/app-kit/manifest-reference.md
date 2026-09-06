@@ -142,6 +142,11 @@ installed against:
 | `ui.sidebar.order` | number | `10` | Sort order within section |
 | `ui.overlays[].id` | string | | Overlay id; must match a bundled overlay component (see below) |
 | `ui.overlays[].replaces` | string | | Host overlay slot this app takes over while enabled |
+| `contributes.sessionControls[].id` | string | | Control id, kebab-case; addressed as `<appName>:<id>` |
+| `contributes.sessionControls[].entryPoint` | string | | ESM bundle path for the control (relative to ui/) |
+| `contributes.sessionControls[].label` | string | | Accessible name, and the chip's tooltip |
+| `contributes.sessionControls[].icon` | string | | Icon name. Only `Shield`, `Bot`, `Search`, `Tag`, `Users`, `Zap`, `Star`, `Package` and `Cat` are rendered; any other name falls back to `Package` |
+| `contributes.sessionControls[].statusPath` | string | | Optional backend route reporting per-session chip state (see below) |
 
 ### `ui.overlays` — Replacing a Host Overlay Surface
 
@@ -181,6 +186,201 @@ so the combination fails the build rather than silently reverting the surface.
 At most one enabled app owns a slot. When two enabled apps declare the same
 `replaces`, the first by app name wins and the collision is reported -- the winner
 does not depend on which app was enabled or installed more recently.
+
+## Contributions
+
+### `contributes.commands` — Adding Rows to the Command Bar
+
+Adds command rows to the host's Command Bar. This is the lightest thing an app can
+be: a command-contributing app needs no page, no frontend bundle, no backend and no
+process — a manifest, plus whatever skill its prompt names.
+
+```json
+{
+  "contributes": {
+    "commands": [
+      {
+        "id": "approve-all",
+        "title": "Approve all PRs",
+        "subtitle": "Approve every pull request behind a link",
+        "icon": "Check",
+        "keywords": ["pr", "lgtm"],
+        "argument": {
+          "placeholder": "Paste a GitHub link…",
+          "hint": "A PR search, a label, or a single pull request.",
+          "kind": "url",
+          "hosts": ["github.com"],
+          "patternError": "Not a github.com link."
+        },
+        "prompt": "Load the $my-skill skill and approve every PR behind {argument}",
+        "autoSend": true
+      }
+    ]
+  }
+}
+```
+
+| Field | Required | Notes |
+|---|---|---|
+| `id` | yes | lowercase alphanumeric + dashes; unique within the app |
+| `title` | yes | row label, up to 120 characters |
+| `prompt` | yes | the action: a new session is seeded with this text, up to 4000 characters |
+| `subtitle` | no | defaults to the app's display name |
+| `icon` | no | a name from the host's glyph set; an unknown name falls back |
+| `keywords` | no | hidden match aliases |
+| `argument` | no | the ONE value the command collects before it runs; must be an object |
+| `autoSend` | no | send the seeded prompt instead of leaving it in the composer |
+
+Every entry of `commands` must be an object, and every length above is counted in UTF-16
+code units -- what the launcher itself counts. Both matter for the same reason: the host
+validates your manifest twice, once on install and once when it renders, and anything the
+two would measure differently is a command that installs clean and then does not appear.
+So a title of 100 emoji is 200 units, not 100, and a single non-object entry is refused
+rather than quietly skipped past.
+
+Inside `argument`:
+
+| Field | Required | Notes |
+|---|---|---|
+| `kind` | no | `url` or `text`; defaults to `text`. An unknown kind is refused |
+| `hosts` | no | `url` only: allowed hostnames, up to 20. Empty means any host |
+| `placeholder` | no | field placeholder |
+| `hint` | no | one line under the field |
+| `patternError` | no | shown when the value is not accepted |
+
+`contributes` sits beside `ui`, not inside it: `ui` declares surfaces the app owns,
+while a contribution is a row inside a surface the host owns and renders.
+
+**A contribution is data, never code.** There is no way to ship a function or an icon
+URL: the launcher would be running app-authored JavaScript inside the host's surface
+on every keystroke, and the root page promises to issue no network request. Ask for a
+new glyph name by pull request.
+
+**The host owns the matcher; a manifest names one rather than supplying it.** The
+collected value is spliced into an instruction handed to an agent with tools, so it has
+to be checked before the prompt is built — but `kind` selects one of a fixed set the
+host implements, and there is no way to ship a regex of your own. An earlier revision
+of this contract accepted `argument.pattern`; a pattern from a manifest runs against
+the field on every keystroke on the thread that draws the launcher, and shapes like
+`^(a+)+$` or `^(a|aa)+$` are a few characters long and exponential, so an `argument`
+that still carries `pattern` is now REFUSED rather than migrated — leaving it to fall
+back on `text` would accept any non-empty string with `autoSend` still on. An unknown
+`kind` is refused for the same reason.
+
+`kind: "url"` parses the value with the runtime's own URL parser and then applies
+`hosts`. The allowlist is exact unless an entry starts with a dot: `github.com` does
+not admit `github.com.evil.test`, while `.github.com` admits `gist.github.com`. Only
+`http` and `https` are accepted. `kind: "text"` takes any non-empty value.
+
+This is less precise than a regex, deliberately: a pattern could demand `/pull/<n>`,
+while `url` + `hosts` admits any URL on the host and leaves what the link DENOTES to
+the agent — or to your skill, which is the better place for your own product's URL
+taxonomy.
+
+Declaring an argument the prompt never interpolates is an error — the reader would be
+asked for a value the command then ignores. A command whose prompt needs no value
+simply omits `argument`; activating it is the whole action.
+
+**What the reader sees with `autoSend`.** The host shows the resolved prompt — the
+template with the reader's value already spliced in — in the argument field before
+the send, so the instruction is visible at the moment it fires. Write prompts on the
+assumption they will be read.
+
+**`autoSend` requires an `argument`.** That preview is what makes the send informed and
+it lives in the argument step, so a command that collects nothing never reaches it and
+the combination is refused rather than silently downgraded. Such a command still works:
+its prompt lands in the composer and one keystroke sends it. `autoSend` is also
+honoured only for the JSON boolean `true`, never for the string `"true"`.
+
+A malformed command is skipped with a console warning and the app's other commands
+still load. Commands from a disabled app do not appear at all.
+
+**If your app is SIGNED, set `minKiroCrewVersion`.** Contributions are covered by the
+admission signature -- a contributed prompt goes to an agent with tools and `autoSend`
+fires it, so leaving it unsigned would make your rows the one part of a signed app an
+attacker could rewrite with the signature still verifying. The consequence for you is
+that a signed manifest declaring `contributes` does not verify on a gateway older than
+this change, because that gateway computes the signed bytes without the
+`contributes` key. It fails CLOSED -- a refused install, not a silent downgrade -- but
+the error will not obviously point here, so declare the floor and the install refuses
+for a legible reason instead. Unsigned apps are unaffected, as are signed apps that
+contribute nothing: the key is only added to the payload when non-empty, so every
+signature issued before this existed still verifies.
+
+### `contributes.sessionControls` — A Per-Chat Control in the Composer
+
+A session control is a compact chip the dashboard renders in the composer bar,
+beside the agent, model and project chips. Opening it mounts the app's own ESM
+module and hands it **the identity of the chat the user is currently in** -- which
+is the reason the slot exists, because nothing else in the app surface reports
+that. `ui.pages` is routed and session-blind, so a per-chat setting placed there
+makes the user leave the conversation to configure it.
+
+```json
+{
+  "contributes": {
+    "sessionControls": [
+      {
+        "id": "env-picker",
+        "entryPoint": "dist/session-control.mjs",
+        "label": "Environment",
+        "icon": "Tag",
+        "statusPath": "session-status"
+      }
+    ]
+  }
+}
+```
+
+Unlike `ui.overlays`, this **is** a third-party extension point: an installed app
+may declare it, and the control is loaded through the same lazy `import()` and
+import map `ui.pages` uses, so React stays a single instance.
+
+**What the control is handed.** The module's default export is rendered as
+`<Control session={…} onClose={…} />`, where `session` is:
+
+| Prop | Type | Meaning |
+|------|------|---------|
+| `session.sessionKey` | string | Session key, e.g. `dashboard:chat-2-1787502679`. Empty before a slot exists |
+| `session.folderId` | string? | Folder the chat is filed in, `''` at top level. A dashboard grouping with its own id -- **not** a directory, so key per-folder state on this and not on `cwd` |
+| `session.folderName` | string? | Folder's display name, to name it back to the user |
+| `session.cwd` | string | Working directory recorded for the session, when known |
+| `onClose` | function | Dismiss the control, e.g. after committing a change |
+
+The control is remounted when the session changes, so per-chat state cannot leak
+across a switch, and a control that throws renders an inline notice instead of
+disturbing the chat.
+
+**Two caps, and the second one drops.** The backend allows at most **2** controls
+per app. The dashboard renders at most **2** across all apps, and controls past
+that are dropped rather than moved into an overflow menu -- the bar shares one row
+with the message input. With three or more contributing apps, a declared control
+can therefore be absent.
+
+**`statusPath` — reporting state before the chip is opened.** Without it a control
+can only report anything once its module loads on first click, so a configured
+setting looks unset. When declared, the dashboard GETs the route under the app's
+own route base, with `session_key` always and `folder_id` / `folder_name`
+when the chat is in a folder, and reads:
+
+```json
+{ "state": "ok", "tooltip": "Bound to production" }
+```
+
+`state` is `ok`, `warn` or `none`; the chip tints for the first two and the
+tooltip is length-bounded. The path is charset-bounded at install and re-checked
+in the dashboard, and one that would leave the app's own route prefix is refused
+before any request rather than sanitized -- so a control with an invalid
+`statusPath` is simply never polled. Polling fails closed: an app that is down is
+not retried, and an unrecognized payload is treated as `none`.
+
+The route base follows how the app serves its backend, and the dashboard derives
+it -- an app declaring `backend.entryPoint` runs its own process and is
+reverse-proxied at `/apps/<app>/api/`, while one declaring only
+`backend.hooks.routes` is registered in-gateway under `/api/apps/<app>/`. Both
+prefixes are built by the host from the app name, so `statusPath` stays the only
+app-authored part of the URL. Declaring the wrong one is not possible: an app
+does not choose.
 
 ### App Icon
 
@@ -301,9 +501,18 @@ root (validated against `HooksConfig._HOOK_PATH_RE`).
 | `backend.hooks.on_startup` | string | `module.path:callable` invoked when the app's hooks are wired up |
 | `backend.hooks.on_shutdown` | string | `module.path:callable` invoked when the app is disabled/torn down |
 
-`hooks.routes` handlers are wired up when the app is enabled (via
-`on_app_enable`, also re-run at gateway startup via `on_gateway_startup`), so
-they go live without waiting for a Gateway restart.
+`hooks.routes` handlers are wired up when the app is enabled **through the
+Gateway** -- the dashboard's enable action (`on_app_enable`), also re-run at
+gateway startup (`on_gateway_startup`) -- so on that path they go live without
+waiting for a Gateway restart.
+
+`kirocrew app enable` is not that path. The CLI is a separate process with no
+handle on a running Gateway's imported modules, so it cannot load or replace
+hooks: a Gateway that is already up keeps executing the hook module it imported
+earlier, even though the command succeeds and `app info` reports the new
+version. Restart the Gateway, or disable and re-enable the app from the
+dashboard, for hook changes to take effect. The CLI prints this reminder after
+enabling any app that declares `backend.hooks`.
 
 **Importing your own modules.** Hook entry files are loaded from their file path
 into a synthetic package named after the app, never via `sys.path`, so use a
@@ -370,7 +579,7 @@ the platform does not rate-limit spawns per app today.
 API: `apps/spawn_sdk.py` — `SpawnSDK`, `build_spawn_impl`, `build_done_probe`,
 `SpawnError`.
 
-> **Advisory today, not enforced in-process.** These fields are **not** a runtime sandbox. The validator functions in `apps/permissions.py` (`validate_permissions`, `format_permissions_summary`) are currently **not wired into the install or runtime path** — they are only exercised by unit tests — so the manifest `permissions` block is neither enforced nor even surfaced today: `mcpTools` is not gated at tool dispatch and an empty `mcpTools` list is treated as unrestricted. What actually confines an app today is the HTTP app-token scope (`permissions.api` allowlist, deny-by-default — see `security.md`) plus the OS sandbox. Install-time path traversal is blocked separately by `_check_path_safety(name)` + `manifest.validate()`, not by the permission validator. Full in-process enforcement is tracked in [app-sandbox-roadmap.md](../request-for-change/rfc-app-sandbox-isolation.md).
+> **Advisory today, not enforced in-process.** These fields are **not** a runtime sandbox. The validator functions in `apps/permissions.py` (`validate_permissions`, `format_permissions_summary`) are currently **not wired into the install or runtime path** — they are only exercised by unit tests — so the manifest `permissions` block is neither enforced nor even surfaced today: `mcpTools` is not gated at tool dispatch and an empty `mcpTools` list is treated as unrestricted. What actually confines an app today is the HTTP app-token scope (`permissions.api` allowlist, deny-by-default — see `security.md`) plus the OS sandbox. Install-time path traversal is blocked separately by `_check_path_safety(name)` + `manifest.validate()`, not by the permission validator. Full in-process enforcement is tracked in [rfc-app-sandbox-isolation.md](../request-for-change/rfc-app-sandbox-isolation.md).
 
 ## Setup Hooks
 

@@ -78,6 +78,7 @@ from kiro_crew.messaging.renderer import (
     apply_options_cap,
     chunk_text,
     new_approval_nonce,
+    session_provenance_tag,
     split_options_trailer,
 )
 from kiro_crew.messaging.split import split_markdown_safe
@@ -269,17 +270,20 @@ def _neutralize_md(raw: str) -> str:
     return re.sub(r"[*_`\[\]()]", "", t)
 
 
-def build_option_components(options: list[str]) -> list[dict] | None:
+def build_option_components(options: list[str], origin_tag: str = "") -> list[dict] | None:
     """Build Discord button action rows from ``[OPTIONS:]`` labels.
 
-    ``custom_id`` is the index only (``opt:<i>``) -- Discord caps it at 100
-    chars and the label is recovered from the button text at interaction time.
-    Labels cap at 80 chars per the component spec. The ``max_buttons`` cap is
-    applied UPSTREAM via ``apply_options_cap`` (overflow degrades to numbered
-    text); the slice below is the platform hard-limit backstop only.
+    ``custom_id`` is ``opt:<i>:<origin_tag>`` (``opt:<i>`` when no tag is given --
+    the pre-provenance legacy shape) -- Discord caps it at 100 chars, which the
+    12-hex tag fits comfortably, and the label is recovered from the button text
+    at interaction time. Labels cap at 80 chars per the component spec. The
+    ``max_buttons`` cap is applied UPSTREAM via ``apply_options_cap`` (overflow
+    degrades to numbered text); the slice below is the platform hard-limit
+    backstop only.
     """
     if not options:
         return None
+    suffix = f":{origin_tag}" if origin_tag else ""
     rows: list[dict] = []
     row: list[dict] = []
     for i, opt in enumerate(options[:_MAX_BUTTONS]):
@@ -288,7 +292,7 @@ def build_option_components(options: list[str]) -> list[dict] | None:
                 "type": 2,  # button
                 "style": _STYLE_SECONDARY,
                 "label": opt[:_BUTTON_LABEL_CHARS],
-                "custom_id": f"opt:{i}",
+                "custom_id": f"opt:{i}{suffix}",
             }
         )
         if len(row) == _BUTTONS_PER_ROW:
@@ -449,7 +453,7 @@ class DiscordRenderer(Renderer):
         capabilities: TransportCapabilities,
         *,
         session_key: str = "",
-        uploads_allowed: bool = True,
+        uploads_allowed: bool = False,
         upload_root: str = "",
         react_message_id: str = "",
         reactions_enabled: bool = True,
@@ -707,7 +711,11 @@ class DiscordRenderer(Renderer):
         # the rotation above ran before that expansion -- re-check, or a
         # near-limit answer with over-cap options seals past the transport cap.
         await self._rotate_on_length()
-        components = build_option_components(opts) if opts else None
+        components = (
+            build_option_components(opts, session_provenance_tag(self._session_key))
+            if opts
+            else None
+        )
         sealed = bool(self._segment_text().strip()) or components is not None
         await self._seal_current(components=components)
         clean_summary = _neutralize_md(summary)
@@ -1193,7 +1201,11 @@ class DiscordRenderer(Renderer):
         body_text, opts = apply_options_cap(self._segment_text(), opts, self.capabilities)
         self._buf = []
         self._delivery_text = body_text
-        components = build_option_components(opts) if opts else None
+        components = (
+            build_option_components(opts, session_provenance_tag(self._session_key))
+            if opts
+            else None
+        )
         # No-rotation fallback: steers were injected but no marker rotated —
         # prepend one summary chip so they're still shown.
         if self._seal_count == 0 and self._steer_texts:

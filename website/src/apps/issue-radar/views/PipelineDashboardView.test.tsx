@@ -44,6 +44,9 @@ function makeStub(name: string) {
     const [open, setOpen] = React.useState(false)
     React.useEffect(() => {
       mounts.push(`${name}:${repo.owner}/${repo.repo}`)
+      // Re-running this on a repo change would append without a remount, and a remount
+      // would stop being distinguishable from a plain re-render.
+      // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-once on purpose: this log IS the mount counter every assertion in this file reads
     }, [])
     return (
       <div>
@@ -74,7 +77,10 @@ beforeEach(() => {
 describe('PipelineDashboardView — the repository is handed in, and a switch discards state', () => {
   /** Reveal the lanes board, which lives behind the second tab. */
   function openLanes(): void {
-    fireEvent.click(screen.getByRole('tab', { name: /lanes/i }))
+    // `mouseDown`, not `click`: Radix's tab trigger activates on mousedown (so a
+    // drag off the rail cannot leave the selection half-applied), and
+    // `fireEvent.click` does not synthesise the preceding mousedown.
+    fireEvent.mouseDown(screen.getByRole('tab', { name: /lanes/i }))
   }
 
   it('keeps the two boards TABBED rather than stacking them', () => {
@@ -83,7 +89,7 @@ describe('PipelineDashboardView — the repository is handed in, and a switch di
     // different data, so one page implies their numbers are comparable -- and an
     // earlier draft of the move stacked them, which also had both polling at once.
     // Pinned on the ROLE, not on a class, because the accessibility contract is the
-    // point: the row is the shared UnderlineTabs precisely because a hand-rolled
+    // point: the row is the shared Radix tabs precisely because a hand-rolled
     // tablist once announced arrow-key navigation it did not implement.
     render(<PipelineDashboardView />)
     expect(screen.getAllByRole('tab')).toHaveLength(2)

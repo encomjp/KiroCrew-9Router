@@ -16,21 +16,25 @@ class _CapturingRecorder:
         self.calls: list = []
 
     def histogram(self, name, value, *, unit="ms", attrs=None, **kwargs) -> None:
-        self.calls.append(
-            {"name": name, "value": value, "unit": unit, "attrs": dict(attrs or {})}
-        )
+        self.calls.append({"name": name, "value": value, "unit": unit, "attrs": dict(attrs or {})})
 
 
-def _run(duration_ms, stop_reason, slot_key="dashboard:abc123", elapsed_ms=None,
-         exhausted=False):
+def _run(duration_ms, stop_reason, slot_key="dashboard:abc123", elapsed_ms=None, exhausted=False):
     """Invoke the production emit helper with a patched recorder; return it."""
     from kiro_crew.dashboard import chat_runner
 
     rec = _CapturingRecorder()
-    # chat_runner imports get_recorder at module top-level → patch the consumer.
-    with patch("kiro_crew.dashboard.chat_runner.get_recorder", return_value=rec):
+    # The emit moved to ``metrics/turns.py`` so every dispatch surface can reach
+    # it (it used to live in chat_runner, which only the dashboard turn loop
+    # runs). ``_emit_turn_metric`` is still the production entry point driven
+    # here; the recorder is imported at the top of its new home, so that is the
+    # consumer to patch.
+    with patch("kiro_crew.metrics.turns.get_recorder", return_value=rec):
         chat_runner._emit_turn_metric(
-            duration_ms, stop_reason, slot_key, elapsed_ms=elapsed_ms,
+            duration_ms,
+            stop_reason,
+            slot_key,
+            elapsed_ms=elapsed_ms,
             exhausted=exhausted,
         )
     return rec
@@ -63,13 +67,26 @@ class TestTurnMetricOutcomeMapping:
     def test_completed_is_ok(self):
         assert _turn_call(_run(5000, "completed"))["attrs"]["outcome"] == "ok"
 
-    def test_cancelled_is_error(self):
-        assert _turn_call(_run(400, "cancelled"))["attrs"]["outcome"] == "error"
+    def test_cancelled_is_its_own_outcome_not_error(self):
+        """A user cancel is not a system fault.
+
+        It used to map to ``error``, which put every press of Stop into
+        fault_rate's numerator. The label must be distinct AND stay out of
+        ``telemetry._TERMINAL_FAULT_OUTCOMES`` (pinned by the drift gate in
+        test_telemetry_handler).
+        """
+        assert _turn_call(_run(400, "cancelled"))["attrs"]["outcome"] == "cancelled"
 
     def test_refusal_is_error(self):
         assert _turn_call(_run(100, "refusal"))["attrs"]["outcome"] == "error"
 
     def test_error_prefix_is_error(self):
+        """Also pins that the cancelled branch matches by EXACT equality.
+
+        This reason contains the word "cancel" but is not
+        ``STOP_REASON_CANCELLED`` — a substring test would reclassify the
+        watchdog's confirmed wedge as a deliberate user action.
+        """
         assert _turn_call(_run(2000, "error: cancel unacked"))["attrs"]["outcome"] == "error"
 
     def test_stale_recover_is_distinct_outcome(self):
@@ -85,9 +102,7 @@ class TestTurnMetricOutcomeMapping:
         it BEFORE the error/timeout fallbacks."""
         from kiro_crew.acp.types import STOP_REASON_TOOL_STALL
 
-        assert (
-            _turn_call(_run(9000, STOP_REASON_TOOL_STALL))["attrs"]["outcome"] == "tool_stall"
-        )
+        assert _turn_call(_run(9000, STOP_REASON_TOOL_STALL))["attrs"]["outcome"] == "tool_stall"
 
     def test_exhausted_stall_is_stall_exhausted(self):
         """A stall turn arriving with its recovery budget already spent dies
@@ -104,7 +119,7 @@ class TestTurnMetricOutcomeMapping:
         """The exhausted flag is a stall-budget signal; it must never relabel
         an ordinary outcome."""
         assert _turn_call(_run(1500, "end_turn", exhausted=True))["attrs"]["outcome"] == "ok"
-        assert _turn_call(_run(400, "cancelled", exhausted=True))["attrs"]["outcome"] == "error"
+        assert _turn_call(_run(400, "cancelled", exhausted=True))["attrs"]["outcome"] == "cancelled"
 
     def test_timeout_is_timeout(self):
         assert _turn_call(_run(120000, "timeout"))["attrs"]["outcome"] == "timeout"
@@ -150,7 +165,15 @@ class TestTurnMetricElapsedFallback:
 
 
 class TestTurnMetricSessionSource:
-    """session_source derived via the real infer_use_case, through production."""
+    """session_source derived via the real telemetry_channel_of, through production.
+
+    Was ``infer_use_case``. Swapped because that function knows only the
+    interactive surfaces, so once the emit moved to the shared per-turn boundary
+    every background surface would have arrived labelled ``unknown`` — samples
+    present but unattributable, which answers "how many cron turns ran" no better
+    than the silence it replaced. ``telemetry_channel_of`` exists for this exact
+    question and is a strict superset of the old labels.
+    """
 
     def test_dashboard_key(self):
         c = _turn_call(_run(500, "end_turn", "dashboard:session-xyz"))
@@ -172,6 +195,25 @@ class TestTurnMetricSessionSource:
         c = _turn_call(_run(500, "end_turn", "1234567890.123456"))
         assert c["attrs"]["session_source"] == "slack"
 
-    def test_unknown_key(self):
+    def test_a_background_surface_is_named_not_lumped(self):
+        """The whole reason the source function changed.
+
+        Under ``infer_use_case`` these three read ``unknown``; a widened
+        population that cannot say WHICH surface was slow is not much better than
+        no population at all.
+        """
+        assert _turn_call(_run(500, "end_turn", "_hb"))["attrs"]["session_source"] == "heartbeat"
+        assert _turn_call(_run(500, "end_turn", "_bg"))["attrs"]["session_source"] == "background"
+        assert _turn_call(_run(500, "end_turn", "wf:r:1"))["attrs"]["session_source"] == "workflow"
+
+    def test_unrecognised_key_is_other_not_unknown(self):
+        """``unknown`` now means "no key at all"; ``other`` means "key I cannot place".
+
+        Worth distinguishing: the first is a caller that passed nothing, the
+        second is a key shape whose surface was never added to the label table —
+        different bugs, and folding them together hid the second one.
+        """
         c = _turn_call(_run(500, "end_turn", "something_random"))
+        assert c["attrs"]["session_source"] == "other"
+        c = _turn_call(_run(500, "end_turn", ""))
         assert c["attrs"]["session_source"] == "unknown"

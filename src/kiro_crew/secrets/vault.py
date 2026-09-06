@@ -17,34 +17,16 @@ Agent isolation:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Optional
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew.atomic_write import atomic_write, fsync_dir
 from kiro_crew.platform_compat import file_lock, restrict_to_owner
-
-
-def _fsync_dir(path: Path) -> None:
-    """Fsync a directory so a rename/create is durable across power loss.
-
-    No-op where directory fds cannot be opened for fsync (e.g. Windows),
-    where the atomic rename + file fsync already provide the guarantee.
-    """
-    try:
-        dir_fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(dir_fd)
 
 
 class SecretValue:
@@ -99,8 +81,49 @@ class SecretVault:
         entries = self._load_entries()
         if name not in entries:
             return None
-        plaintext = self._decrypt_entry(name, entries[name])
+        key = self._get_or_create_key()
+        plaintext = self._decrypt_entry(name, entries[name], key)
         return SecretValue(plaintext.decode("utf-8"))
+
+    def get_many(self, names: list[str]) -> dict[str, Optional[SecretValue]]:
+        """Batch-retrieve secrets, loading the store and key exactly once.
+
+        Returns a mapping from each requested name to its :class:`SecretValue`,
+        or ``None`` for names not present in the store — the same
+        per-name found/missing semantics as :meth:`get`, but without re-reading
+        ``secrets.enc`` (``_load_entries``) and the key file
+        (``_get_or_create_key``) once per name. On the spawn path K secret
+        references would otherwise cost K full store loads plus K key reads.
+
+        Like :meth:`get`, this is lock-free by design: ``_load_entries`` reads
+        the store atomically (writers commit via ``os.replace``, so a torn read
+        is impossible), and the key file is immutable once created. All names
+        resolve against the SAME on-disk snapshot, which is the intended
+        behaviour for a single spawn.
+
+        The vault key is only loaded when at least one requested name is
+        present, so a call for names none of which exist on a fresh vault does
+        not create a key file (matching :meth:`get`, which returns before
+        ``_get_or_create_key`` for a missing name).
+        """
+        entries = self._load_entries()
+        result: dict[str, Optional[SecretValue]] = {}
+        key: Optional[bytes] = None
+        for name in names:
+            # Membership, then index: a corrupt store can hold a JSON ``null``
+            # entry, and ``entries.get(name)`` would misclassify it as MISSING
+            # (wrong remediation: "store the secret") instead of MALFORMED
+            # (the store is corrupt) — ``_decrypt_entry`` raises the
+            # descriptive fail-closed ValueError for it.
+            if name not in entries:
+                result[name] = None
+                continue
+            entry = entries[name]
+            if key is None:
+                key = self._get_or_create_key()
+            plaintext = self._decrypt_entry(name, entry, key)
+            result[name] = SecretValue(plaintext.decode("utf-8"))
+        return result
 
     async def set(self, name: str, value: str) -> None:
         """Store or overwrite a secret."""
@@ -225,6 +248,18 @@ class SecretVault:
         """Return all stored secret names."""
         return list(self._load_entries().keys())
 
+    def derive_subkey(self, purpose: str) -> bytes:
+        """Derive a purpose-scoped 32-byte key from the vault key (HMAC-SHA256).
+
+        Lets other agent-fenced mechanisms (e.g. the cron grant-pin HMAC) key
+        themselves without a second key file and its own birth/corruption
+        handling — the vault key's exclusive-create birth, fsync durability,
+        and owner-only ACL are inherited. Distinct purposes yield independent
+        keys, and the vault key itself is never handed out.
+        """
+
+        return hmac.new(self._get_or_create_key(), purpose.encode(), hashlib.sha256).digest()
+
     # ── Key management ──
 
     def _get_or_create_key(self) -> bytes:
@@ -281,7 +316,11 @@ class SecretVault:
                 pass
             raise
         os.close(fd)
-        _fsync_dir(self._config_dir)
+        # best_effort: the key file is created, written and fsynced by this point, and
+        # the failure cleanup above has already been left behind. Raising here would
+        # report a key that IS on disk as never created, and the caller's recovery for
+        # that is to mint a second one over it.
+        fsync_dir(self._config_dir, best_effort=True)
         return key
 
     # ── Crypto helpers ──
@@ -291,17 +330,39 @@ class SecretVault:
         return b"v1" + self._SCOPE.encode() + b"\x00" + name.encode()
 
     def _encrypt_entry(self, name: str, plaintext: bytes) -> dict[str, str]:
+        # Imported HERE, not at module top. `kiro_crew.secrets` is reached from
+        # the tool-approval hook's import chain (hooks.on_tool_call ->
+        # slack.gateway -> autonudge -> irq -> cron_script -> secrets), so a
+        # top-level import made every tool approval depend on the `cryptography`
+        # native wheel loading. Only touching a vault entry needs AES-GCM.
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
         key = self._get_or_create_key()
         aesgcm = AESGCM(key)
         nonce = os.urandom(12)
         ct = aesgcm.encrypt(nonce, plaintext, self._aad_for(name))
         return {"nonce": nonce.hex(), "ct": ct.hex()}
 
-    def _decrypt_entry(self, name: str, entry: dict[str, str]) -> bytes:
-        key = self._get_or_create_key()
+    def _decrypt_entry(self, name: str, entry: dict[str, str], key: bytes) -> bytes:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # see _encrypt_entry
+
         aesgcm = AESGCM(key)
-        nonce = bytes.fromhex(entry["nonce"])
-        ct = bytes.fromhex(entry["ct"])
+        # A corrupt / hand-edited store can make ``entry`` any shape (a string,
+        # a list, a dict missing ``nonce``/``ct``, or one whose values are not
+        # valid hex). Guard the extraction so callers see the module's
+        # fail-closed descriptive ValueError instead of a raw TypeError /
+        # KeyError / non-hex ValueError. The message names the entry but NEVER
+        # includes ciphertext or plaintext material.
+        try:
+            nonce = bytes.fromhex(entry["nonce"])
+            ct = bytes.fromhex(entry["ct"])
+        except (TypeError, KeyError, ValueError, AttributeError) as exc:
+            # No entry name in the message: names are caller-supplied strings
+            # that may contain anything, and this error propagates into spawn
+            # logs. The resolution caller already names the env-var key.
+            raise ValueError(
+                f"Vault store corrupt: an entry is malformed ({type(exc).__name__})."
+            ) from None
         return aesgcm.decrypt(nonce, ct, self._aad_for(name))
 
     # ── Store I/O ──
@@ -314,13 +375,33 @@ class SecretVault:
         raw = self._store_path.read_text(encoding="utf-8")
         envelope = json.loads(raw)
 
+        # A corrupt / hand-edited store can carry a non-object top-level value
+        # (a list, a string, null, a number). Guard before ``.get`` so it fails
+        # closed with a descriptive ValueError rather than a raw AttributeError,
+        # matching the ``entries`` guard below. No store content is echoed.
+        if not isinstance(envelope, dict):
+            raise ValueError(
+                f"Vault store corrupt: top-level value must be an object, "
+                f"got {type(envelope).__name__}."
+            )
+
         if envelope.get("backend") != self._BACKEND:
             raise ValueError(
                 f"Vault backend mismatch: expected {self._BACKEND!r}, "
                 f"got {envelope.get('backend')!r}"
             )
 
-        return dict(envelope.get("entries", {}))
+        entries = envelope.get("entries", {})
+        # A corrupt / hand-edited store can carry a non-mapping ``entries``
+        # (a list, a string, null). Fail closed with a descriptive ValueError
+        # rather than letting ``dict(entries)`` raise a raw ValueError/TypeError
+        # deep in an unrelated caller. No store content is echoed.
+        if not isinstance(entries, dict):
+            raise ValueError(
+                f"Vault store corrupt: 'entries' must be an object, "
+                f"got {type(entries).__name__}."
+            )
+        return dict(entries)
 
     @contextmanager
     def hold_cross_process_lock(self) -> Iterator[None]:
@@ -389,4 +470,10 @@ class SecretVault:
                 fsync=True,
                 restrict_to_owner=True,
             )
-            _fsync_dir(self._config_dir)
+            # best_effort, and it is this call site's own decision, not a weakening of
+            # the helper: atomic_write has already COMMITTED the entry. A raise here
+            # would abort set_if_absent before it returns its fingerprint, so a
+            # migration would omit an entry that is on disk from its rollback set and
+            # let it shadow the plaintext it was migrating away from. The directory
+            # entry is the least of what is at stake once the value is stored.
+            fsync_dir(self._config_dir, best_effort=True)

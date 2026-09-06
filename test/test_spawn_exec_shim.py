@@ -432,6 +432,261 @@ class TestCreateSubprocessLimited:
                     "mytool", cwd=str(tmp_path), chdir_fd=9, env={"PATH": "tools:.:"}
                 )
 
+    @staticmethod
+    def _planted_tool(directory, body="#!/bin/sh\n"):
+        directory.mkdir(parents=True, exist_ok=True)
+        tool = directory / "mytool"
+        tool.write_text(body)
+        tool.chmod(0o755)
+        return tool
+
+    @pytest.mark.asyncio
+    async def test_chdir_fd_drops_an_absolute_path_entry_inside_the_pinned_directory(
+        self, tmp_path
+    ):
+        """The lexical screen alone kept this: absolute, yet inside the workspace.
+
+        ``PATH=<workspace>/bin:...`` reaches the same planted binary a relative
+        entry did, by a different spelling, so the identity screen must drop it
+        from the search AND from the child's environment (clause (c)). The
+        surviving entry's pathname deliberately EXTENDS the workspace's own
+        (``pinned-outside`` startswith ``pinned``): only an identity comparison
+        keeps it, so this also guards against a string-prefix reimplementation.
+        """
+        workspace = tmp_path / "pinned"
+        self._planted_tool(workspace / "bin", body="#!/bin/sh\nexit 9\n")
+        real_dir = tmp_path / "pinned-outside"
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)
+        descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        spawn = AsyncMock()
+        try:
+            with patch("asyncio.create_subprocess_exec", spawn):
+                await create_subprocess_limited(
+                    "mytool",
+                    chdir_fd=descriptor,
+                    env={"PATH": os.pathsep.join([str(workspace / "bin"), str(real_dir)])},
+                )
+        finally:
+            os.close(descriptor)
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
+
+    @pytest.mark.asyncio
+    async def test_chdir_fd_drops_the_pinned_directory_itself_as_a_path_entry(self, tmp_path):
+        """The E-is-the-bound-directory case, distinct from the descendant case."""
+        workspace = tmp_path / "pinned"
+        self._planted_tool(workspace, body="#!/bin/sh\nexit 9\n")
+        real_dir = tmp_path / "real-bin"
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)
+        descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        spawn = AsyncMock()
+        try:
+            with patch("asyncio.create_subprocess_exec", spawn):
+                await create_subprocess_limited(
+                    "mytool",
+                    chdir_fd=descriptor,
+                    env={"PATH": os.pathsep.join([str(workspace), str(real_dir)])},
+                )
+        finally:
+            os.close(descriptor)
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
+
+    @pytest.mark.asyncio
+    async def test_chdir_fd_drops_a_symlink_alias_of_the_pinned_directory(
+        self, tmp_path, monkeypatch
+    ):
+        """The screen is an identity check, not a pathname or realpath check.
+
+        The alias string shares no prefix with the workspace's own path, and
+        ``os.path.realpath`` is broken on purpose: a screen that compared
+        resolved pathname STRINGS would keep this entry, while descriptor
+        identity sees the same ``(st_dev, st_ino)`` regardless of spelling.
+        """
+        workspace = tmp_path / "pinned"
+        self._planted_tool(workspace, body="#!/bin/sh\nexit 9\n")
+        alias = tmp_path / "alias"
+        os.symlink(workspace, alias)
+        real_dir = tmp_path / "real-bin"
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)  # before realpath is broken below
+        monkeypatch.setattr(sandbox.os.path, "realpath", lambda path, **_kwargs: os.fspath(path))
+        descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        spawn = AsyncMock()
+        try:
+            with patch("asyncio.create_subprocess_exec", spawn):
+                await create_subprocess_limited(
+                    "mytool",
+                    chdir_fd=descriptor,
+                    env={"PATH": os.pathsep.join([str(alias), str(real_dir)])},
+                )
+        finally:
+            os.close(descriptor)
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
+
+    @pytest.mark.asyncio
+    async def test_chdir_fd_with_only_workspace_path_entries_resolves_nothing(self, tmp_path):
+        """The identity screen emptying PATH fails closed, exactly like the lexical one."""
+        workspace = tmp_path / "pinned"
+        self._planted_tool(workspace / "bin")
+        descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with patch("asyncio.create_subprocess_exec", AsyncMock()):
+                with pytest.raises(FileNotFoundError):
+                    await create_subprocess_limited(
+                        "mytool",
+                        chdir_fd=descriptor,
+                        env={"PATH": os.pathsep.join([str(workspace), str(workspace / "bin")])},
+                    )
+        finally:
+            os.close(descriptor)
+
+    @pytest.mark.asyncio
+    async def test_chdir_fd_drops_a_path_entry_that_cannot_be_opened(self, tmp_path):
+        """An unopenable entry is dropped, never kept.
+
+        It cannot contribute a resolvable binary today, and dropping is the
+        direction that cannot be gamed by making a directory un-``stat``-able.
+        Covers both a missing entry (ENOENT) and a file where a directory
+        should be (ENOTDIR).
+        """
+        workspace = tmp_path / "pinned"
+        workspace.mkdir()
+        missing = tmp_path / "missing"
+        not_a_dir = tmp_path / "not-a-dir"
+        not_a_dir.write_text("")
+        real_dir = tmp_path / "real-bin"
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)
+        descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        spawn = AsyncMock()
+        try:
+            with patch("asyncio.create_subprocess_exec", spawn):
+                await create_subprocess_limited(
+                    "mytool",
+                    chdir_fd=descriptor,
+                    env={"PATH": os.pathsep.join([str(missing), str(not_a_dir), str(real_dir)])},
+                )
+        finally:
+            os.close(descriptor)
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
+
+    @pytest.mark.asyncio
+    async def test_chdir_fd_respells_a_kept_entry_from_the_verified_descriptor(self, tmp_path):
+        """A kept entry is the OPENED descriptor's canonical path, not the spelling.
+
+        The child re-resolves its ``PATH`` strings at its own lookup, so a kept
+        spelling that traverses a symlink could be retargeted between this
+        screen and that lookup -- pointing the child at a directory the screen
+        never verified. Emitting the descriptor-derived path pins the child to
+        the identity that passed the screen.
+        """
+        workspace = tmp_path / "pinned"
+        workspace.mkdir()
+        real_dir = tmp_path / "real-bin"
+        self._planted_tool(real_dir)
+        canonical_dir = os.path.realpath(real_dir)
+        link = tmp_path / "mutable-link"
+        os.symlink(real_dir, link)
+        descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        spawn = AsyncMock()
+        try:
+            with patch("asyncio.create_subprocess_exec", spawn):
+                await create_subprocess_limited(
+                    "mytool", chdir_fd=descriptor, env={"PATH": str(link)}
+                )
+        finally:
+            os.close(descriptor)
+        # Both consumers see the canonical directory; the mutable spelling is gone.
+        assert spawn.await_args.kwargs["env"]["PATH"] == canonical_dir
+        assert strip_spawn_shim(spawn.await_args.args) == (os.path.join(canonical_dir, "mytool"),)
+
+    @pytest.mark.asyncio
+    async def test_chdir_fd_drops_an_entry_whose_canonical_path_is_unreadable(self, tmp_path):
+        """Unresolvable canonical path => the entry is dropped, never the raw spelling.
+
+        Falling back to the caller's spelling would reopen the retarget window
+        the re-spelling exists to close, so the degrade direction is DROP --
+        here that empties ``PATH`` and the resolve fails closed.
+        """
+        workspace = tmp_path / "pinned"
+        workspace.mkdir()
+        real_dir = tmp_path / "real-bin"
+        self._planted_tool(real_dir)
+        descriptor = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            with (
+                patch("asyncio.create_subprocess_exec", AsyncMock()),
+                patch("kiro_crew.hooks._fd_real_path", return_value=None),
+            ):
+                with pytest.raises(FileNotFoundError):
+                    await create_subprocess_limited(
+                        "mytool", chdir_fd=descriptor, env={"PATH": str(real_dir)}
+                    )
+        finally:
+            os.close(descriptor)
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_bound_descriptor_degrades_to_the_lexical_screen(self, tmp_path):
+        """No bound identity to compare against => the absolute-only screen stands.
+
+        This is the deliberate degrade that keeps the placeholder-descriptor
+        tests above meaningful (a mocked spawn never opens fd 9), and it must
+        not silently become fail-open: relative entries still drop, absolute
+        entries are kept without an identity walk. A descriptor number at the
+        NOFILE soft limit can never be open, so the ``fstat`` failure is
+        deterministic -- and in production such a descriptor is one the shim's
+        own ``fchdir`` rejects before any command runs.
+        """
+        never_open = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+        real_dir = tmp_path / "real-bin"
+        real = self._planted_tool(real_dir)
+        spawn = AsyncMock()
+        with patch("asyncio.create_subprocess_exec", spawn):
+            await create_subprocess_limited(
+                "mytool",
+                chdir_fd=never_open,
+                env={"PATH": os.pathsep.join(["tools", ".", "", str(real_dir)])},
+            )
+        assert strip_spawn_shim(spawn.await_args.args) == (str(real),)
+        assert spawn.await_args.kwargs["env"]["PATH"] == str(real_dir)
+
+    @pytest.mark.asyncio
+    async def test_an_unpinned_spawn_env_is_byte_identical(self):
+        """No screen of any kind runs without a pin -- the whole env passes through."""
+        env = {"PATH": "tools:.:/usr/bin", "HOME": "/home/someone"}
+        spawn = AsyncMock()
+        with patch("asyncio.create_subprocess_exec", spawn):
+            await create_subprocess_limited("/bin/true", env=dict(env))
+        assert spawn.await_args.kwargs["env"] == env
+
+    @pytest.mark.asyncio
+    async def test_pinned_screen_and_resolve_run_off_the_event_loop(self):
+        """The identity walk opens PATH entries, so it must not run on the loop.
+
+        Same hazard as the resolve's own stats: one stalled NFS/autofs entry
+        would freeze the gateway. The screen and the resolve share a single
+        worker-thread hop, which also pins that a pinned EXPLICIT-path spawn
+        takes the hop -- its child env still needs screening (clause (c)).
+        """
+        loop_thread = threading.get_ident()
+        ran_on: list[int] = []
+
+        def spy(env, *, chdir_fd=None):
+            ran_on.append(threading.get_ident())
+            return {"PATH": "/usr/bin"}
+
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock()),
+            patch.object(sandbox, "_pinned_spawn_path", spy),
+        ):
+            await create_subprocess_limited("/bin/true", chdir_fd=9)
+        assert ran_on and ran_on[0] != loop_thread
+
     @pytest.mark.asyncio
     async def test_an_unpinned_spawn_still_resolves_a_relative_path_entry(self, tmp_path):
         """The refusal is scoped to a pinned spawn; ordinary callers are unchanged."""

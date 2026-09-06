@@ -22,7 +22,8 @@ calls in general. The tree carries many raw POSIX call sites (``fcntl``,
 ``resource``, ``os.killpg``, ``pty``, ``termios``, …) and the overwhelming
 majority are legitimately POSIX-gated implementation detail; auditing them all
 here would bury this signal in noise. General portability is governed by the
-``platform_compat`` shim table in ``AGENTS.md``, the ``cross-platform.yml``
+``platform_compat`` shim table in
+``docs/system-specs/common/platform-compat.md``, the ``cross-platform.yml``
 added-line gate, and review. What makes signal-0 special is that getting it
 wrong is *destructive* rather than merely unavailable — and the CI gate only
 inspects lines a PR adds, so a probe that arrives by a file move or a rebase is
@@ -53,17 +54,6 @@ GATED_PROBES: dict[str, str] = {
     # only under `if IS_POSIX`.
     "platform_compat.py::pid_exists": "the shim's own POSIX branch (under IS_POSIX)",
     "platform_compat.py::pid_liveness": "the shim's own POSIX branch (under IS_POSIX)",
-    # Post-TERM grace poll in the POSIX-only gatewayd orphan sweep. Its sole
-    # caller, `kill_orphan_mcps`, returns 0 on the first line of its body under
-    # `if platform_compat.IS_WINDOWS`, and the function body is process-group
-    # machinery throughout (`os.getpgid`, `os.getpgrp`, `killpg`) which does not
-    # exist on Windows. The gatewayd it reaps is itself POSIX-only (AF_UNIX
-    # socket + SO_PEERCRED peer check), and the Windows path needs no sweep
-    # because the tree-kill after a session ends already used `taskkill /T`.
-    "session_pid.py::_kill_orphan_gatewayd": (
-        "unreachable on Windows: `kill_orphan_mcps` early-outs under "
-        "`if platform_compat.IS_WINDOWS`, and the body is POSIX process-group only"
-    ),
 }
 
 

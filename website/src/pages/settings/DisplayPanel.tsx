@@ -1,4 +1,4 @@
-import { X, Loader2 } from 'lucide-react'
+import { Loader2 } from 'lucide-react'
 import { useState, useMemo } from 'react'
 import { motion, useReducedMotion } from 'framer-motion'
 import { useZoomCtx } from '../../hooks/ZoomProvider'
@@ -10,7 +10,7 @@ import { SettingsSection, SettingsCard, SettingsSelect, SettingsStepper, Setting
 import SimpleSelect from '../../components/SimpleSelect'
 import { Input } from '../../components/ui'
 import { useThemeEditor, ThemeEditorPanel } from '../../components/themeEditor'
-import Clickable from '../../components/Clickable'
+import Modal from '../../components/Modal'
 import { useAppSelector, useAppDispatch } from '../../store'
 import { setSessionDefaultColor, setSessionColorsMode, setSessionColorsPalette, setSessionColorsIntensity } from '../../store/dashboardSlice'
 import { useSessionPalette } from '../../hooks/useSessionPalette'
@@ -18,6 +18,7 @@ import { PALETTE_NAMES, INTENSITY_NAMES } from '../../utils/sessionColors'
 import type { DefaultColorSetting, PaletteName, IntensityName, SessionColorMode } from '../../utils/sessionColors'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { api, ApiError } from '../../api/client'
+import { useOptimisticConfigPaths, setConfigPathValue } from './useOptimisticConfigPaths'
 import { parseErrorCode } from '../../utils/errorReport'
 import { clampTintCount, RECENT_TINT_COUNT } from '../../utils/recencyTint'
 import { useLanguage } from '../../i18n/LanguageProvider'
@@ -140,63 +141,66 @@ export function DisplayPanel() {
   const defaultColor = useAppSelector(s => s.dashboard.sessionDefaultColor) as DefaultColorSetting
 
   // Recency-tint count is persisted server-side (dashboard.recent_tint_count) via the shared
-  // kirocrewConfig query, so the choice follows the user across browsers/restarts. Optimistic
-  // cache write makes the sidebar tint (which reads the same query) re-rank instantly.
+  // kirocrewConfig query, so the choice follows the user across browsers/restarts.
   const qc = useQueryClient()
-  const mcQ = useQuery<{ dashboard?: { recent_tint_count?: number; terminal?: { shell?: string } } }>({
+  type KirocrewCfg = { dashboard?: { recent_tint_count?: number; terminal?: { shell?: string } } }
+  const mcQ = useQuery<KirocrewCfg>({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
   })
+  // Per-path optimistic display shared by the tint and shell saves below.
+  // Both PATCH the same ['kirocrewConfig'] object, so a whole-object
+  // onMutate snapshot here is a live race: a tint rollback would restore a
+  // pre-shell-save snapshot, transiently reverting an in-flight shell save
+  // (and vice versa). Each control instead renders `shown(path, server)`;
+  // full lifecycle contract in useOptimisticConfigPaths.ts. The sidebar tint
+  // (which reads the same query) re-ranks when the save is accepted rather
+  // than at click time — the stepper itself stays instant via the overlay.
+  const overlay = useOptimisticConfigPaths(qc)
   const recentTintCount = clampTintCount(mcQ.data?.dashboard?.recent_tint_count)
-  const tintMut = useMutation({
+  const shownTintCount = overlay.shown('dashboard.recent_tint_count', recentTintCount)
+  // A failed tint save used to roll the stepper back and refetch with no
+  // message — the number simply snapped back, which reads as a stuck control.
+  // Same shape as the shell field's `onFailure` below: one line of local error
+  // state. It is cleared by `onSupersede` when the NEXT save starts — not on
+  // success, because a success callback is not token-guarded here: an older
+  // save resolving after a newer one failed would wipe the newer failure.
+  const [tintError, setTintError] = useState<string | null>(null)
+  const tintMut = useMutation(overlay.mutationOpts<number>({
+    queryKey: ['kirocrewConfig'],
     mutationFn: (value: number) => api.patchConfig('dashboard.recent_tint_count', value),
-    onMutate: async (value: number) => {
-      await qc.cancelQueries({ queryKey: ['kirocrewConfig'] })
-      const prev = qc.getQueryData<{ dashboard?: { recent_tint_count?: number } }>(['kirocrewConfig'])
-      const next = structuredClone(prev ?? {})
-      next.dashboard = { ...(next.dashboard ?? {}), recent_tint_count: value }
-      qc.setQueryData(['kirocrewConfig'], next)
-      return { prev }
-    },
-    onError: (_e, _v, ctx) => { if (ctx?.prev) qc.setQueryData(['kirocrewConfig'], ctx.prev) },
-    onSettled: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
-  })
+    path: () => 'dashboard.recent_tint_count',
+    displayValue: v => v,
+    applyToCache: (cached, value) => setConfigPathValue(cached as KirocrewCfg, 'dashboard.recent_tint_count', value),
+    onFailure: () => setTintError(i18nT('pages.settings.displayPanel.recent_tint_save_failed')),
+    onSupersede: () => setTintError(null),
+  }))
+  // Steps are computed from the SHOWN count so rapid clicks stack on the
+  // in-flight value instead of re-incrementing a stale server value.
   const setTintCount = (n: number) => tintMut.mutate(clampTintCount(n))
 
   // Default shell for the built-in terminal — persisted server-side
   // (dashboard.terminal.shell) because the SHELL is spawned by the gateway
   // host, unlike the terminal font above, which is a per-client rendering
   // choice and stays in localStorage. Drafted locally and committed on blur so
-  // a half-typed path is never persisted. The write mirrors tintMut above:
-  // optimistic cache write + rollback, because onSuccess clears the draft and
-  // React Query serves the stale cache while refetching — without the
-  // optimistic write the just-saved value blinks back to the previous one for
-  // a round-trip, which reads as a failed save. Errors are mapped from the
-  // response's machine-readable `code` to catalog keys: the backend's English
-  // sentence must never render verbatim in a 12-language dashboard.
-  type KirocrewCfg = { dashboard?: { recent_tint_count?: number; terminal?: { shell?: string } } }
+  // a half-typed path is never persisted. The overlay keeps the just-saved
+  // value shown after onSuccess clears the draft, because React Query serves
+  // the stale cache while refetching — without it the value would blink back
+  // to the previous one for a round-trip, which reads as a failed save.
+  // Errors are mapped from the response's machine-readable `code` to catalog
+  // keys: the backend's English sentence must never render verbatim in a
+  // 12-language dashboard.
   const serverShell = mcQ.data?.dashboard?.terminal?.shell ?? ''
+  const shownShell = overlay.shown('dashboard.terminal.shell', serverShell)
   const [shellDraft, setShellDraft] = useState<string | null>(null)
   const [shellError, setShellError] = useState<string | null>(null)
-  const shellMut = useMutation({
+  const shellOpts = overlay.mutationOpts<string>({
+    queryKey: ['kirocrewConfig'],
     mutationFn: (value: string) => api.patchConfig('dashboard.terminal.shell', value),
-    onMutate: async (value: string) => {
-      await qc.cancelQueries({ queryKey: ['kirocrewConfig'] })
-      const prev = qc.getQueryData<KirocrewCfg>(['kirocrewConfig'])
-      const next = structuredClone(prev ?? {})
-      next.dashboard = {
-        ...(next.dashboard ?? {}),
-        terminal: { ...(next.dashboard?.terminal ?? {}), shell: value },
-      }
-      qc.setQueryData(['kirocrewConfig'], next)
-      return { prev }
-    },
-    onSuccess: () => {
-      setShellDraft(null)
-      setShellError(null)
-    },
-    onError: (e, _value, ctx) => {
-      if (ctx?.prev) qc.setQueryData(['kirocrewConfig'], ctx.prev)
+    path: () => 'dashboard.terminal.shell',
+    displayValue: v => v,
+    applyToCache: (cached, value) => setConfigPathValue(cached as KirocrewCfg, 'dashboard.terminal.shell', value),
+    onFailure: e => {
       const code = e instanceof ApiError ? parseErrorCode(e.body) : undefined
       setShellError(i18nT(
         code === 'shell_not_executable'
@@ -204,12 +208,20 @@ export function DisplayPanel() {
           : 'pages.settings.displayPanel.terminal_shell_save_failed',
       ))
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: ['kirocrewConfig'] }),
+    onSupersede: () => setShellError(null),
+  })
+  const shellMut = useMutation({
+    ...shellOpts,
+    onSuccess: (data: unknown, value: string, token: number) => {
+      setShellDraft(null)
+      setShellError(null)
+      return shellOpts.onSuccess(data, value, token)
+    },
   })
   const commitShell = () => {
     if (shellDraft === null) return
     const value = shellDraft.trim()
-    if (value === serverShell) {
+    if (value === shownShell) {
       setShellDraft(null)
       setShellError(null)
       return
@@ -282,12 +294,13 @@ export function DisplayPanel() {
           />
           {/* A failed write means the choice is browser-local only, and the next
               load will silently revert it to the server's value. Say so rather
-              than letting the user discover it on reload. */}
-          {langSyncFailed && (
-            <span className="text-[12px] text-danger" role="status" aria-live="polite">
-              {i18nT('settings.display.language.sync_failed')}
-            </span>
-          )}
+              than letting the user discover it on reload. No hand-off: the
+              `shellDraft` and `installValue` fields further down this panel are
+              unsaved local state, and the navigation unmounts the panel. */}
+          <ErrorNotice
+            variant="inline"
+            message={langSyncFailed ? i18nT('settings.display.language.sync_failed') : null}
+          />
           <SettingsButtonGroup label={i18nT('pages.settings.displayPanel.interface')} description={i18nT('pages.settings.displayPanel.chat_bubbles_or_cli_style_line_by_line_output')} value={uiMode}
             options={[
               { value: 'chat', label: 'Chat' },
@@ -383,14 +396,26 @@ export function DisplayPanel() {
           <SettingsInput
             label={i18nT('pages.settings.displayPanel.terminal_shell')}
             description={i18nT('pages.settings.displayPanel.terminal_shell_desc')}
-            value={shellDraft ?? serverShell}
+            value={shellDraft ?? shownShell}
             onChange={setShellDraft}
             onBlur={commitShell}
-            disabled={shellMut.isPending}
+            disabled={shellMut.isPending || !mcQ.isSuccess}
             configKey="dashboard.terminal.shell"
             aria-label={i18nT('pages.settings.displayPanel.terminal_shell')}
           />
+          {/* No hand-off: shellDraft (terminal shell path) is uncommitted —
+              a rejected path stays in the field for the user to fix, and the
+              hand-off would navigate away from it. */}
           <ErrorNotice message={shellError} variant="inline" />
+          {/* The shell field and the recency-tint stepper are both disabled
+              while this query is not successful. A failed read used to leave
+              them greyed out with no reason on screen. No hand-off: the theme
+              `installValue` field on this panel is unaffected by the query and
+              may hold a half-typed source the navigation would discard. */}
+          <ErrorNotice
+            variant="inline"
+            message={mcQ.isError ? i18nT('pages.settings.displayPanel.config_load_failed') : null}
+          />
         </SettingsCard>
       </SettingsSection>
 
@@ -472,22 +497,37 @@ export function DisplayPanel() {
                 {installBusy ? (installPhase === 'applying' ? i18nT('pages.settings.displayPanel.applying') : i18nT('pages.settings.displayPanel.fetching')) : i18nT('pages.settings.displayPanel.install')}
               </button>
             </div>
+            {/* No hand-off: installValue (the GitHub URL / local path just typed)
+                is still in the field on failure — the user corrects it in place,
+                and navigating to the chat would discard it. */}
             <ErrorNotice message={installError} variant="inline" />
           </div>
         </SettingsCard>
       </SettingsSection>
 
-      {editor.editorOpen && (
-        <Clickable className="fixed inset-0 z-[49] flex items-center justify-center bg-black/50 backdrop-blur-sm" onClick={e => { if (!e || e.target === e.currentTarget) editor.closeEditor() }}>
-          <div role="dialog" aria-modal="true" aria-label={editor.isEditing ? i18nT('pages.settings.displayPanel.edit_theme') : i18nT('pages.settings.displayPanel.create_theme')} className="relative z-10 w-full max-w-2xl max-h-[85vh] overflow-y-auto mx-4 bg-card border border-border rounded-xl p-6 shadow-xl animate-rise">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-sm font-bold text-text-strong">{editor.isEditing ? i18nT('pages.settings.displayPanel.edit_theme') : i18nT('pages.settings.displayPanel.create_theme')}</h3>
-              <button className="text-muted text-[13px] cursor-pointer hover:text-text bg-transparent border-none" onClick={editor.closeEditor}><X className="lucide-inline" /></button>
-            </div>
-            <ThemeEditorPanel editor={editor} />
-          </div>
-        </Clickable>
-      )}
+      {/* The shared Modal owns the backdrop, Escape dismissal, the focus
+          trap/restore, the scroll lock and the keyboard isolation the
+          hand-rolled overlay lacked, and it portals to document.body so the
+          editor still escapes the SettingsCard's card-glow stacking context.
+          The panel rises from z-[49] to Modal's own z-[100]/[101] layer, which
+          is what puts it above the floating theme-experience toggle instead of
+          under it. The dialog keeps its accessible name from its own title.
+
+          `guardAccidentalDismiss` is gated on the editor being dirty, because
+          Escape dismissal is a path this conversion ADDS and `closeEditor`
+          discards the draft unconditionally: on an untouched form both
+          accidental exits still work (Escape is the capability the issue asks
+          for), and once a name or a colour has been entered only the explicit
+          exits — the header close button and the panel's own Cancel — close it. */}
+      <Modal
+        open={editor.editorOpen}
+        onClose={editor.closeEditor}
+        title={editor.isEditing ? i18nT('pages.settings.displayPanel.edit_theme') : i18nT('pages.settings.displayPanel.create_theme')}
+        maxWidth={672}
+        guardAccidentalDismiss={editor.isDirty}
+      >
+        <ThemeEditorPanel editor={editor} />
+      </Modal>
 
       {/* Sidebar Colors */}
       <SettingsSection title={i18nT('pages.settings.displayPanel.sidebar_colors')}>
@@ -516,11 +556,16 @@ export function DisplayPanel() {
           <SettingsStepper
             label={i18nT('pages.settings.displayPanel.highlight_recent_sessions')}
             description={i18nT('pages.settings.displayPanel.highlight_the_n_most_recently_active_sessions_wi')}
-            value={recentTintCount}
-            onIncrement={() => setTintCount(recentTintCount + 1)}
-            onDecrement={() => setTintCount(recentTintCount - 1)}
+            value={shownTintCount}
+            onIncrement={() => setTintCount(shownTintCount + 1)}
+            onDecrement={() => setTintCount(shownTintCount - 1)}
             onReset={() => setTintCount(RECENT_TINT_COUNT)}
+            disabled={!mcQ.isSuccess}
           />
+          {/* Outside the stepper row so the row's own value/buttons stay the
+              only things inside it. No hand-off: `shellDraft` and `installValue`
+              share this panel and the navigation would unmount them. */}
+          <ErrorNotice message={tintError} variant="inline" />
           {/* Color swatches use raw buttons — circular color dots don't fit SettingsButtonGroup's text-button pattern */}
           <div className="flex flex-col gap-1.5 py-1.5" data-setting-label={i18nT('pages.settings.displayPanel.default_for_new_sessions')}>
             <span className="text-[13px] font-semibold text-text">{i18nT('pages.settings.displayPanel.default_for_new_sessions')}</span>

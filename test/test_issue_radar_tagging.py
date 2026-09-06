@@ -40,6 +40,20 @@ from kiro_crew.apps.builtins.issue_radar.backend import provider, routes, store
 _KEY = provider.key_from_parts("o", "r")
 
 
+def _merge(*args, ui_language: str = "", **kwargs):
+    """``store.merge_tagging_suggestions`` with an AGREEING in-lock verifier.
+
+    The verifier is required in production -- there is one caller and it always has
+    a language to check against, so an optional one would only offer a way to write
+    without the guard that makes writing safe. Most tests here are not about the
+    language, so they pass a verifier that agrees: the guard is exercised on its
+    pass path rather than bypassed. The tests that ARE about it pass their own,
+    which `setdefault` leaves alone.
+    """
+    kwargs.setdefault("verify_language", lambda: ui_language)
+    return store.merge_tagging_suggestions(*args, ui_language=ui_language, **kwargs)
+
+
 class TestTaggingCache(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -51,7 +65,7 @@ class TestTaggingCache(unittest.TestCase):
         self.assertIsNone(store.read_tagging_cache("o", "r", self.tmp))
 
     def test_merge_roundtrip_stamps_generated_at(self):
-        res = store.merge_tagging_suggestions(
+        res = _merge(
             "o", "r", {"7": [{"name": "bug", "reason": "crash"}]}, root=self.tmp
         )
         self.assertEqual(res["suggestions"], {"7": [{"name": "bug", "reason": "crash"}]})
@@ -61,13 +75,13 @@ class TestTaggingCache(unittest.TestCase):
         self.assertEqual(got["suggestions"], {"7": [{"name": "bug", "reason": "crash"}]})
 
     def test_merge_keeps_other_issues_and_replaces_covered_one(self):
-        store.merge_tagging_suggestions(
+        _merge(
             "o", "r", {"7": [{"name": "bug", "reason": "a"}], "8": [{"name": "docs", "reason": "b"}]},
             root=self.tmp,
         )
         # Regenerating #7 must replace its stale proposal but leave #8 alone —
         # this is what lets the dashboard walk a long queue in slices.
-        res = store.merge_tagging_suggestions(
+        res = _merge(
             "o", "r", {"7": [{"name": "question", "reason": "c"}]}, root=self.tmp
         )
         self.assertEqual(res["suggestions"]["7"], [{"name": "question", "reason": "c"}])
@@ -76,14 +90,14 @@ class TestTaggingCache(unittest.TestCase):
     def test_empty_list_is_persisted_not_dropped(self):
         # "Analysed, nothing applies" must be recorded, else the next batch would
         # keep handing back the same unlabelable issue forever.
-        store.merge_tagging_suggestions("o", "r", {"9": []}, root=self.tmp)
+        _merge("o", "r", {"9": []}, root=self.tmp)
         got = store.read_tagging_cache("o", "r", self.tmp)
         assert got is not None
         self.assertIn("9", got["suggestions"])
         self.assertEqual(got["suggestions"]["9"], [])
 
     def test_drop_removes_only_named_issues(self):
-        store.merge_tagging_suggestions(
+        _merge(
             "o", "r", {"7": [{"name": "bug", "reason": ""}], "8": [{"name": "docs", "reason": ""}]},
             root=self.tmp,
         )
@@ -102,6 +116,117 @@ class TestTaggingCache(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"schema": 0, "suggestions": {"7": []}}', encoding="utf-8")
         self.assertIsNone(store.read_tagging_cache("o", "r", self.tmp))
+
+    # ── the language the `reason` prose was written in ────────────────────────
+    #
+    # Each cached entry carries prose the Tagging queue renders as a tooltip, so
+    # the document has to record which language that prose is in. Without it a
+    # dashboard language switch left every tooltip in the old language for good.
+
+    def test_merge_stamps_the_language_it_was_generated_in(self):
+        _merge(
+            "o", "r", {"7": [{"name": "bug", "reason": "Absturz"}]},
+            root=self.tmp, ui_language="de-DE",
+        )
+        got = store.read_tagging_cache("o", "r", self.tmp)
+        assert got is not None
+        self.assertEqual(got["ui_language"], "de-DE")
+
+    def test_an_unstamped_document_reads_as_the_unconfigured_sentinel(self):
+        # No schema bump was taken, so a document written before this field is
+        # still a HIT. It has to read as "" — the same value an install with no
+        # configured language resolves to — or the upgrade would silently discard
+        # every existing suggestion.
+        path = store.tagging_cache_path("o", "r", self.tmp)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "schema": store.TAGGING_CACHE_SCHEMA, "owner": "o", "repo": "r",
+                "suggestions": {"7": [{"name": "bug", "reason": "crash"}]},
+                "generated_at": "2026-08-18T00:00:00Z",
+            }),
+            encoding="utf-8",
+        )
+        got = store.read_tagging_cache("o", "r", self.tmp)
+        assert got is not None
+        self.assertEqual(got["ui_language"], "")
+        self.assertEqual(got["suggestions"], {"7": [{"name": "bug", "reason": "crash"}]})
+
+    def test_a_batch_in_a_new_language_replaces_instead_of_merging(self):
+        _merge(
+            "o", "r", {"7": [{"name": "bug", "reason": "reports a crash"}],
+                       "8": [{"name": "docs", "reason": "docs only"}]},
+            root=self.tmp, ui_language="en",
+        )
+        # Accumulating across a switch would leave #8 English beside #7 Chinese,
+        # with nothing on screen to say which row is which. A regenerate the user
+        # can trigger beats a permanently mixed queue.
+        res = _merge(
+            "o", "r", {"7": [{"name": "bug", "reason": "Absturzbericht"}]},
+            root=self.tmp, ui_language="de-DE",
+        )
+        self.assertEqual(list(res["suggestions"]), ["7"])
+        # The document is re-stamped, which is what makes the new entries servable.
+        got = store.read_tagging_cache("o", "r", self.tmp)
+        assert got is not None
+        self.assertEqual(got["ui_language"], "de-DE")
+
+    def test_a_batch_in_the_same_language_still_accumulates(self):
+        _merge(
+            "o", "r", {"8": [{"name": "docs", "reason": "b"}]}, root=self.tmp, ui_language="ja",
+        )
+        res = _merge(
+            "o", "r", {"7": [{"name": "bug", "reason": "a"}]}, root=self.tmp, ui_language="ja",
+        )
+        self.assertEqual(sorted(res["suggestions"]), ["7", "8"])
+
+    # ── the in-lock language verifier ─────────────────────────────────────────
+    #
+    # The caller checks the language before calling, but that check and this write
+    # are not atomic: a switch landing between them lets a stale generation replace
+    # a newer-language one that already landed, and the replace semantics turn a
+    # lost race into lost data. Re-checking inside the lock is the only place the
+    # check and the write it authorises cannot be separated.
+
+    def test_a_verifier_that_disagrees_refuses_the_write(self):
+        _merge(
+            "o", "r", {"8": [{"name": "docs", "reason": "aktuell"}]},
+            root=self.tmp, ui_language="de-DE",
+        )
+        # The batch was generated under "en", but the configured language is now
+        # "de-DE" -- so this write would replace the German entry with an English one.
+        res = _merge(
+            "o", "r", {"7": [{"name": "bug", "reason": "stale"}]},
+            root=self.tmp, ui_language="en", verify_language=lambda: "de-DE",
+        )
+        self.assertTrue(res["stale_language"])
+        # The refusal returns the UNTOUCHED document, not an empty one.
+        self.assertEqual(list(res["suggestions"]), ["8"])
+        got = store.read_tagging_cache("o", "r", self.tmp)
+        assert got is not None
+        self.assertEqual(list(got["suggestions"]), ["8"])
+        self.assertEqual(got["ui_language"], "de-DE")
+
+    def test_a_verifier_that_agrees_writes_normally(self):
+        res = _merge(
+            "o", "r", {"7": [{"name": "bug", "reason": "Absturz"}]},
+            root=self.tmp, ui_language="de-DE", verify_language=lambda: "de-DE",
+        )
+        self.assertFalse(res["stale_language"])
+        self.assertEqual(list(res["suggestions"]), ["7"])
+
+    def test_drop_carries_the_language_through(self):        # `drop` rewrites the document. Losing the tag here would make every
+        # surviving entry read as "generated with no language configured" and
+        # become servable again after a switch.
+        _merge(
+            "o", "r", {"7": [{"name": "bug", "reason": "a"}], "8": [{"name": "docs", "reason": "b"}]},
+            root=self.tmp, ui_language="de",
+        )
+        res = store.drop_tagging_suggestions("o", "r", [7], root=self.tmp)
+        self.assertEqual(list(res["suggestions"]), ["8"])
+        got = store.read_tagging_cache("o", "r", self.tmp)
+        assert got is not None
+        self.assertEqual(got["ui_language"], "de")
 
     def test_corrupt_json_reads_as_miss(self):
         path = store.tagging_cache_path("o", "r", self.tmp)
@@ -388,7 +513,7 @@ class TestTaggingCacheLockSerializesWriters(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        store.merge_tagging_suggestions(
+        _merge(
             "o", "r",
             {str(n): [{"name": "bug", "reason": ""}] for n in range(1, 21)},
             root=self.tmp,
@@ -407,7 +532,7 @@ class TestTaggingCacheLockSerializesWriters(unittest.TestCase):
             try:
                 start.wait(timeout=5)
                 for n in range(100, 120):
-                    store.merge_tagging_suggestions(
+                    _merge(
                         "o", "r", {str(n): [{"name": "docs", "reason": ""}]}, root=self.tmp
                     )
             except BaseException as exc:  # pragma: no cover - surfaced below
@@ -478,6 +603,51 @@ class TestUntaggedQueueRoute(unittest.IsolatedAsyncioTestCase):
         body = json.loads(resp.body)
         # #8 picked up a label, so its cached proposal is moot.
         self.assertEqual(list(body["suggestions"]), ["7"])
+
+    async def test_serves_suggestions_generated_in_the_current_language(self):
+        cached = {"suggestions": {"7": [{"name": "bug", "reason": "Absturz"}]},
+                  "generated_at": "2026-08-18T00:00:00Z", "ui_language": "de-DE"}
+        with (
+            mock.patch.object(store, "is_repo_connected", return_value=True),
+            mock.patch.object(store, "read_issues_cache", return_value=self.ISSUES),
+            mock.patch.object(store, "read_tagging_cache", return_value=cached),
+            mock.patch.object(routes, "_ui_language", return_value="de-DE"),
+        ):
+            resp = await routes._handle_get_tagging(self._req())
+        self.assertEqual(list(json.loads(resp.body)["suggestions"]), ["7"])
+
+    async def test_withholds_suggestions_written_before_a_language_switch(self):
+        # THE REPORTED DEFECT. Each `reason` is rendered as a tooltip, and the
+        # frontend wraps it in a LOCALIZED template -- so a stale-language reason
+        # produces a half-translated tooltip rather than a plainly foreign one.
+        # Serving nothing offers the regenerate the user can act on.
+        cached = {"suggestions": {"7": [{"name": "bug", "reason": "reports a crash"}]},
+                  "generated_at": "2026-08-18T00:00:00Z", "ui_language": "en"}
+        with (
+            mock.patch.object(store, "is_repo_connected", return_value=True),
+            mock.patch.object(store, "read_issues_cache", return_value=self.ISSUES),
+            mock.patch.object(store, "read_tagging_cache", return_value=cached),
+            mock.patch.object(routes, "_ui_language", return_value="de-DE"),
+        ):
+            resp = await routes._handle_get_tagging(self._req())
+        body = json.loads(resp.body)
+        self.assertEqual(body["suggestions"], {})
+        # The QUEUE itself is unaffected -- only the prose is stale, so the issue
+        # must still be offered for tagging.
+        self.assertEqual(body["untagged"], [7])
+
+    async def test_an_unstamped_cache_still_serves_an_unconfigured_install(self):        # The upgrade path: a document written before the tag existed, on an install
+        # that never set a language. Both sides read "", so nothing is discarded.
+        cached = {"suggestions": {"7": [{"name": "bug", "reason": "reports a crash"}]},
+                  "generated_at": "2026-08-18T00:00:00Z"}
+        with (
+            mock.patch.object(store, "is_repo_connected", return_value=True),
+            mock.patch.object(store, "read_issues_cache", return_value=self.ISSUES),
+            mock.patch.object(store, "read_tagging_cache", return_value=cached),
+            mock.patch.object(routes, "_ui_language", return_value=""),
+        ):
+            resp = await routes._handle_get_tagging(self._req())
+        self.assertEqual(list(json.loads(resp.body)["suggestions"]), ["7"])
 
     async def test_refresh_bypasses_the_cache_and_refetches(self):
         read_cache = mock.Mock(return_value=self.ISSUES)
@@ -591,6 +761,55 @@ class TestGenerateTaggingRoute(unittest.IsolatedAsyncioTestCase):
         # un-analysed slice" would hand back the same unlabelable issues forever.
         self.assertEqual(merged[0]["1"], [{"name": "bug", "reason": "x"}])
         self.assertEqual(merged[0]["5"], [])
+
+    async def test_the_store_refusing_under_its_lock_claims_nothing_analysed(self):
+        """The route's own pre-write check can pass and the store still refuse.
+
+        Those two are not atomic, so a switch landing between them is caught only by
+        the in-lock check. When it fires, the response must not claim a batch the
+        store did not persist -- otherwise the client marks the slice done and the
+        rows are never re-earned.
+        """
+        merged: list = []
+        with contextlib.ExitStack() as stack:
+            for p in self._patches({"1": [{"name": "bug", "reason": "x"}]}, None, merged):
+                stack.enter_context(p)
+            # Language holds across the route's own check...
+            stack.enter_context(mock.patch.object(routes, "_ui_language", return_value="en"))
+            # ...but the store reports it moved before the write.
+            stack.enter_context(
+                mock.patch.object(
+                    store, "merge_tagging_suggestions",
+                    return_value={
+                        "suggestions": {"9": [{"name": "docs", "reason": "neuer"}]},
+                        "generated_at": "t", "ui_language": "de-DE", "stale_language": True,
+                    },
+                )
+            )
+            resp = await routes._handle_generate_tagging(self._req({"owner": "o", "repo": "r"}))
+        assert resp.status == 200
+        body = json.loads(resp.body)
+        self.assertEqual(body["analyzed"], [])
+        self.assertEqual(body["remaining"], 5)
+        # Nothing comes back. The untouched document this refusal protected may
+        # still be in the language the switch just left, and returning it would put
+        # exactly the stale prose this route withholds into the client's cache --
+        # the GET route gates on the language, so an error path that skips the gate
+        # would reintroduce the defect through the back door.
+        self.assertEqual(body["suggestions"], {})
+        self.assertIsNone(body["generated_at"])
+
+    async def test_a_generation_whose_language_held_is_written(self):        # The control: same path, language unchanged across the generation.
+        merged: list = []
+        with contextlib.ExitStack() as stack:
+            for p in self._patches({"1": [{"name": "bug", "reason": "x"}]}, None, merged):
+                stack.enter_context(p)
+            stack.enter_context(
+                mock.patch.object(routes, "_ui_language", return_value="de-DE")
+            )
+            resp = await routes._handle_generate_tagging(self._req({"owner": "o", "repo": "r"}))
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(sorted(json.loads(resp.body)["analyzed"]), [1, 2, 3, 4, 5])
 
     async def test_automatic_slice_skips_already_analysed_issues(self):
         merged: list = []

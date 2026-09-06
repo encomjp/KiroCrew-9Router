@@ -677,6 +677,11 @@ _AUDIT_CASES = [
     ("_audit_pool_fallback", ("caller", "demo-mcp", "pool full"), "mcp-gateway.fallback"),
     ("_audit_pool_rejected", ("caller", "demo-mcp", "unknown target"), "mcp-gateway.ensure_backend"),
     ("_audit_prewarm_spawn", ("demo-mcp",), "mcp-gateway.prewarm-spawn"),
+    (
+        "_audit_reserved_stub_prefix_denied",
+        ("__app_call__deadbeef",),
+        "mcp-gateway.reserved-stub-prefix-denied",
+    ),
 ]
 
 
@@ -1006,12 +1011,15 @@ class TestEnvTargetResolver:
         monkeypatch.setenv("PYTHONPATH", "/host/site-packages")
         monkeypatch.setenv("PYTHONHOME", "/host/python")
         monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/host/cache/pycache")
+        monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
 
         resolved = gw.env_target_resolver(key)
         assert resolved is not None
         _command, _args, env, _work_dir = resolved
 
-        for leaked_key in ("PYTHONPATH", "PYTHONHOME", "PYTHONPYCACHEPREFIX"):
+        for leaked_key in (
+            "PYTHONPATH", "PYTHONHOME", "PYTHONPYCACHEPREFIX", "PYTHONDONTWRITEBYTECODE",
+        ):
             assert leaked_key not in env
 
 
@@ -1368,6 +1376,437 @@ class TestRespawnBackendForStub:
         _backend, _inbox, task = out
         await _drain_task(task)
 
+    # --- validating the replacement's tool set (#6294) -----------------------
+
+    @staticmethod
+    def _surface_pair(*, served, published, stub="stub-r8"):
+        """An old backend that already served *served* TO ``stub``, and a fresh
+        one that publishes *published* — both as projected tool surfaces."""
+        old = _fake_backend()
+        old.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
+        if served is not None:
+            old._served_tool_surfaces[stub] = served
+        fresh = _fake_backend(_pool_key(server="respawn-surface-mcp"), pid=8383)
+        fresh.prime_initialize = AsyncMock()  # type: ignore[method-assign]
+        fresh.attach_stub = AsyncMock(  # type: ignore[method-assign]
+            return_value=asyncio.Queue()
+        )
+        fresh.probe_tool_surface = AsyncMock(return_value=published)  # type: ignore[method-assign]
+        return old, fresh
+
+    @pytest.mark.asyncio
+    async def test_a_replacement_whose_tool_set_moved_is_not_adopted(
+        self, monkeypatch
+    ):
+        """The gap this closes: priming the captured handshake proves the fresh
+        process talks MCP, so without this check a server upgraded in place is
+        adopted under a session still holding the DEAD process's schema."""
+        key = _pool_key(server="respawn-surface-mcp")
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        old, fresh = self._surface_pair(
+            served={"read_file": '{"type":"object"}'},
+            published={"readFile": '{"type":"object"}'},
+        )
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+        audits: list[tuple] = []
+        monkeypatch.setattr(gw, "_audit_replacement_validated", lambda *a: audits.append(a))
+
+        with pytest.raises(gw._ReplacementRefused) as excinfo:
+            await gw._respawn_backend_for_stub(
+                pool,
+                key,
+                lambda k: None,
+                "stub-r8",
+                cast(Any, _FakeWriter()),
+                {"id": 0, "method": "initialize"},
+                old,
+                None,
+                None,
+                caller=CallerContext(session_key="dashboard:1"),
+            )
+
+        # The SESSION is told what changed, not just "backend gone".
+        assert "tool set changed" in str(excinfo.value)
+        assert "read_file" in str(excinfo.value)
+
+        # Refused BEFORE adoption: the stub is never bound to the replacement.
+        fresh.attach_stub.assert_not_awaited()
+        # And the give-up still releases the reservation it took, or the digest
+        # is skipped by evict_idle forever.
+        pool.unreserve.assert_called_once_with(key)
+        assert audits and audits[0][0] == "dashboard:1"
+        assert audits[0][2] == "denied"
+        assert "gone=read_file" in audits[0][3]
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_tool_set_is_adopted(self, monkeypatch):
+        """Control: the check must not cost the transparent recovery when the
+        replacement publishes what the session was already told."""
+        key = _pool_key(server="respawn-surface-mcp")
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        same = {"read_file": '{"type":"object"}'}
+        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r9")
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            key,
+            lambda k: None,
+            "stub-r9",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+        )
+
+        assert out is not None
+        fresh.attach_stub.assert_awaited_once_with("stub-r9")
+        await _drain_task(out[2])
+
+    @pytest.mark.asyncio
+    async def test_a_replacement_that_cannot_be_asked_is_not_adopted(
+        self, monkeypatch
+    ):
+        """A probe that establishes nothing is not agreement. The old backend
+        answered a listing projectably, so a replacement that will not is the
+        change — adopting on an unanswered probe would be the silent path again."""
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        old, fresh = self._surface_pair(
+            served={"read_file": '{"type":"object"}'}, published=None, stub="stub-r10"
+        )
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        with pytest.raises(gw._ReplacementRefused):
+            await gw._respawn_backend_for_stub(
+                pool,
+                _pool_key(server="respawn-surface-mcp"),
+                lambda k: None,
+                "stub-r10",
+                cast(Any, _FakeWriter()),
+                {"id": 0, "method": "initialize"},
+                old,
+                None,
+                None,
+            )
+
+        fresh.attach_stub.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_an_owner_rekeyed_mid_respawn_is_not_adopted(self, monkeypatch):
+        """A claim can retarget this connection during the probe. Both sides of
+        the comparison belong to the CAPTURED caller, so across a rekey it
+        describes a principal that no longer owns the stub — and re-probing would
+        race the same way."""
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        same = {"read_file": '{"type":"object"}'}
+        # The tool set AGREES; only the owner moved.
+        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r14")
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+        audits: list[tuple] = []
+        monkeypatch.setattr(gw, "_audit_replacement_validated", lambda *a: audits.append(a))
+
+        captured = CallerContext(session_key="dashboard:old-owner")
+        conn = gw._StubConn(
+            "stub-r14", [], "pool", CallerContext(session_key="dashboard:new-owner")
+        )
+
+        with pytest.raises(gw._ReplacementRefused):
+            await gw._respawn_backend_for_stub(
+                pool,
+                _pool_key(server="respawn-surface-mcp"),
+                lambda k: None,
+                "stub-r14",
+                cast(Any, _FakeWriter()),
+                {"id": 0, "method": "initialize"},
+                old,
+                None,
+                None,
+                caller=captured,
+                conn=conn,
+            )
+
+        fresh.attach_stub.assert_not_awaited()
+        assert audits and audits[0][2] == "denied"
+        assert "retargeted mid-respawn" in audits[0][3]
+
+    @pytest.mark.asyncio
+    async def test_a_rekey_landing_after_validation_still_refuses(self, monkeypatch):
+        """attach_stub and the subscription replay both await, so a claim can
+        land AFTER the check beside the comparison. The re-check before the
+        return is the one that closes that window; the earlier one only saves
+        the attach."""
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        same = {"read_file": '{"type":"object"}'}
+        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r18")
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        owner = CallerContext(session_key="dashboard:old-owner")
+        conn = gw._StubConn("stub-r18", [], "pool", owner)
+
+        async def _attach_then_rekey(stub_uuid):
+            # The claim lands during the adoption await, past the early check.
+            conn.caller = CallerContext(session_key="dashboard:new-owner")
+            return asyncio.Queue()
+
+        fresh.attach_stub = AsyncMock(  # type: ignore[method-assign]
+            side_effect=_attach_then_rekey
+        )
+        fresh.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
+
+        with pytest.raises(gw._ReplacementRefused):
+            await gw._respawn_backend_for_stub(
+                pool,
+                _pool_key(server="respawn-surface-mcp"),
+                lambda k: None,
+                "stub-r18",
+                cast(Any, _FakeWriter()),
+                {"id": 0, "method": "initialize"},
+                old,
+                None,
+                None,
+                caller=owner,
+                conn=conn,
+            )
+
+        # The stub it had just attached is released, or the refcount holds a stub
+        # that is about to be told the adoption failed.
+        fresh.attach_stub.assert_awaited_once_with("stub-r18")
+        fresh.detach_stub.assert_awaited_once_with("stub-r18")
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_owner_still_adopts(self, monkeypatch):
+        """Control for the rekey gate: the same owner is not a rekey, and a
+        connection that cannot answer the question is not one either."""
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        same = {"read_file": '{"type":"object"}'}
+        old, fresh = self._surface_pair(served=same, published=dict(same), stub="stub-r15")
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        owner = CallerContext(session_key="dashboard:same")
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            _pool_key(server="respawn-surface-mcp"),
+            lambda k: None,
+            "stub-r15",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+            caller=owner,
+            conn=gw._StubConn("stub-r15", [], "pool", owner),
+        )
+
+        assert out is not None
+        fresh.attach_stub.assert_awaited_once_with("stub-r15")
+        await _drain_task(out[2])
+
+    @pytest.mark.asyncio
+    async def test_no_listing_ever_served_skips_the_probe_entirely(
+        self, monkeypatch
+    ):
+        """With no claim on record there is nothing a replacement can
+        contradict, so the recovery this path already performs must not become a
+        failure — and the extra round-trip must not be paid either."""
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        old, fresh = self._surface_pair(served=None, published=None, stub="stub-r11")
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            _pool_key(server="respawn-surface-mcp"),
+            lambda k: None,
+            "stub-r11",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+        )
+
+        assert out is not None
+        fresh.probe_tool_surface.assert_not_awaited()
+        await _drain_task(out[2])
+
+    @pytest.mark.asyncio
+    async def test_an_adopted_replacement_is_audited_too(self, monkeypatch):
+        """Both outcomes are access decisions about which process may answer a
+        live session. Recording only refusals would leave the swap this guard
+        exists to make visible as a rotating log line and nothing more — and it
+        must be recorded in the no-anchor case especially, which is exactly where
+        nothing checked it."""
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        audits: list[tuple] = []
+        monkeypatch.setattr(gw, "_audit_replacement_validated", lambda *a: audits.append(a))
+        same = {"read_file": '{"type":"object"}'}
+
+        for stub, served, expected in (
+            ("stub-r16", same, "verified: 1 tool(s) unchanged"),
+            ("stub-r17", None, "not verified"),
+        ):
+            old, fresh = self._surface_pair(
+                served=served,
+                published=dict(same) if served is not None else None,
+                stub=stub,
+            )
+            monkeypatch.setattr(
+                gw, "_acquire_backend", AsyncMock(return_value=(fresh, True))
+            )
+
+            out = await gw._respawn_backend_for_stub(
+                pool,
+                _pool_key(server="respawn-surface-mcp"),
+                lambda k: None,
+                stub,
+                cast(Any, _FakeWriter()),
+                {"id": 0, "method": "initialize"},
+                old,
+                None,
+                None,
+                caller=CallerContext(session_key=f"dashboard:{stub}"),
+            )
+
+            assert out is not None
+            await _drain_task(out[2])
+
+        assert [a[2] for a in audits] == ["allowed", "allowed"]
+        assert "verified: 1 tool(s) unchanged" in audits[0][3]
+        assert "not verified" in audits[1][3]
+
+    @pytest.mark.asyncio
+    async def test_the_validated_surface_survives_into_the_next_respawn(
+        self, monkeypatch
+    ):
+        """The claim follows the SESSION, not the process. Without carrying it
+        the replacement starts anchor-less, so a second respawn of the same stub
+        adopts blindly while the client's frozen tool set is still its original
+        listing — the guard would cover only the first swap in a session's life."""
+        pool = BackendPool(max_backends=3)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        same = {"read_file": '{"type":"object"}'}
+        old, first = self._surface_pair(served=same, published=dict(same), stub="stub-r19")
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(first, True)))
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            _pool_key(server="respawn-surface-mcp"),
+            lambda k: None,
+            "stub-r19",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+        )
+        assert out is not None
+        await _drain_task(out[2])
+
+        # The adopted backend now holds the session's claim...
+        assert first.served_tool_surface("stub-r19") == same
+
+        # ...so when IT dies, the second replacement is validated too, and a
+        # drifted one is refused rather than adopted.
+        second = _fake_backend(_pool_key(server="respawn-surface-mcp"), pid=9494)
+        second.prime_initialize = AsyncMock()  # type: ignore[method-assign]
+        second.attach_stub = AsyncMock(return_value=asyncio.Queue())  # type: ignore[method-assign]
+        second.probe_tool_surface = AsyncMock(return_value={})  # type: ignore[method-assign]
+        first.detach_stub = AsyncMock(return_value=0)  # type: ignore[method-assign]
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(second, True)))
+
+        with pytest.raises(gw._ReplacementRefused):
+            await gw._respawn_backend_for_stub(
+                pool,
+                _pool_key(server="respawn-surface-mcp"),
+                lambda k: None,
+                "stub-r19",
+                cast(Any, _FakeWriter()),
+                {"id": 0, "method": "initialize"},
+                first,
+                None,
+                None,
+            )
+
+        second.attach_stub.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_co_pooled_stubs_listing_is_not_this_stubs_anchor(
+        self, monkeypatch
+    ):
+        """One backend serves several sessions. The comparison must be about the
+        session being recovered, not whichever tenant listed most recently — a
+        sibling's listing must neither supply nor suppress this stub's anchor."""
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        # Only the SIBLING was ever served a listing.
+        old, fresh = self._surface_pair(
+            served={"read_file": '{"type":"object"}'},
+            published={"totally": '{"type":"object"}'},
+            stub="stub-sibling",
+        )
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        out = await gw._respawn_backend_for_stub(
+            pool,
+            _pool_key(server="respawn-surface-mcp"),
+            lambda k: None,
+            "stub-r12",
+            cast(Any, _FakeWriter()),
+            {"id": 0, "method": "initialize"},
+            old,
+            None,
+            None,
+        )
+
+        # Adopted: stub-r12 holds no declaration, so the replacement's very
+        # different tool set contradicts nothing it was told.
+        assert out is not None
+        fresh.probe_tool_surface.assert_not_awaited()
+        await _drain_task(out[2])
+
+    @pytest.mark.asyncio
+    async def test_the_anchor_is_read_before_the_detach_that_prunes_it(
+        self, monkeypatch
+    ):
+        """Real ``detach_stub`` drops the stub's anchor. Reading it after the
+        detach would report "nothing was ever served" for a session that was
+        told plenty, and adopt a drifted replacement."""
+        pool = BackendPool(max_backends=2)
+        pool.unreserve = MagicMock()  # type: ignore[method-assign]
+        old, fresh = self._surface_pair(
+            served={"read_file": '{"type":"object"}'},
+            published={"readFile": '{"type":"object"}'},
+            stub="stub-r13",
+        )
+        # NOT mocked: the real detach prunes the per-stub anchor.
+        del old.detach_stub
+        await old.attach_stub("stub-r13")
+        monkeypatch.setattr(gw, "_acquire_backend", AsyncMock(return_value=(fresh, True)))
+
+        with pytest.raises(gw._ReplacementRefused):
+            await gw._respawn_backend_for_stub(
+                pool,
+                _pool_key(server="respawn-surface-mcp"),
+                lambda k: None,
+                "stub-r13",
+                cast(Any, _FakeWriter()),
+                {"id": 0, "method": "initialize"},
+                old,
+                None,
+                None,
+            )
+
+        fresh.attach_stub.assert_not_awaited()
+
 
 # --- zombie diagnostic ------------------------------------------------------
 
@@ -1510,17 +1949,25 @@ class TestZombieDiagnostic:
     async def test_dead_accept_loop_is_dumped_and_stops_the_daemon(self, monkeypatch, tmp_path):
         diag = tmp_path / "diag.jsonl"
         monkeypatch.setattr(gw, "_zombie_diagnostic_path", lambda: diag)
-        monkeypatch.setattr(gw, "_ZOMBIE_PROBE_INTERVAL_SECS", 0.01)
+        writes: list[tuple[Path, tuple[dict[str, Any], ...]]] = []
+
+        def capture_write(path: Path, *records: dict[str, Any]) -> None:
+            writes.append((path, records))
+
+        monkeypatch.setattr(gw, "_write_diagnostic", capture_write)
         server = MagicMock()
         server.is_serving.return_value = False
         stop = asyncio.Event()
+        monkeypatch.setattr(stop, "wait", AsyncMock(side_effect=asyncio.TimeoutError))
 
-        await asyncio.wait_for(
-            gw._zombie_diagnostic(cast(Any, server), BackendPool(max_backends=1), set(), stop),
-            timeout=5,
+        await gw._zombie_diagnostic(
+            cast(Any, server), BackendPool(max_backends=1), set(), stop
         )
 
-        records = [json.loads(line) for line in diag.read_text().strip().splitlines()]
+        assert len(writes) == 1
+        written_path, records = writes[0]
+        assert written_path == diag
+        assert [record["tag"] for record in records] == ["probe", "zombie_detected"]
         assert records[-1]["tag"] == "zombie_detected"
         assert isinstance(records[-1]["tasks"], list)
         assert isinstance(records[-1]["traceback"], list)

@@ -41,7 +41,10 @@ from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
 from conftest import requires_symlinks
-from kiro_crew.apps.builtins.spec_builder.backend import routes as r
+from kiro_crew.apps.builtins.spec_builder.backend import handlers as handler_module
+from kiro_crew.apps.builtins.spec_builder.backend import parsers as parser_module
+from kiro_crew.apps.builtins.spec_builder.backend import runtime as runtime_module
+from kiro_crew.apps.builtins.spec_builder.tests.routes_facade import routes as r
 
 # A name that satisfies _NAME_RE yet does NOT survive _redact -- the exact shape
 # _usable_name exists to reject (a description can slugify into one).
@@ -1102,7 +1105,7 @@ class TestSecurityModuleUnavailable:
         # which is exactly the condition the try/except in the module guards.
         sys.modules["kiro_crew.security"] = None  # type: ignore[assignment]
         try:
-            spec = importlib.util.spec_from_file_location("_sb_nosec", r.__file__)
+            spec = importlib.util.spec_from_file_location("_sb_nosec", parser_module.__file__)
             assert spec is not None and spec.loader is not None
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
@@ -1119,7 +1122,8 @@ class TestSecurityModuleUnavailable:
         # Fail CLOSED: with no way to make the judgement, treat every path as
         # sensitive rather than waving them all through.
         assert module.is_sensitive_path(str(tmp_path)) is True
-        assert module._safe_dir(str(tmp_path)) is None
+        with mock.patch.object(r, "is_sensitive_path", module.is_sensitive_path):
+            assert r._safe_dir(str(tmp_path)) is None
 
     def test_text_is_withheld_rather_than_served_unscrubbed(self):
         module = self._load_without_security()
@@ -4201,14 +4205,28 @@ class TestHandleDelete:
 
 
 class TestRegisterRoutes:
+    def test_test_facade_patches_owner_and_captured_consumer_bindings(self):
+        original_owner = runtime_module._dispatch_turn
+        original_consumer = handler_module._dispatch_turn
+        replacement = object()
+
+        with mock.patch.object(r, "_dispatch_turn", replacement):
+            assert runtime_module._dispatch_turn is replacement
+            assert handler_module._dispatch_turn is replacement
+
+        assert runtime_module._dispatch_turn is original_owner
+        assert handler_module._dispatch_turn is original_consumer
+
     def test_every_documented_route_is_registered_and_gated(self):
         app = web.Application()
         r.register_routes(app)
+        routes = [route for route in app.router.routes() if route.method != "HEAD"]
+        gate_code = r._require_enabled(mock.AsyncMock()).__code__
+        # functools.wraps deliberately preserves the raw handler's name, so the
+        # route-name contract alone cannot prove the enablement gate is present.
+        assert all(getattr(route.handler, "__code__", None) is gate_code for route in routes)
         registered = {
-            (route.method, route.resource.canonical)  # type: ignore[union-attr]
-            for route in app.router.routes()
-            # aiohttp registers a HEAD companion for every GET on its own.
-            if route.method != "HEAD"
+            (route.method, route.resource.canonical) for route in routes  # type: ignore[union-attr]
         }
         base = f"/api/apps/{r.APP_NAME}"
         assert registered == {
@@ -4238,6 +4256,20 @@ class TestRegisterRoutes:
             ("POST", f"{base}/specs/{{name}}/archive"),
             ("POST", f"{base}/specs/{{name}}/duplicate"),
         }
+
+    def test_automatic_head_routes_cover_each_get_path(self):
+        app = web.Application()
+        r.register_routes(app)
+        routes = list(app.router.routes())
+        paths_by_method = {
+            method: {
+                route.resource.canonical  # type: ignore[union-attr]
+                for route in routes
+                if route.method == method
+            }
+            for method in ("GET", "HEAD")
+        }
+        assert paths_by_method["HEAD"] == paths_by_method["GET"]
 
     def test_registration_creates_nothing_on_disk(self, tmp_path):
         # This runs during start_dashboard ON THE EVENT LOOP, so a KIROCREW_HOME on

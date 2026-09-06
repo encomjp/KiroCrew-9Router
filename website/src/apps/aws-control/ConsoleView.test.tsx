@@ -2,13 +2,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { renderWithProviders } from '../../test/helpers'
 import { i18nT } from '../../i18n/t'
-import { fmtBytes, fmtDate } from '../../i18n/format'
-import type {
-  AwsAccount, DriveStatus, CostReport, LibraryResponse, BackupStatus, SharesResponse,
-} from './types'
+import { fmtBytes, fmtCurrency, fmtDate, fmtNumber } from '../../i18n/format'
+import type { AwsAccount, DriveStatus, CostReport } from './types'
 
-/* The console reads only through the api client; mocking it keeps every case
- * network-free while leaving `AwsControlError` real for the page's 403/409 paths. */
+/* The pane reads only through the api client; mocking it keeps every case
+ * network-free while leaving `AwsControlError` real for the 409 paths. */
 vi.mock('./api', async () => {
   const actual = await vi.importActual<typeof import('./api')>('./api')
   return {
@@ -20,25 +18,13 @@ vi.mock('./api', async () => {
       drive: vi.fn(),
       driveBootstrapPreview: vi.fn(),
       driveBootstrapConfirm: vi.fn(),
-      driveList: vi.fn(),
-      driveDownload: vi.fn(),
-      driveUpload: vi.fn(),
-      driveDelete: vi.fn(),
-      driveShare: vi.fn(),
-      shares: vi.fn(),
-      shareForget: vi.fn(),
       costs: vi.fn(),
-      library: vi.fn(),
-      libraryPush: vi.fn(),
-      backup: vi.fn(),
-      backupRun: vi.fn(),
-      backupNightly: vi.fn(),
-      backupRestore: vi.fn(),
     },
   }
 })
 
-/* The Cost Explorer consent nudge fetches through the shared client. */
+/* Consent status (the CE ask and the paid-service receipts) fetches through
+ * the shared client. */
 vi.mock('../../api/client', () => ({
   api: {
     awsConsent: vi.fn(),
@@ -49,8 +35,7 @@ vi.mock('../../api/client', () => ({
 
 import { awsControlApi } from './api'
 import { api } from '../../api/client'
-import ConsoleView from './ConsoleView'
-import AwsControlPage from './AwsControlPage'
+import UsagePane, { ReconnectAction, ConnectionsSection, SetupCard } from './ConsoleView'
 
 const ACCOUNT: AwsAccount = {
   account: '111122223333',
@@ -60,6 +45,19 @@ const ACCOUNT: AwsAccount = {
     {
       name: 'personal', region: 'us-west-2', kind: 'sso', identityOk: true,
       account: '111122223333', arn: 'arn:aws:iam::111122223333:role/x', detail: '', default: true,
+    },
+  ],
+  summary: { storage: null, sites: null, tasks: null, costMonthToDate: null },
+}
+
+const DEGRADED: AwsAccount = {
+  account: '444455556666',
+  name: 'work',
+  health: 'degraded',
+  profiles: [
+    {
+      name: 'work', region: 'eu-west-1', kind: 'credential-process', identityOk: false,
+      account: '444455556666', arn: '', detail: 'expired', default: true,
     },
   ],
   summary: { storage: null, sites: null, tasks: null, costMonthToDate: null },
@@ -85,81 +83,290 @@ const costsFresh: CostReport = {
   byService: [{ service: 'S3', amount: 12.5 }], fetchedAt: '2026-08-24T05:00:00Z',
 }
 
-const emptyLibrary: LibraryResponse = { artifacts: [] }
-const emptyBackup: BackupStatus = { nightly: false, runs: {}, remote: { snapshot: [], sessions: [] } }
-const noShares: SharesResponse = { shares: [] }
+/* Consent fixtures. A grant is service-scoped and carries the account it was
+ * confirmed for; the receipt logic keys on that account matching. */
+const grantHere = { granted: true, grant: { account: ACCOUNT.account } }
+const grantElsewhere = { granted: true, grant: { account: '999988887777' } }
+const notGranted = { granted: false }
 
-function stubDrivePresent() {
-  vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
-  vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
-  vi.mocked(awsControlApi.library).mockResolvedValue(emptyLibrary)
-  vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
-  vi.mocked(awsControlApi.backup).mockResolvedValue(emptyBackup)
-  vi.mocked(awsControlApi.shares).mockResolvedValue(noShares)
+/** Resolve the consent status per service ('s3' | 'ce'). */
+function stubConsent(map: Record<string, unknown>) {
+  vi.mocked(api.awsConsent).mockImplementation(
+    (svc: string) => Promise.resolve(map[svc] ?? notGranted) as ReturnType<typeof api.awsConsent>,
+  )
 }
+
+/** The month-to-date StatCard's value node (absent while its read is in flight). */
+const costValue = () => within(screen.getByTestId('console-cost-stat')).getByTestId('stat-card-value')
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // Default: consent status never resolves → granted is UNDEFINED, not false.
   vi.mocked(api.awsConsent).mockReturnValue(new Promise(() => {}) as ReturnType<typeof api.awsConsent>)
 })
 
-describe('AwsControlPage → ConsoleView navigation', () => {
-  it('opens the console when an account row is clicked, and the crumb returns', async () => {
-    vi.mocked(awsControlApi.accounts).mockResolvedValue({
-      accounts: [ACCOUNT],
-      totals: { accounts: 1, profiles: 1, profilesHealthy: 1 },
-      generatedAt: '2026-08-24T05:00:00Z',
+describe('UsagePane', () => {
+  it('renders the pane header and the fresh month-to-date bill, with no "as of" hint', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    const pane = await screen.findByTestId('usage-pane')
+    expect(within(pane).getByTestId('page-title')).toHaveTextContent(i18nT('apps.awsControl.rail.usage'))
+
+    // The bill arrives async — wait for the figure, not the skeleton.
+    screen.getByTestId('console-stats')
+    await waitFor(() => expect(costValue()).toHaveTextContent(fmtCurrency(12.5, 'USD')))
+    // fresh:true → no "as of" staleness hint.
+    const asOf = i18nT('apps.awsControl.console.costs_as_of', { date: fmtDate(costsFresh.fetchedAt) })
+    expect(screen.queryByText(asOf)).toBeNull()
+  })
+
+  it('states storage and object count as their own figures beside the bill', async () => {
+    // The strip is the pane's answer to "how much, and how much of it": the
+    // meter below splits the storage by section but never states the total.
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    const storage = await screen.findByTestId('console-storage-stat')
+    await waitFor(() =>
+      expect(within(storage).getByTestId('stat-card-value')).toHaveTextContent(fmtBytes(3_500_000_000)),
+    )
+    expect(within(screen.getByTestId('console-objects-stat')).getByTestId('stat-card-value'))
+      .toHaveTextContent(fmtNumber(42))
+  })
+
+  it('does NOT mount the CE consent ask while the consent status is still unknown', async () => {
+    // The gate mounts on granted === false only. The default awsConsent mock
+    // never resolves, so `granted` is undefined here — the ask must not flash,
+    // and with no row to hold, the Paid services card must not exist either.
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    await waitFor(() => expect(costValue()).toHaveTextContent(fmtCurrency(12.5, 'USD')))
+    expect(screen.queryByTestId('costs-consent-gate')).toBeNull()
+    expect(screen.queryByTestId('paid-services')).toBeNull()
+  })
+
+  it('renders an em dash on consentMissing and mounts the CE ask when consent reports granted:false', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue({
+      fresh: false, monthToDate: 0, projected: 0, currency: 'USD',
+      byService: [], fetchedAt: '2026-08-24T05:00:00Z', consentMissing: true,
     })
-    stubDrivePresent()
-    renderWithProviders(<AwsControlPage />)
+    stubConsent({ s3: notGranted, ce: notGranted })
 
-    fireEvent.click(await screen.findByTestId('account-card'))
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
 
-    // The console mounts (crumb + its own stats strip appear).
-    expect(await screen.findByTestId('console-crumb')).toBeTruthy()
-    expect(screen.getByTestId('console-stats')).toBeTruthy()
+    // The consentMissing branch renders "—", never a zero figure or the as-of line.
+    await screen.findByTestId('console-stats')
+    await waitFor(() => expect(costValue()).toHaveTextContent('—'))
+    expect(costValue()).not.toHaveTextContent(fmtCurrency(0, 'USD'))
+    // WHY there is no figure is a visible sub-line, not a hover-only title.
+    expect(screen.getByTestId('console-cost-reason')).toHaveTextContent(
+      i18nT('apps.awsControl.console.costs_consent_missing'),
+    )
 
-    // The crumb returns to the accounts list.
-    fireEvent.click(screen.getByTestId('console-crumb'))
-    expect(await screen.findByTestId('accounts-list')).toBeTruthy()
-    expect(screen.queryByTestId('console-crumb')).toBeNull()
+    // granted === false → the Cost Explorer ask mounts, and fetches ce status.
+    expect(await screen.findByTestId('costs-consent-gate')).toBeTruthy()
+    await waitFor(() => expect(api.awsConsent).toHaveBeenCalledWith('ce'))
+  })
+
+  it('a stale bill served from cache keeps its figure and says the refresh failed', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue({
+      ...costsFresh, fresh: false, fetchedAt: '2026-09-05T08:00:00Z', fetchError: 'Throttling',
+    })
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    await screen.findByTestId('console-stats')
+    await waitFor(() => expect(costValue()).toHaveTextContent(fmtCurrency(12.5, 'USD')))
+    const notice = await screen.findByTestId('costs-error')
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.costs_refresh_failed'))
+  })
+
+  it('renders the month-to-date stat as an em dash when the cost read fails, without a consent ask', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    // A rejected costs read (CE not enabled / throttled) must settle to "—".
+    vi.mocked(awsControlApi.costs).mockRejectedValue(new Error('CE disabled'))
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    // The costs query carries retry:1, so its error settles after one
+    // backoff — give waitFor room.
+    await screen.findByTestId('console-stats')
+    await waitFor(() => expect(costValue()).toHaveTextContent('—'), { timeout: 4000 })
+    // A failed read is an error surface: the notice below says the sentence
+    // once, and the stat carries no caption of its own. The consent sub-line
+    // stays empty — this is a failure, not a pending decision.
+    expect(screen.queryByTestId('console-cost-reason')).toBeNull()
+    // No consent ask fires — this is a failure, not a missing gate.
+    expect(screen.queryByTestId('costs-consent-gate')).toBeNull()
+    // The em dash stays quiet, but the failure itself is said — with the
+    // hand-off, since "CE disabled" is exactly what the agent can act on.
+    const notice = await screen.findByTestId('costs-error')
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.costs_unavailable'))
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeTruthy()
+  })
+
+  it('a consent-refused 409 on costs is the ask, not an error notice', async () => {
+    // The gate's own refusal is answered by the CE ask row; a red banner beside
+    // it would report the reader's pending decision as a fault.
+    const { AwsControlError } = await import('./api')
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockRejectedValue(new AwsControlError('aws_consent_required', 409))
+    stubConsent({ s3: notGranted, ce: notGranted })
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    expect(await screen.findByTestId('costs-consent-gate')).toBeTruthy()
+    await waitFor(() => expect(costValue()).toHaveTextContent('—'), { timeout: 4000 })
+    expect(screen.queryByTestId('costs-error')).toBeNull()
+  })
+
+  it('shows a visible "as of" hint next to the cost figure when it came from cache', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue({
+      // fresh:false → the number is cached and must carry the "as of" hint.
+      fresh: false, monthToDate: 9.99, projected: 20, currency: 'USD',
+      byService: [{ service: 'S3', amount: 9.99 }], fetchedAt: '2026-08-24T05:00:00Z',
+    })
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    await screen.findByTestId('console-stats')
+    await waitFor(() => expect(costValue()).toHaveTextContent(fmtCurrency(9.99, 'USD')))
+    // Visible rather than a hover-only title, so staleness is stated, not hidden.
+    const asOf = i18nT('apps.awsControl.console.costs_as_of', { date: fmtDate('2026-08-24T05:00:00Z') })
+    expect(screen.getByText(asOf)).toBeTruthy()
+  })
+
+  it('renders the storage block (bucket line + meter) only when the drive exists', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    const storage = await screen.findByTestId('usage-storage')
+    expect(within(storage).getByTestId('drive-bucket')).toHaveTextContent('kirocrew-drive-abc123')
+    expect(within(storage).getByTestId('drive-copy-bucket')).toBeTruthy()
+    expect(storage).toHaveTextContent('us-west-2')
+    // The StorageMeter mounts with the drive's usage split.
+    expect(within(storage).getByTestId('drive-storage-meter')).toBeTruthy()
+  })
+
+  it('renders NO storage block before the drive bucket is created', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue({ exists: false })
+    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    await waitFor(() => expect(costValue()).toHaveTextContent(fmtCurrency(12.5, 'USD')))
+    expect(screen.queryByTestId('usage-storage')).toBeNull()
+    expect(screen.queryByTestId('drive-storage-meter')).toBeNull()
+    // The strip still answers instead of skeletoning forever.
+    expect(within(screen.getByTestId('console-storage-stat')).getByTestId('stat-card-value'))
+      .toHaveTextContent('—')
+  })
+
+  it('carries both receipts once each grant is recorded for THIS account, and no CE ask', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+    stubConsent({ s3: grantHere, ce: grantHere })
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    const receipts = await screen.findByTestId('paid-services')
+    expect(within(receipts).getByTestId('aws-consent-s3')).toBeTruthy()
+    expect(within(receipts).getByTestId('aws-consent-ce')).toBeTruthy()
+    // granted === true → the ask must not also be on screen.
+    expect(screen.queryByTestId('costs-consent-gate')).toBeNull()
+  })
+
+  it('lists the CE ask as a row in Paid services, with no receipt, when nothing is granted', async () => {
+    // The ask and the receipt are the same row with a different right-hand
+    // control, so they belong in one list — a reader comparing "enabled"
+    // against "not enabled" is reading one thing. What must NOT appear is a
+    // receipt for a grant that does not exist.
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+    stubConsent({ s3: notGranted, ce: notGranted })
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    const services = await screen.findByTestId('paid-services')
+    const ask = within(services).getByTestId('costs-consent-gate')
+    expect(within(ask).getByRole('button', { name: /confirm and enable/i })).toBeTruthy()
+    expect(within(services).queryByTestId('aws-consent-s3')).toBeNull()
+    expect(within(services).queryByRole('button', { name: /withdraw confirmation/i })).toBeNull()
+  })
+
+  it('never shows a receipt for a grant recorded under a DIFFERENT account', async () => {
+    // The withdraw control is GLOBAL: one grant per service. A receipt shown on
+    // the wrong account's pane is not a cosmetic mislabel — clicking it revokes
+    // the grant the OTHER account's drive and cost figure run on. Neither is
+    // there an ask to show, so the card itself must not exist.
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+    stubConsent({ s3: grantElsewhere, ce: grantElsewhere })
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    await waitFor(() => expect(api.awsConsent).toHaveBeenCalledWith('s3'))
+    await waitFor(() => expect(costValue()).toHaveTextContent(fmtCurrency(12.5, 'USD')))
+    expect(screen.queryByTestId('paid-services')).toBeNull()
+  })
+
+  it('suppresses the S3 receipt while the drive read is a 409 consent refusal, keeping the CE one', async () => {
+    // Granting invalidates the consent query but not the drive cache: between a
+    // withdraw and the next refetch, the cached 409 refusal and a receipt would
+    // both be on screen saying opposite things about the same service.
+    const { AwsControlError } = await import('./api')
+    vi.mocked(awsControlApi.drive).mockRejectedValue(new AwsControlError('aws_consent_required', 409))
+    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+    stubConsent({ s3: grantHere, ce: grantHere })
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    const receipts = await screen.findByTestId('paid-services')
+    expect(within(receipts).getByTestId('aws-consent-ce')).toBeTruthy()
+    expect(within(receipts).queryByTestId('aws-consent-s3')).toBeNull()
+  })
+
+  it('suppresses the CE receipt while costs report consentMissing, keeping the S3 one', async () => {
+    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
+    vi.mocked(awsControlApi.costs).mockResolvedValue({
+      fresh: false, monthToDate: 0, projected: 0, currency: 'USD',
+      byService: [], fetchedAt: '2026-08-24T05:00:00Z', consentMissing: true,
+    })
+    stubConsent({ s3: grantHere, ce: grantHere })
+
+    renderWithProviders(<UsagePane account={ACCOUNT} />)
+
+    const receipts = await screen.findByTestId('paid-services')
+    expect(within(receipts).getByTestId('aws-consent-s3')).toBeTruthy()
+    expect(within(receipts).queryByTestId('aws-consent-ce')).toBeNull()
   })
 })
 
-describe('ConsoleView', () => {
-  it('leads the header with the name and the FULL account id (no truncated tail)', async () => {
-    stubDrivePresent()
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    const crumb = await screen.findByTestId('console-crumb')
-    // The crumb shows the account name, not a "···tail".
-    expect(crumb).toHaveTextContent('personal')
-    expect(crumb.textContent).not.toContain('···')
-    // The header carries the full 12-digit id.
-    expect(screen.getByTestId('console-account-id')).toHaveTextContent('111122223333')
-    expect(screen.queryByText(/···/)).toBeNull()
+describe('ConnectionsSection', () => {
+  it('names the account its keys belong to in the title', async () => {
+    // The card sits under a list of several accounts; a bare heading read as
+    // a global list, so the title scopes itself to the one account it shows.
+    renderWithProviders(<ConnectionsSection account={ACCOUNT} askAgent />)
+    const conns = await screen.findByTestId('connections-section')
+    expect(conns).toHaveTextContent(
+      i18nT('apps.awsControl.console.keys_for_account', { name: ACCOUNT.name }),
+    )
   })
 
-  it('states name, id and connection once each, with no General card', async () => {
-    // The General card repeated every field it showed: name (crumb + title),
-    // account id (title), region and key count (the connection rows), and a
-    // connection state the title dot already carried -- at a coarser precision,
-    // which was its own small lie. Identity is stated once now.
-    stubDrivePresent()
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    await screen.findByTestId('connections-section')
-    expect(screen.queryByTestId('general-section')).toBeNull()
-    expect(screen.getByTestId('console-account-id')).toHaveTextContent('111122223333')
-    expect(screen.getByTestId('console-health')).toBeTruthy()
-    // Region and key count are the connection row's to state.
-    const conns = screen.getByTestId('connections-section')
-    expect(conns).toHaveTextContent('us-west-2')
-  })
-
-  it('renders one Connections row per key with its kind, region and health', async () => {
-    stubDrivePresent()
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
+  it('renders one row per key with its kind, region and health — no Reconnect on a healthy key', async () => {
+    renderWithProviders(<ConnectionsSection account={ACCOUNT} askAgent />)
 
     const conns = await screen.findByTestId('connections-section')
     const rows = within(conns).getAllByTestId('connection-row')
@@ -167,340 +374,142 @@ describe('ConsoleView', () => {
     expect(within(rows[0]).getByTestId('connection-name')).toHaveTextContent('personal')
     expect(rows[0]).toHaveTextContent(i18nT('apps.awsControl.page.kind_sso'))
     expect(rows[0]).toHaveTextContent('us-west-2')
-    // A healthy key shows the healthy state and NO reconnect action.
     expect(rows[0]).toHaveTextContent(i18nT('apps.awsControl.console.key_healthy'))
+    // The dot is decoration: the badge word carries the state, so the dot does
+    // not announce it a second time.
+    expect(within(rows[0]).getByTestId('connection-health').getAttribute('aria-hidden')).toBe('true')
     expect(within(rows[0]).queryByTestId('reconnect-toggle')).toBeNull()
   })
 
-  it('shows an inline Reconnect on a failing key in Connections and loads its command', async () => {
-    const degraded: AwsAccount = {
-      account: '444455556666',
-      name: 'work',
-      health: 'degraded',
-      profiles: [
-        {
-          name: 'work', region: 'eu-west-1', kind: 'credential-process', identityOk: false,
-          account: '444455556666', arn: '', detail: 'expired', default: true,
-        },
-      ],
-      summary: { storage: null, sites: null, tasks: null, costMonthToDate: null },
-    }
-    vi.mocked(awsControlApi.drive).mockResolvedValue({ exists: false })
-    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+  it('shows the empty line when the account has no keys', async () => {
+    const bare: AwsAccount = { ...ACCOUNT, profiles: [] }
+    renderWithProviders(<ConnectionsSection account={bare} askAgent />)
+
+    expect(await screen.findByTestId('connections-empty')).toHaveTextContent(
+      i18nT('apps.awsControl.page.not_connected_yet'),
+    )
+    expect(screen.queryByTestId('connection-row')).toBeNull()
+  })
+
+  it('shows an inline Reconnect on a failing key and loads its command on demand', async () => {
     vi.mocked(awsControlApi.reconnectPlan).mockResolvedValue({
       method: 'terminal', kind: 'credential-process', command: 'aws sso login --profile work',
     })
 
-    renderWithProviders(<ConsoleView account={degraded} onBack={() => {}} />)
+    renderWithProviders(<ConnectionsSection account={DEGRADED} askAgent />)
 
     const row = await screen.findByTestId('connection-row')
-    expect(row).toHaveTextContent(i18nT('apps.awsControl.console.key_failed'))
+    expect(row).toHaveTextContent(i18nT('apps.awsControl.console.key_needs_attention'))
 
+    // The plan query is disabled until the toggle opens the panel.
+    expect(awsControlApi.reconnectPlan).not.toHaveBeenCalled()
     fireEvent.click(within(row).getByTestId('reconnect-toggle'))
     await waitFor(() => expect(awsControlApi.reconnectPlan).toHaveBeenCalledWith('work'))
     expect(await screen.findByTestId('reconnect-command')).toHaveTextContent('aws sso login --profile work')
   })
+})
 
-  it('renders only the tiles that have a data source, and no ghosts', async () => {
-    // SITES and TASKS were hardcoded em-dashes with no query behind them, and
-    // they said the same "connects later" as the two dashed ghost cards that
-    // closed the page: four elements for two features that do not exist.
-    stubDrivePresent()
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
+describe('ReconnectAction', () => {
+  it('shows the reconnect error state when the plan query fails', async () => {
+    vi.mocked(awsControlApi.reconnectPlan).mockRejectedValue(new Error('plan failed'))
 
-    const stats = await screen.findByTestId('console-stats')
-    // ONE tile, because the month-to-date bill is the only figure this page
-    // alone can state - the stored bytes and object count are on the Cloud
-    // drive row, which is the thing they describe. The bill arrives async, so
-    // wait for it rather than reading the skeleton StatCard renders while it is
-    // undefined.
-    await waitFor(() => expect(within(stats).getAllByTestId('stat-card-value')).toHaveLength(1))
-    expect(stats.textContent).not.toMatch(/\b0\b/)
-    expect(screen.queryByTestId('console-ghosts')).toBeNull()
-    expect(screen.queryAllByTestId('app-ghost')).toHaveLength(0)
-    expect(screen.queryByTestId('console-guard')).toBeNull()
+    renderWithProviders(<ReconnectAction profile={DEGRADED.profiles[0]} askAgent />)
+
+    fireEvent.click(await screen.findByTestId('reconnect-toggle'))
+    // The panel resolves to its error message, not a command block.
+    expect(await screen.findByTestId('reconnect-error')).toBeTruthy()
+    expect(screen.queryByTestId('reconnect-command')).toBeNull()
+    expect(screen.getByRole('button', { name: /ask the agent/i })).toBeTruthy()
   })
 
-  it('carries no Payments control: it would only restate this screen', async () => {
-    // Consent is service-scoped and stays page-wide on the accounts list;
-    // everything else a panel here could show is already on this page (kind and
-    // region in the connection row, account id in the title, the bill in a tile).
-    stubDrivePresent()
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
+  it('withholds the hand-off when the host says so', async () => {
+    // The accounts pane hosts this next to the Add-accounts checkboxes; while a
+    // selection is ticked it passes false, and the notice must not navigate.
+    vi.mocked(awsControlApi.reconnectPlan).mockRejectedValue(new Error('plan failed'))
 
-    await screen.findByTestId('connections-section')
-    expect(screen.queryByTestId('console-payments-toggle')).toBeNull()
-    expect(screen.queryByTestId('console-payments')).toBeNull()
+    renderWithProviders(<ReconnectAction profile={DEGRADED.profiles[0]} askAgent={false} />)
+
+    fireEvent.click(await screen.findByTestId('reconnect-toggle'))
+    expect(await screen.findByTestId('reconnect-error')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /ask the agent/i })).toBeNull()
+    // The retry stays: it is the reader's own recovery and navigates nowhere.
+    expect(screen.getByTestId('reconnect-error-retry')).toBeTruthy()
   })
+})
 
-  it('keeps the three-state connection label and the id copy button', async () => {
-    // Both came off the deleted General card. A binary dot would announce "not
-    // connected" for a degraded account whose keys still partly work.
-    stubDrivePresent()
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    const dot = await screen.findByTestId('console-health')
-    expect(dot).toHaveAttribute('aria-label', i18nT('apps.awsControl.console.connection_connected'))
-    expect(screen.getByTestId('console-copy-id')).toBeTruthy()
-  })
-
-  it('shows the drive-missing setup card, previews, then confirms and invalidates', async () => {
-    vi.mocked(awsControlApi.drive).mockResolvedValueOnce({ exists: false })
-    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+describe('SetupCard', () => {
+  it('previews the bootstrap payload, then confirms and creates the bucket', async () => {
     vi.mocked(awsControlApi.driveBootstrapPreview).mockResolvedValue({
       preview: true, account: ACCOUNT.account, region: 'us-west-2', resource: 'kirocrew-drive-abc123',
     })
     vi.mocked(awsControlApi.driveBootstrapConfirm).mockResolvedValue({ created: true, bucket: 'kirocrew-drive-abc123' })
 
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    // Setup card replaces the drive sections.
-    expect(await screen.findByTestId('drive-setup')).toBeTruthy()
-    expect(screen.queryByTestId('library-section')).toBeNull()
+    renderWithProviders(<SetupCard account={ACCOUNT.account} region="us-west-2" />)
 
     // Preview shows the payload, confirm creates the bucket.
-    fireEvent.click(screen.getByTestId('drive-preview-btn'))
+    fireEvent.click(await screen.findByTestId('drive-preview-btn'))
     expect(await screen.findByTestId('drive-preview')).toHaveTextContent('kirocrew-drive-abc123')
 
     fireEvent.click(screen.getByTestId('drive-confirm-btn'))
     await waitFor(() => expect(awsControlApi.driveBootstrapConfirm).toHaveBeenCalledWith(ACCOUNT.account))
   })
 
-  it('offers the cost confirmation when nothing has ever been confirmed', async () => {
-    // The state a never-confirmed account is always in: no cached cost reading
-    // for the backend to attach `consentMissing` to, so the costs request is a
-    // bare 409 and that field never exists. Keying the ask on it left Cost
-    // Explorer with no confirmation control anywhere in the product, so the ask
-    // is driven by the consent status instead.
-    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
-    const { AwsControlError } = await import('./api')
-    vi.mocked(awsControlApi.costs).mockRejectedValue(
-      new AwsControlError('aws_consent_required', 409),
-    )
-    vi.mocked(awsControlApi.library).mockResolvedValue(emptyLibrary)
-    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
-    vi.mocked(awsControlApi.backup).mockResolvedValue(emptyBackup)
-    vi.mocked(awsControlApi.shares).mockResolvedValue(noShares)
-    vi.mocked(api.awsConsent).mockResolvedValue({ granted: false } as never)
-
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    expect(await screen.findByTestId('costs-consent-gate')).toBeTruthy()
-  })
-
-  it('shows the cost-consent nudge when costs report consentMissing', async () => {
-    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
-    vi.mocked(awsControlApi.costs).mockResolvedValue({
-      fresh: false, monthToDate: 0, projected: 0, currency: 'USD',
-      byService: [], fetchedAt: '2026-08-24T05:00:00Z', consentMissing: true,
-    })
-    vi.mocked(awsControlApi.library).mockResolvedValue(emptyLibrary)
-    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
-    vi.mocked(awsControlApi.backup).mockResolvedValue(emptyBackup)
-    vi.mocked(awsControlApi.shares).mockResolvedValue(noShares)
-    vi.mocked(api.awsConsent).mockResolvedValue({ granted: false } as never)
-
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    expect(await screen.findByTestId('costs-consent-gate')).toBeTruthy()
-    // The consent gate fetches the ce service status.
-    await waitFor(() => expect(api.awsConsent).toHaveBeenCalledWith('ce'))
-  })
-
-  it('carries the granted confirmations, and no empty heading without them', async () => {
-    // This section is why the account list no longer shows confirmations: it is
-    // the surface that keeps a granted one readable and withdrawable. It must
-    // not exist when there is nothing to show, or it becomes exactly the
-    // always-present placeholder this page was cleaned of.
-    vi.mocked(awsControlApi.library).mockResolvedValue(emptyLibrary)
-    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
-    vi.mocked(awsControlApi.backup).mockResolvedValue(emptyBackup)
-    vi.mocked(awsControlApi.shares).mockResolvedValue(noShares)
-    vi.mocked(api.awsConsent).mockResolvedValue({ granted: false } as never)
-
-    const nothing = renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-    await waitFor(() => expect(api.awsConsent).toHaveBeenCalledWith('s3'))
-    expect(nothing.container.querySelector('[data-testid="paid-services"]')).toBeNull()
-    nothing.unmount()
-
-    vi.mocked(api.awsConsent).mockResolvedValue(
-      { granted: true, grant: { account: ACCOUNT.account } } as never,
-    )
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-    expect(await screen.findByTestId('paid-services')).toBeTruthy()
-  })
-
-  it('never shows a receipt for a grant recorded under a different account', async () => {
-    // The withdraw control is GLOBAL: one grant per service. So a receipt shown
-    // on the wrong account's console is not a cosmetic mislabel — clicking it
-    // revokes the grant the OTHER account's drive and cost figure run on. The
-    // grant carries the account it was confirmed for, and that is the test.
-    vi.mocked(awsControlApi.library).mockResolvedValue(emptyLibrary)
-    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
-    vi.mocked(awsControlApi.backup).mockResolvedValue(emptyBackup)
-    vi.mocked(awsControlApi.shares).mockResolvedValue(noShares)
-    vi.mocked(api.awsConsent).mockResolvedValue(
-      { granted: true, grant: { account: '999988887777' } } as never,
-    )
-
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-    await waitFor(() => expect(api.awsConsent).toHaveBeenCalledWith('s3'))
-    expect(screen.queryByTestId('paid-services')).toBeNull()
-  })
-
-  /* ── Cost-strip failure branches ──────────────────────────────────────────
-   * The month-to-date stat has three distinct renderings; the consentMissing
-   * one is covered above. These two exercise the isError em-dash (a dead bill
-   * read must resolve to "—", never skeleton forever) and the stale-cache "as
-   * of" title (fresh:false). */
-
-  it('renders the month-to-date stat as an em dash when the cost read fails', async () => {
-    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
-    // A rejected costs read (CE not enabled / throttled) must settle to "—".
-    vi.mocked(awsControlApi.costs).mockRejectedValue(new Error('CE disabled'))
-    vi.mocked(awsControlApi.library).mockResolvedValue(emptyLibrary)
-    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
-    vi.mocked(awsControlApi.backup).mockResolvedValue(emptyBackup)
-    vi.mocked(awsControlApi.shares).mockResolvedValue(noShares)
-
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    // The month-to-date query carries retry:1, so its error settles after one
-    // backoff — give waitFor room. Once it errors, the card renders its "—"
-    // value and an InfoTip whose title is the "unavailable" explanation.
-    const stats = await screen.findByTestId('console-stats')
-    await waitFor(
-      () => expect(within(stats).getByTitle(i18nT('apps.awsControl.console.costs_unavailable'))).toBeTruthy(),
-      { timeout: 4000 },
-    )
-    // No cost-consent nudge fires — this is a failure, not a missing gate.
-    expect(screen.queryByTestId('costs-consent-gate')).toBeNull()
-  })
-
-  it('shows an "as of" hint on the cost stat when the figure came from cache', async () => {
-    vi.mocked(awsControlApi.drive).mockResolvedValue(driveExists)
-    vi.mocked(awsControlApi.costs).mockResolvedValue({
-      // fresh:false → the number is cached and must carry the "as of" title.
-      fresh: false, monthToDate: 9.99, projected: 20, currency: 'USD',
-      byService: [{ service: 'S3', amount: 9.99 }], fetchedAt: '2026-08-24T05:00:00Z',
-    })
-    vi.mocked(awsControlApi.library).mockResolvedValue(emptyLibrary)
-    vi.mocked(awsControlApi.driveList).mockResolvedValue({ files: [], folders: [] })
-    vi.mocked(awsControlApi.backup).mockResolvedValue(emptyBackup)
-    vi.mocked(awsControlApi.shares).mockResolvedValue(noShares)
-
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    const stats = await screen.findByTestId('console-stats')
-    // The cached figure renders, and the stale-cache branch attaches an
-    // "as of <date>" InfoTip title (the fresh branch would attach no title).
-    await waitFor(() => expect(stats.textContent ?? '').toContain('9.99'))
-    const asOf = i18nT('apps.awsControl.console.costs_as_of', { date: fmtDate('2026-08-24T05:00:00Z') })
-    expect(within(stats).getByTitle(asOf)).toBeTruthy()
-  })
-
-  /* ── Drive: stored-usage stat, folder navigation, load-more ──────────────── */
-
-  it('states the stored-usage figure ONCE, on the Cloud drive row and not in the stats strip', async () => {
-    // The drive CONTENTS moved to DrivePage. The usage figure stayed on this
-    // page but only in one place: it used to be a Stored stat tile AND the
-    // capability row, which is the same fact twice on one screen. The
-    // listing/folder/file/load-more assertions live in DrivePage.test.tsx.
-    stubDrivePresent()
-
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} onOpenDrive={() => {}} />)
-
-    const usage = i18nT('apps.awsControl.console.stat_stored_value', {
-      size: fmtBytes(driveExists.usage.bytes), objects: driveExists.usage.objects,
-    })
-    // On the row, reading the real figure rather than an em dash.
-    const row = await screen.findByTestId('capability-drive-usage')
-    await waitFor(() => expect(row.textContent ?? '').toContain(usage))
-    // And nowhere else on the page.
-    const stats = await screen.findByTestId('console-stats')
-    expect(stats.textContent ?? '').not.toContain(usage)
-  })
-
-  /* ── Setup card: preview ERROR, and the IAM policy drawer ────────────────── */
-
-  it('surfaces a setup preview error and does not advance to the confirm step', async () => {
-    vi.mocked(awsControlApi.drive).mockResolvedValue({ exists: false })
-    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
+  it('surfaces a preview error and does not advance to the confirm step', async () => {
     // The bootstrap preview rejects (e.g. AccessDenied): the error line shows
     // and the confirm button never appears.
     vi.mocked(awsControlApi.driveBootstrapPreview).mockRejectedValue(new Error('AccessDenied'))
 
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
+    renderWithProviders(<SetupCard account={ACCOUNT.account} region="us-west-2" />)
 
     fireEvent.click(await screen.findByTestId('drive-preview-btn'))
     expect(await screen.findByTestId('drive-preview-error')).toBeTruthy()
     expect(screen.queryByTestId('drive-confirm-btn')).toBeNull()
   })
 
+  it('a refused CONFIRM is said under the button, not swallowed', async () => {
+    // AccessDenied on CreateBucket is the common way this card fails, and the
+    // button used to just come back enabled. The confirm step stays so the
+    // reader can paste the permissions below and try again.
+    const { AwsControlError } = await import('./api')
+    vi.mocked(awsControlApi.driveBootstrapPreview).mockResolvedValue({
+      preview: true, account: ACCOUNT.account, region: 'us-west-2', resource: 'kirocrew-drive-abc123',
+    })
+    vi.mocked(awsControlApi.driveBootstrapConfirm).mockRejectedValue(new AwsControlError('aws_call_failed', 502))
+
+    renderWithProviders(<SetupCard account={ACCOUNT.account} region="us-west-2" />)
+    fireEvent.click(await screen.findByTestId('drive-preview-btn'))
+    fireEvent.click(await screen.findByTestId('drive-confirm-btn'))
+
+    const notice = await screen.findByTestId('drive-confirm-error')
+    expect(notice).toHaveTextContent(i18nT('apps.awsControl.console.setup_confirm_error'))
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeTruthy()
+    expect(screen.getByTestId('drive-confirm-btn')).toBeTruthy()
+  })
+
+  it('a failed permissions read is said inside the drawer', async () => {
+    vi.mocked(awsControlApi.iamPolicy).mockRejectedValue(new Error('boom'))
+
+    renderWithProviders(<SetupCard account={ACCOUNT.account} region="us-west-2" />)
+    fireEvent.click(await screen.findByTestId('policy-toggle'))
+
+    const drawer = await screen.findByTestId('policy-drawer')
+    expect(await within(drawer).findByTestId('policy-error')).toHaveTextContent(
+      i18nT('apps.awsControl.console.setup_policy_error'),
+    )
+    expect(within(drawer).queryByTestId('policy-copy')).toBeNull()
+  })
+
   it('reveals the IAM policy in the setup drawer and offers it to copy', async () => {
-    vi.mocked(awsControlApi.drive).mockResolvedValue({ exists: false })
-    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
     vi.mocked(awsControlApi.iamPolicy).mockResolvedValue({ policy: '{"Version":"2012-10-17"}' })
 
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
+    renderWithProviders(<SetupCard account={ACCOUNT.account} region="us-west-2" />)
 
     // The policy drawer is closed and its query disabled until toggled.
+    expect(awsControlApi.iamPolicy).not.toHaveBeenCalled()
     fireEvent.click(await screen.findByTestId('policy-toggle'))
     await waitFor(() => expect(awsControlApi.iamPolicy).toHaveBeenCalled())
     const drawer = await screen.findByTestId('policy-drawer')
     expect(drawer).toHaveTextContent('2012-10-17')
     expect(within(drawer).getByTestId('policy-copy')).toBeTruthy()
   })
-
-  /* ── Reconnect: error branch of the plan query ───────────────────────────── */
-
-  it('shows the reconnect error state when the plan query fails', async () => {
-    const degraded: AwsAccount = {
-      account: '444455556666', name: 'work', health: 'degraded',
-      profiles: [{
-        name: 'work', region: 'eu-west-1', kind: 'other', identityOk: false,
-        account: '444455556666', arn: '', detail: 'expired', default: true,
-      }],
-      summary: { storage: null, sites: null, tasks: null, costMonthToDate: null },
-    }
-    vi.mocked(awsControlApi.drive).mockResolvedValue({ exists: false })
-    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
-    vi.mocked(awsControlApi.reconnectPlan).mockRejectedValue(new Error('plan failed'))
-
-    renderWithProviders(<ConsoleView account={degraded} onBack={() => {}} />)
-
-    const row = await screen.findByTestId('connection-row')
-    fireEvent.click(within(row).getByTestId('reconnect-toggle'))
-    // The panel resolves to its error message, not a command block.
-    expect(await screen.findByTestId('reconnect-error')).toBeTruthy()
-    expect(screen.queryByTestId('reconnect-command')).toBeNull()
-  })
-
-  /* ── Storage 409 branches (drive query error) ────────────────────────────── */
-
-  it('renders the S3 consent gate when the drive read returns a 409 consent-required', async () => {
-    const { AwsControlError } = await import('./api')
-    vi.mocked(awsControlApi.drive).mockRejectedValue(new AwsControlError('aws_consent_required', 409))
-    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
-
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    // The storage-consent block renders with a recheck button; no drive sections.
-    expect(await screen.findByTestId('console-storage-consent')).toBeTruthy()
-    expect(screen.getByTestId('console-consent-recheck')).toBeTruthy()
-    expect(screen.queryByTestId('library-section')).toBeNull()
-  })
-
-  it('renders the account-unavailable line for a non-consent 409', async () => {
-    const { AwsControlError } = await import('./api')
-    vi.mocked(awsControlApi.drive).mockRejectedValue(new AwsControlError('dead_connection', 409))
-    vi.mocked(awsControlApi.costs).mockResolvedValue(costsFresh)
-
-    renderWithProviders(<ConsoleView account={ACCOUNT} onBack={() => {}} />)
-
-    // A 409 that is NOT consent maps to the quiet "account unavailable" line.
-    expect(await screen.findByTestId('console-unavailable')).toBeTruthy()
-    expect(screen.queryByTestId('console-storage-consent')).toBeNull()
-  })
 })
-

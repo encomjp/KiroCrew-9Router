@@ -90,9 +90,11 @@ export default function SkillPickerMenu({
   // invalidateQueries({queryKey:['skills']}) call keeps working.
   // staleTime is long because skills change rarely. `enabled: open` keeps the
   // menu lazy — the focus-prefetch warms the same key separately.
+  // `loading` below is `isLoading && open` and isLoading clears only on settle,
+  // so an unbounded fetch leaves "Loading skills…" up forever.
   const { data, isLoading, isFetching, isError } = useQuery<SkillsPayload<SkillItem>>({
     queryKey: ['skills', slotKey ?? null, project ?? null, agent ?? null],
-    queryFn: () => api.skills(slotKey, agent),
+    queryFn: ({ signal }) => api.skills(slotKey, agent, signal),
     enabled: open,
     staleTime: skillsCacheStaleTime(project),
   })
@@ -198,7 +200,7 @@ export default function SkillPickerMenu({
 
   if (!open || !anchorRef.current) return null
 
-  const { top, left, width, maxHeight } = menuGeometry(
+  const { above, top, bottom, left, width, maxHeight } = menuGeometry(
     anchorRef.current, results.length, 48, showScopeFooter ? SCOPE_FOOTER_H : 0,
   )
 
@@ -210,7 +212,16 @@ export default function SkillPickerMenu({
   // catalog filtered to nothing by the query keeps the generic copy. Both
   // branches preserve the Enter/Ctrl+Enter release announcement.
   const mappedEmpty = agentScoped && items.length === 0
-  const emptyKey = mappedEmpty
+  // A settled ERROR is not an empty catalog: both release Enter, but "No matching
+  // skills" asserts something false about the user's skills.
+  const loadFailed = isError && items.length === 0
+  const emptyKey = loadFailed
+    ? (!releaseKeysWhenEmpty
+        ? 'components.skillPickerMenu.skills_load_failed'
+        : sendOnEnter === 'ctrl-enter'
+          ? 'components.skillPickerMenu.skills_load_failed_ctrl_enter_sends'
+          : 'components.skillPickerMenu.skills_load_failed_enter_sends')
+    : mappedEmpty
     ? (!releaseKeysWhenEmpty
         ? 'components.skillPickerMenu.no_skills_mapped_to_agent'
         : sendOnEnter === 'ctrl-enter'
@@ -222,8 +233,14 @@ export default function SkillPickerMenu({
           ? 'components.skillPickerMenu.no_matching_skills_ctrl_enter_sends'
           : 'components.skillPickerMenu.no_matching_skills_enter_sends')
 
+  // `loading` implies isFetching, so the gate above swallows the send key here.
+  // Say what that means for the reader — it won't send yet — not how it works.
+  const loadingKey = sendOnEnter === 'ctrl-enter'
+    ? 'components.skillPickerMenu.loading_skills_ctrl_enter_held'
+    : 'components.skillPickerMenu.loading_skills_enter_held'
+
   const empty = loading
-    ? <div className="px-3 py-3 text-[12px] text-muted">{i18nT('components.skillPickerMenu.loading_skills')}</div>
+    ? <div role="status" className="px-3 py-3 text-[12px] text-muted">{i18nT(loadingKey)}</div>
     // Enter's meaning flips with the release gate (pick → send), so the copy
     // must announce it at the point of action rather than silently sending.
     // Named per the composer's send binding: in 'ctrl-enter' mode a bare
@@ -247,7 +264,7 @@ export default function SkillPickerMenu({
     // stays in the accessibility tree and in `title`.
     <div
       className="fixed z-[9999] bg-card border border-border rounded-lg shadow-lg py-1 animate-slide-up flex flex-col"
-      style={{ top, left, width: Math.min(width, 460), maxHeight }}
+      style={{ ...(above ? { bottom } : { top }), left, width: Math.min(width, 460), maxHeight }}
     >
       <div
         role="listbox"

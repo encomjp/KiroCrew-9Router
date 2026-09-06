@@ -13,9 +13,9 @@ import os
 import plistlib
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.gateway_shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
 from kiro_crew.service.common import (
     LAUNCHD_LABEL,
@@ -161,25 +161,23 @@ class ServiceInstallError(RuntimeError):
 def _write_plist_atomic(contents: str) -> None:
     """Write the plist atomically.
 
-    Writes to a sibling temp file in the same directory, then
-    ``os.replace`` to swap into place. ``os.replace`` is atomic on POSIX
-    when source and destination are on the same filesystem, so a SIGINT
-    or crash mid-write leaves either the old plist or no plist at all —
-    never a partial XML document that ``launchctl load`` would reject.
+    Delegates to :func:`kiro_crew.atomic_write.atomic_write`: it writes a
+    sibling temp file in the same directory, then ``os.replace``s it into
+    place. ``os.replace`` is atomic on POSIX when source and destination are
+    on the same filesystem, so a SIGINT or crash never leaves a partial XML
+    document that ``launchctl load`` would reject: the final path holds the old
+    plist before the rename, the new one after it, or nothing where there was no
+    plist to begin with. The shared helper also cleans the temp file up on
+    ``BaseException`` (so that SIGINT leaves no scratch file) and retries the
+    rename past a Windows sharing violation. ``fsync`` is off.
+
+    ``mode=0o600`` has to be explicit: with no *mode*, ``atomic_write`` applies
+    the umask default, so the plist's permissions would follow the operator's
+    umask — world-readable under a common ``022``, owner-only only if they happen
+    to run something as tight as ``077``. launchd loads the agent as the owning
+    user, so nothing else needs to read it.
     """
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=PLIST_PATH.name + ".", suffix=".tmp", dir=str(PLIST_DIR)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(contents)
-        os.replace(tmp_path, PLIST_PATH)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
-        raise
+    atomic_write(PLIST_PATH, contents, mode=0o600)
 
 
 def _launchctl(*args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -232,9 +230,12 @@ def write_live_program(contents: str, path: Path | None = None) -> None:
     disagree about which file is authoritative.
 
     Atomic because the agent may be kickstarted at any moment: a partially
-    written launcher would exec a truncated script. The temp file is chmod'd
-    BEFORE the rename so the file is never visible at the final path without its
-    exec bit.
+    written launcher would exec a truncated script.
+    :func:`kiro_crew.atomic_write.atomic_write` applies *mode* to the
+    descriptor before any content reaches it, so the file is never visible at
+    the final path without its exec bit — and never visible anywhere with
+    content but a wider mode. It also cleans the temp file up on
+    ``BaseException``.
 
     ``0o700``, not ``0o755``: launchd runs the agent as the owning user, so
     nobody else needs to read or execute it, and it lives in that user's own
@@ -242,21 +243,8 @@ def write_live_program(contents: str, path: Path | None = None) -> None:
     """
     dest = path or LIVE_PROGRAM
     dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix=dest.name + ".", suffix=".tmp", dir=str(dest.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(contents)
-        # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- launchd EXECUTES this file as the ProgramArguments entry, so the exec bit is required and the rule's suggested 0o644 would stop the agent from spawning at all. 0o700 is the tightest mode that still works: owner-only, in the owner's own application-support directory, and the agent runs as that same user.  # noqa: E501
-        os.chmod(tmp_path, 0o700)  # fmt: skip
-        os.replace(tmp_path, dest)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except FileNotFoundError:
-            pass
-        raise
+    # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions -- launchd EXECUTES this file as the ProgramArguments entry, so the exec bit is required and the rule's suggested 0o644 would stop the agent from spawning at all. 0o700 is the tightest mode that still works: owner-only, in the owner's own application-support directory, and the agent runs as that same user.  # noqa: E501
+    atomic_write(dest, contents, mode=0o700)
 
 
 def _repairer_bin() -> str:
@@ -437,12 +425,12 @@ def restart() -> bool:
     and the respawn ITSELF, so this is safe to call from inside the process being
     restarted.
 
-    The previous implementation (``unload`` then ``load``) could not do that. Run
-    from the gateway, the ``unload`` half SIGTERMs the caller, so the ``load``
-    half never executes and the agent stays down — the exact failure mode that
-    made Dev Fleet's Restart unimplementable on macOS. ``launchctl restart`` is
-    deprecated and behaves like ``stop``; ``KeepAlive`` immediately respawns the
-    loaded job definition rather than re-reading anything.
+    ``unload`` + ``load`` cannot: run from the gateway, the ``unload`` half
+    SIGTERMs the caller, so the ``load`` half never executes and the agent stays
+    down — which is what makes Dev Fleet's Restart unimplementable that way on
+    macOS. ``launchctl restart`` is deprecated and behaves like ``stop``;
+    ``KeepAlive`` immediately respawns the loaded job definition rather than
+    re-reading anything.
 
     Returns False when the plist is absent or launchd rejects the kickstart, so
     callers never report a restart that never happened.

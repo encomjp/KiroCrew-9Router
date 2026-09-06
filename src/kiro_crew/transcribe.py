@@ -19,8 +19,9 @@ first-class, and neither may add a step to the local path:
 Compressed input still needs ffmpeg: a Slack voice memo arrives as ogg/Opus and
 the dashboard records webm. Desktop releases carry a pinned imageio-ffmpeg wheel
 with that executable, so desktop users never install a system binary separately;
-source installs use a system FFmpeg from fixed platform paths. A 16 kHz mono WAV
-and live PCM skip the executable entirely.
+source installs use a system FFmpeg from fixed platform paths, or the
+digest-verified store :mod:`kiro_crew.stt.decoder` fetches the same pinned upstream
+bytes into. A 16 kHz mono WAV and live PCM skip the executable entirely.
 
 Two guards here are deliberately provider-independent, because a per-branch copy
 is a copy that will be missing from the next branch someone adds:
@@ -43,9 +44,16 @@ import sys
 import tempfile
 import threading
 import wave
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator
 
 from kiro_crew import aws_consent, platform_compat, stt
+
+# The pinned-artifact table and the digest-verified decoder store live here. It
+# imports no numpy and no recogniser binding, so this stays cheap on the gateway
+# boot path; `stt.decoder` in turn imports THIS module only inside a function,
+# which is what keeps the pair acyclic.
+from kiro_crew.stt import decoder
 
 # Re-exported: the hallucination filter lives in kiro_crew.stt.hallucinations so
 # the live session's final transcript and this batch path apply the SAME rules.
@@ -70,6 +78,8 @@ except ImportError:  # pragma: no cover — covered by cli_doctor tests
 
 if TYPE_CHECKING:  # annotations only; see the deferred-import note below
     import numpy as np
+
+from kiro_crew.extras import install_hint
 
 logger = logging.getLogger(__name__)
 
@@ -121,29 +131,136 @@ def _ffmpeg_candidate_dirs() -> list[str]:
 _FFMPEG_CANDIDATE_DIRS = _ffmpeg_candidate_dirs()
 
 
-# imageio-ffmpeg==0.6.0 executables, taken from the four wheels that the desktop
-# matrix installs. The filename selects the platform artifact; size makes a
-# truncated payload fail cheaply; SHA-256 is the trust anchor. Desktop build
-# staging is intentionally writable, so path placement or a removable `.git`
-# marker cannot establish provenance. These are the bytes the WHEEL publishes.
-_PACKAGED_FFMPEG_ARTIFACTS: dict[str, tuple[int, str]] = {
-    "ffmpeg-macos-aarch64-v7.1": (
-        49_368_728,
-        "6d175a4743ca50256e89a8cdd731100f9cee33bd79aeea46894d209410dc6617",
-    ),
-    "ffmpeg-linux-aarch64-v7.0.2": (
-        51_134_160,
-        "6bb182d0d75d23028db82e9e4f723ca69b853d055698486e6984ddb2c06fb8ce",
-    ),
-    "ffmpeg-linux-x86_64-v7.0.2": (
-        79_826_272,
-        "e7e7fb30477f717e6f55f9180a70386c62677ef8a4d4d1a5d948f4098aa3eb99",
-    ),
-    "ffmpeg-win-x86_64-v7.1.exe": (
-        87_638_016,
-        "2ce797a0f88d7f067180338fb227f7b1928ea727bd9a4d7a1d022f7c52af71a3",
-    ),
-}
+# imageio-ffmpeg==0.6.0 executables, taken from the published wheels that the
+# desktop matrix installs -- one per shipped platform, and which platforms those
+# are is _SHIPPED_FFMPEG_PLATFORMS below rather than a count restated here. The
+# filename selects the platform artifact; size makes a truncated payload fail
+# cheaply; SHA-256 is the trust anchor. Desktop build staging is intentionally
+# writable, so path placement or a removable `.git` marker cannot establish
+# provenance. These are the bytes the WHEEL publishes.
+#
+# The table is OWNED by `stt.decoder`, which also pins the wheel each artifact
+# comes out of and installs it into the digest-verified store this module resolves
+# from. One table, because the store must never be able to install bytes the
+# resolver would refuse: two copies would fail as a decoder that downloads
+# successfully and then cannot be executed, with nothing to say which copy is
+# wrong. The name stays here because this is where every reader of it looks.
+_PACKAGED_FFMPEG_ARTIFACTS: dict[str, tuple[int, str]] = decoder.PACKAGED_FFMPEG_ARTIFACTS
+
+# The upstream imageio_ffmpeg platform KEYS the desktop matrix actually ships a
+# bundled decoder for. This is the maintainer-owned source of truth for WHICH
+# platforms are covered; the completeness test in test_transcribe.py maps each key
+# through imageio_ffmpeg._definitions.FNAME_PER_PLATFORM to derive the authoritative
+# filename set and asserts _PACKAGED_FFMPEG_ARTIFACTS covers exactly it. Keys, not
+# filenames, so this module imports no imageio_ffmpeg at all (not a core dependency).
+#
+# Each key ties to the build leg that ships it:
+#   macos-aarch64 + macos-x86_64 = the ONE universal DMG from the macos-15 leg of
+#       .github/workflows/build-desktop.yml; the Makefile's `desktop` target builds
+#       that single DMG covering arm64 AND x86_64, so both slices ship together.
+#   linux-x86_64  = ubuntu-22.04 leg of build-desktop.yml.
+#   linux-aarch64 = ubuntu-22.04-arm leg of build-desktop.yml.
+#   windows-x86_64 = .github/workflows/build-windows.yml.
+#
+# windows-i686 (upstream ffmpeg-win32-v4.2.2.exe) is DELIBERATELY excluded: no
+# 32-bit Windows target exists in any build workflow or the Electron config.
+# Adding a win32 lane must add its key here, which then forces a pin via the
+# completeness test.
+_SHIPPED_FFMPEG_PLATFORMS: frozenset[str] = frozenset(
+    {
+        "macos-aarch64",
+        "macos-x86_64",
+        "linux-x86_64",
+        "linux-aarch64",
+        "windows-x86_64",
+    }
+)
+
+# Artifacts the macOS app signer REWRITES on its way into a release, so the
+# upstream digest above cannot be the only anchor. Signing replaces the wheel's
+# ad-hoc LC_CODE_SIGNATURE with a Developer ID one (plus hardened runtime and a
+# secure timestamp), which changes both size and SHA-256, and it is not optional:
+# Apple notarization rejects the whole submission over an unsigned nested
+# executable -- including one hidden inside a compressed member, which the notary
+# service decompresses and scans (submission 3dbd3c7d). A digest that could
+# survive signing does not exist, because it is not known until after the signing
+# service has run.
+#
+# So these artifacts are authenticated by EITHER anchor, both cryptographic:
+#   - the pinned upstream digest -- a local/unsigned build, and the desktop build
+#     gate, which executes the decoder BEFORE the bundle is signed; or
+#   - a valid Developer ID signature from our own team on the exact bytes staged
+#     for execution, which is what a released app carries.
+# Neither anchor is a path or a filesystem-permission claim.
+# BOTH macOS slices are here: build-desktop.sh ships the arm64 AND x86_64
+# imageio-ffmpeg executables as plain Mach-O under Contents/Resources, and the app
+# signer signs every nested binary with Developer ID + hardened runtime + secure
+# timestamp (generate-manifest.py enumerates them). So the released Intel-Mac slice
+# authenticates via its signature anchor exactly like the arm64 slice, its bytes
+# having been rewritten by signing away from the pinned upstream digest.
+#
+# The set is therefore exactly the macos-* members of _SHIPPED_FFMPEG_PLATFORMS, and
+# test_transcribe.py asserts that equality rather than a subset: a macOS slice added
+# above but forgotten here has no anchor left once signing has rewritten its bytes,
+# so a SIGNED release would refuse its own decoder.
+_SIGNER_REWRITTEN_FFMPEG_ARTIFACTS: frozenset[str] = frozenset(
+    {"ffmpeg-macos-aarch64-v7.1", "ffmpeg-macos-x86_64-v7.1"}
+)
+
+# Upper bound on a signer-rewritten payload, whose exact size is unknowable in
+# source. Signing appends a code-signature superblob to a ~50 MB executable, so
+# this is a safety ceiling that keeps the copy below bounded, not a pin.
+_MAX_SIGNED_FFMPEG_BYTES = 192 * 1024 * 1024
+
+# Apple team identifier of the Developer ID certificate that signs Kiro Crew
+# releases (see packaging/signing/manifest-template.json). `anchor apple generic`
+# ties the chain to Apple's root, so only a certificate Apple issued to THIS team
+# satisfies the requirement -- a self-signed or ad-hoc replacement does not.
+_MACOS_SIGNING_TEAM_ID = "94KV3E626L"
+# The team identifier MUST stay quoted. In the requirement language a bare token
+# beginning with a digit is not a valid identifier, so an unquoted 94KV3E626L is
+# a SYNTAX ERROR rather than a comparison: codesign exits non-zero without ever
+# evaluating the signature, which this function cannot tell apart from a genuine
+# authenticity failure. That made every signed macOS release refuse its own
+# decoder -- the digest anchor cannot cover a signed artifact by construction,
+# so with the signature anchor unparseable both anchors were unreachable.
+_MACOS_FFMPEG_REQUIREMENT = (
+    f'anchor apple generic and certificate leaf[subject.OU] = "{_MACOS_SIGNING_TEAM_ID}"'
+)
+
+
+def _macos_developer_id_authentic(path: str) -> bool:
+    """True when *path* carries an intact Developer ID signature from our team.
+
+    /usr/bin/codesign is the only supported authenticity oracle for a signed
+    Mach-O: it validates the code-directory hashes over the file's own bytes AND
+    evaluates the certificate chain, so a tampered or foreign-signed payload
+    fails. The absolute path is deliberate -- an ambient `codesign` on PATH must
+    never be able to answer this question.
+    """
+    if not platform_compat.IS_MACOS:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "/usr/bin/codesign",
+                "--verify",
+                "--strict",
+                # A leading "=" marks the argument as requirement SOURCE TEXT;
+                # without it codesign reads it as a path to a requirement file.
+                "-R",
+                f"={_MACOS_FFMPEG_REQUIREMENT}",
+                "--",
+                path,
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 # Artifacts the macOS app signer REWRITES on its way into a release, so the
 # upstream digest above cannot be the only anchor. Signing replaces the wheel's
@@ -600,6 +717,67 @@ def _authenticated_ffmpeg(
             _remove_named_snapshot(snapshot_path)
 
 
+def _open_authenticated_in(
+    binaries_root: str, *, containing_root: str | None = None, allow_signature_anchor: bool
+) -> list[_AuthenticatedFfmpeg]:
+    """Open every pinned artifact directly inside *binaries_root* that authenticates.
+
+    One implementation for both places a pinned executable can be found -- a
+    bundled interpreter's ``imageio_ffmpeg/binaries`` and the digest-verified store
+    under the data home -- so the path-safety checks around the digest cannot be
+    present at one and missing at the other. Callers differ only in whether the
+    macOS signature anchor applies (it does not in the store: nothing signs those
+    bytes, so the pin is the only anchor there).
+
+    *containing_root* is the directory *binaries_root* must resolve inside, for a
+    caller whose root is itself composed from an outside value.
+    """
+    opened: list[_AuthenticatedFfmpeg] = []
+    try:
+        if containing_root is not None and (
+            os.path.commonpath((containing_root, binaries_root)) != containing_root
+        ):
+            return opened
+    except ValueError:
+        return opened
+    # Driven by the pin table rather than by a directory listing: the table is
+    # already the sole authority on which filenames may be opened here, so probing
+    # its keys says that directly instead of enumerating the directory and then
+    # discarding everything absent from the table. It also keeps the name that
+    # reaches the log below a module constant rather than a value composed from the
+    # interpreter's own install prefix.
+    for filename, artifact in _PACKAGED_FFMPEG_ARTIFACTS.items():
+        unresolved = os.path.join(binaries_root, filename)
+        candidate = os.path.realpath(unresolved)
+        # A symlink out of the directory, or a name that only resolves to this
+        # directory after following one, is refused rather than hashed: the digest
+        # would then describe bytes at a path nobody vouched for.
+        if (
+            os.path.dirname(candidate) != binaries_root
+            or candidate != os.path.abspath(unresolved)
+            or not os.path.isfile(candidate)
+        ):
+            continue
+        if not platform_compat.IS_WINDOWS and not os.access(candidate, os.X_OK):
+            continue
+        authenticated = _authenticated_ffmpeg(
+            candidate,
+            *artifact,
+            signature_anchored=(
+                allow_signature_anchor and filename in _SIGNER_REWRITTEN_FFMPEG_ARTIFACTS
+            ),
+        )
+        if authenticated is None:
+            logger.warning(
+                "Ignoring %s in a pinned decoder location: its bytes do not match the "
+                "digest pinned for that filename.",
+                filename,
+            )
+            continue
+        opened.append(authenticated)
+    return opened
+
+
 def _open_packaged_ffmpeg_resource() -> _AuthenticatedFfmpeg | None:
     """Open the one authenticated imageio-ffmpeg executable in this runtime."""
     candidates: list[_AuthenticatedFfmpeg] = []
@@ -610,37 +788,70 @@ def _open_packaged_ffmpeg_resource() -> _AuthenticatedFfmpeg | None:
         try:
             if os.path.commonpath((root, package_root)) != root:
                 continue
-            if os.path.commonpath((package_root, binaries_root)) != package_root:
-                continue
-            filenames = os.listdir(binaries_root)
-        except (OSError, ValueError):
+        except ValueError:
             continue
-        for filename in filenames:
-            artifact = _PACKAGED_FFMPEG_ARTIFACTS.get(filename)
-            if artifact is None:
-                continue
-            unresolved = os.path.join(binaries_root, filename)
-            candidate = os.path.realpath(unresolved)
-            if (
-                os.path.dirname(candidate) != binaries_root
-                or candidate != os.path.abspath(unresolved)
-                or not os.path.isfile(candidate)
-            ):
-                continue
-            if not platform_compat.IS_WINDOWS and not os.access(candidate, os.X_OK):
-                continue
-            authenticated = _authenticated_ffmpeg(
-                candidate,
-                *artifact,
-                signature_anchored=filename in _SIGNER_REWRITTEN_FFMPEG_ARTIFACTS,
+        candidates.extend(
+            _open_authenticated_in(
+                binaries_root,
+                containing_root=package_root,
+                allow_signature_anchor=True,
             )
-            if authenticated is not None:
-                candidates.append(authenticated)
+        )
     if len(candidates) == 1:
         return candidates[0]
     for opened_candidate in candidates:
         opened_candidate.close()
     return None
+
+
+def _open_store_ffmpeg_resource() -> _AuthenticatedFfmpeg | None:
+    """Open the decoder in the data home's store, if its bytes match the pin.
+
+    The third and last source, after a bundled interpreter's own payload and a
+    package manager's system FFmpeg. It exists because a source install on a
+    distribution that ships no FFmpeg package previously had no decoder it could
+    ever reach, and the store is how ``stt.decoder`` puts the SAME upstream bytes
+    the desktop release carries onto such a host.
+
+    This does not widen the trust model, and the distinction is worth being exact
+    about: the store directory is user-writable, so its PATH vouches for nothing
+    and is not treated as if it did. What is accepted is a filename in
+    ``_PACKAGED_FFMPEG_ARTIFACTS`` whose bytes match that pin, re-verified here on
+    every open exactly as a bundled payload is, with the bytes staying bound to the
+    descriptor that gets spawned. A file that fails is ignored and logged rather
+    than executed, and no store directory is added to ``_ffmpeg_candidate_dirs`` --
+    that list is for a package manager's own directories, where the search is by
+    NAME and a match would be executed on the strength of where it sits.
+
+    The macOS signature anchor deliberately does not apply: nothing signs these
+    bytes, so accepting a signature here would accept a payload the pin refused.
+    """
+    # Resolved before the scan, exactly as the packaged roots are. The per-file
+    # guard compares the realpath of a candidate against this directory, so a data
+    # home reached through a symlinked ancestor -- /home -> /var/home on an
+    # rpm-ostree distribution, which is also one that ships no ffmpeg package --
+    # would otherwise fail that comparison for every file and report a decoder this
+    # store had just installed and verified as absent, forever.
+    store_dir = os.path.realpath(str(decoder.store_dir()))
+    candidates = _open_authenticated_in(store_dir, allow_signature_anchor=False)
+    if len(candidates) == 1:
+        return candidates[0]
+    # More than one pinned filename in the store means two platforms' decoders are
+    # present; refusing is the same ambiguity guard the packaged lookup applies.
+    for opened_candidate in candidates:
+        opened_candidate.close()
+    return None
+
+
+def _store_ffmpeg() -> str | None:
+    """Report the store decoder's path when it authenticates, else ``None``."""
+    authenticated = _open_store_ffmpeg_resource()
+    if authenticated is None:
+        return None
+    try:
+        return authenticated.source_path
+    finally:
+        authenticated.close()
 
 
 def _packaged_ffmpeg_resource() -> str | None:
@@ -661,11 +872,86 @@ def _packaged_ffmpeg_resource() -> str | None:
         authenticated.close()
 
 
-def _packaged_ffmpeg_version_probe() -> bool:
-    """Run ``-version`` from authenticated bytes for the desktop build gate."""
+#: Outcome codes for :func:`_packaged_ffmpeg_version_probe`.
+DECODER_OK = "decoder_ok"
+DECODER_UNAUTHENTIC = "decoder_unauthentic"
+DECODER_NOT_EXECUTABLE = "decoder_not_executable"
+
+#: Windows loader refusals worth naming in the build gate's report. Both mean the
+#: image was rejected BEFORE its entry point ran -- a missing or wrong-version
+#: import -- which is a property of the host, never of the bytes. Spelled as the
+#: signed values ``subprocess`` reports, because CPython surfaces the Windows exit
+#: DWORD through a signed C int.
+_WINDOWS_LOADER_STATUS: dict[int, str] = {
+    -1073741515: "STATUS_DLL_NOT_FOUND",
+    -1073741511: "STATUS_ENTRYPOINT_NOT_FOUND",
+}
+
+#: Cap on child output quoted into a probe's ``detail``. Enough for a loader or
+#: dynamic-linker complaint, short enough to stay one readable log line.
+_DECODER_DETAIL_MAX_CHARS = 400
+
+
+@dataclass(frozen=True)
+class PackagedDecoderProbe:
+    """Whether the packaged decoder authenticated, and whether it then ran.
+
+    Two INDEPENDENT questions, and collapsing them is what made this unreadable.
+    ``authentic`` is a property of the ARTIFACT: the bytes matched the pinned
+    upstream digest or an accepted signature, and it must hold on every host.
+    ``ok`` additionally requires that they EXECUTED, which is a property of the
+    BUILD HOST -- a container image can lack an OS library the executable
+    load-time imports, and the loader then refuses it before its entry point runs
+    even though the identical bytes run correctly for a user.
+
+    A caller that treats a host limitation as a corrupt payload sends the reader
+    to the wrong half of the problem, so the release gate reads these separately:
+    ``authentic`` false fails the build, ``ok`` false alone only warns.
+    """
+
+    ok: bool
+    authentic: bool
+    code: str = DECODER_OK
+    detail: str = ""
+
+
+def _decoder_exit_detail(source_path: str, result: subprocess.CompletedProcess[bytes]) -> str:
+    """Describe a decoder that authenticated but would not run."""
+    code = result.returncode
+    named = _WINDOWS_LOADER_STATUS.get(code)
+    # The unsigned spelling is what a reader can look up; the signed one is what
+    # the log of a failing build will actually have shown them.
+    status = f"exit {code} (0x{code & 0xFFFFFFFF:08X}{f', {named}' if named else ''})"
+    # Decoded here rather than by asking subprocess for text mode: a loader or
+    # dynamic-linker complaint arrives in the host's console encoding, not
+    # necessarily UTF-8, and a probe must not raise while explaining a failure.
+    streams = b"\n".join(part for part in (result.stderr, result.stdout) if part)
+    noise = streams.decode("utf-8", "replace").strip()
+    if len(noise) > _DECODER_DETAIL_MAX_CHARS:
+        noise = f"{noise[:_DECODER_DETAIL_MAX_CHARS]}…"
+    return f"{source_path} authenticated but did not run: {status}{f'; {noise}' if noise else ''}"
+
+
+def _packaged_ffmpeg_version_probe() -> PackagedDecoderProbe:
+    """Authenticate the packaged decoder, then try to run it, for the build gate.
+
+    Both halves are reported because they fail for unrelated reasons and demand
+    unrelated fixes; see :class:`PackagedDecoderProbe`. Streams are captured
+    rather than discarded so that a refusal explains itself in the build log
+    instead of arriving as one unattributable line.
+    """
     authenticated = _open_packaged_ffmpeg_resource()
     if authenticated is None:
-        return False
+        return PackagedDecoderProbe(
+            ok=False,
+            authentic=False,
+            code=DECODER_UNAUTHENTIC,
+            detail=(
+                "no packaged decoder authenticated against the pinned upstream "
+                "digest or an accepted signature"
+            ),
+        )
+    source_path = authenticated.source_path
     try:
         kwargs: dict[str, Any] = {}
         if not platform_compat.IS_WINDOWS:
@@ -673,15 +959,26 @@ def _packaged_ffmpeg_version_probe() -> bool:
         result = subprocess.run(
             [authenticated.execution_path, "-version"],
             check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            capture_output=True,
             **kwargs,
         )
-        return result.returncode == 0
-    except OSError:
-        return False
+    except OSError as exc:
+        return PackagedDecoderProbe(
+            ok=False,
+            authentic=True,
+            code=DECODER_NOT_EXECUTABLE,
+            detail=f"{source_path} authenticated but could not be spawned: {exc}",
+        )
     finally:
         authenticated.close()
+    if result.returncode == 0:
+        return PackagedDecoderProbe(ok=True, authentic=True)
+    return PackagedDecoderProbe(
+        ok=False,
+        authentic=True,
+        code=DECODER_NOT_EXECUTABLE,
+        detail=_decoder_exit_detail(source_path, result),
+    )
 
 
 def _bundled_ffmpeg() -> str | None:
@@ -698,7 +995,13 @@ def _open_ffmpeg_for_execution() -> str | _AuthenticatedFfmpeg | None:
         # missing or damaged, fail closed instead of executing a fixed-path
         # binary that was never authenticated as part of this installation.
         return _open_packaged_ffmpeg_resource()
-    return _find_system_ffmpeg()
+    system = _find_system_ffmpeg()
+    if system is not None:
+        return system
+    # Last: the digest-verified store. Ordered after a package manager's copy
+    # because a system FFmpeg is the one a host's own updates keep current, and
+    # because a host that has one never needed the store to be populated.
+    return _open_store_ffmpeg_resource()
 
 
 def _close_abandoned_ffmpeg_resolution(
@@ -747,18 +1050,50 @@ async def _close_ffmpeg_for_execution(
             raise
 
 
+def _describe_ffmpeg_exit(returncode: int | None, stderr_tail: str) -> str:
+    """Render an FFmpeg exit status for a log line, naming a signal death.
+
+    A negative return code is an external signal, not an FFmpeg error, and a
+    signalled child usually wrote no stderr, so a bare "exited -9 ...
+    (no stderr)" reads as corrupt audio. On macOS the likeliest sender for a
+    just-spawned staged binary is the asynchronous system policy assessment
+    denying the exec (#8918), so name that path in the line.
+    """
+    detail = stderr_tail or "(no stderr)"
+    if returncode is None or returncode >= 0:
+        return f"exited {returncode}: {detail}"
+    message = f"was killed by signal {-returncode}: {detail}"
+    if platform_compat.IS_MACOS:
+        message += (
+            "; on macOS a SIGKILL immediately after spawn usually means the"
+            " system policy assessment (Gatekeeper) denied the exec"
+        )
+    return message
+
+
 async def _create_ffmpeg_subprocess(
     executable: str | _AuthenticatedFfmpeg, *args: str, **kwargs: Any
 ) -> asyncio.subprocess.Process:
-    """Spawn FFmpeg while its authenticated image remains immutable/open."""
+    """Spawn FFmpeg while its authenticated image remains immutable/open.
+
+    A returning ``create_subprocess_exec`` means only that the fork/exec was
+    issued, not that the platform authorized it: on macOS the syspolicy
+    assessment resolves the staged *path* asynchronously after the spawn, so
+    closing the handle here (which removes the staged directory) had the
+    kernel deny the exec with SIGKILL (#8918). The caller therefore owns the
+    close and must run it once the child has exited. A failed spawn never
+    produced a child, so nothing depends on the path surviving and the handle
+    is closed here before the error propagates.
+    """
     if isinstance(executable, str):
         return await asyncio.create_subprocess_exec(executable, *args, **kwargs)
     try:
         if not platform_compat.IS_WINDOWS:
             kwargs["pass_fds"] = (executable.descriptor,)
         return await asyncio.create_subprocess_exec(executable.execution_path, *args, **kwargs)
-    finally:
-        await _close_ffmpeg_for_execution(executable)
+    except BaseException:
+        await _close_ffmpeg_for_execution(executable, preserve_active_exception=True)
+        raise
 
 
 def ensure_ffmpeg_in_path() -> None:
@@ -792,7 +1127,7 @@ def _find_system_ffmpeg() -> str | None:
 
 
 def _find_ffmpeg() -> str | None:
-    """Report the authenticated bundle path or a fixed-path system FFmpeg.
+    """Report the authenticated bundle path, a fixed-path system FFmpeg, or the store.
 
     Deliberately NOT ``shutil.which("ffmpeg")``. A gateway's PATH can legitimately lead
     with agent-writable directories (a worktree venv's ``bin``, ``~/.local/bin``), which
@@ -805,6 +1140,10 @@ def _find_ffmpeg() -> str | None:
     lives under a Homebrew prefix and on Windows under a package-manager directory --
     so the system set alone would find it almost nowhere.
 
+    Last comes the digest-verified store (:func:`_store_ffmpeg`), which is a
+    filename-and-digest match rather than a directory the search trusts; see
+    :func:`_open_store_ffmpeg_resource` for why that is not the same widening.
+
     Reached through `trusted_system_path` rather than `trusted_system_bin` because that
     helper warns once per name when a tool is on PATH but outside the system set, and
     that message states the caller "degrades instead of running a PATH-chosen binary".
@@ -816,7 +1155,37 @@ def _find_ffmpeg() -> str | None:
     """
     if platform_compat.is_bundled_interpreter():
         return _bundled_ffmpeg()
-    return _find_system_ffmpeg()
+    system = _find_system_ffmpeg()
+    if system is not None:
+        return system
+    return _store_ffmpeg()
+
+
+#: Where the decoder the transcode path would run comes from, as reported by
+#: :func:`ffmpeg_source` and served on ``GET /api/stt/status``. Codes rather than
+#: prose because the dashboard renders localised text, and each one leads
+#: somewhere different: a bundled payload is repaired by reinstalling the app, a
+#: system one by the host's package manager, and the store one by
+#: ``stt.decoder``'s own fetch.
+FFMPEG_SOURCE_BUNDLED = "bundled"
+FFMPEG_SOURCE_SYSTEM = "system"
+FFMPEG_SOURCE_STORE = "store"
+
+
+def ffmpeg_source() -> str | None:
+    """Which of the three decoder sources answers on this host, or ``None``.
+
+    Resolved in the same order :func:`_open_ffmpeg_for_execution` uses, so the
+    settings panel names the decoder that would actually run rather than the first
+    one that happens to exist.
+    """
+    if platform_compat.is_bundled_interpreter():
+        return FFMPEG_SOURCE_BUNDLED if _bundled_ffmpeg() is not None else None
+    if _find_system_ffmpeg() is not None:
+        return FFMPEG_SOURCE_SYSTEM
+    if _store_ffmpeg() is not None:
+        return FFMPEG_SOURCE_STORE
+    return None
 
 
 # Homebrew installs its ``brew`` shim at a fixed prefix per platform, and none of
@@ -876,7 +1245,7 @@ CODE_APPLE_NEEDS_TOOLCHAIN = "stt_apple_needs_toolchain"
 #: What to do about a missing AWS Transcribe client. Named once because doctor,
 #: the settings panel and the failure log all report it, and a divergent copy
 #: sends a user to install the wrong thing.
-_VOICE_EXTRA_HINT = "AWS Transcribe needs the voice extra: pip install 'kirocrew[voice]'"
+_VOICE_EXTRA_HINT = f"AWS Transcribe needs its cloud dependencies: {install_hint('voice-aws')}"
 
 
 def _aws_availability() -> stt.Availability:
@@ -1024,7 +1393,7 @@ class _ProfileCredentialResolver(CredentialResolver):
         if boto3 is None:  # pragma: no cover (the optional 'voice' extra is absent)
             raise RuntimeError(
                 "AWS Transcribe support is not available: install the optional "
-                "dependencies (pip install 'kirocrew[voice]')."
+                f"dependencies ({install_hint('voice-aws')})."
             )
         self._session = boto3.Session(profile_name=profile)
 
@@ -1113,14 +1482,14 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
     # amazon-transcribe + boto3 are the optional 'voice' extra. Absent on a
     # vanilla install → report not available rather than raising ImportError.
     if boto3 is None:
-        logger.error("AWS Transcribe not available: install 'kirocrew[voice]'")
+        logger.error("AWS Transcribe not available: %s", install_hint("voice-aws"))
         return None
     try:
         TranscribeStreamingClient, TranscriptCollector = await asyncio.to_thread(
             _load_aws_transcribe_components
         )
     except ImportError:
-        logger.error("AWS Transcribe not available: install 'kirocrew[voice]'")
+        logger.error("AWS Transcribe not available: %s", install_hint("voice-aws"))
         return None
 
     region = stt_config.transcribe_region
@@ -1138,66 +1507,96 @@ async def _transcribe_aws(audio_path: str, stt_config) -> str | None:  # type: i
             raise
         proc = None
         try:
-            proc = await _create_ffmpeg_subprocess(
-                ffmpeg_bin,
-                "-y",
-                "-i",
-                audio_path,
-                "-c:a",
-                "copy",
-                tmp_ogg,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
             try:
-                await asyncio.wait_for(proc.communicate(), timeout=10)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
-                raise
-            if proc.returncode != 0:
-                raise RuntimeError(f"ffmpeg exited with {proc.returncode}")
-        except Exception:
-            logger.exception("ffmpeg remux failed for %s", audio_path)
-            if tmp_ogg:
-                await asyncio.to_thread(_unlink_if_exists, tmp_ogg)
-            return None
-        except BaseException:
-            # ``CancelledError`` derives from ``BaseException``, so the
-            # ``Exception`` guard above never sees it: a cancellation landing
-            # mid-``communicate`` used to leave the ffmpeg child running and the
-            # owned temp on disk (#5780). Mirror ``_to_native_audio``'s cleanup
-            # (#5777): stop AND reap the child BEFORE the unlink — Windows keeps
-            # the output file locked until the child fully exits, and on POSIX a
-            # live child can race the removal. Every step is best-effort, and
-            # the unlink stays synchronous (one-file unlink, matching #5777): a
-            # repeat cancellation could eat an off-loop hop before it runs. The
-            # exception in flight is the one that must surface.
-            if proc is not None:
+                proc = await _create_ffmpeg_subprocess(
+                    ffmpeg_bin,
+                    "-y",
+                    "-i",
+                    audio_path,
+                    "-c:a",
+                    "copy",
+                    tmp_ogg,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
                 try:
+                    _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+                except asyncio.TimeoutError:
                     proc.kill()
-                except (OSError, ProcessLookupError):
-                    logger.debug(
-                        "ffmpeg kill during cancellation cleanup failed",
-                        exc_info=True,
-                    )
-                else:
+                    await proc.communicate()
+                    raise
+                if proc.returncode != 0:
+                    tail = stderr.decode(errors="replace").strip()[-500:] if stderr else ""
+                    raise RuntimeError(f"ffmpeg {_describe_ffmpeg_exit(proc.returncode, tail)}")
+            except Exception:
+                logger.exception("ffmpeg remux failed for %s", audio_path)
+                if tmp_ogg:
+                    await asyncio.to_thread(_unlink_if_exists, tmp_ogg)
+                return None
+            except BaseException:
+                # ``CancelledError`` derives from ``BaseException``, so the
+                # ``Exception`` guard above never sees it: a cancellation landing
+                # mid-``communicate`` used to leave the ffmpeg child running and the
+                # owned temp on disk (#5780). Mirror ``_to_native_audio``'s cleanup
+                # (#5777): stop AND reap the child BEFORE the unlink — Windows keeps
+                # the output file locked until the child fully exits, and on POSIX a
+                # live child can race the removal. Every step is best-effort, and
+                # the unlink stays synchronous (one-file unlink, matching #5777): a
+                # repeat cancellation could eat an off-loop hop before it runs. The
+                # exception in flight is the one that must surface.
+                if proc is not None:
                     try:
-                        await proc.communicate()
-                    except BaseException:
-                        # A repeat cancellation can land on this await; swallow
-                        # it so the unlink below still runs and the ORIGINAL
-                        # exception is the one that propagates.
+                        proc.kill()
+                    except (OSError, ProcessLookupError):
+                        logger.debug(
+                            "ffmpeg kill during cancellation cleanup failed",
+                            exc_info=True,
+                        )
+                    else:
+                        try:
+                            await proc.communicate()
+                        except BaseException:
+                            # A repeat cancellation can land on this await; swallow
+                            # it so the unlink below still runs and the ORIGINAL
+                            # exception is the one that propagates.
+                            pass
+                if tmp_ogg:
+                    try:
+                        _unlink_if_exists(tmp_ogg)
+                    except OSError:
+                        # A not-yet-exited child can still hold the file (Windows
+                        # lock); letting that escape would REPLACE the in-flight
+                        # cancellation with a PermissionError.
                         pass
-            if tmp_ogg:
-                try:
-                    _unlink_if_exists(tmp_ogg)
-                except OSError:
-                    # A not-yet-exited child can still hold the file (Windows
-                    # lock); letting that escape would REPLACE the in-flight
-                    # cancellation with a PermissionError.
-                    pass
-            raise
+                raise
+        finally:
+            # The authenticated handle must outlive the spawn (#8918): every
+            # branch above has already reaped the child (``communicate`` on
+            # success and on a nonzero exit, kill-and-reap on timeout and on
+            # cancellation), so the staged image can be released now. The
+            # ``finally`` makes the close unconditional — the staged 0700
+            # directory must never leak. ``preserve_active_exception`` is set
+            # only while an exception is genuinely in flight, so a cleanup
+            # failure never masks the original error and a cancellation landing
+            # on the close await of a success path still propagates.
+            try:
+                await _close_ffmpeg_for_execution(
+                    ffmpeg_bin,
+                    preserve_active_exception=sys.exc_info()[1] is not None,
+                )
+            except BaseException:
+                # This await is the only suspension point between the remux
+                # child exiting and ``actual_path`` taking ownership of the
+                # temp. A cancellation landing exactly here (it can only raise
+                # on the no-exception-in-flight path) would otherwise propagate
+                # with ``tmp_ogg`` still on disk; the failure branches already
+                # unlinked, and ``_unlink_if_exists`` tolerates that.
+                if tmp_ogg:
+                    try:
+                        _unlink_if_exists(tmp_ogg)
+                    except OSError:
+                        pass
+                raise
         actual_path = tmp_ogg
 
     transcript_parts: list[str] = []
@@ -1431,21 +1830,34 @@ async def _pcm_via_ffmpeg(audio_path: str, timeout_secs: int) -> np.ndarray | No
         if proc.returncode != 0:
             tail = stderr.decode(errors="replace").strip()[-500:] if stderr else ""
             logger.error(
-                "ffmpeg exited %s decoding %s: %s",
-                proc.returncode,
+                "ffmpeg %s decoding %s",
+                _describe_ffmpeg_exit(proc.returncode, tail),
                 audio_path,
-                tail or "(no stderr)",
             )
             return None
         return await asyncio.to_thread(_pcm_from_wav, tmp_wav)
     finally:
-        # Off the loop, and scheduled as its own task BEFORE it is awaited, so a
-        # repeat cancellation landing on the await abandons only the wait while
-        # the removal still runs to completion in its worker thread. ``shield``
-        # keeps that cancellation out of the removal task; the exception itself
-        # still reaches the awaiter.
+        # Off the loop, and scheduled as its own task BEFORE anything is
+        # awaited, so a repeat cancellation landing on an await abandons only
+        # the wait while the removal still runs to completion in its worker
+        # thread. ``shield`` keeps that cancellation out of the removal task;
+        # the exception itself still reaches the awaiter.
         rm = asyncio.ensure_future(asyncio.to_thread(_unlink_if_exists, tmp_wav))
-        await asyncio.shield(rm)
+        try:
+            # The authenticated handle must outlive the spawn (#8918): every
+            # path reaching this ``finally`` has already reaped the child
+            # (``communicate`` on success and on a nonzero exit, kill-and-reap
+            # on timeout and on cancellation) or never spawned one, so the
+            # staged image can be released now. ``preserve_active_exception``
+            # is set only while an exception is genuinely in flight, so a
+            # cleanup failure never masks the original error and a cancellation
+            # landing on the close await of a success path still propagates.
+            await _close_ffmpeg_for_execution(
+                ffmpeg_bin,
+                preserve_active_exception=sys.exc_info()[1] is not None,
+            )
+        finally:
+            await asyncio.shield(rm)
 
 
 async def _transcribe_local(audio_path: str, stt_config) -> str | None:  # type: ignore[no-untyped-def]

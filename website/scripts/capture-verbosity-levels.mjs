@@ -21,6 +21,7 @@ import { join } from 'node:path'
 
 import { json } from './lib/boot-api.mjs'
 import { serveDist } from './lib/serve-dist.mjs'
+import { shotSettingRow } from './lib/settings-row-shot.mjs'
 import { stubDashboardApi, logPageProblems } from './lib/stub-dashboard-api.mjs'
 
 const OUT = process.argv[2] || '/tmp/verbosity-levels-shots'
@@ -74,28 +75,17 @@ await stubDashboardApi(page, { extra, localStorageEntries: { 'mc-lang': 'en' } }
 
 /**
  * Frame the setting's row from the union of the label's and the control's own
- * boxes, padded. A `div:has-text(...)` wrapper is not usable here: the deepest
- * match is an inner leaf and produced 2 KB near-empty crops, while the outermost
- * is the whole scroll panel.
+ * boxes, padded -- see `lib/settings-row-shot.mjs` for why a `div:has-text(...)`
+ * wrapper cannot do this. Shared with the other settings-row harnesses because
+ * `jscpd` runs at a 0% threshold: a second copy of that geometry fails the gate.
  */
-const shootRow = async (name) => {
-  const label = page.getByText('Response Verbosity', { exact: true }).first()
-  const control = page.getByRole('combobox', { name: 'Response Verbosity' })
-  const a = await label.boundingBox()
-  const b = await control.boundingBox()
-  const pad = 18
-  const x = Math.max(0, Math.min(a.x, b.x) - pad)
-  const y = Math.max(0, Math.min(a.y, b.y) - pad)
-  const clip = {
-    x,
-    y,
-    width: Math.max(a.x + a.width, b.x + b.width) - x + pad,
-    height: Math.max(a.y + a.height, b.y + b.height) - y + pad,
-  }
-  const out = join(OUT, name)
-  await page.screenshot({ path: out, clip })
-  console.log('wrote', out, `${Math.round(clip.width)}x${Math.round(clip.height)}`)
-}
+const shootRow = (name) =>
+  shotSettingRow(page, {
+    label: page.getByText('Response Verbosity', { exact: true }).first(),
+    control: page.getByRole('combobox', { name: 'Response Verbosity' }),
+    outDir: OUT,
+    name,
+  })
 
 async function openChatSettings() {
   await page.goto(base + '/settings?tab=chat', { waitUntil: 'domcontentloaded' })

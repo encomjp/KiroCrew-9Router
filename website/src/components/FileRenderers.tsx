@@ -1,10 +1,13 @@
 import { memo, useState, useMemo, useCallback, useEffect, useRef } from 'react'
-import { Download, FileText, Film, Music } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
+import { Download, ExternalLink, FileText, Film, Music } from 'lucide-react'
 import DOMPurify from 'dompurify'
 
 import { i18nT } from '../i18n/t'
 import { ExcalidrawBlock } from './ExcalidrawBlock'
-import { fileDownloadUrl, fileStreamUrl } from '../utils/fileReadUrl'
+import ErrorNotice from './ErrorNotice'
+import { useCanOpenFile, useCopyAck } from './FilePathMenu'
+import { fileDownloadUrl, fileStreamUrl, fileOfficePreviewUrl } from '../utils/fileReadUrl'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
 /* ── extension helpers ── */
 const IMG_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico'])
@@ -170,7 +173,18 @@ export const JsonViewer = memo(function JsonViewer({ content }: { content: strin
     const preview = content.slice(0, 2000)
     return (
       <div className="h-full overflow-auto p-3 bg-bg-elevated border border-border rounded-md text-sm">
-        <div className="text-danger font-semibold font-mono mb-2">{i18nT('components.fileRenderers.invalid_json')} {parsed.error}</div>
+        {/* askAgent on: the viewer is read-only (no draft), and a file the
+            agent wrote that does not parse is exactly what it can repair. The
+            parser message is the `message` so the raw preview below stays the
+            evidence, not the notice body. */}
+        <ErrorNotice
+          className="mb-2"
+          messageClassName="font-mono"
+          title={i18nT('components.fileRenderers.invalid_json')}
+          message={parsed.error}
+          askAgent
+          testId="json-viewer-error"
+        />
         <div className="text-[11px] text-muted mb-1 font-mono">{content.length > preview.length ? i18nT('components.fileRenderers.showing_raw_content_truncated_count', { count: content.length, shown: preview.length }) : i18nT('components.fileRenderers.showing_raw_content_count', { count: content.length })}</div>
         <pre className="text-[13px] font-mono whitespace-pre-wrap break-all text-text">{preview}{content.length > preview.length ? '\n…' : ''}</pre>
       </div>
@@ -266,6 +280,9 @@ export const HtmlViewer = memo(function HtmlViewer({ content }: { content: strin
         srcDoc={content}
         sandbox=""
         className="w-full h-full border-none"
+        // Own compositing layer: a sandboxed srcDoc frame with no transform can
+        // skip its first paint and render blank. Same remedy as McpAppFrame.
+        style={{ transform: 'translateZ(0)' }}
         title={i18nT('components.fileRenderers.html_preview')}
       />
     </div>
@@ -289,17 +306,42 @@ export const PdfViewer = memo(function PdfViewer({ filePath }: { filePath: strin
   )
 })
 
-/* ── Office viewer (download-only card for .docx/.xlsx/.pptx/etc.) ──
+/* ── Office viewer ─────────────────────────────────────────────────
  *
  * Office binary formats are ZIP archives (OOXML) or legacy OLE compound files
  * that browsers cannot render inline. Serving them through /api/file-read
  * decodes them as UTF-8 with errors='replace', producing garbled control-code
- * text (raw ZIP bytes starting with 'PK…'). This viewer replaces that broken
- * rendering with a filename + extension badge + Download button pointing at
- * /api/file-download, which streams the original bytes with attachment
- * disposition + nosniff so the file downloads cleanly instead. */
-export const OfficeViewer = memo(function OfficeViewer({ filePath, hideHint }: { filePath: string; hideHint?: boolean }) {
-  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+ * text (raw ZIP bytes starting with 'PK…').
+ *
+ * Two rendering states:
+ *   1. **Preview** — for .docx and .pptx the backend can extract plaintext
+ *      via `kiro_crew.doc_parser.extract_text` (defusedxml-hardened, no
+ *      python-docx / python-pptx dep). We render that text in a scrollable
+ *      pre with a smaller "Download original" button pinned at the bottom.
+ *   2. **Download-only card** — for extensions the backend can't preview
+ *      (.xls / .xlsx / .doc / .ppt / .odt / .ods / .odp) we render the
+ *      original card: filename + extension badge + full-size Download button.
+ *      This is also the fallback when the preview fetch fails, the document
+ *      is empty, or extract_text returns "" (parse failure).
+ *
+ * The preview endpoint returns 415 for unsupported extensions, so anything
+ * other than a 2xx-with-non-empty-text falls through to the card without
+ * duplicating the previewable-ext list on the frontend. */
+
+/** Card body shared by both rendering states — full-size Download button
+ *  (fallback mode) or compact "Download original" affordance (preview mode).
+ *
+ *  Both modes lead with **Open with default app**, not Download. The file is
+ *  already on disk at the path this panel is showing, so downloading writes a
+ *  SECOND copy: the user then edits that copy, which the agent never reads back
+ *  and a later agent write silently diverges from. Handing the existing file to
+ *  Word / PowerPoint / Excel is the action the surface is actually for.
+ *
+ *  Open is shown only when `useCanOpenFile` allows it — the same gate every other
+ *  Open surface reads. A browser talking to a remote gateway has no desktop to
+ *  open on, so there Download is the only thing that can work and it takes the
+ *  accent styling back. */
+function OfficeCard({ filePath, showBigDownload, hideHint }: { filePath: string; showBigDownload: boolean; hideHint?: boolean }) {
   // Split on BOTH separators — Kiro Crew ships native on Windows where paths
   // arrive as `C:\Users\…\report.docx`, and a `/`-only split would surface the
   // whole path as the "filename". Matches the pattern in MarkdownRenderer.tsx
@@ -307,31 +349,163 @@ export const OfficeViewer = memo(function OfficeViewer({ filePath, hideHint }: {
   const filename = filePath.split(/[\\/]/).pop() || filePath
   const ext = extOf(filePath).replace('.', '').toUpperCase()
   const url = fileDownloadUrl(filePath)
+  const sizeCls = showBigDownload ? 'px-3 py-1.5 text-sm' : 'px-2 py-1 text-xs'
+  const iconSize = showBigDownload ? 16 : 14
+  // The ONE gate for an Open-with-default-app surface, shared with the file
+  // panel's ⋯ entry and MarkdownPanel's overflow: the browser must sit on the
+  // gateway host, or `/api/reveal` has no desktop to open on and the click looks
+  // broken. When it is false the card falls back to Download-as-primary, which
+  // is what a remote session actually needs — the bytes.
+  const canOpen = useCanOpenFile('file')
+  // A headless direct-local host has no desktop, so the backend degrades the
+  // `open` to a clipboard copy. Shared with the file-path menu (see useCopyAck)
+  // so the primary button acknowledges that degrade with the same inline swap
+  // instead of reading as a dead click.
+  const { copyStatus, revealOrOpenWithAck, revealError, clearRevealError } = useCopyAck(filePath)
+  const openLabel = copyStatus === 'copied'
+    ? i18nT('components.filePathMenu.path_copied')
+    : copyStatus === 'failed'
+      ? i18nT('components.filePathMenu.copy_failed')
+      : i18nT('components.markdownPanel.open_with_default_app')
   return (
-    <div className="h-full flex items-center justify-center p-4 bg-bg-elevated rounded-md border border-border">
-      <div className="flex flex-col items-center gap-3 max-w-md text-center">
-        <div className="relative">
-          <FileText size={64} className="text-muted" strokeWidth={1.25} />
-          <span
-            className="absolute bottom-1 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-accent text-white"
-            aria-hidden="true"
-          >{ext}</span>
+    <div className="flex flex-col items-center gap-3 max-w-md text-center mx-auto">
+      <div className="relative">
+        <FileText size={showBigDownload ? 64 : 40} className="text-muted" strokeWidth={1.25} />
+        <span
+          className={`absolute bottom-1 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded font-semibold bg-accent text-white text-[10px]`}
+          aria-hidden="true"
+        >{ext}</span>
+      </div>
+      <div className="text-sm text-text break-all">{filename}</div>
+      {/* A failed Open (policy-blocked path, backend error) renders here instead
+          of the legacy blocking alert(). askAgent on: the card is read-only. */}
+      <ErrorNotice
+        variant="inline"
+        className="text-left whitespace-normal"
+        message={revealError}
+        askAgent
+        onDismiss={clearRevealError}
+        testId="office-card-open-error"
+      />
+      {showBigDownload && !hideHint && (
+        <div className="text-xs text-muted">
+          {/* The hint is the card's only instruction, so it must name the action
+              the card leads with. Pointing a local user at Download is pointing
+              them at the duplicate-file divergence this card exists to avoid;
+              on remote/Windows, where Open is gated away, Download IS the
+              action and the original wording stays correct. */}
+          {canOpen
+            ? i18nT('components.fileRenderers.office_open_hint')
+            : i18nT('components.fileRenderers.office_download_hint')}
         </div>
-        <div className="text-sm text-text break-all">{filename}</div>
-        {!hideHint && (
-          <div className="text-xs text-muted">
-            {i18nT('components.fileRenderers.office_download_hint')}
-          </div>
+      )}
+      {/* Wraps rather than shrinks: the file panel is narrow, and a clipped
+          label is worse than a second line. */}
+      <div className="flex items-center justify-center gap-2 flex-wrap">
+        {canOpen && (
+          <button
+            type="button"
+            onClick={() => { void revealOrOpenWithAck('open') }}
+            className={`inline-flex items-center gap-2 rounded border-none cursor-pointer bg-accent text-white hover:opacity-90 ${sizeCls}`}
+          >
+            <ExternalLink size={iconSize} aria-hidden="true" />
+            {openLabel}
+          </button>
         )}
         <a
           href={url}
           download={filename}
-          className="inline-flex items-center gap-2 px-3 py-1.5 rounded text-sm bg-accent text-white hover:opacity-90 no-underline"
+          className={`inline-flex items-center gap-2 rounded no-underline ${sizeCls} ${canOpen
+            ? 'border border-border bg-bg-hover text-text hover:bg-bg-elevated'
+            : 'bg-accent text-white hover:opacity-90'}`}
           aria-label={i18nT('components.fileRenderers.download_file', { filename })}
         >
-          <Download size={16} aria-hidden="true" />
-          {i18nT('components.fileRenderers.download')}
+          <Download size={iconSize} aria-hidden="true" />
+          {showBigDownload
+            ? i18nT('components.fileRenderers.download')
+            : i18nT('components.fileRenderers.office_download_original')}
         </a>
+      </div>
+    </div>
+  )
+}
+
+type OfficePreviewBody = { text?: string; truncated?: boolean }
+
+// Extensions the backend can actually extract (mirrors _OFFICE_PREVIEWABLE_EXT
+// in dashboard/handlers/files.py). Known-unsupported office formats render the
+// download card directly — no fetch, no "Loading preview…" flash for a
+// guaranteed 415. The 415 fallback below stays as the safety net if the two
+// lists ever drift.
+const OFFICE_PREVIEWABLE_EXTS = new Set(['.docx', '.pptx'])
+
+export const OfficeViewer = memo(function OfficeViewer({ filePath, hideHint }: { filePath: string; hideHint?: boolean }) {
+  useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
+  const filename = filePath.split(/[\\/]/).pop() || filePath
+  const previewable = OFFICE_PREVIEWABLE_EXTS.has(extOf(filePath))
+  // React Query (repo convention for server fetches — see ArtifactPanel /
+  // AgentSkillsEditor). Keyed on filePath so navigating between .docx files
+  // in the tree never flashes a stale response; aborts via the provided
+  // signal on unmount/key change.
+  const previewQuery = useQuery<OfficePreviewBody | null>({
+    queryKey: ['office-preview', filePath],
+    queryFn: async ({ signal }) => {
+      const res = await fetch(fileOfficePreviewUrl(filePath), { signal })
+      if (!res.ok) {
+        // 415 (unsupported ext), 404, 400, 500 → all fall through to the
+        // download-only card. We don't distinguish here because a broken
+        // preview should never block downloading the real file.
+        return null
+      }
+      return await res.json() as OfficePreviewBody
+    },
+    enabled: previewable,
+    // No staleTime: a reopened file must show its CURRENT contents — the
+    // document may have been edited since the last preview. Deduping within
+    // a single mount still applies; only remounts refetch.
+    staleTime: 0,
+    retry: false,
+  })
+
+  if (previewable && previewQuery.isLoading) {
+    return (
+      <div className="h-full flex items-center justify-center p-4 bg-bg-elevated rounded-md border border-border">
+        <div className="text-xs text-muted animate-pulse">
+          {i18nT('components.fileRenderers.office_preview_loading')}
+        </div>
+      </div>
+    )
+  }
+
+  const body = previewable && !previewQuery.isError ? previewQuery.data : null
+  if (!body?.text) {
+    return (
+      <div className="h-full flex items-center justify-center p-4 bg-bg-elevated rounded-md border border-border">
+        <OfficeCard filePath={filePath} showBigDownload={true} hideHint={hideHint} />
+      </div>
+    )
+  }
+
+  // Preview state — scrollable plaintext + compact download affordance at bottom.
+  // tabIndex + aria-label make the scroll container keyboard-reachable so long
+  // documents stay readable past the fold without a pointer.
+  return (
+    <div className="h-full flex flex-col bg-bg-elevated rounded-md border border-border overflow-hidden">
+      {/* Keyboard-scrollable region — same pattern as CodeBlock.tsx. */}
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex */}
+      <div className="flex-1 overflow-auto p-4" tabIndex={0} role="region" aria-label={filename}>
+        <pre className="text-sm text-text whitespace-pre-wrap break-words font-sans leading-relaxed">{body.text}</pre>
+      </div>
+      <div className="border-t border-border p-3 bg-bg">
+        {/* Truncation notice lives in the always-visible pinned bar (not after
+            the 512 KB of text) so users skimming the top of a large document
+            learn the preview is partial without scrolling to the end. */}
+        {body.truncated && (
+          <div className="mb-2 text-xs text-muted italic text-center">
+            {i18nT('components.fileRenderers.office_preview_truncated')}
+          </div>
+        )}
+        <OfficeCard filePath={filePath} showBigDownload={false} />
       </div>
     </div>
   )

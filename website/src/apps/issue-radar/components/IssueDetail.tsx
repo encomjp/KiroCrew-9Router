@@ -49,7 +49,7 @@ import ListDetailBack from '../../../components/ListDetailBack'
 import InvestigateButton from './InvestigateButton'
 import { useIssueRadar } from '../context'
 import { useTitleScrolledOut } from '../lib/useTitleScrolledOut'
-import { relativeTimeOrDate, hexToRgba, asArray, detailPollMs } from '../lib/format'
+import { relativeTimeOrDate, hexToRgba, asArray, detailPollMs, resolveAiLanguage } from '../lib/format'
 import {
   issueRadarApi,
   AssigneesConflictError,
@@ -61,6 +61,7 @@ import { commitUrlFor, userUrlFor, repoScopeKey } from '../lib/links'
 import { providerTerms, readOnlyHint } from '../lib/links'
 
 import { i18nT } from '../../../i18n/t'
+import ErrorNotice from '../../../components/ErrorNotice'
 import { fmtDateTime, fmtDateTimeNumeric } from '../../../i18n/format'
 /** A relative timestamp that flips to the absolute local date-time when
  * clicked (and always shows it on hover). Within the last 24h it reads
@@ -470,7 +471,7 @@ function Section({
 export default function IssueDetail({ issue }: { issue: Issue }) {
   const {
     active, colorByName, memberRoleByLogin, repoLabels, countByLabel, canWrite, stateFilter,
-    me, refreshPrefs, listDetail, refStack,
+    me, refreshPrefs, listDetail, refStack, aiLanguage,
   } = useIssueRadar()
   const { owner, repo } = active
   const scopeKey = repoScopeKey(active)
@@ -585,12 +586,15 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
   // server-side (one model call per issue, served instantly on re-open). The
   // regenerate button forces a recompute via ?refresh=1 (same ref trick).
   const aiRefreshRef = useRef(false)
+  // The resolved AI-output language is part of the key: a summary fetched under
+  // one language must not be replayed from the client cache under another.
+  const aiLang = resolveAiLanguage(aiLanguage)
   const aiQuery = useQuery({
-    queryKey: ['issue-radar', 'issue-ai', scopeKey, issue.number],
+    queryKey: ['issue-radar', 'issue-ai', scopeKey, issue.number, aiLang],
     queryFn: () => {
       const useRefresh = aiRefreshRef.current
       aiRefreshRef.current = false
-      return issueRadarApi.issueAi(active, issue.number, { refresh: useRefresh })
+      return issueRadarApi.issueAi(active, issue.number, aiLang, { refresh: useRefresh })
     },
     // Wait for the detail read to land first (mirrors PrDetail's aiQuery). The AI
     // route derives its summary from the issue detail, and on a COLD open firing
@@ -920,9 +924,14 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
               </DetailOverflowMenu>
             </>}
             extra={stateMutation.isError && (
-              <div className="mt-2 text-[12px] text-danger">
-                {(stateMutation.error as Error).message}
-              </div>
+              /* Acts on a persisted issue; this pane holds no composer, so the
+                 hand-off loses nothing. Same for the three notices below. */
+              <ErrorNotice
+                message={(stateMutation.error as Error).message}
+                variant="inline"
+                askAgent
+                className="mt-2"
+              />
             )}
           />
 
@@ -997,7 +1006,12 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
 
             {activityLoading && <TimelineSkeleton />}
             {activityError && (
-              <div className="py-2 text-[12px] text-danger">{i18nT('apps.issueRadar.components.issueDetail.couldn_t_load_activity')} {activityError.message}</div>
+              <ErrorNotice
+                title={i18nT('apps.issueRadar.components.issueDetail.couldn_t_load_activity')}
+                message={activityError.message}
+                askAgent
+                className="my-2"
+              />
             )}
             {!activityLoading && !activityError && activityDesc.length === 0 && (
               <div className="py-2 text-[12px] text-muted">{i18nT('apps.issueRadar.components.issueDetail.no_activity_yet')}</div>
@@ -1057,7 +1071,12 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
               )}
 
               {assigneesMutation.isError && (
-                <div className="mt-2 text-[11px] text-danger">{(assigneesMutation.error as Error).message}</div>
+                <ErrorNotice
+                  message={(assigneesMutation.error as Error).message}
+                  variant="inline"
+                  askAgent
+                  className="mt-2"
+                />
               )}
             </Section>
 
@@ -1108,7 +1127,12 @@ export default function IssueDetail({ issue }: { issue: Issue }) {
               />
 
               {labelMutation.isError && (
-                <div className="mt-2 text-[11px] text-danger">{(labelMutation.error as Error).message}</div>
+                <ErrorNotice
+                  message={(labelMutation.error as Error).message}
+                  variant="inline"
+                  askAgent
+                  className="mt-2"
+                />
               )}
             </Section>
 

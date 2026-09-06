@@ -46,7 +46,9 @@ class TestConfig:
 
         c = InstancesConfig()
         assert c.enabled is False
-        assert c.warm_set_cap == DEFAULT_WARM_SET_CAP == 5
+        # 0 == automatic: the cap follows the REGISTERED crew count (resolved per
+        # request by resolve_warm_set_cap), so no configured crew is ever evicted.
+        assert c.warm_set_cap == DEFAULT_WARM_SET_CAP == 0
         assert c.tunnel_base_port == DEFAULT_TUNNEL_BASE_PORT == 7778
         assert DEFAULT_CONNECT_TIMEOUT_SECS == 15.0
         assert c.connect_timeout_secs is None
@@ -56,9 +58,16 @@ class TestConfig:
     def test_clamps_out_of_range(self):
         from kiro_crew.config.loader import InstancesConfig
 
-        c = InstancesConfig(warm_set_cap=0, tunnel_base_port=99999)
-        assert c.warm_set_cap == 1
+        # 0 is a legal value (automatic), so only a negative cap is clamped, and
+        # it falls back to automatic rather than to the tightest possible cap.
+        c = InstancesConfig(warm_set_cap=-3, tunnel_base_port=99999)
+        assert c.warm_set_cap == 0
         assert c.tunnel_base_port == 7778
+
+    def test_zero_warm_set_cap_is_kept_as_automatic(self):
+        from kiro_crew.config.loader import InstancesConfig
+
+        assert InstancesConfig(warm_set_cap=0).warm_set_cap == 0
 
     def test_roundtrip_and_schema(self):
         from kiro_crew.config.loader import KiroCrewConfig
@@ -67,7 +76,7 @@ class TestConfig:
         d = KiroCrewConfig().to_dict()
         assert d["instances"] == {
             "enabled": False,
-            "warm_set_cap": 5,
+            "warm_set_cap": 0,
             "tunnel_base_port": 7778,
             "ssh_compression": True,
             "connect_timeout_secs": None,
@@ -790,10 +799,8 @@ class TestTokenMint:
         from kiro_crew.instances import token_mint as tm
 
         seen: list[int] = []
-        real = tm.redact_credentials
-        monkeypatch.setattr(
-            tm, "redact_credentials", lambda text, *a, **k: seen.append(len(text)) or real(text)
-        )
+        real = tm.redact
+        monkeypatch.setattr(tm, "redact", lambda text: seen.append(len(text)) or real(text))
 
         huge = ("x" * 60 + " could not reach gateway\n") * 20_000  # ~1.7 MB
         self._fake_proc(monkeypatch, 1, huge.encode(), b"")
@@ -879,10 +886,16 @@ class TestRunMarker:
         assert marker.read_text(encoding="utf-8").strip() == str(launcher)
         # The pid sidecar rides alongside and names THIS process.
         assert run_marker.read_pid(7879) == os.getpid()
+        # The start identity is its OWN file, so the pid file stays a bare pid
+        # that main's shipped whole-file isdigit() reader still parses.
+        start = run_marker._start_path_for(run_marker.pid_path(7879))
+        assert start.name == "gateway-7879.start"
+        assert start.read_text(encoding="utf-8").strip() == run_marker.pid_start_token(os.getpid())
 
         run_marker.clear_marker(7879)
         assert not marker.exists()
         assert not run_marker.pid_path(7879).exists()  # sidecar cleared too
+        assert not start.exists()  # ...and so is the start identity it attests
         assert run_marker.read_pid(7879) is None
         run_marker.clear_marker(7879)  # clearing a missing marker is a no-op
 
@@ -996,6 +1009,130 @@ class TestRunMarkerDiscovery:
         (d / "gateway-6776.pid").write_text(" 4242 \n", encoding="utf-8")
         assert run_marker.read_pid(6776) == 4242
 
+    def test_explicit_pid_reader_is_bounded_ascii_decimal_and_read_only(self, tmp_path):
+        from kiro_crew.instances import run_marker
+
+        path = tmp_path / "missing" / "gateway.pid"
+        assert run_marker._read_pid_path(path) is None
+        assert not path.parent.exists()
+        path.parent.mkdir()
+        for junk in (b"\xd9\xa4\xd9\xa2", b"+42", b"-42", b"0", b"9" * 65):
+            path.write_bytes(junk)
+            assert run_marker._read_pid_path(path) is None
+        path.write_bytes(b" 4242 \n")
+        assert run_marker._read_pid_path(path) == 4242
+        path.write_bytes(b"9" * 64)
+        assert run_marker._read_pid_path(path) == int(b"9" * 64)
+
+    def test_the_start_identity_is_read_from_its_own_sidecar(self, tmp_path):
+        """The token lives beside the pid file, never inside it.
+
+        Keeping the pid file a bare pid is what lets the reader SHIPPED on an
+        older client -- whole file, stripped, ``isdigit()`` -- keep parsing a
+        record this gateway wrote, instead of answering ``None`` and denying a
+        gateway that genuinely is ours.
+        """
+        from kiro_crew.instances import run_marker
+
+        pid_file = tmp_path / "gateway-7999.pid"
+        pid_file.write_bytes(b"4242\n")
+        start = run_marker._start_path_for(pid_file)
+        assert start == tmp_path / "gateway-7999.start"
+
+        # No sidecar: a pid with no proof of freshness, never a wildcard match.
+        assert run_marker.read_pid_record_path(pid_file) == (4242, "")
+        start.write_bytes(b"246853591\n")
+        assert run_marker.read_pid_record_path(pid_file) == (4242, "246853591")
+
+        # Defensive read-side parsing: oversized, non-ASCII and whitespace-bearing
+        # sidecars all read as unproven rather than as some other process's value.
+        for junk in (b"9" * 129, b"\xd9\xa4\xd9\xa2", b"12 34", b"12\n34"):
+            start.write_bytes(junk)
+            assert run_marker.read_pid_record_path(pid_file) == (4242, ""), junk
+
+        # Reading a record never materialises the sidecar it looked for.
+        absent = tmp_path / "elsewhere" / "gateway-7000.pid"
+        assert run_marker.read_pid_record_path(absent) is None
+        assert not absent.parent.exists()
+
+    def test_the_pid_body_still_parses_under_the_reader_shipped_on_main(
+        self, tmp_path, monkeypatch
+    ):
+        """The whole point of splitting the record out of the pid file.
+
+        ``read_pid`` as shipped on ``origin/main`` is ``_read_sidecar(port,
+        ".pid")`` -- the WHOLE file, stripped -- gated on ``isdigit()``. This
+        asserts the body a live ``write_marker`` produces against exactly that
+        reader, so a second line can never be reintroduced without a red test.
+        An older client venv sharing this data home is the caller that breaks.
+        """
+        monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
+        from kiro_crew.instances import run_marker
+
+        run_marker.write_marker(7999)
+        pid_file = run_marker.pid_path(7999)
+        # The invariant is "one line holding the bare pid", not a literal byte
+        # string: atomic_write opens in text mode, so Windows translates the
+        # trailing \n to \r\n — for THIS branch and for main's writer alike,
+        # which is exactly why the shipped reader strips before isdigit().
+        body = pid_file.read_bytes()
+        assert body.decode("ascii").splitlines() == [str(os.getpid())]
+
+        shipped = run_marker._read_sidecar(7999, ".pid")  # main's read, verbatim
+        assert shipped.isdigit()
+        assert int(shipped) == os.getpid()
+
+        # The identity is still recorded -- just in the file next to it.
+        assert run_marker.read_pid_record_path(pid_file) == (
+            os.getpid(),
+            run_marker.pid_start_token(os.getpid()),
+        )
+
+    def test_start_identity_comes_from_the_shared_start_id_producer(self, monkeypatch):
+        """One producer for the value written and the value compared.
+
+        ``platform_compat.get_process_start_id`` is microsecond-resolution on
+        macOS, unlike ``process_start_time``'s ``ps -o lstart=`` spelling, whose
+        1-second granularity lets a pid recycled inside the same second forge an
+        identical value.
+        """
+        from kiro_crew import platform_compat
+        from kiro_crew.instances import run_marker
+
+        monkeypatch.setattr(platform_compat, "get_process_start_id", lambda pid: "1730.000042")
+        assert run_marker.pid_start_token(4242) == "1730.000042"
+
+        # The preferred producer implements Linux and macOS only. When it says
+        # nothing, the fallback is consulted rather than the token going empty --
+        # that fallback is the ONLY start identity available on Windows (a
+        # creation FILETIME), so skipping it would make a pod there permanently
+        # unprovable.
+        monkeypatch.setattr(platform_compat, "get_process_start_id", lambda pid: None)
+        monkeypatch.setattr(platform_compat, "process_start_time", lambda pid: "133724160000000000")
+        assert run_marker.pid_start_token(4242) == "133724160000000000"
+
+        # A space-padded fallback (the macOS `ps -o lstart=` spelling) is
+        # collapsed to a single token, because the reader refuses inner whitespace.
+        monkeypatch.setattr(
+            platform_compat, "process_start_time", lambda pid: "Thu Sep  4 00:00:00 2026"
+        )
+        assert run_marker.pid_start_token(4242) == "Thu-Sep-4-00:00:00-2026"
+
+        # Only when NEITHER producer will answer is the token unproven.
+        monkeypatch.setattr(platform_compat, "process_start_time", lambda pid: None)
+        assert run_marker.pid_start_token(4242) == ""
+
+        def _boom(pid: int) -> str:
+            raise OSError("libproc exploded")
+
+        monkeypatch.setattr(platform_compat, "get_process_start_id", _boom)
+        monkeypatch.setattr(platform_compat, "process_start_time", _boom)
+        assert run_marker.pid_start_token(4242) == ""
+
+        # A raising primary must still let the working fallback answer.
+        monkeypatch.setattr(platform_compat, "process_start_time", lambda pid: "133724160000000001")
+        assert run_marker.pid_start_token(4242) == "133724160000000001"
+
     def test_read_launcher_reads_marker_content(self, tmp_path, monkeypatch):
         """read_launcher returns the recorded path, None for absent/empty, and
         never creates run/ (read-only, like read_pid)."""
@@ -1034,6 +1171,7 @@ class TestRunMarkerDiscovery:
         # Residue from three earlier runs on other ports.
         self._marker(tmp_path, "gateway-5476.bin")
         (tmp_path / "run" / "gateway-5476.pid").write_text("111\n", encoding="utf-8")
+        (tmp_path / "run" / "gateway-5476.start").write_text("111-start\n", encoding="utf-8")
         self._marker(tmp_path, "gateway-6777.bin")
         self._marker(tmp_path, "gateway-9001.bin")
 
@@ -1041,6 +1179,9 @@ class TestRunMarkerDiscovery:
 
         assert run_marker.marker_ports() == [6776]
         assert not (tmp_path / "run" / "gateway-5476.pid").exists()
+        # The start identity goes with the pid it attests; left behind it would
+        # pair a dead generation's token with a pid file a later gateway rewrites.
+        assert not (tmp_path / "run" / "gateway-5476.start").exists()
         assert run_marker.read_pid(6776) == os.getpid()
 
     def test_prune_keeps_unrelated_files(self, tmp_path, monkeypatch):
@@ -1737,9 +1878,37 @@ class _State:
         self.instances_manager = manager
 
 
-def _enable(tmp_path: Path, monkeypatch, *, enabled=True):
+class _ConnectedMgr:
+    """Manager stub where the named instances report a live tunnel.
+
+    Only the three members ``_status_for`` touches are implemented, which is
+    what the warm-set-cap tests need: the cap is derived from how many instances
+    come back ``connected``.
+    """
+
+    def __init__(self, connected):
+        self._connected = set(connected)
+
+    def status(self, instance_id):
+        if instance_id not in self._connected:
+            return None
+        return types.SimpleNamespace(
+            to_dict=lambda: {"instance_id": instance_id, "state": "connected"}
+        )
+
+    def token_ttl_remaining(self, instance_id):
+        return None
+
+    def last_error(self, instance_id):
+        return None
+
+
+def _enable(tmp_path: Path, monkeypatch, *, enabled=True, warm_set_cap=None):
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path))
-    (tmp_path / "config.json").write_text(json.dumps({"instances": {"enabled": enabled}}))
+    section: dict = {"enabled": enabled}
+    if warm_set_cap is not None:
+        section["warm_set_cap"] = warm_set_cap
+    (tmp_path / "config.json").write_text(json.dumps({"instances": section}))
     from kiro_crew.config import loader
 
     loader._invalidate_config_cache()
@@ -2080,9 +2249,64 @@ class TestHandlers:
         assert r.status == 201
         r = asyncio.run(handlers.api_instances_list(_FakeReq(state)))
         b = _body(r)
-        assert b["warm_set_cap"] == 5 and len(b["instances"]) == 1
+        # One crew registered => automatic cap 1, and adding it is enough: the
+        # cap does not wait for the tunnel to come up.
+        assert b["warm_set_cap"] == 1 and len(b["instances"]) == 1
         # no manager on this state => enabled-in-config but not active (needs restart)
         assert b["active"] is False
+
+    def test_automatic_cap_covers_every_registered_crew_not_just_connected_ones(
+        self, tmp_path, monkeypatch
+    ):
+        """The served cap covers every REGISTERED crew, connected or not.
+
+        This is the regression that produced "one random crew is broken". The cap
+        used to be the live connected count, so a crew whose tunnel came up just
+        after this request was not counted, the cap arrived one short, and the
+        viewport evicted a pane to honour it. Eviction unmounts the pane and
+        cold-boots the remote SPA on the next click, which reads as a disconnect —
+        and which crew lost depended on connection order, so the victim moved on
+        every restart. Here 3 are registered and only 2 are connected; the cap
+        must still be 3.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        for name in ("a", "b", "c"):
+            reg.add(name=name, ssh_host=f"{name}-alias")
+        state = _State(reg, _ConnectedMgr(["a", "c"]))
+        b = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))
+        assert len(b["instances"]) == 3
+        assert b["warm_set_cap"] == 3
+
+    def test_adding_a_crew_widens_the_served_cap(self, tmp_path, monkeypatch):
+        """Otherwise every new crew has to be paired with a config edit.
+
+        Forgetting that edit reintroduces the eviction above, so the cap has to
+        rise on its own when the fleet grows.
+        """
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch)
+        reg = self._reg(tmp_path)
+        reg.add(name="a", ssh_host="a-alias")
+        state = _State(reg, _ConnectedMgr([]))
+        before = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))["warm_set_cap"]
+        reg.add(name="b", ssh_host="b-alias")
+        after = _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))["warm_set_cap"]
+        assert (before, after) == (1, 2)
+
+    def test_explicit_cap_is_served_even_below_the_registered_count(self, tmp_path, monkeypatch):
+        """An operator's own number is the budget and is not widened for them."""
+        from kiro_crew.dashboard import handlers_instances as handlers
+
+        _enable(tmp_path, monkeypatch, warm_set_cap=1)
+        reg = self._reg(tmp_path)
+        for name in ("a", "b"):
+            reg.add(name=name, ssh_host=f"{name}-alias")
+        state = _State(reg, _ConnectedMgr(["a", "b"]))
+        assert _body(asyncio.run(handlers.api_instances_list(_FakeReq(state))))["warm_set_cap"] == 1
 
     def test_list_active_reflects_manager_running(self, tmp_path, monkeypatch):
         from kiro_crew.dashboard import handlers_instances as handlers
@@ -3277,6 +3501,67 @@ class TestTokenMintGeneric:
         assert rc == 255
         assert "AKIAIOSFODNN7EXAMPLE" not in err
         assert "[REDACTED: credential]" in err
+
+    def test_run_remote_kirocrew_redacts_urls_before_credentials(self, monkeypatch):
+        """#9014: pin the ORDER of the redaction passes, not just the redaction.
+
+        The exfiltration-URL pass keys on the token-bearing URL shape, so
+        running the credential pass first substitutes a placeholder into the
+        query string and disarms it — the suspicious destination host then
+        survives into the returned tail. Each pass is green in isolation, so
+        only an input carrying a suspicious URL whose query string also carries
+        a credential distinguishes the two orders. This test fails if the
+        composition is ever reversed again.
+        """
+        from kiro_crew.instances import token_mint as tm
+
+        class FakeProc:
+            returncode = 255
+
+            async def communicate(self):
+                return b"", b"banner https://evil.example.com/x?token=AKIAIOSFODNN7EXAMPLE end"
+
+        async def fake_exec(*a, **k):
+            return FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        rc, err = asyncio.run(tm.run_remote_kirocrew("cd-1", "restart"))
+        assert rc == 255
+        # The URL pass must fire: the destination must be suppressed, not just
+        # the credential inside it. Under the reversed (credentials-first)
+        # order the URL survives as https://evil.example.com/x?token=[...].
+        assert "https://evil.example.com" not in err
+        assert "[REDACTED: suspicious URL" in err
+        assert "AKIAIOSFODNN7EXAMPLE" not in err
+
+    def test_stdout_tail_url_pass_not_disarmed_by_token_prescrub(self, monkeypatch):
+        """#9014: the stdout-tail site has a second disarm path — its own
+        ``_TOKEN_RE`` pre-scrub. Substituting ``token=<redacted>`` into a URL's
+        query string before the exfiltration-URL pass destroys the token-bearing
+        shape that pass keys on, so a suspicious destination would survive into
+        the raised TokenMintError even with the composed helper in place. Pins
+        that the generic redactors see the window before the token scrubs.
+        """
+        from kiro_crew.instances import token_mint as tm
+
+        stdout = b"fail: see https://evil.example.com/x?token=AKIAIOSFODNN7EXAMPLE now"
+
+        class FakeProc:
+            returncode = 1
+
+            async def communicate(self):
+                return stdout, b""
+
+        async def fake_exec(*a, **k):
+            return FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        with pytest.raises(tm.TokenMintError) as excinfo:
+            asyncio.run(tm.mint_remote_token("cd-1", ttl="20h"))
+        msg = str(excinfo.value)
+        assert "https://evil.example.com" not in msg
+        assert "[REDACTED: suspicious URL" in msg
+        assert "AKIAIOSFODNN7EXAMPLE" not in msg
 
     class _HangProc:
         """First ``communicate`` times out; the reap (a SECOND communicate)
@@ -5040,6 +5325,59 @@ class TestSsmTunnelProcessGroup:
         assert seen["start_new_session"] is False
         assert seen["creationflags"] == 0
 
+    @pytest.mark.asyncio
+    async def test_ssm_child_gets_plugin_search_path_and_ssh_inherits(self, monkeypatch, tmp_path):
+        """The SSM child needs a PATH that can find session-manager-plugin.
+
+        The argv head is resolved absolutely, but the aws CLI then looks the
+        plugin up BY NAME on this child's own PATH — under a GUI-launched gateway
+        the minimal launchd one — so the tunnel died inside a correctly resolved
+        ``aws`` (#5392). SSH keeps ``env=None`` (inherit): its binary lives in
+        the system bin dir and widening a tunnel child's PATH without a reason to
+        is the opposite of what this fix argues for.
+        """
+        import kiro_crew.instances.ssh_tunnel_manager as mod
+        from kiro_crew.deploy import engine
+
+        seen = {}
+
+        async def fake_exec(*argv, **kw):
+            seen.update(kw)
+            raise OSError("stop here — we only care about the spawn kwargs")
+
+        # tmp_path stand-ins: a host path literal would flake and is unrunnable
+        # on Windows, which this class deliberately also exercises. `aws` sits on
+        # the inherited PATH so the head resolves absolutely (a PATH hit needs no
+        # provenance check), which is what makes the widening applicable. Windows
+        # resolves executables by PATHEXT rather than the exec bit, so the planted
+        # file differs there — otherwise the head falls back to the bare name and
+        # the widening is (correctly) withheld.
+        inherited = tmp_path / "sysbin"
+        inherited.mkdir()
+        if os.name == "nt":
+            fake_aws = inherited / "aws.cmd"
+            fake_aws.write_text("@echo off\n")
+            monkeypatch.setenv("PATHEXT", ".cmd")
+        else:
+            fake_aws = inherited / "aws"
+            fake_aws.write_text("#!/bin/sh\n")
+            fake_aws.chmod(0o755)
+        install_dir = tmp_path / "install"
+        monkeypatch.setenv("PATH", str(inherited))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(install_dir),))
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(mod.platform_compat, "IS_POSIX", True)
+
+        await self._tunnel("ssm").start()
+        child_path = seen["env"]["PATH"].split(os.pathsep)
+        assert str(install_dir) in child_path
+        # Appended: the inherited PATH still wins every name it can resolve.
+        assert child_path.index(str(inherited)) < child_path.index(str(install_dir))
+
+        seen.clear()
+        await self._tunnel("ssh").start()
+        assert seen["env"] is None
+
     def test_teardown_routes_through_the_platform_shim(self, monkeypatch):
         """Not raw os.killpg — that leaves the plugin alive on Windows."""
         import kiro_crew.instances.ssh_tunnel_manager as mod
@@ -5266,6 +5604,44 @@ class TestSsmTransportSelection:
         await mgr2.connect("ec2b")
         assert seen["timeout_secs"] == 45.0
         await mgr2.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_plugin_probe_runs_off_the_event_loop(self, tmp_path, monkeypatch):
+        """#5392: the prerequisite probe must not block the gateway event loop.
+
+        The probe resolves the plugin through the deploy engine's shared resolver
+        — PATH scan, then the well-known install dirs, then executable-provenance
+        validation — so a stalled network mount on any of those would freeze every
+        request and heartbeat. Pinned by the THREAD it actually runs on rather
+        than by source inspection, so an edit that drops the offload fails here
+        even if it keeps the wording.
+        """
+        import threading
+
+        from kiro_crew.instances.ssh_tunnel_manager import TunnelState
+
+        loop_thread = threading.get_ident()
+        ran_on: dict = {}
+
+        def _probe():
+            ran_on["thread"] = threading.get_ident()
+            return False  # short-circuit: no tunnel spawn, error status asserted
+
+        monkeypatch.setattr("kiro_crew.cloud.ssm.session_manager_plugin_installed", _probe)
+        reg, mgr = self._mgr(tmp_path)
+        reg.add(
+            name="EC2",
+            connection_method="ssm",
+            ssm_target="i-0123456789abcdef0",
+            instance_id="ec2",
+            remote_port=53514,
+        )
+
+        st = await mgr.connect("ec2")
+
+        assert st.state == TunnelState.ERROR
+        assert ran_on["thread"] != loop_thread
+        await mgr.shutdown()
 
     @pytest.mark.asyncio
     async def test_ssm_connect_fails_clean_without_plugin(self, tmp_path, monkeypatch):

@@ -1,8 +1,9 @@
 """Lazy per-session detail: first message, real turn count, image count.
 
-Called once when a row expands in the storage inventory UI.  Streams files
-line-by-line so multi-GB sessions never load into memory.  Degrades to
-empty/zero on any malformed or unreadable file rather than raising.
+Called once when a row expands in the storage inventory UI.  Reads files one
+capped record at a time so neither a multi-GB session nor a single crafted
+newline-free line loads into memory.  Degrades to empty/zero on any malformed,
+over-cap, or unreadable file rather than raising.
 """
 
 from __future__ import annotations
@@ -14,8 +15,17 @@ from pathlib import Path
 
 from kiro_crew.config.paths import data_home, kiro_sessions_dir
 from kiro_crew.history import ARCHIVE_DIR_NAME, ARCHIVE_SEGMENT_DELIMITER, SESSIONS_DIR_NAME
+from kiro_crew.jsonl_util import RECORD_CAP, bounded_records
 
 logger = logging.getLogger(__name__)
+
+# The shared reader's cap (see :data:`kiro_crew.jsonl_util.RECORD_CAP`, which
+# derives it from the largest legitimate transcript record -- the shape this
+# module reads, so that derivation is this module's own). Named here and passed
+# explicitly because both trees read here are agent-writable, so
+# `for line in handle` would hand one crafted newline-free line a single
+# allocation the size of the whole file.
+_RECORD_CAP = RECORD_CAP
 
 
 @dataclass(frozen=True)
@@ -100,14 +110,16 @@ def digest(uid: str, stems: tuple[str, ...], sid: str) -> SessionDigest:
 def _scan_transcript(path: Path) -> tuple[str, int]:
     """Stream a transcript file and extract (first_user_message, user_turn_count).
 
-    Skips metadata/archive header lines. Never raises.
+    Skips metadata/archive header lines, and any record over ``_RECORD_CAP``
+    bytes (see :func:`kiro_crew.jsonl_util.bounded_records`, which also owns
+    the decode). Never raises.
     """
     first_msg = ""
     turn_count = 0
 
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
+        with open(path, "rb") as f:
+            for line in bounded_records(f, path, cap=_RECORD_CAP, label="digest"):
                 line = line.strip()
                 if not line:
                     continue
@@ -115,7 +127,7 @@ def _scan_transcript(path: Path) -> tuple[str, int]:
                     record = json.loads(line)
                 except ValueError:
                     # Malformed line: skip, don't lose the rest
-                    logger.debug("digest: skipping malformed line in %s", path)
+                    logger.debug("digest: skipping malformed line in %r", path)
                     continue
 
                 if not isinstance(record, dict):
@@ -132,7 +144,7 @@ def _scan_transcript(path: Path) -> tuple[str, int]:
                         if not first_msg and content.strip():
                             first_msg = _collapse_whitespace(content, 280)
     except OSError:
-        logger.debug("digest: cannot read transcript %s", path)
+        logger.debug("digest: cannot read transcript %r", path)
 
     return first_msg, turn_count
 
@@ -142,14 +154,16 @@ def _scan_cli_log(path: Path) -> tuple[int, int]:
 
     User turns are lines with ``kind == "Prompt"``.
     Images are content items with ``kind == "image"`` in any record.
+    Records over ``_RECORD_CAP`` bytes are skipped (see
+    :func:`kiro_crew.jsonl_util.bounded_records`).
     Never raises.
     """
     turns = 0
     images = 0
 
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
+        with open(path, "rb") as f:
+            for line in bounded_records(f, path, cap=_RECORD_CAP, label="digest"):
                 line = line.strip()
                 if not line:
                     continue
@@ -174,7 +188,7 @@ def _scan_cli_log(path: Path) -> tuple[int, int]:
                             if isinstance(item, dict) and item.get("kind") == "image":
                                 images += 1
     except OSError:
-        logger.debug("digest: cannot read cli log %s", path)
+        logger.debug("digest: cannot read cli log %r", path)
 
     return turns, images
 
@@ -183,11 +197,13 @@ def _first_message_from_cli(path: Path) -> str:
     """Extract the first user message text from a kiro-cli event log.
 
     Returns the text of the first Prompt record's first text content item.
+    Records over ``_RECORD_CAP`` bytes are skipped (see
+    :func:`kiro_crew.jsonl_util.bounded_records`).
     Never raises.
     """
     try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            for line in f:
+        with open(path, "rb") as f:
+            for line in bounded_records(f, path, cap=_RECORD_CAP, label="digest"):
                 line = line.strip()
                 if not line:
                     continue
@@ -218,7 +234,7 @@ def _first_message_from_cli(path: Path) -> str:
                 # Prompt found but no text content
                 return ""
     except OSError:
-        logger.debug("digest: cannot read cli log %s for first_message", path)
+        logger.debug("digest: cannot read cli log %r for first_message", path)
 
     return ""
 

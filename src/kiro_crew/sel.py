@@ -54,6 +54,7 @@ from typing import IO, Literal, NamedTuple, overload
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
+from kiro_crew.credential_patterns import AWS_KEY_ID_PREFIXES
 
 logger = logging.getLogger(__name__)
 
@@ -404,7 +405,11 @@ def _redact_deep(obj: object, redactor: Callable[[str], str]) -> object:
 # alphanumeric run (where extra chars change the case-restore candidates)
 # stays out of scope.
 _AWS_KEY_ANYCASE_RE = re.compile(
-    r"(?<![A-Za-z0-9])(?:AKIA|ASIA)[A-Za-z0-9]{16}(?![A-Za-z0-9])",
+    # Prefixes come from the shared home; the BODY deliberately does not. This net
+    # is mixed-case and boundary-bounded, so it is a different pattern from the
+    # scrubber's uppercase-only one rather than another spelling of it.
+    f"(?<![A-Za-z0-9])(?:{AWS_KEY_ID_PREFIXES})"
+    r"[A-Za-z0-9]{16}(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
@@ -1150,14 +1155,19 @@ class SecurityEventLog:
             written = os.fstat(f.fileno())
         # Ensure permissions are correct even if file pre-existed with
         # wrong mode (e.g. created by an older version). POSIX repair only,
-        # deliberately NOT ``platform_compat.restrict_to_owner``: that helper
-        # spawns ``icacls`` on Windows (a blocking subprocess), and this
-        # append path can run inline on a caller's thread that may be the
-        # asyncio event loop — the ``critical=True`` audit-or-deny write, and
-        # the fallback taken when the writer thread cannot start (see
-        # ``_may_rotate``) — where a blocking call freezes every gateway task.
+        # deliberately still NOT ``platform_compat.restrict_to_owner``: on POSIX
+        # that helper IS this exact call, so a swap would add only the Windows
+        # owner-only DACL — and this append path can run inline on a caller's
+        # thread that may be the asyncio event loop (the ``critical=True``
+        # audit-or-deny write, and the fallback taken when the writer thread
+        # cannot start, see ``_may_rotate``), where a DACL write to a UNC or
+        # mapped-drive path costs an unbounded SMB round-trip. Adopting the
+        # helper here therefore means first deciding what a non-local volume
+        # gets, the way ``write_config_atomically`` gates its own lockdown on
+        # ``windows_acl.volume_is_local``; until that is settled the log keeps
+        # whatever DACL it inherits on Windows. Tracked in #6359.
         try:
-            os.chmod(self._path, 0o600)  # lockdown-ok: #5228 -- icacls would block the event loop
+            os.chmod(self._path, 0o600)  # lockdown-ok: #5228 -- unbounded SMB round-trip on the loop
         except OSError:
             logger.warning("Failed to enforce 0o600 permissions on SEL audit log %s", self._path, exc_info=True)
         self._live_seen = (written.st_dev, written.st_ino, written.st_size)
@@ -2130,7 +2140,11 @@ class SecurityEventLog:
         The HMAC chain (prev_hash/entry_hash) is computed in the writer thread
         in enqueue order, so callers never pay the hash + file-append cost on
         the hot path. If the writer can't be started (unexpected), fall back to
-        a synchronous write so an event is never silently dropped.
+        a synchronous write off the event loop; ON the loop the non-critical
+        event is dropped with a warning instead, because the inline write's
+        filesystem work would freeze every task the loop serves
+        (no-blocking-call-on-event-loop) — best-effort audit loss is the
+        survivable direction.
 
         When ``critical=True`` the event is written SYNCHRONOUSLY and a
         filesystem failure is re-raised, so a fail-closed caller (e.g. safety
@@ -2169,13 +2183,33 @@ class SecurityEventLog:
                 self.flush()
             self._flush_batch([event], raise_on_error=True)
             return
+        incremented = False
         try:
             self._ensure_writer()
             with self._pending_cond:
                 self._pending += 1
+            incremented = True
             self._queue.put(event)
         except Exception:
-            # Writer unavailable — write synchronously so the audit entry lands.
+            # The event never reached the queue, so return its pending credit —
+            # otherwise flush() waits its full timeout on a count nothing will
+            # ever decrement (the writer only credits batches it dequeues).
+            if incremented:
+                self._decr_pending(1)
+            # Writer unavailable. Off the loop, write synchronously so the
+            # audit entry lands. ON the loop, drop it instead: `_flush_batch`
+            # is redaction + chain lock + open/write/flush on the caller's
+            # thread, and a non-critical audit is best-effort by contract —
+            # losing one event is survivable, freezing every session's turn
+            # and the liveness heartbeat is not (no-blocking-call-on-event-loop).
+            # Critical writes never take this branch; they fail closed above.
+            if _on_event_loop():
+                logger.warning(
+                    "SEL writer enqueue failed on the event loop; "
+                    "dropping non-critical event",
+                    exc_info=True,
+                )
+                return
             logger.warning("SEL writer enqueue failed; writing synchronously", exc_info=True)
             self._flush_batch([event])
 
@@ -3312,6 +3346,77 @@ def sel() -> SecurityEventLog:
     return SecurityEventLog()
 
 
+async def warm_sel_singleton() -> None:
+    """Prime the SecurityEventLog singleton OFF the event loop at startup.
+
+    The first ``sel()`` of a process runs ``_init_locked`` — blocking file I/O
+    (trust-dir creation, HMAC key load/create, a tail read of the live log) —
+    on whatever thread touches it first. Before this warm existed, every
+    handler that could plausibly be a fresh gateway's first SEL touch carried
+    its own ``asyncio.to_thread`` wrapper (18+ sites), while 250+ other
+    ``log_api_access`` call sites remained candidate first-touch stalls
+    (#8608). Warming once here, before the server accepts traffic, fixes the
+    class: a post-init ``log_api_access`` only enqueues to the writer thread
+    (after the writer's one-time daemon-thread start on first ``log()``), so
+    call sites need no thread hop.
+
+    Both async startup paths (``start_dashboard`` / ``start_api_server``)
+    ``await`` this before building the middleware chain — the same pattern as
+    ``token_auth.warm_auth_singletons``. The cost does not scale with user
+    data: one key-file read (or create), one backward tail read of the live
+    log (a single 4 KiB chunk on a healthy log; worst case a full backward
+    scan of the live log, bounded by rotation's ``_SEGMENT_MAX_BYTES``, when
+    its tail holds no parseable record), and a ``stat``.
+
+    Best-effort by design: construction can raise (e.g. a trust root too
+    short to sign the chain), and an SEL init failure must not keep the
+    gateway from becoming ready — audit degradation is survivable, a boot
+    loop is not. On a failed warm the first later touch retries init on its
+    caller's thread, as every call site did before the per-site hops existed;
+    every ``critical=True`` audit still fails closed at its own site.
+    """
+    try:
+        await asyncio.to_thread(sel)
+    except Exception:
+        logger.warning(
+            "SEL startup warm failed; the first audit write will retry init",
+            exc_info=True,
+        )
+
+
+def sel_is_warm() -> bool:
+    """Is the singleton constructed, so that ``sel()`` is a plain attribute read?
+
+    The complement to :func:`warm_sel_singleton`'s best-effort contract. A
+    failed warm leaves ``_instance`` allocated but ``_initialized`` False, and
+    the next ``sel()`` retries ``_init_locked`` -- blocking file I/O -- on the
+    caller's thread. A call site that must never block the event loop (a
+    middleware deny path is the one every request can hit) asks this first and
+    takes a thread hop ONLY when the answer is no; on the healthy path (the
+    warm succeeded, which is every normal start) it keeps the direct enqueue
+    that #8608 established. Cheap and lock-free: two attribute reads.
+    """
+    inst = SecurityEventLog._instance
+    return inst is not None and bool(getattr(inst, "_initialized", False))
+
+
+def _trust_root_key_loads(path: Path) -> bool:
+    """True when *path* is a regular file currently holding a usable key.
+
+    ``stat`` only — the caller reads the bytes just after, and the point here is
+    to answer "does the resolved path still resolve?" without paying a read on
+    the healthy path. ``S_ISREG`` is load-bearing rather than tidiness: a
+    candidate location an actor can create is a place they can put a FIFO, and
+    opening one blocks in-kernel forever, which an ``asyncio`` timeout cannot
+    reclaim because the thread is stuck in a syscall.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_size >= _HMAC_KEY_MIN_BYTES
+
+
 def sel_hmac_key_path() -> Path:
     """Canonical on-disk location of the SEL trust-root key (``sel_hmac.key``).
 
@@ -3326,11 +3431,63 @@ def sel_hmac_key_path() -> Path:
     (e.g. via ``config_dir()``; ``_default_dir()`` honors ``KIROCREW_HOME`` the
     same way, so resolving through the shared accessor keeps the trust root
     single under isolated-home deployments).
+
+    RE-RESOLVES per call. ``_hmac_key_file`` is decided once inside
+    ``_load_or_create_hmac_key`` and a legacy install can leave it on the legacy
+    location after a failed migration; a sibling process that later completes
+    that migration deletes the file this process is still naming. Without
+    re-resolution every dependent protocol inherits that dead path and has to
+    grow its own recovery, which is one fallback per caller instead of the class
+    being closed (the shape ``session_pid_sig`` was left in by #2574).
+
+    What re-resolution does NOT touch is the audit chain. The chain is signed
+    and verified with ``self._hmac_key``, the BYTES read once at init, and no
+    record carries a key id or generation marker — so re-reading the key file
+    into the signing key mid-process would orphan every record already chained
+    (which is why ``_load_or_create_hmac_key`` raises rather than regenerating,
+    and why migration moves bytes with ``os.replace``). This accessor returns a
+    PATH that the signing and verification code never reads. The anchor stays
+    pinned to the bytes cached at init; only the path handed to dependent
+    protocols follows the file.
+
+    A relocated candidate is adopted ONLY when its bytes equal the key this
+    process already validated at init. Adopting an unverified file would be a
+    downgrade rather than a fix: the resolved path vanishing is exactly the
+    moment an actor who can write the trust directory would plant a key of their
+    own, and handing dependents a path is handing them signing material. When
+    nothing verifies, the resolved path is returned unchanged so the operator
+    report keeps naming the file that actually broke, and
+    ``session_pid_sig._load_hmac_key`` still recovers from the in-memory copy.
     """
     inst = SecurityEventLog._instance
-    if inst is not None and getattr(inst, "_initialized", False):
-        return inst._hmac_key_file
-    return _default_dir() / _TRUST_SUBDIR / _HMAC_KEY_FILE
+    if inst is None or not getattr(inst, "_initialized", False):
+        # No singleton in this process (the verifying MCP process, typically):
+        # this branch already recomputes on every call, so it was never frozen.
+        return _default_dir() / _TRUST_SUBDIR / _HMAC_KEY_FILE
+    resolved: Path = inst._hmac_key_file
+    if _trust_root_key_loads(resolved):
+        return resolved
+    anchor: bytes | None = getattr(inst, "_hmac_key", None)
+    if not anchor:
+        return resolved
+    base: Path = inst._dir
+    # Same precedence as _load_or_create_hmac_key: the trust/ location first,
+    # the legacy sibling-of-the-log location second.
+    for cand in (base / _TRUST_SUBDIR / _HMAC_KEY_FILE, base / _HMAC_KEY_FILE):
+        if cand == resolved or not _trust_root_key_loads(cand):
+            continue
+        try:
+            found = cand.read_bytes()
+        except OSError:
+            continue
+        if hmac.compare_digest(found, anchor):
+            logger.debug(
+                "SEL trust root re-resolved %s -> %s (same key bytes)",
+                resolved,
+                cand,
+            )
+            return cand
+    return resolved
 
 
 def _sel_hmac_key_bytes() -> bytes | None:
@@ -3348,10 +3505,13 @@ def _sel_hmac_key_bytes() -> bytes | None:
     record from that in-memory copy, so the audit chain is immune to the key
     file moving, being deleted, losing read permission, or being truncated
     afterwards. The dependent protocol that re-reads the file on every use is
-    not, and its resolved path is never re-resolved — which is how a gateway
-    ends up publishing unsigned identities forever while its audit chain still
-    looks healthy. These are the same bytes, already validated at init
-    (``>= _HMAC_KEY_MIN_BYTES``, see ``_load_or_create_hmac_key``).
+    not. ``sel_hmac_key_path`` re-resolves a relocation whose bytes match this
+    anchor (#2588), so what reaches here is the residue it cannot resolve — a
+    key deleted, unreadable, truncated, or replaced by bytes that are not the
+    anchor — which is how a gateway would otherwise end up publishing unsigned
+    identities forever while its audit chain still looks healthy. These are the
+    same bytes, already validated at init (``>= _HMAC_KEY_MIN_BYTES``, see
+    ``_load_or_create_hmac_key``).
 
     Returns ``None`` when no initialized singleton exists in this process (the
     verifying MCP process, typically) or the cached key is unusable.

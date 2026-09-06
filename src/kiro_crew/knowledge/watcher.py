@@ -5,20 +5,13 @@ import hashlib
 import json
 import logging
 import os
-from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from kiro_crew.config.loader import KiroCrewConfig, default_project_dir
+from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 
-from .autosource import (
-    AUTO_ADDED_PROP,
-    DEFAULT_DROP_DIRNAME,
-    auto_source_still_contained,
-    discover_and_register,
-)
 from .dedup import dedup_sweep
 from .embedder import embedder_signature
 from .folder_watcher import FolderWatcher, folder_chunk_budget
@@ -28,11 +21,6 @@ from .ingestion import (
     count_stale_items,
     rebuild_embeddings,
     start_rebuild_job,
-)
-from .project_docs import discover_and_register as discover_project_docs
-from .project_docs import (
-    is_project_doc_source,
-    project_source_still_valid,
 )
 from .store import KnowledgeStore
 
@@ -50,25 +38,14 @@ _LARGE_REBUILD_WARN_THRESHOLD = 1000
 class KnowledgeWatcher:
     """Polls registered local_file sources for file changes and re-ingests."""
 
-    def __init__(self, store: KnowledgeStore, pipeline: IngestionPipeline, interval: int = 300,
-                 project_dirs: Callable[[], list[str]] | None = None):
+    def __init__(self, store: KnowledgeStore, pipeline: IngestionPipeline,
+                 interval: int = 300):
         self.store = store
         self.pipeline = pipeline
         self.interval = interval
         self._stop_event = asyncio.Event()
         self._folder_watcher = FolderWatcher(store, pipeline)
         self._reembed_task: asyncio.Task | None = None
-        # Last discovery error signature, for log dedup across sweeps.
-        self._discover_error_sig: str | None = None
-        # Project-docs discovery keeps its OWN error signature: sharing one with
-        # the drop folder would let a failure in either suppress the first log of
-        # a failure in the other.
-        self._project_docs_error_sig: str | None = None
-        # Resolver for the directories the user is working in. Injected by the
-        # dashboard (which owns chat-slot state) rather than importing dashboard
-        # state here. Called ON the event loop -- it reads an in-memory dict the
-        # loop mutates -- so it must not do I/O.
-        self._project_dirs = project_dirs
         # Sweeps completed, for the dedup cadence.
         self._sweep_count = 0
         # False until a scheduled dedup pass has actually applied deletes; the
@@ -91,115 +68,34 @@ class KnowledgeWatcher:
         self._stop_event.set()
         logger.info("Source watcher stopped")
 
-    async def _discover_drop_folder(self) -> None:
-        """Register the workspace drop folder if it has appeared.
+    async def _store_rows(self, sql: str, params: tuple = ()) -> list:
+        """Run a sweep query off the event loop.
 
-        Runs every sweep so a folder created after startup is picked up without
-        a restart (within one ``interval``). Gated on
-        ``knowledge.auto_discover_folder``; re-reads config each sweep so
-        toggling the flag takes effect without a restart, matching KiroCrew's
-        live-config behaviour. Never raises into the sweep: a discovery failure
-        must not stop registered sources from being scanned.
+        The sweep is a background coroutine on the gateway's loop, and sqlite
+        reads are synchronous: a contended database can hold one for as long as
+        ``busy_timeout``, stalling every other task on the loop. ``KnowledgeStore``
+        keeps a connection per THREAD, so a worker thread gets its own rather
+        than sharing the loop's -- the same reason the sweep's writes hop out
+        too. Rows come back detached, so the caller uses them normally.
         """
-        try:
-            cfg = KiroCrewConfig.load()
-            if not cfg.knowledge.auto_discover_folder:
-                return
-            dirname = cfg.knowledge.auto_discover_dirname or DEFAULT_DROP_DIRNAME
-            base = await asyncio.to_thread(default_project_dir)
-            if not base:
-                return
-            source_id = await asyncio.to_thread(
-                discover_and_register, self.store, base, dirname
-            )
-            self._discover_error_sig = None
-            if source_id:
-                # Registering a source that will spend LLM extraction on the
-                # user's files is an auditable mutation -- the manual POST path
-                # SEL-logs it, so the automatic path must too.
-                sel().log_tool_invocation(
-                    session_key="gateway", agent="knowledge-watcher",
-                    tool_name="knowledge.source.auto_add", outcome="completed",
-                    resources=f"source_id={source_id} dirname={dirname}",
-                )
-        except Exception as exc:
-            # Contained so a discovery failure cannot stop the sweep from
-            # scanning already-registered sources. Repeats are deduped: this runs
-            # every interval, and an unanticipated persistent error would
-            # otherwise emit a full traceback forever.
-            sig = f"{type(exc).__name__}:{exc}"
-            if sig != self._discover_error_sig:
-                self._discover_error_sig = sig
-                logger.warning("Knowledge drop-folder discovery failed", exc_info=True)
-            else:
-                logger.debug("Knowledge drop-folder discovery still failing: %s", sig)
-
-    async def _discover_project_docs(self) -> None:
-        """Register the documents of each project the user is working in.
-
-        Runs every sweep so a project opened after startup is picked up without a
-        restart. Gated on ``knowledge.auto_register_project_docs``; re-reads
-        config each sweep so toggling the flag takes effect immediately, matching
-        Kiro Crew's live-config behaviour. Never raises into the sweep: a
-        discovery failure must not stop registered sources from being scanned.
-        """
-        try:
-            cfg = KiroCrewConfig.load()
-            if not cfg.knowledge.auto_register_project_docs:
-                return
-            if self._project_dirs is None:
-                return
-            # Resolved on the loop: it copies a dict that other coroutines on the
-            # loop mutate, so the copy has to happen where those mutations are
-            # serialised against it.
-            dirs = self._project_dirs()
-            if not dirs:
-                return
-            try:
-                max_sources = max(0, int(cfg.knowledge.max_sources))
-            except (TypeError, ValueError):
-                max_sources = 0
-            created = await asyncio.to_thread(
-                discover_project_docs, self.store, dirs, max_sources=max_sources)
-            self._project_docs_error_sig = None
-            for source_id in created:
-                # Registering a source that will spend LLM extraction on the
-                # user's files is an auditable mutation -- the manual POST path
-                # SEL-logs it, so the automatic path must too.
-                sel().log_tool_invocation(
-                    session_key="gateway", agent="knowledge-watcher",
-                    tool_name="knowledge.source.auto_add", outcome="completed",
-                    resources=f"source_id={source_id} kind=project_docs",
-                )
-        except Exception as exc:
-            sig = f"{type(exc).__name__}:{exc}"
-            if sig != self._project_docs_error_sig:
-                self._project_docs_error_sig = sig
-                logger.warning("Knowledge project-docs discovery failed", exc_info=True)
-            else:
-                logger.debug("Knowledge project-docs discovery still failing: %s", sig)
+        return await asyncio.to_thread(
+            lambda: self.store.db.execute(sql, params).fetchall())
 
     async def _scan(self):
         """Check all watched sources for changes."""
-        # Pick up a newly-created workspace drop folder before scanning, so a
-        # folder made since the last sweep is ingested in this same pass.
-        await self._discover_drop_folder()
-        await self._discover_project_docs()
-
         # Global sweep budget: caps total extraction calls across ALL sources in
         # one sweep. Read live so the knob takes effect without a restart.
         sweep_budget = self._sweep_chunk_budget()
         sweep_chunks_used = 0
 
         # Folder sources (local_folder, obsidian_vault)
-        folder_rows = self.store.db.execute(
-            "SELECT id, uri, source_type, properties FROM sources WHERE source_type IN ({})".format(
+        folder_rows = await self._store_rows(
+            "SELECT id, uri, source_type, properties, sync_status FROM sources "
+            "WHERE source_type IN ({})".format(
                 ",".join("?" for _ in FOLDER_SOURCE_TYPES)
             ),
             tuple(FOLDER_SOURCE_TYPES),
-        ).fetchall()
-        ws_base: str | None = None
-        chunk_budget: int | None = None
+        )
         for row in folder_rows:
             # Global budget exhausted — defer remaining sources to next sweep.
             if sweep_budget and sweep_chunks_used >= sweep_budget:
@@ -211,48 +107,19 @@ class KnowledgeWatcher:
             try:
                 source = dict(row)
                 props = self._parse_props(source.get("properties"))
-                if props.get("sync_status") in ("paused", "pending_confirmation"):
+                # Read from the sync_status COLUMN, the single source of truth
+                # the dashboard and SyncScheduler also read. This used to read a
+                # copy inside the properties JSON, so a pause recorded only in
+                # the column still walked and delete-reconciled the whole folder
+                # every sweep.
+                if source.get("sync_status") in ("paused", "pending_confirmation"):
                     continue
-                budget: int | None = None
-                if props.get(AUTO_ADDED_PROP):
-                    # Re-validate containment on EVERY sweep, not just at
-                    # registration: the stored URI is a path that can be swapped
-                    # for a symlink to an external tree after the fact, and
-                    # os.walk would then follow it out of the workspace.
-                    if is_project_doc_source(props):
-                        # A project repo root lives outside the workspace by
-                        # design, so workspace containment is the wrong
-                        # invariant; what must still hold is that the recorded
-                        # path has not been swapped for a link elsewhere.
-                        contained = await asyncio.to_thread(
-                            project_source_still_valid, source["uri"])
-                        if chunk_budget is None:
-                            chunk_budget = self._chunk_budget()
-                        budget = chunk_budget or None
-                    else:
-                        if ws_base is None:
-                            ws_base = await asyncio.to_thread(default_project_dir)
-                        contained = await asyncio.to_thread(
-                            auto_source_still_contained, source["uri"], ws_base or ""
-                        )
-                    if not contained:
-                        logger.warning(
-                            "Skipping auto-added source %s: %s no longer resolves to a "
-                            "permitted directory", source["id"], source["uri"],
-                        )
-                        sel().log_tool_invocation(
-                            session_key="gateway", agent="knowledge-watcher",
-                            tool_name="knowledge.source.auto_scan_denied",
-                            outcome="denied",
-                            resources=f"source_id={source['id']} reason=not_contained",
-                        )
-                        continue
-                else:
-                    # A hand-added folder is paced too. The user asked for the whole
-                    # folder and still gets it -- newest files first, the rest on
-                    # later sweeps -- but pointing the Library at a source repo no
-                    # longer spends the whole bill before anyone can look at it.
-                    budget = folder_chunk_budget(props)
+                # Every folder source is one the user added by hand, and it is
+                # paced: the whole folder still arrives -- newest files first,
+                # the rest on later sweeps -- but pointing the Library at a
+                # source repo no longer spends the whole bill before anyone can
+                # look at it.
+                budget = folder_chunk_budget(props)
 
                 # Apply global budget as an additional cap on the per-source budget.
                 if sweep_budget:
@@ -279,9 +146,10 @@ class KnowledgeWatcher:
                 logger.exception("Error scanning folder source %s", row["uri"])
 
         # Single-file sources (local_file)
-        rows = self.store.db.execute(
-            "SELECT id, uri, properties FROM sources WHERE source_type = 'local_file'"
-        ).fetchall()
+        rows = await self._store_rows(
+            "SELECT id, uri, properties, sync_status FROM sources "
+            "WHERE source_type = 'local_file'"
+        )
 
         for row in rows:
             try:
@@ -292,18 +160,29 @@ class KnowledgeWatcher:
                     logger.warning("Skipping sensitive path: %s", uri)
                     continue
                 if not Path(uri).exists():
-                    # Mark missing
-                    props = self._parse_props(row["properties"])
-                    if props.get("sync_status") != "missing":
-                        props["sync_status"] = "missing"
-                        self.store.update_source(row["id"], properties=json.dumps(props))
+                    # Mark missing in the COLUMN. Writing it into the properties
+                    # JSON instead left the row's visible state stale -- the
+                    # Library renders the column, so a file that had vanished
+                    # went on showing 'synced'. ``if_sync_status`` because the
+                    # value under test came from the snapshot at the top of the
+                    # sweep: a row a manual sync has moved since is left alone
+                    # and re-examined next sweep.
+                    if row["sync_status"] != "missing":
+                        await asyncio.to_thread(
+                            self.store.update_source, row["id"],
+                            sync_status="missing", if_sync_status=row["sync_status"])
                     continue
 
                 mtime = os.stat(uri).st_mtime
                 props = self._parse_props(row["properties"])
                 stored_mtime = props.get("mtime", 0)
-
-                if mtime > stored_mtime:
+                # A row that reads 'missing' has been away, and the mtime gate
+                # cannot speak for it: a restore preserving the archived mtime
+                # (cp -p, rsync -t, tar -x) puts different content on disk under
+                # an mtime that never advanced, so the gate reports 'unchanged'
+                # about a file it has not read. Deletion is exactly the event
+                # that breaks the mtime heuristic, so read the content instead.
+                if mtime > stored_mtime or row["sync_status"] == "missing":
                     # Check content hash to avoid re-ingesting touched-but-unchanged files
                     content_hash = await asyncio.get_running_loop().run_in_executor(
                         None, self._hash_file, Path(uri)
@@ -322,20 +201,42 @@ class KnowledgeWatcher:
                             # persisting mtime/hash so the file is re-evaluated on
                             # the next scan -- raising knowledge.max_ingest_file_mb
                             # (config is read live) then recovers it automatically.
-                            self.store.db.execute(
-                                "UPDATE sources SET sync_status = 'error' WHERE id = ?",
-                                (row["id"],))
-                            self.store.db.commit()
+                            await asyncio.to_thread(
+                                self.store.update_source, row["id"], sync_status="error")
                             continue
                         # Re-read props after ingest (ingest may update them)
-                        source = self.store.get_source_by_uri(uri)
+                        source = await asyncio.to_thread(
+                            self.store.get_source_by_uri, uri)
                         if source:
                             props = self._parse_props(source.get("properties"))
                     props["mtime"] = mtime
                     props["content_hash"] = content_hash
-                    self.store.update_source(row["id"], properties=json.dumps(props))
+                    await asyncio.to_thread(
+                        self.store.update_source, row["id"], properties=json.dumps(props))
+                if row["sync_status"] == "missing":
+                    # The file is back, so the marker has to come off, and the
+                    # CAS on 'missing' is what decides whether this write is the
+                    # one to do it. An ingestion that ran has already written the
+                    # column -- 'synced' when it stored the document, 'error' on
+                    # a partial write -- and moves the row off 'missing', so this
+                    # no-ops. It fires for the outcome that writes NO status: the
+                    # duplicate gate, which refuses the write because a holder
+                    # already holds this exact document (verified under its write
+                    # lock) and deletes this source's superseded items. Without
+                    # this the marker would sit on a file that is present and
+                    # accounted for. Deliberately LAST, after the read: claiming
+                    # 'synced' before reading the file would leave that claim
+                    # standing if the read then failed -- a failed ingest raises,
+                    # so control never reaches here.
+                    await asyncio.to_thread(
+                        self.store.update_source, row["id"],
+                        sync_status="synced", if_sync_status="missing")
             except Exception:
-                logger.exception("Error checking source %s", row.get("uri", row["id"]))
+                # sqlite3.Row has no .get(): the previous spelling raised
+                # AttributeError from inside the handler, which replaced the real
+                # error with a confusing one AND escaped the loop, abandoning
+                # every source after this one for the rest of the sweep.
+                logger.exception("Error checking source %s", row["uri"] or row["id"])
 
         # After file-level reconciliation, self-heal vectors left stale by an
         # embedding-setup change (model/budget) -- the file gates above never fire
@@ -343,18 +244,6 @@ class KnowledgeWatcher:
         await self._maybe_reembed_stale()
         self._sweep_count += 1
         await self._maybe_dedup_sweep()
-
-    @staticmethod
-    def _chunk_budget() -> int:
-        """Chunks an auto-registered source may ingest in one sweep.
-
-        Read per sweep so the value is live. 0 disables the bound.
-        """
-        try:
-            return max(0, int(KiroCrewConfig.load().knowledge.auto_ingest_chunk_budget))
-        except Exception:
-            logger.debug("Could not read auto_ingest_chunk_budget", exc_info=True)
-            return 0
 
     @staticmethod
     def _sweep_chunk_budget() -> int:
@@ -473,6 +362,11 @@ class KnowledgeWatcher:
 
     async def _run_reembed_job(self, embedder, job_id: str) -> None:
         try:
+            # Paced (the default) on purpose: nobody is waiting on a self-heal
+            # sweep, so it embeds at the bulk scheduling class on the reduced
+            # thread pool and idles between rows instead of pinning cores for
+            # the whole corpus. The dashboard-triggered rebuild, which a human
+            # watches, is the path that opts out with pace=False.
             processed = await rebuild_embeddings(self.store, embedder, job_id=job_id)
             # OFFLOADED: single-row write, but a commit can block up to the
             # busy_timeout behind a concurrent writer — keep it off the loop.

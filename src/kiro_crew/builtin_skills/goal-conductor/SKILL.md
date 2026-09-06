@@ -14,7 +14,11 @@ Your four jobs, none of which can be delegated to a work item:
 3. Verify what came back.
 4. Decide the next round, or stop.
 
-Everything else belongs in a work item. This spec has **no `fs_write`** — that
+Everything else belongs in a work item. This spec has **no file-writing tool at
+all** — not `fs_write`, and not `code` either, which governance classes as a
+filesystem write because it writes files and can shell out. `grep`, `glob` and
+`web_search` are unmounted as well; `fs_read` and `web_fetch` are what you read
+the world with. That
 is deliberate. If a task needs a file written, it is a work item, not something
 you do. `execute_bash` IS granted, for exactly one purpose: running this
 skill's bundled scripts — the acceptance evaluator (`scripts/accept_eval.py`)
@@ -98,40 +102,23 @@ beats more parallelism: every open item is a session the user may have to read.
 
 ### Dispatch a round
 
-**Before the round: the goal's folder must exist.** Once per goal, ahead of the
-FIRST `session_create` you ever make for it, call `chat_folder_tree` and then
-`chat_folder_create` for the goal if it is not already there. Keep the returned
-folder id — every session for this goal is filed there.
+For each item in the round:
 
-`session_create` has no `folder` argument, so filing is a separate call and
-therefore easy to skip. Do not skip it. **A `session_create` for this goal
-before its folder exists is a defect, not a shortcut**: the sessions land loose
-at the sidebar's top level, the user cannot tell which goal they belong to, and
-there is no grouping to clean up by when the goal ends. If `chat_folder_create`
-fails, say so and stop — do not dispatch into no folder.
-
-Then for each item in the round:
-
-1. `session_create` with a title that says what the item is FOR, and `agent` set
-   to the crew that fits. Call `select_crew` first and pass the agent it names —
+1. `session_create` with a title that says what the item is FOR, `folder` set to
+   the goal's folder (missing path segments are created automatically, and the
+   session is filed as part of creation — there is no separate move step and no
+   window where the folder can vanish between the two), and `agent` set to the
+   crew that fits. Call `select_crew` first and pass the agent it names —
    the matched crew when the item is clearly a specialist's job, otherwise the
    `default_agent` it returns. **Do NOT leave `agent` unset to "inherit the
    default":** the value inherited is YOUR agent, `kirocrew-conductor`, whose
    spec deliberately has no `fs_write` — so the child could not write a file even
    though writing one is the work you dispatched it to do, and the item would
    look stalled rather than misconfigured.
-2. `chat_folder_move_session` to file the new session under the goal's folder.
-   Do this immediately after the create, before the seed — an unfiled session
-   that then starts working is one the user has to hunt for. **If the move
-   fails, stop this item before the seed** and say so: the folder can be gone
-   by now even though you created it (the user can delete it mid-round), and
-   seeding anyway is exactly the unfiled-session outcome the precondition above
-   exists to prevent — except worse, because the session is now also doing work.
-   Recreate the folder and retry the move, or leave the item undispatched.
-3. `session_send` the seed prompt into the new session — the item's goal, its
+2. `session_send` the seed prompt into the new session — the item's goal, its
    acceptance condition, and where to report. The seed is the item's whole
    contract: the child session gets no other context from you.
-4. `session_ledger_record` the item: its goal text, the round number, and — in
+3. `session_ledger_record` the item: its goal text, the round number, and — in
    `artifacts`, under an `item-<n>` key — the durable item entry carrying its
    acceptance spec, session key, round, status and read cursor. **Never
    hand-write the entry value: encode it with the bundled codec**
@@ -263,10 +250,10 @@ stops growing.
 in the autonudge handler. When the USER messages you mid-flight, there is no
 snapshot — read the ledger yourself before answering anything about item state.
 
-**A terminal phase silences the snapshot.** `render_snapshot` returns empty when
-the phase is terminal. Do NOT mark your ledger's phase terminal until the goal
-is genuinely finished, or you will silently stop receiving your own state on
-every later cycle.
+**A terminal phase silences the snapshot.** `render_snapshot` returns empty once
+the phase is `done` or `abandoned` — the only two terminal values. Do NOT set
+either until the goal is genuinely finished, or you will silently stop receiving
+your own state on every later cycle.
 
 What goes where:
 
@@ -359,20 +346,45 @@ watches, and that cost grows with the loop's own history.
 
 ## Known limits of this version
 
-- **The whole surface sits behind one config switch.** `agent.session_control`
-  defaults to OFF and fails closed — every session tool answers
-  `session_control_disabled` until the user sets it to `true` in config.json.
-  If you see that error, say which switch to flip; do not retry.
+- **The session tools may not be in your tool list yet.** With MCP Tool Search
+  active their specs are deferred, so a first `session_create` fails with
+  `A tool with the name 'session_create' does not exist`. That means DEFERRED, not
+  missing: load it with
+  `tool_search(tool_id="kirocrew-dashboard::session_create")` — `tool_search` is
+  auto-approved for exactly this, so the load never prompts — then repeat the
+  call. `chat_folder_create` is on the same server; `monitor_start` is served by
+  `kirocrew-core`, so its id is `kirocrew-core::monitor_start`.
+- **A cron job may dispatch into the sessions it created**, so a fleet can be
+  stood up and driven from a schedule instead of only from a live chat session.
+  Session control is on by default: the agent config is the grant, so you do not
+  need the user to flip a switch first.
+- **Never dispatch a work item onto `kirocrew-conductor` itself** — it is an
+  unadvertised agent and its spec cannot write a file, so the item would look
+  stalled rather than misconfigured.
+- **The grant is the agent's MCP mount, not a feature switch.** The session tools
+  come from `@kirocrew-dashboard`; an agent whose spec does not mount it never sees
+  them, exactly like any other MCP server. `agent.session_control` defaults to true
+  and exists only as a single withdrawal — if an operator set it to `false`, every
+  session tool answers `session_control_disabled`. If you see that error, say which
+  switch to flip; do not retry.
 - **Reads and creates do not prompt; anything that touches another session does.**
   Auto-approved by name: `chat_folder_tree`, `chat_folder_create`,
   `session_create`, `session_read_message` — so a patrol cycle that wakes on a
-  nudge with nobody at the keyboard never blocks. **`chat_folder_move_session`,
-  `session_send` and `session_stop` are deliberately NOT auto-approved**, because
-  each writes to a session that is not yours: filing rewrites another session's
-  folder, a seed runs as the target's own turn, and a stop discards the target's
-  in-flight work. You ingest external content by design, so the prompt is the only
-  call-time check on all three. Expect an approval per item at dispatch (one to
-  file it, one to seed it) and one if you ever stop an item — all of which happen
+  nudge with nobody at the keyboard never blocks, and filing rides the create
+  itself (the `folder` argument), so it costs no extra approval. The
+  `@kirocrew-core` verbs are granted by name too, and only these: `monitor_start`,
+  `monitor_update`, `autonudge_stop`, `wait`, `resource_status`, `list_sessions`,
+  `session_ledger_read`, `session_ledger_record`, `skill_search`, `skill_fetch`,
+  `select_crew`, `send_message`, `send_notification`, `ask_question`. That covers
+  every core call this procedure asks you to make; **any other core tool is
+  mounted but prompts**, including `task_run`, `workflow_run` and the `spawn_*`
+  family, which this charter forbids you to route a work item to in the first
+  place. **`session_send`
+  and `session_stop` are deliberately NOT auto-approved**, because each writes to
+  a session that is not yours: a seed runs as the target's own turn, and a stop
+  discards the target's in-flight work. You ingest external content by design, so
+  the prompt is the only call-time check on both. Expect one approval per item at
+  dispatch (the seed) and one if you ever stop an item — all of which happen
   right after the user approved a plan, not mid-patrol. `execute_bash` also still
   prompts, so **each patrol cycle blocks on one approval for the
   `accept_eval.py` invocation** plus one per codec call. Size the nudge interval

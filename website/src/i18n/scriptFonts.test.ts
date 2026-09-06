@@ -39,8 +39,9 @@
  * leading unicode-ranged alias is deterministic regardless of what follows it.
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
-import { join, relative } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { readFile, readdir } from 'node:fs/promises'
+import { basename, join, relative } from 'node:path'
 
 import { describe, it, expect } from 'vitest'
 
@@ -92,6 +93,12 @@ const ALIASES = [...SC_ALIASES, ...REGIONAL_ALIASES, ...COMMON_ALIASES] as const
  * Ranges that must stay OUT of every alias. Latin proper plus general punctuation:
  * an alias claiming U+2000-206F would take over quotes, dashes and ellipses in
  * Latin text, which is the same class of silent regression as claiming Latin.
+ *
+ * The ONE intentional exception is 'KC Straight Quotes' (#6374): it claims exactly
+ * U+0022 and U+0027 to replace Space Grotesk's miscut straight quotes. It is
+ * deliberately NOT in ALIASES, so the checks above never run on it; instead it is
+ * pinned separately at the bottom of this file to those two code points and nothing
+ * wider, which is what keeps the exception from quietly growing into a Latin claim.
  */
 const FORBIDDEN = [
   { name: 'Latin (Basic through Extended-B)', lo: 0x0000, hi: 0x024f },
@@ -196,23 +203,32 @@ function scriptToken(block: string, mono = false): string {
 }
 
 /** Every file that DECLARES --font-body or --mono, found by walking the tree. */
-function declarationSites(): Array<{ file: string; line: number; text: string }> {
+async function declarationSites(): Promise<Array<{ file: string; line: number; text: string }>> {
   const out: Array<{ file: string; line: number; text: string }> = []
-  const walk = (dir: string) => {
-    for (const entry of readdirSync(dir)) {
-      if (entry === 'node_modules' || entry.startsWith('.')) continue
-      const full = join(dir, entry)
-      if (statSync(full).isDirectory()) {
-        walk(full)
-        continue
-      }
-      if (!/\.(css|ts|tsx)$/.test(entry)) continue
+  const sourceFiles = async (dir: string): Promise<string[]> => {
+    const entries = await readdir(dir, { withFileTypes: true })
+    const nested = await Promise.all(entries.map(async (entry) => {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) return []
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) return sourceFiles(full)
+      return /\.(css|ts|tsx)$/.test(entry.name) ? [full] : []
+    }))
+    return nested.flat()
+  }
+
+  const files = await sourceFiles(SRC)
+  let next = 0
+  const scan = async () => {
+    while (next < files.length) {
+      const full = files[next++]
+      const entry = basename(full)
       // Tests never declare a font stack, and this file necessarily contains the
       // detection pattern as a literal — without the exclusion it matches itself.
       // The only false-negative this creates is a stack declared inside a test,
       // which would not reach the app.
       if (/\.test\.(ts|tsx)$/.test(entry)) continue
-      readFileSync(full, 'utf8')
+      const content = await readFile(full, 'utf8')
+      content
         .split('\n')
         .forEach((text, i) => {
           // A declaration, not a read: `--font-body:` / `--mono:` / a role token
@@ -226,9 +242,17 @@ function declarationSites(): Array<{ file: string; line: number; text: string }>
         })
     }
   }
-  walk(SRC)
-  return out
+  // Files are independent. A bounded worker set avoids both the serial OneDrive
+  // walk that exceeded Vitest's test budget under full-suite load and an
+  // unbounded Promise.all that could exhaust file descriptors on a larger tree.
+  await Promise.all(Array.from({ length: Math.min(16, files.length) }, scan))
+  return out.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line)
 }
+
+// The three assertions inspect the same immutable source snapshot. Scan once so
+// later assertions cannot pay another full-tree I/O pass or observe a different
+// tree halfway through the file.
+const allDeclarationSites = declarationSites()
 
 describe('script fallback faces', () => {
   it.each(ALIASES)('defines %s with a unicode-range and local()-only sources', (family) => {
@@ -338,14 +362,14 @@ describe('script fallback faces', () => {
 })
 
 describe('font stack declarations', () => {
-  it('finds every declaration site the tree actually contains', () => {
+  it('finds every declaration site the tree actually contains', async () => {
     // Guards the walker itself: if this drops to a handful, the glob broke and the
     // next assertion would pass vacuously.
-    expect(declarationSites().length).toBeGreaterThanOrEqual(12)
+    expect((await allDeclarationSites).length).toBeGreaterThanOrEqual(12)
   })
 
-  it('references the alias token at every declaration site', () => {
-    const offenders = declarationSites()
+  it('references the alias token at every declaration site', async () => {
+    const offenders = (await allDeclarationSites)
       .filter((s) => !/var\(--script-fallbacks(-mono)?\)/.test(s.text))
       .map((s) => `${s.file}:${s.line}: ${s.text.trim().slice(0, 96)}`)
     expect(
@@ -354,9 +378,9 @@ describe('font stack declarations', () => {
     ).toEqual([])
   })
 
-  it('puts the aliases ahead of every Latin base family', () => {
+  it('puts the aliases ahead of every Latin base family', async () => {
     const offenders: string[] = []
-    for (const site of declarationSites()) {
+    for (const site of await allDeclarationSites) {
       const aliasAt = site.text.search(/var\(--script-fallbacks(-mono)?\)/)
       if (aliasAt < 0) continue
       for (const base of BASE_FAMILIES) {
@@ -367,5 +391,51 @@ describe('font stack declarations', () => {
       }
     }
     expect(offenders, offenders.join('\n')).toEqual([])
+  })
+})
+
+/**
+ * The straight-quote alias is the deliberate inverse of every alias above: those
+ * exist to add script coverage WITHOUT touching Latin, while this one exists to
+ * REPLACE the Latin body face for exactly two code points. Space Grotesk (the
+ * default body face) draws U+0022 and U+0027 as its closing curly glyph, so a
+ * straight quote in UI copy — or one a user types — renders as ” / ’ on the wrong
+ * side of the word (#6374). The alias leads the sans stack with a local()
+ * straight-quote face and a unicode-range of just those two code points.
+ *
+ * Two properties keep it safe, and both are pinned here because neither is visible
+ * from reading a family list: it may claim ONLY U+0022 and U+0027 (widening it back
+ * into Latin is the regression FORBIDDEN guards for the other aliases), and it must
+ * stay OUT of the mono tokens (JetBrains Mono already draws straight quotes, so the
+ * override is neither needed nor wanted there).
+ */
+describe('KC Straight Quotes (#6374) — the one deliberate Latin-claiming alias', () => {
+  const FAMILY = 'KC Straight Quotes'
+
+  it('exists, is local()-only, and claims EXACTLY U+0022 and U+0027', () => {
+    const block = faceBlock(FAMILY)
+    expect(block, `no @font-face for '${FAMILY}' in index.css`).not.toBe('')
+    expect(block).toMatch(/src:[^;]*local\(/)
+    expect(block, `'${FAMILY}' must not fetch a remote font`).not.toMatch(/url\(/)
+    const ranges = parseUnicodeRange(block).map((r) => [r.lo, r.hi]).sort((a, b) => a[0] - b[0])
+    // The whole safety of a Latin-claiming leading alias is that it claims these
+    // two code points and no others. Any wider range is a silent Latin takeover.
+    expect(ranges).toEqual([[0x22, 0x22], [0x27, 0x27]])
+  })
+
+  it('leads every sans --script-fallbacks and appears in none of the mono ones', () => {
+    const sansSites: Array<[string, string]> = [
+      ['root', ruleBody(/:root\s*\{([^}]*)\}/)],
+      ...REGIONAL.map(({ lang }) => [lang, htmlLangRuleBody(lang)] as [string, string]),
+    ]
+    for (const [label, block] of sansSites) {
+      const sans = scriptToken(block)
+      const mono = scriptToken(block, true)
+      expect(sans, `'${FAMILY}' missing from the ${label} sans token`).toContain(FAMILY)
+      // Leading is what makes it win for U+0022/U+0027 over the body face without a
+      // unicode-range collision changing anything else (see the aliases' rationale).
+      expect(sans.trimStart().startsWith(`'${FAMILY}'`), `'${FAMILY}' must lead the ${label} sans token`).toBe(true)
+      expect(mono, `'${FAMILY}' must not appear in the ${label} mono token`).not.toContain(FAMILY)
+    }
   })
 })

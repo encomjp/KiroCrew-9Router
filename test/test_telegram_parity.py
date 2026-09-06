@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1024,6 +1025,7 @@ class TestCommandSurface:
             ("/status", "status"),
             ("/ping", "ping"),
             ("/sessions", "sessions"),
+            ("/session launch plan", "sessions"),
             ("/title rename me", "title"),
             ("/cron list", "cron"),
             ("/crons list", "cron"),
@@ -1038,7 +1040,7 @@ class TestCommandSurface:
 
     def test_the_menu_and_the_help_card_stay_one_source(self) -> None:
         names = {name for name, _ in COMMAND_SPEC}
-        assert {"agent", "status", "sessions", "cron"} <= names
+        assert {"agent", "status", "session", "cron"} <= names
         # Every row must survive the Bot API's own constraints, or Telegram
         # rejects the WHOLE array and the user loses the entire menu.
         payload = bot_command_payload()
@@ -1212,62 +1214,71 @@ class TestAgentSwitchSafety:
 
 
 class TestSessionsCommand:
+    @staticmethod
+    def _install_log(dispatcher: Any, log: Any) -> None:
+        dispatcher.conv_log = log
+        dispatcher._session_resume.conv_log = log
+        dispatcher._session_resume._controller.conv_log = log
+
     @pytest.mark.asyncio
-    async def test_the_read_is_audited_on_both_outcomes(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Reaching into the data home and posting what it finds is an access worth
-        # a record — and the FAILURE path is the one that matters most, because an
-        # unaudited I/O error makes the attempt invisible.
-        from kiro_crew.messaging import sessions_view as sv
+    async def test_singular_alias_fuzzy_searches_and_posts_buttons(self, tmp_path: Any) -> None:
+        from kiro_crew.history import ConversationLog
 
-        seen: list[dict] = []
-        monkeypatch.setattr(
-            sv, "sel", lambda: SimpleNamespace(log_api_access=lambda **kw: seen.append(kw))
-        )
         dispatcher, client, _ = _dispatcher({1})
-        monkeypatch.setattr(sv, "_collect_recent_sessions_off_loop", AsyncMock(return_value=[]))
-        await dispatcher.handle_message(_msg("/sessions"))
-        assert seen and seen[-1]["outcome"] == "allowed"
-
-        monkeypatch.setattr(
-            sv,
-            "_collect_recent_sessions_off_loop",
-            AsyncMock(side_effect=OSError("sessions dir gone")),
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        await asyncio.to_thread(
+            log.append,
+            "dashboard:matching",
+            "user",
+            "The blue marmot owns the launch checklist",
         )
-        await dispatcher.handle_message(_msg("/sessions"))
-        assert seen[-1]["outcome"] == "error"
+        await asyncio.to_thread(log.set_title, "dashboard:matching", "General Q&A")
+        await asyncio.to_thread(log.append, "dashboard:other", "user", "Different topic")
+        await asyncio.to_thread(log.set_title, "dashboard:other", "Other session")
+        self._install_log(dispatcher, log)
+
+        await dispatcher.handle_message(_msg("/session blue marmot"))
+
+        heading, markup = client.sent[-1]
+        labels = [row[0]["text"] for row in markup["inline_keyboard"]]
+        assert "Dashboard session search" in heading
+        assert any("General Q&A" in label for label in labels)
+        assert all("Other session" not in label for label in labels)
+
+    @pytest.mark.asyncio
+    async def test_empty_history_says_so(self, tmp_path: Any) -> None:
+        from kiro_crew.history import ConversationLog
+
+        dispatcher, client, _ = _dispatcher({1})
+        self._install_log(dispatcher, ConversationLog(base_dir=tmp_path / "sessions"))
+
+        await dispatcher.handle_message(_msg("/session"))
+
+        assert client.sent[-1][0] == "No recent dashboard sessions."
+
+    @pytest.mark.asyncio
+    async def test_search_failure_is_audited_and_fails_closed(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.messaging import session_resume as resume_core
+
+        dispatcher, client, _ = _dispatcher({1})
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        self._install_log(dispatcher, log)
+        seen: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            resume_core,
+            "sel",
+            lambda: SimpleNamespace(log_api_access=lambda **kw: seen.append(kw)),
+        )
+        monkeypatch.setattr(log, "search_sessions", MagicMock(side_effect=OSError("gone")))
+
+        await dispatcher.handle_message(_msg("/session launch"))
+
+        assert seen and seen[-1]["outcome"] == "error"
         assert seen[-1]["source"] == "telegram"
-        assert "Sessions unavailable" in client.sent[-1][0]
-
-    @pytest.mark.asyncio
-    async def test_an_empty_history_says_so(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        dispatcher, client, _ = _dispatcher({1})
-        monkeypatch.setattr(
-            "kiro_crew.telegram.transport_dispatch.collect_recent_sessions_audited",
-            AsyncMock(return_value=[]),
-        )
-        await dispatcher.handle_message(_msg("/sessions"))
-        assert client.sent[-1][0] == "No recent conversations."
-
-    @pytest.mark.asyncio
-    async def test_rows_are_listed_with_a_live_marker_and_redacted(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        dispatcher, client, _ = _dispatcher({1})
-        rows = [
-            {"title": f"leak {_AWS_KEY}", "agent": "kirocrew", "active": True},
-            {"title": "older thing", "agent": "researcher", "active": False},
-        ]
-        monkeypatch.setattr(
-            "kiro_crew.telegram.transport_dispatch.collect_recent_sessions_audited",
-            AsyncMock(return_value=rows),
-        )
-        await dispatcher.handle_message(_msg("/sessions"))
-        out = client.sent[-1][0]
-        assert "🟢" in out and "⚫" in out
-        assert "older thing" in out and "researcher" in out
-        assert _AWS_KEY not in out
+        assert client.sent[-1][0] == "⚠️ Recent sessions are unavailable."
 
 
 class TestAgentPicker:
@@ -1411,6 +1422,64 @@ class TestUploadGate:
         dispatcher, _, _ = _dispatcher({1})
         assert await dispatcher._uploads_restricted("telegram:kirocrew:direct:1") is False
 
+    @pytest.mark.asyncio
+    async def test_a_persisted_mode_survives_an_empty_tracker(self, tmp_path) -> None:
+        # The restart case. The privacy trackers are process-local and only an
+        # INBOUND channel message populates them, so a turn no inbound message
+        # drove — a cron, a webhook resume, a monitor/auto-nudge re-injection, an
+        # explicit file_send — reaches this gate with empty trackers even though
+        # the user's !incognito is on disk. Without the durable restore the gate
+        # reads "unrestricted" and the bytes leave the session that forbade them.
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.messaging.upload_gate import uploads_restricted
+        from kiro_crew.session_map import SessionMap
+
+        key = "telegram:kirocrew:direct:1"
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            sm = SessionMap()
+        # ``set_flag`` -> ``_save`` schedules a debounced ``_flush_async`` task on
+        # THIS test's loop, so the retirement has to be in a ``finally``: loop
+        # teardown would otherwise destroy it mid-write ("Task was destroyed but
+        # it is pending"), leaking a failure into whichever test runs next.
+        try:
+            sm.set_flag(key, privacy_mode.MODE_INCOGNITO, True)
+            privacy_mode.reset()  # the empty process-local view a restart leaves
+            state = SimpleNamespace(sessions=SimpleNamespace(_session_map=sm))
+
+            assert (
+                await uploads_restricted(
+                    state,
+                    key,
+                    channel_type="telegram",
+                    persisted_probe=lambda _slot: (False, None),
+                )
+                is True
+            )
+        finally:
+            await sm.aclose()
+
+    @pytest.mark.asyncio
+    async def test_an_unflagged_channel_key_stays_allowed_after_the_restore(self, tmp_path) -> None:
+        # The restore must not turn the common case into a refusal: a conversation
+        # with no durable flag is still permitted.
+        from kiro_crew.messaging import privacy_mode
+        from kiro_crew.messaging.upload_gate import uploads_restricted
+        from kiro_crew.session_map import SessionMap
+
+        privacy_mode.reset()
+        with patch("kiro_crew.session_map.config_dir", return_value=tmp_path):
+            state = SimpleNamespace(sessions=SimpleNamespace(_session_map=SessionMap()))
+
+        assert (
+            await uploads_restricted(
+                state,
+                "telegram:kirocrew:direct:1",
+                channel_type="telegram",
+                persisted_probe=lambda _slot: (False, None),
+            )
+            is False
+        )
+
     @pytest.mark.parametrize("restricted", [True, False])
     @pytest.mark.asyncio
     async def test_a_live_dashboard_slot_decides(self, restricted: bool) -> None:
@@ -1428,9 +1497,12 @@ class TestUploadGate:
 
         dispatcher, _, _ = _dispatcher({1})
         dispatcher.dashboard_state = SimpleNamespace(get_slot=lambda _name: None)
-        # Two args now: the gate takes the persisted probe as a PARAMETER rather
-        # than importing it, so `messaging` keeps its one-way dependency.
-        monkeypatch.setattr(ug, "_persisted_mode_is_restricted", lambda key, probe: True)
+        # The persisted probe is a PARAMETER rather than an import, so `messaging`
+        # keeps its one-way dependency; the third argument is the unknown-mode
+        # posture, which the upload ceiling leaves fail-closed.
+        monkeypatch.setattr(
+            ug, "_persisted_mode_is_restricted", lambda key, probe, unknown_denies=True: True
+        )
         assert await dispatcher._uploads_restricted("dashboard:ghost") is True
 
     @pytest.mark.asyncio
@@ -2199,13 +2271,14 @@ class TestSessionsIsDirectMessageOnly:
     @pytest.mark.asyncio
     async def test_a_forum_topic_is_refused_and_lists_nothing(self) -> None:
         dispatcher, client, _ = _dispatcher({1}, allow_forum=True, allowed_forum_chat_ids=[-100999])
-        with patch(
-            "kiro_crew.telegram.transport_dispatch.collect_recent_sessions_audited"
-        ) as collect:
-            await dispatcher.handle_message(_forum_msg("/sessions"))
-        # The refusal is the point, but so is not having READ the directory: a
-        # listing that was collected and then not sent still touched the data home.
-        collect.assert_not_called()
+        picker = AsyncMock()
+        dispatcher._session_resume.show_picker = picker
+
+        await dispatcher.handle_message(_forum_msg("/sessions"))
+
+        # The refusal is the point, but so is not having READ the directory: the
+        # picker owns the read and must never be called for a shared Topic.
+        picker.assert_not_awaited()
         reply = client.sent[-1][0]
         assert "direct message" in reply
         # No titles leak through the refusal itself.
@@ -2220,7 +2293,9 @@ class TestSessionsIsDirectMessageOnly:
         assert "direct message" not in reply
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("command", ["/sessions", "/cron list", "/spawn list"])
+    @pytest.mark.parametrize(
+        "command", ["/sessions", "/session launch", "/cron list", "/spawn list"]
+    )
     async def test_a_listing_needs_an_unambiguous_owner_even_in_a_dm(self, command: str) -> None:
         """A DM is the right audience; it also has to be the right PERSON.
 
@@ -2234,15 +2309,13 @@ class TestSessionsIsDirectMessageOnly:
         dispatcher, client, sessions = _dispatcher({7, 8})
         dispatcher.cron_service = MagicMock()
         dispatcher.subagent_manager = MagicMock()
+        picker = AsyncMock()
+        dispatcher._session_resume.show_picker = picker
 
-        with patch(
-            "kiro_crew.telegram.transport_dispatch.collect_recent_sessions_audited"
-        ) as collect:
-            await dispatcher.handle_message(_dm(command))
+        await dispatcher.handle_message(_dm(command))
 
-        # Refused BEFORE the listing was built, for the same reason a Topic is:
-        # a listing collected and then not sent still read the data.
-        collect.assert_not_called()
+        # Refused BEFORE any picker or host listing is built.
+        picker.assert_not_awaited()
         assert not dispatcher.cron_service.method_calls
         assert "single operator" in client.sent[-1][0]
 
@@ -2793,7 +2866,9 @@ class TestPrivacyModes:
         logged: list = []
         d, _, _ = _dispatcher({7})
         d.conv_log = SimpleNamespace(  # type: ignore[assignment]
-            append=lambda *a, **k: logged.append(a), set_title=lambda *a, **k: None
+            append=lambda *a, **k: logged.append(a),
+            set_title=lambda *a, **k: None,
+            atomic_appends=lambda _key: nullcontext(),
         )
         key = "telegram:kirocrew:direct:7"
         d._persist_turn(key, "hello", "hi there", True, "kirocrew")
@@ -2910,8 +2985,11 @@ class TestARestrictedSessionWritesNothingAtAll:
                 if node.name not in functions:
                     continue
                 # Both shapes count: an early return (``_persist_turn``) and a
-                # guarded branch that answers the user (``_handle_title``).
-                if "is_restricted" not in ast.dump(node):
+                # guarded branch that answers the user (``_handle_title``). The
+                # dashboard-aware helper is named ``_session_restricted`` rather
+                # than ``privacy_mode.is_restricted``; both are explicit gates.
+                dump = ast.dump(node)
+                if "is_restricted" not in dump and "session_restricted" not in dump:
                     ungated.append(f"{channel}.{node.name}")
         assert not ungated, (
             "these write a durable title without checking the privacy mode, so a "
@@ -3062,7 +3140,9 @@ class TestAMidTurnModifierSurvivesTheQueue:
         key = d._session_key(("direct", "7"))
         logged: list = []
         d.conv_log = SimpleNamespace(  # type: ignore[assignment]
-            append=lambda *a, **k: logged.append(a), set_title=lambda *a, **k: None
+            append=lambda *a, **k: logged.append(a),
+            set_title=lambda *a, **k: None,
+            atomic_appends=lambda _key: nullcontext(),
         )
         sessions.enqueue(key, "1", "summarise this", force=True, privacy_request="temporary")
 
@@ -3350,7 +3430,13 @@ class TestPrivacyModeEnforcement:
         with pytest.MonkeyPatch.context() as mp:
             mp.setattr(privacy_mode, "hydrate", lambda s, k: seen.append(k))
             await d.handle_message(_dm("hello"))
-        assert seen == [d._session_key(("direct", "7"))]
+        # Asserted as a SET: what matters is which key is restored and that the
+        # pre-rotation one never is. The restore is idempotent and every gate that
+        # reads the process-local trackers runs it, so pinning a call count here
+        # would fail on a second gate joining the turn rather than on the key
+        # being wrong.
+        assert seen, "the inbound path must restore the durable flags"
+        assert set(seen) == {d._session_key(("direct", "7"))}
 
 
 class TestPollingLoopAck:
@@ -3550,6 +3636,7 @@ class TestFallbackTitleYieldsToAutoTitle:
         log = SimpleNamespace(
             append=lambda *a, **k: None,
             set_title=lambda key, title: titles.append((key, title)),
+            atomic_appends=lambda _key: nullcontext(),
         )
         return log, titles
 
@@ -3711,7 +3798,9 @@ class TestRotationChokepoint:
         d._conv.maybe_rotate(route, time.time() - 3600, idle_minutes=1, daily_reset_hour=-1)
         logged: list[Any] = []
         d.conv_log = SimpleNamespace(  # type: ignore[assignment]
-            append=lambda *a, **k: logged.append(a), set_title=lambda *a, **k: None
+            append=lambda *a, **k: logged.append(a),
+            set_title=lambda *a, **k: None,
+            atomic_appends=lambda _key: nullcontext(),
         )
         await d.handle_message(_dm("/temporary"))
         assert privacy_mode.is_temporary(d._session_key(route))
@@ -3871,29 +3960,29 @@ async def _false(_channel: str) -> bool:
 
 
 class TestSessionsAuditCaller:
-    """The audit's subject is the participant, not the channel.
-
-    `caller` was the constant `"telegram"`, which is the SOURCE. With more than one
-    entry in `allowed_user_ids` — the forum case this channel now serves — a read of
-    every conversation's titles could not be attributed to anyone.
-    """
-
     @pytest.mark.asyncio
-    async def test_the_requesting_user_id_is_the_audited_caller(self) -> None:
-        from kiro_crew.telegram import transport_dispatch as td
+    async def test_the_requesting_user_id_is_the_audited_caller(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from kiro_crew.history import ConversationLog
+        from kiro_crew.messaging import session_resume as resume_core
 
-        d, _, _ = _dispatcher({7})
-        calls: list[dict] = []
+        dispatcher, _, _ = _dispatcher({7})
+        log = ConversationLog(base_dir=tmp_path / "sessions")
+        dispatcher.conv_log = log
+        dispatcher._session_resume.conv_log = log
+        dispatcher._session_resume._controller.conv_log = log
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(
+            resume_core,
+            "sel",
+            lambda: SimpleNamespace(log_api_access=lambda **kw: calls.append(kw)),
+        )
 
-        async def _collect(sessions: Any, **kw: Any) -> list:
-            calls.append(kw)
-            return []
+        await dispatcher.handle_message(_dm("/session"))
 
-        with pytest.MonkeyPatch.context() as mp:
-            mp.setattr(td, "collect_recent_sessions_audited", _collect)
-            await d.handle_message(_dm("/sessions"))
         assert calls and calls[0]["caller"] == "7"
-        assert calls[0]["source"] == "telegram", "the source stays the channel"
+        assert calls[0]["source"] == "telegram"
 
 
 class TestHiddenLinkUrls:
@@ -4046,11 +4135,18 @@ class TestWidgetPressBypassesActivation:
     @pytest.mark.asyncio
     async def test_an_options_press_marks_its_synthetic_message(self) -> None:
         # The flag has to be SET where the synthetic message is built, or the
-        # exemption above is unreachable in production.
+        # exemption above is unreachable in production. The same handoff keeps
+        # model-authored labels out of command parsing and carries the posting
+        # session tag into the dispatcher's provenance gates.
+        from kiro_crew.messaging.renderer import session_provenance_tag
+
         d, client, _ = _dispatcher({7}, forum_activation="mention")
         d.bot_username = "kirocrewbot"
-        seen: list[Any] = []
-        d.handle_message = lambda msg, **kw: seen.append(msg) or _done_none()  # type: ignore[assignment]
+        seen: list[tuple[Any, dict[str, Any]]] = []
+        d.handle_message = (  # type: ignore[assignment]
+            lambda msg, **kw: seen.append((msg, kw)) or _done_none()
+        )
+        tag = session_provenance_tag(d._session_key(("direct", "7")))
         await d.on_callback(
             SimpleNamespace(
                 callback_query_id="q",
@@ -4058,13 +4154,16 @@ class TestWidgetPressBypassesActivation:
                 chat_id=7,
                 chat_type="private",
                 message_id=101,
-                data="opt:0",
+                data=f"opt:0:{tag}",
                 label="alpha",
                 message_thread_id=None,
             )
         )
         assert seen, "the press must re-enter the turn path"
-        assert getattr(seen[0], "from_widget", False) is True
+        msg, kwargs = seen[0]
+        assert getattr(msg, "from_widget", False) is True
+        assert kwargs["interpret_commands"] is False
+        assert kwargs["origin_tag"] == tag
 
 
 async def _done_none() -> None:
@@ -4105,7 +4204,7 @@ class TestDurableWritesUseTheRotatedKey:
         "_handle_model": False,
         "_apply_model": False,
         "_apply_agent": False,
-        "on_callback": False,
+        "_callback_session_key": False,
     }
 
     def test_every_classified_method_matches_its_side(self) -> None:
@@ -4144,7 +4243,12 @@ class TestDurableWritesUseTheRotatedKey:
             elif "_session_key(route)" in line and current:
                 consumers.add(current)
         # These resolve a key for reasons the durable/live split does not govern.
-        exempt = {"_rotated_session_key", "handle_message", "_notify_mode"}
+        exempt = {
+            "_rotated_session_key",
+            "handle_message",
+            "_notify_mode",
+            "_callback_session_key",
+        }
         missing = consumers - set(self._CLASSIFIED) - exempt
         assert not missing, f"unclassified session-key consumers: {sorted(missing)}"
 

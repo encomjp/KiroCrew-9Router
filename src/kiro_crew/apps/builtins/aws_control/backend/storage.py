@@ -34,13 +34,22 @@ from __future__ import annotations
 
 import json
 import logging
+import mimetypes
 import os
 import re
 import secrets
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
+from kiro_crew import platform_compat
+from kiro_crew.config.paths import data_home
 from kiro_crew.deploy import engine
 from kiro_crew.deploy.engine import AWSError, _checked, _harden_bucket
+from kiro_crew.platform_compat import is_link_or_junction
+from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
 
@@ -316,8 +325,6 @@ def list_section(
         # other tools): a key embedding a credential or beacon URL must not
         # reach the dashboard verbatim. Same double-pass discipline as every
         # other egress surface.
-        from kiro_crew.security import redact_credentials, redact_exfiltration_urls
-
         name, _ = redact_credentials(name)
         name, _ = redact_exfiltration_urls(name)
         return name
@@ -342,6 +349,132 @@ def list_section(
     }
 
 
+def list_library_folders(profile: str, region: str, bucket: str, *, account: str) -> list[str]:
+    """Every immediate folder name directly under ``artifacts/`` — RAW, unredacted.
+
+    Singular rather than section-parameterized, unlike its object-I/O siblings.
+    The Library is the only section with a local ledger to reconcile, so a
+    ``section`` argument here would have exactly one reachable value; the prefix
+    is anchored from ``SECTION_PREFIXES`` inside, which keeps the rule that a raw
+    prefix never comes from a caller.
+
+    Deliberately NOT :func:`list_section`. That one is a DISPLAY read: it runs
+    every name through the egress redactors, which is right for a name rendered
+    in the dashboard and wrong for an IDENTITY read. The Library reconcile
+    compares these names against ledger KEYS, and a redacted name matches no
+    key — so a reconcile fed the display listing could read a cloud copy that
+    is present as absent, and drop a live ledger entry on that reading.
+
+    Also deliberately without a page token. Omitting ``--max-items`` lets the
+    CLI auto-paginate and applies ``--query`` to the MERGED result (the same
+    property :func:`usage` relies on), so the answer is either the COMPLETE
+    set of folders or a raised error — never a first page a caller could
+    mistake for the whole prefix. Callers here reason about ABSENCE, and
+    absence from a partial listing is not absence.
+
+    For the same reason an unreadable response RAISES instead of degrading to
+    an empty list, unlike :func:`usage`: empty means "nothing in the cloud",
+    and a caller acting on that would discard every record it holds.
+    """
+    prefix = SECTION_PREFIXES["library"]
+    out = _checked(
+        [
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            bucket,
+            "--prefix",
+            prefix,
+            "--delimiter",
+            "/",
+            "--expected-bucket-owner",
+            account,
+            "--output",
+            "json",
+            "--query",
+            "CommonPrefixes[].Prefix",
+        ],
+        profile,
+        action="s3:ListBucket",
+        timeout=60,
+    )
+    try:
+        rows = json.loads(out or "[]") or []
+    except json.JSONDecodeError:
+        raise AWSError(
+            "the folder listing returned a response that could not be read as JSON; "
+            "refusing to report the section as empty"
+        ) from None
+    return [
+        row[len(prefix) :].rstrip("/")
+        for row in rows
+        if isinstance(row, str) and row.startswith(prefix) and row[len(prefix) :].strip("/")
+    ]
+
+
+def list_object_keys(profile: str, region: str, bucket: str, *, account: str) -> set[str]:
+    """Every object key in the drive — RAW, unredacted, complete or raised.
+
+    The share ledger's rows name objects, and only the bucket can say whether
+    one is still there. This is the read that answers it for a whole render at
+    once: one listing, membership-tested per row.
+
+    Deliberately NOT :func:`object_exists` per row, which is the obvious shape
+    and the wrong one here. That function answers ``rc == 0``, so a throttle, a
+    timeout, an expired session and a 404 are one answer. Collapsing them is
+    correct where it lives — a mint refuses rather than signing a URL for an
+    object it could not see — and is the opposite of correct on this path,
+    where "could not see" would report a live share as broken. One listing that
+    fails LOUDLY replaces up to ``shares._MAX_SHARES`` probes that cannot.
+
+    The same two rules :func:`list_library_folders` states hold here, for the
+    same reason — the caller reasons about ABSENCE, and absence from a partial
+    listing is not absence:
+
+    * No ``--max-items`` and no page token. The CLI auto-paginates and applies
+      ``--query`` to the MERGED result, so the answer is the COMPLETE key set
+      or an error, never a first page a caller could mistake for the drive.
+    * An unreadable response RAISES instead of degrading to an empty set,
+      unlike :func:`usage`. Empty means "the drive holds nothing", and a caller
+      acting on that would mark every share it holds as pointing at nothing.
+
+    Also deliberately NOT redacted, for the reason :func:`list_library_folders`
+    gives: these keys are compared against LEDGER keys, and a redacted key
+    matches none of them — so a share whose object is present would read as
+    absent. Nothing here reaches the dashboard; only the membership answer does.
+
+    The whole bucket rather than one section per call: a share row can name any
+    shareable section, and one listing has one failure mode where several would
+    have one each. Listing the whole bucket at drive scale is the cost
+    :func:`usage` already accepts.
+    """
+    out = _checked(
+        [
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            bucket,
+            "--expected-bucket-owner",
+            account,
+            "--output",
+            "json",
+            "--query",
+            "Contents[].Key",
+        ],
+        profile,
+        action="s3:ListBucket",
+        timeout=120,
+    )
+    try:
+        rows = json.loads(out or "[]") or []
+    except json.JSONDecodeError:
+        raise AWSError(
+            "the object listing returned a response that could not be read as JSON; "
+            "refusing to report the drive as empty"
+        ) from None
+    return {row for row in rows if isinstance(row, str)}
+
+
 #: Ceiling for a single owner-pinned transfer. ``put-object`` is one request and
 #: S3 rejects a body over 5 GiB; ``s3 cp`` would have split it into a multipart
 #: upload, but no ``aws s3`` command accepts ``--expected-bucket-owner``, so a
@@ -349,6 +482,33 @@ def list_section(
 #: drive's own upload cap is far below this; only a session archive could approach
 #: it, and it is better for that to fail with a reason than to move unpinned.
 _MAX_PINNED_TRANSFER_BYTES = 5 * 1024 * 1024 * 1024
+
+#: Content-Type prefixes the upload is allowed to declare. The preview dialog
+#: renders these through a presigned URL in an ``<img>``/``<video>``/``<audio>``/
+#: ``<iframe>``, and a browser only renders inline what the object's stored
+#: Content-Type says it is -- with S3's ``binary/octet-stream`` default, a PDF
+#: downloads instead of showing. Everything else stays on that default ON
+#: PURPOSE: ``text/html`` and ``image/svg+xml`` would make a shared or downloaded
+#: object render as a live document on the bucket origin, script included, when
+#: the same file opened in-app goes through the text preview as inert bytes.
+_INLINE_CONTENT_TYPE_PREFIXES = ("image/", "video/", "audio/")
+_INLINE_CONTENT_TYPES = frozenset({"application/pdf"})
+_INLINE_CONTENT_TYPE_DENY = frozenset({"image/svg+xml"})
+
+
+def inline_content_type(key: str) -> str:
+    """The Content-Type to store for ``key``, or ``""`` to keep S3's default.
+
+    Guessed from the extension and then filtered to the inline-safe set above;
+    a type outside it returns ``""`` rather than the guess, so an ``.html``
+    upload is stored as an opaque blob exactly as it was before previews.
+    """
+    guessed, _ = mimetypes.guess_type(key)
+    if not guessed or guessed in _INLINE_CONTENT_TYPE_DENY:
+        return ""
+    if guessed in _INLINE_CONTENT_TYPES or guessed.startswith(_INLINE_CONTENT_TYPE_PREFIXES):
+        return guessed
+    return ""
 
 
 def put_file(
@@ -372,6 +532,12 @@ def put_file(
     there can allow the write. The upload would then succeed into a stranger's
     bucket carrying the owner's file. ``--expected-bucket-owner`` is what makes S3
     itself reject that, per request, whatever the policy says.
+
+    The stored Content-Type is guessed from the KEY's extension. Without it S3
+    defaults to ``binary/octet-stream``, and a presigned URL then serves a PDF
+    or a video as a forced download instead of rendering inline — the preview
+    surface depends on the browser trusting this header. An extension
+    ``mimetypes`` cannot place keeps the S3 default rather than guessing.
     """
     size = os.path.getsize(local_path)
     if size > _MAX_PINNED_TRANSFER_BYTES:
@@ -380,19 +546,22 @@ def put_file(
             "single owner-pinned upload; refusing rather than transferring without "
             "the bucket-owner check"
         )
+    args = [
+        "s3api",
+        "put-object",
+        "--bucket",
+        bucket,
+        "--key",
+        section_key(section, key),
+        "--body",
+        local_path,
+    ]
+    content_type = inline_content_type(key)
+    if content_type:
+        args += ["--content-type", content_type]
+    args += ["--expected-bucket-owner", account]
     _checked(
-        [
-            "s3api",
-            "put-object",
-            "--bucket",
-            bucket,
-            "--key",
-            section_key(section, key),
-            "--body",
-            local_path,
-            "--expected-bucket-owner",
-            account,
-        ],
+        args,
         profile,
         action="s3:PutObject",
         timeout=timeout,
@@ -431,6 +600,276 @@ def get_file(
         ],
         profile,
         action="s3:GetObject",
+        timeout=timeout,
+    )
+
+
+#: Gateway-owned transfer staging, a TOP-LEVEL leaf of the data home. Every
+#: agent sandbox bind-masks it and the shared file-tool gate refuses it
+#: (``sandbox._CREW_HIDDEN_LEAVES`` / ``security._CREW_SECRET_LEAVES`` carry the
+#: matching entry -- a test pins the three together, because moving the staging
+#: root out of that directory would silently un-fence it). Top-level rather than
+#: under ``apps/aws-control/``: a mask covers the leaf, not its ancestors, and an
+#: agent-writable ancestor (``apps/``, ``apps/aws-control/``) could be renamed
+#: out from under it mid-transfer so the CLI's path resolves through a planted
+#: link. At the top level the only ancestors are the data home and ``$HOME``,
+#: the same residual every other fenced leaf (the credential staging included)
+#: already stands on. It is NOT the app's ``data`` directory either: that one
+#: holds the owner-authorization bits and must stay masked from the CLI spawn,
+#: whereas this one is exactly what that spawn is granted.
+STAGING_DIR_LEAF = "aws-control-staging"
+
+#: Read-back chunk for the staged preview file. The window is a few hundred
+#: KB at most, so this is about not asking for one oversized buffer, not about
+#: throughput.
+_STAGING_READ_CHUNK = 64 * 1024
+
+#: S3's error code for a byte range that starts past the end of the object --
+#: the only way a ``bytes=0-N`` range fails, which means the object is empty.
+_S3_INVALID_RANGE_CODE = "InvalidRange"
+
+
+def _preview_staging_parent() -> Path:
+    """The agent-masked root that preview staging directories are cut under.
+
+    On a sandboxed host the root already exists by the time any agent runs: the
+    sandbox materialises it before every namespace spawn
+    (``sandbox._CREW_PRECREATE_HIDDEN_DIR_LEAVES``), because a mask can only bind
+    over a name that exists, and a root created lazily here would appear inside
+    an already-running sandbox's view. The ``mkdir`` below therefore matters only
+    where no sandbox is masking anything (sandbox off, Windows) and is a no-op
+    otherwise.
+
+    Guarded the way the backup restore staging is: the directory itself must be
+    a real directory -- a link planted at the root would put every staged file
+    outside the fence, which no per-file check can see. One function so a test
+    can point it at a temp dir.
+    """
+    base = data_home()
+    staging = base / STAGING_DIR_LEAF
+    if is_link_or_junction(staging):
+        raise ValueError("preview staging directory is not a real directory")
+    # No parents=True: the leaf sits directly under the data home, which exists
+    # for as long as the gateway does. A missing parent is a real error here,
+    # not something to paper over with a freshly minted tree.
+    staging.mkdir(exist_ok=True)
+    # Re-check after mkdir: exist_ok=True happily accepts a pre-existing link,
+    # and resolving both sides is what catches a component swapped higher up.
+    if staging.resolve() != (base.resolve() / STAGING_DIR_LEAF):
+        raise ValueError("preview staging directory resolves outside the data home")
+    if not staging.is_dir():
+        raise ValueError("preview staging directory is not a real directory")
+    if platform_compat.IS_POSIX:
+        platform_compat.chmod_safe(str(staging), 0o700)
+    else:
+        platform_compat.restrict_dir_to_owner(str(staging))
+    return staging
+
+
+def get_object_head_bytes(
+    profile: str,
+    region: str,
+    bucket: str,
+    section: str,
+    key: str,
+    *,
+    account: str,
+    max_bytes: int,
+) -> tuple[bytes, int]:
+    """The first ``max_bytes`` of ``section/key`` plus the object's FULL size.
+
+    Exists for the gateway-proxied text preview: the browser cannot fetch a
+    presigned URL itself because the bucket carries no CORS configuration, so
+    the gateway reads on its behalf. A ``--range`` bounds the transfer to the
+    preview window — S3 answers with the whole object when it is smaller than
+    the range, which is the desired behaviour, not an error.
+
+    The full size comes from the same response (``ContentRange``'s total,
+    falling back to ``ContentLength``), so the caller can tell a truncated
+    preview from a complete one without a second round trip. Owner-pinned
+    like every other transfer, for :func:`put_file`'s name-reuse reason.
+
+    The CLI only writes to a path, and a path in a shared temp directory is
+    attacker-influenceable: a same-UID process watching that directory can
+    swap the file for a link between our create and the CLI's open, and the
+    CLI — writing with the gateway's reach — then lands the object bytes on
+    whatever the link names. So the file is staged in a fresh private
+    directory under :data:`STAGING_DIR_LEAF`, which every agent sandbox masks
+    and the shared file-tool gate refuses. That mask would hide the directory
+    from the sandboxed CLI as well, so the per-call directory is named in
+    ``extra_visible_dirs`` — lifting the mask for this one fixed-argv spawn,
+    never for the agent.
+
+    The mask is a Linux/macOS mechanism; Windows has no sandbox, so there the
+    destination is pinned by IDENTITY instead of by hiding, and the pin covers
+    the whole path, not just the file. The staging root and then the per-call
+    directory are each opened and held (:func:`platform_compat.pin_directory`,
+    which refuses a link or reparse point at the name) before anything inside
+    them is named: a held directory can be neither renamed nor deleted, nor can
+    any directory above it, so the path the CLI writes through cannot be
+    re-pointed at a planted junction. Inside it the gateway creates the
+    destination itself, exclusively (``O_EXCL`` refuses a name something else
+    planted first — a hard link to a sensitive file included) and holds that
+    handle open across the CLI call too. After the call the path is re-checked
+    against the held file handle (device, inode, link count) and the bytes are
+    read back through that handle rather than by reopening the path, so a link
+    that appeared anyway is refused rather than followed. The directory is
+    removed before returning — nothing of the object outlives the call.
+    """
+    staging_parent = _preview_staging_parent()
+    # Pin the root BEFORE cutting the per-call directory, then pin that
+    # directory before naming anything inside it. Each pin refuses a link or
+    # reparse point at the name, and on Windows -- where no mask hides the
+    # tree -- a pinned directory can be neither renamed nor deleted, and
+    # neither can anything above it. So by the time the destination is created
+    # below, every component of the path the CLI will write through is held
+    # in place: a watcher can no longer rename the directory away and plant a
+    # junction at its name between our create and the CLI's open.
+    root_fd = platform_compat.pin_directory(staging_parent)
+    dir_fd = -1
+    fd = -1
+    tmp_dir = ""
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix="drive-preview-", dir=str(staging_parent))
+        dir_fd = platform_compat.pin_directory(tmp_dir)
+        if platform_compat.IS_POSIX:
+            platform_compat.chmod_safe(tmp_dir, 0o700)
+        else:
+            platform_compat.restrict_dir_to_owner(tmp_dir)
+        tmp_path = os.path.join(tmp_dir, "object")
+        # Ours, exclusively, before the CLI ever sees the name. A pre-planted
+        # entry of any kind fails the create instead of becoming the target.
+        # Created RELATIVE to the pinned directory where the platform allows,
+        # so even our own open cannot be steered by a re-resolved path.
+        create_flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        if os.open in os.supports_dir_fd:
+            fd = os.open("object", create_flags, 0o600, dir_fd=dir_fd)
+        else:
+            fd = os.open(tmp_path, create_flags, 0o600)
+        created = os.fstat(fd)
+        try:
+            out = _checked(
+                [
+                    "s3api",
+                    "get-object",
+                    "--bucket",
+                    bucket,
+                    "--key",
+                    section_key(section, key),
+                    "--range",
+                    f"bytes=0-{max_bytes - 1}",
+                    "--expected-bucket-owner",
+                    account,
+                    "--output",
+                    "json",
+                    tmp_path,
+                ],
+                profile,
+                action="s3:GetObject",
+                timeout=60,
+                extra_visible_dirs=(tmp_dir,),
+            )
+        except AWSError as exc:
+            # A byte range is unsatisfiable against a 0-byte object, and S3
+            # says so with 416 InvalidRange rather than an empty body. The
+            # file is perfectly readable and simply empty -- an empty object
+            # can be created out-of-band by any tool the bucket name reaches --
+            # so that one answer is the empty preview, not a failure.
+            if _S3_INVALID_RANGE_CODE in str(exc):
+                return b"", 0
+            raise
+        # The CLI wrote through the PATH; the bytes are read through the
+        # HANDLE. The two must still be the same file, and that file must
+        # have exactly the one name we gave it.
+        landed = os.stat(tmp_path)
+        if (landed.st_dev, landed.st_ino) != (created.st_dev, created.st_ino):
+            raise ValueError("preview staging file was replaced during the transfer")
+        if landed.st_nlink != 1:
+            raise ValueError("preview staging file has been linked elsewhere")
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, _STAGING_READ_CHUNK)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+    finally:
+        # Handles go before the rmtree: on Windows the pins are exactly what
+        # would make the removal fail.
+        for handle in (fd, dir_fd, root_fd):
+            if handle >= 0:
+                os.close(handle)
+        # The preview must not fail over a leftover staging directory.
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    try:
+        meta = json.loads(out or "{}") or {}
+    except json.JSONDecodeError:
+        meta = {}
+    size = 0
+    content_range = str(meta.get("ContentRange", ""))
+    if "/" in content_range:
+        try:
+            size = int(content_range.rsplit("/", 1)[1])
+        except ValueError:
+            size = 0
+    if not size:
+        size = int(meta.get("ContentLength", 0) or 0)
+    # A garbled response must not report a shorter object than the bytes in
+    # hand — that would read as "not truncated" on a truncated preview.
+    return data, max(size, len(data))
+
+
+def copy_object(
+    profile: str,
+    region: str,
+    bucket: str,
+    section: str,
+    from_key: str,
+    to_key: str,
+    *,
+    account: str,
+    timeout: int = 600,
+) -> None:
+    """Server-side copy of ``section/from_key`` to ``section/to_key``.
+
+    ``s3api copy-object`` rather than ``s3 cp`` for the same reason as
+    :func:`put_file`: the high-level ``aws s3`` commands cannot carry the
+    bucket-owner pin. Both ends are pinned — ``--expected-bucket-owner`` for
+    the destination write and ``--expected-source-bucket-owner`` for the read
+    — so a renamed bucket in a stranger's account can serve neither side.
+
+    The copy source travels inside an HTTP header, so its key is URL-encoded
+    here (``/`` kept as the separator); the destination ``--key`` is a plain
+    request parameter and stays raw. Bytes never transit this host: S3 copies
+    within the bucket, which is what makes copy-then-delete a safe move — the
+    caller deletes the source only after this call returned without raising.
+    """
+    source = quote(f"{bucket}/{section_key(section, from_key)}", safe="/")
+    _checked(
+        [
+            "s3api",
+            "copy-object",
+            "--bucket",
+            bucket,
+            "--key",
+            section_key(section, to_key),
+            "--copy-source",
+            source,
+            "--expected-bucket-owner",
+            account,
+            "--expected-source-bucket-owner",
+            account,
+        ],
+        profile,
+        action="s3:PutObject",
         timeout=timeout,
     )
 
@@ -734,8 +1173,30 @@ def object_exists(
     Presigning is LOCAL signing — S3 is never consulted — so without this
     check a typo'd key would mint a working-looking URL that 404s for the
     recipient AND leave a phantom entry in the share ledger.
+
+    Only a HEAD that S3 itself answered 404/NotFound reads as "absent".
+    Any other failure — a timeout, a throttle, a credential lapse, an
+    owner-pin 403 — RAISES instead of returning ``False``: the move handler
+    treats ``False`` on the destination as permission to copy over that key,
+    so folding a transient error into "absent" would turn one failed HEAD
+    into an overwrite plus a source delete.
     """
-    rc, _out, _err = engine.run_aws(
+    return head_object_meta(profile, region, bucket, section, key, account=account) is not None
+
+
+def head_object_meta(
+    profile: str, region: str, bucket: str, section: str, key: str, *, account: str
+) -> Optional[dict[str, Any]]:
+    """``head-object`` for ``section/key``: its metadata, or ``None`` when absent.
+
+    The same HEAD :func:`object_exists` makes, with the response kept: the
+    download path needs the stored ``ContentType`` so the dashboard can tell a
+    real PDF from a ``.pdf``-named object uploaded before content types were
+    set (those are served as octet-stream, which a sandboxed iframe can neither
+    render nor download). Same absent/raise contract as ``object_exists``: only
+    an S3 404 reads as ``None``; anything else raises.
+    """
+    rc, out, err = engine.run_aws(
         [
             "s3api",
             "head-object",
@@ -745,11 +1206,27 @@ def object_exists(
             section_key(section, key),
             "--expected-bucket-owner",
             account,
+            "--output",
+            "json",
         ],
         profile,
         timeout=30,
     )
-    return rc == 0
+    if rc == 0:
+        try:
+            meta = json.loads(out or "{}")
+        except json.JSONDecodeError:
+            meta = {}
+        return meta if isinstance(meta, dict) else {}
+    # head-object reports a missing key as "(404)... Not Found" on stderr
+    # (HEAD carries no body, so there is no NoSuchKey code to parse).
+    text = err or ""
+    if "(404)" in text or "Not Found" in text:
+        return None
+    raise AWSError(
+        "head-object failed — cannot tell whether the key exists. "
+        f"({engine._trimmed_stderr(err)})"
+    )
 
 
 def presign(
@@ -828,3 +1305,97 @@ def usage(profile: str, region: str, bucket: str, *, account: str) -> dict[str, 
         "objects": total_objects,
         "sections": per_section,
     }
+
+
+# --- search -----------------------------------------------------------------
+
+#: One listing window per round-trip. Same client-side pagination the drive's
+#: other walks use; the token loop below is what lets a hit-heavy search stop
+#: without listing the rest of the section.
+_SEARCH_PAGE_ITEMS = 1000
+
+#: How many hits a search hands back before it stops walking. Public because
+#: the search route echoes it in the response and the dashboard interpolates
+#: it into the "showing the first N" notice -- this constant is the ONLY place
+#: the number lives, so changing it never strands a translation.
+SEARCH_MAX_RESULTS = 200
+
+
+def search_keys(
+    profile: str,
+    region: str,
+    bucket: str,
+    section: str,
+    query: str,
+    *,
+    account: str,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Case-insensitive filename search across one section's whole prefix.
+
+    S3 has no server-side substring filter, so this pages ``list-objects-v2``
+    under the section prefix and matches locally — against the ENTIRE
+    section-relative key, not just the basename, so ``reports/2026`` finds a
+    file by its folder as well as its name. Folder placeholders (keys ending
+    in ``/``) are navigation structure, not files, and are skipped.
+
+    Returns ``(results, capped)``. ``capped`` is True when a match BEYOND the
+    :data:`SEARCH_MAX_RESULTS` cap was observed and the walk stopped EARLY —
+    exactly the cap's worth of hits is a complete result set, not a truncated
+    one. The remaining pages are never requested, which is what keeps a broad
+    query on a large drive bounded.
+
+    Matching runs on the RAW relative key; the key handed back is run through
+    the same egress redactors as :func:`list_section`, because these names
+    render in the dashboard and can be authored outside this app.
+    """
+
+    def _safe_name(name: str) -> str:
+        name, _ = redact_credentials(name)
+        name, _ = redact_exfiltration_urls(name)
+        return name
+
+    prefix = SECTION_PREFIXES[section]
+    needle = query.lower()
+    results: list[dict[str, Any]] = []
+    token = ""
+    while True:
+        args = [
+            "s3api",
+            "list-objects-v2",
+            "--bucket",
+            bucket,
+            "--prefix",
+            prefix,
+            "--max-items",
+            str(_SEARCH_PAGE_ITEMS),
+            "--expected-bucket-owner",
+            account,
+            "--output",
+            "json",
+        ]
+        if token:
+            args += ["--starting-token", token]
+        out = _checked(args, profile, action="s3:ListBucket", timeout=60)
+        data = json.loads(out or "{}")
+        for obj in data.get("Contents", []) or []:
+            key = obj.get("Key", "")
+            rel = key[len(prefix) :]
+            if not rel or rel.endswith("/"):
+                continue
+            if needle in rel.lower():
+                # ``capped`` means "there were MORE than the cap", so it is
+                # decided by the first match past the cap, not by the cap-th
+                # one: exactly SEARCH_MAX_RESULTS hits is a complete result set
+                # and must not be reported as truncated.
+                if len(results) >= SEARCH_MAX_RESULTS:
+                    return results, True
+                results.append(
+                    {
+                        "key": _safe_name(rel),
+                        "size": obj.get("Size", 0),
+                        "modified": obj.get("LastModified", ""),
+                    }
+                )
+        token = data.get("NextToken", "")
+        if not token:
+            return results, False

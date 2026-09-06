@@ -25,7 +25,7 @@ function Harness({
   handleEscape?: boolean
 }) {
   const ref = useRef<HTMLDivElement>(null)
-  useDialogFocusTrap(ref, onEscape, enabled, handleEscape)
+  useDialogFocusTrap(ref, onEscape, { enabled, handleEscape })
   return (
     <div ref={ref} role="dialog">
       <button data-testid="first">first</button>

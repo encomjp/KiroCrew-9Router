@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from kiro_crew import platform_compat
+from kiro_crew.apps.builtins.ops_mission_control.backend.models import CorruptDocumentError
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 from kiro_crew.sel import sel
@@ -197,18 +198,145 @@ class KeystoneFileBackend:
     def _path(self) -> Path:
         return self._pinned_path if self._pinned_path is not None else secrets_path()
 
-    def _read(self) -> dict[str, dict[str, str]]:
-        try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return {}
+    @staticmethod
+    def _coerce(raw: Any, *, strict: bool = False) -> dict[str, dict[str, str]]:
+        """Normalize a parsed store to ``provider -> {field: value}``, all strings.
+
+        Shared by both readers below so the only thing that can differ between
+        them is which read FAILURES are allowed to answer "empty".
+
+        ``strict`` is the update path, and its rule is the one three review
+        rounds converged on for the incident index (see
+        ``store._coerce_index``): deserialize, re-serialize, and refuse if
+        anything that was on disk did not survive. The lenient coercion drops a
+        provider whose entry is not an object and retypes a field that is not a
+        string -- right for a LOOKUP, where the worst outcome is "not
+        configured", and destruction on the update path, where the caller
+        rewrites the whole file from what this returns. The refusal names the
+        entry's POSITION and nothing else: in a malformed document ANY part --
+        the provider key included -- can be a pasted credential, so no
+        document content may ride on an exception that crosses into responses
+        and logs. Found in review (GPT 5.6), which produced the counterexample
+        ``{"<token>": "scalar"}``.
+        """
         if not isinstance(raw, dict):
+            if strict:
+                raise CorruptDocumentError("secret store root is not a JSON object", "", 0)
             return {}
         out: dict[str, dict[str, str]] = {}
         for provider, fields in raw.items():
             if isinstance(fields, dict):
                 out[str(provider)] = {str(k): str(v) for k, v in fields.items()}
+        if strict:
+            for index, (provider, fields) in enumerate(raw.items()):
+                if out.get(str(provider)) != fields:
+                    raise CorruptDocumentError(
+                        f"secret store entry at position {index} would not survive "
+                        "a read-write cycle",
+                        "",
+                        0,
+                    )
         return out
+
+    def _read(self) -> dict[str, dict[str, str]]:
+        """Every stored secret, or ``{}`` when there is nothing readable.
+
+        A LOOKUP read: ``get``/``configured_fields`` answer "not configured"
+        rather than raising, so the Settings UI still renders and a provider
+        whose token cannot be loaded is refused by the fail-closed
+        ``has_secrets`` check instead of 500ing the route. See
+        :meth:`_read_for_update` for why a mutation may not stand on the same
+        answer.
+
+        An absent file is silent -- no secret has been stored yet, not a fault.
+        Anything else is logged, because the state this degrades into looks
+        exactly like health: every provider reads as unconfigured, polling
+        stops, and nothing else would prompt an operator to look.
+        """
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            # The message is a fixed literal with NO interpolated value — the only
+            # dynamic content is the traceback, and a decode error's rendering never
+            # includes the document. Semgrep matches on the word "secret" in the
+            # message string, not on the argument (see the sibling annotation on
+            # the backend-set log line below).
+            logger.warning(  # nosemgrep: python-logger-credential-disclosure
+                "ops-mission-control: secret store unreadable; every provider will "
+                "read as unconfigured",
+                exc_info=True,
+            )
+            return {}
+        if not isinstance(raw, dict):
+            # The same degradation reached without a parse failure -- same
+            # silence problem, same log line. Fixed literal, no content.
+            logger.warning(  # nosemgrep: python-logger-credential-disclosure
+                "ops-mission-control: secret store root is not an object; every "
+                "provider will read as unconfigured"
+            )
+            return {}
+        return self._coerce(raw)
+
+    def _read_for_update(self) -> dict[str, dict[str, str]]:
+        """The store a read-modify-write is allowed to publish over.
+
+        ``put`` and ``delete`` rewrite the WHOLE file from what they read, so an
+        empty base is not "no secrets to carry forward" -- it is "delete every
+        provider token already stored". Only a MISSING file makes that true. An
+        unreadable one (a transient EACCES/EIO, a scanner holding the handle on
+        Windows) is a store we still have, and this file is the only copy that
+        exists: a provider token is not derivable from anything else on the box,
+        so truncating it means the operator must mint new credentials at
+        PagerDuty and Datadog, and every poll fails closed until they do. The
+        error propagates and the mutation is abandoned instead.
+
+        Corruption propagates too (#7805, mirroring #7794's decision for the
+        incident index): "cannot merge into" is not "safe to destroy". A
+        truncated store still holds most of its tokens verbatim -- readable
+        right up to the moment a rewrite replaces them -- and a refusal costs
+        one skipped mutation and a visible error. Every corruption door raises
+        the one named type, :class:`CorruptDocumentError`: a parse failure, a
+        byte stream that is not UTF-8 (``UnicodeDecodeError`` is a
+        ``ValueError`` but NOT a ``JSONDecodeError``, so unwrapped it slips
+        past every corruption clause at the callers), and -- via the strict
+        coercion -- valid JSON whose content would not survive a read-write
+        cycle.
+
+        One deliberate divergence from the index reader it mirrors: the
+        refusal carries ``""`` where that one forwards ``exc.doc``, and the
+        exception CHAIN is severed rather than kept. The doc is the raw file
+        text, and HERE that text is the credential store -- and the chain is
+        not cosmetics, because ``__cause__`` (or ``__context__`` under ``from
+        None``) keeps the original parser exception alive with the full
+        document on it. What debugging loses is repaid in the message: the
+        parser's own line/column are folded into the text, which is the part a
+        log actually renders.
+        """
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError as exc:
+            # The REAL location is folded into the message text, because the
+            # scrubbed empty ``doc`` below makes the exception's own rendering
+            # recompute a meaningless "line 1 column 1".
+            corrupt_msg = (
+                f"{exc.msg} (at line {exc.lineno} column {exc.colno} of the stored document)"
+            )
+        except UnicodeDecodeError as exc:
+            corrupt_msg = f"secret store is not valid UTF-8: {exc.reason}"
+        else:
+            return self._coerce(raw, strict=True)
+        # Raised OUTSIDE the except block, deliberately: ``raise ... from exc``
+        # keeps the original exception -- whose ``doc``/``object`` attribute IS
+        # the raw credential file -- reachable through ``__cause__``, and even
+        # ``from None`` leaves it on ``__context__``. Constructing the refusal
+        # after the handler has exited severs the chain entirely, so no copy of
+        # the store's bytes rides on the exception that crosses into route
+        # handlers and log formatters. Found in review (GPT 5.6).
+        raise CorruptDocumentError(corrupt_msg, "", 0)
 
     def _lock(self) -> "_SecretLock":
         return _SecretLock(self._path)
@@ -243,14 +371,24 @@ class KeystoneFileBackend:
         # onto a stale snapshot and the later atomic replace would DELETE the first secret while
         # both returned 200. On the credential store a lost update is a lost secret. Found in
         # review — the same class as the config/index/ledger/policy locks elsewhere in this app.
+        #
+        # The base is ``_read_for_update``, not ``_read``: the lock serializes
+        # writers but says nothing about a read that FAILED, and this write
+        # replaces the whole file. See that method for why one transient EACCES
+        # must abandon the save rather than publish an empty store over it.
         with self._lock():
-            data = self._read()
+            data = self._read_for_update()
             data.setdefault(provider_id, {})[field_name] = value
             self._write(data)
 
     def delete(self, provider_id: str) -> bool:
+        # ``_read_for_update`` for the same reason as ``put``, plus one specific to
+        # revocation: on an unreadable store the lenient read reported the provider
+        # absent, so this returned False and the audit logged ``not_found`` — telling
+        # the operator there was nothing to revoke while the live token was still on
+        # disk and still working. A raise is the honest answer.
         with self._lock():
-            data = self._read()
+            data = self._read_for_update()
             if provider_id not in data:
                 return False
             del data[provider_id]

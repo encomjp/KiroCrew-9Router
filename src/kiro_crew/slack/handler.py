@@ -64,12 +64,14 @@ from kiro_crew.dashboard.chat_utils import (
     remember_slack_options,
     run_config_write,
 )
+from kiro_crew.dashboard.state import append_and_surface
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import (
     HOOK_REPLY,
     TOOL_AUTO_APPROVE,
     TOOL_DENY,
+    event_is_spawn_run,
     safe_read_file_bytes,
     validate_file_path,
 )
@@ -79,12 +81,15 @@ from kiro_crew.llm_helpers import (
 )
 from kiro_crew.messaging import auto_title, privacy_mode
 from kiro_crew.messaging.commands import (
+    compact_unsupported_backend,
+    compact_unsupported_reply,
     cron_command_reply,
     spawn_command_reply,
     task_command_reply,
 )
 from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import canonical_key
+from kiro_crew.messaging.renderer import credential_redaction_notice
 from kiro_crew.messaging.session_trust import _trusted_sessions as _shared_trusted_sessions
 from kiro_crew.messaging.session_trust import add_trusted_session as _add_trusted_session
 from kiro_crew.messaging.session_trust import clear_trusted_sessions, is_session_trusted
@@ -105,8 +110,10 @@ from kiro_crew.safety_override import (
     describe_new_grant,
     grant_declared_yolo,
     safety_override,
+    yolo_policy_permits,
 )
 from kiro_crew.security import (
+    CREDENTIAL_REDACTION_TAGS,
     StreamRedactor,
     is_sensitive_path,
     redact,
@@ -163,13 +170,18 @@ APPROVAL_AUTO = "auto"
 APPROVAL_INTERACTIVE = "interactive"
 
 
-def _should_auto_approve_spawn(context_builder, event_title: str) -> bool:
-    """Check if a spawn_run tool call should be auto-approved."""
+def _should_auto_approve_spawn(context_builder, event) -> bool:
+    """Check if a spawn_run tool call should be auto-approved.
+
+    Takes the PERMISSION EVENT, not the title: the title is model-authored
+    (a shell command's title can be forged to ``spawn_run``), so the check
+    keys on ``event_is_spawn_run``'s canonical identity.
+    """
     return bool(
         context_builder
         and context_builder.hooks
         and context_builder.hooks.auto_approve_subagent_spawn
-        and event_title == "spawn_run"
+        and event_is_spawn_run(event)
     )
 
 
@@ -1272,8 +1284,14 @@ def is_owner(user_id: str) -> bool:
 
 
 def disable_yolo() -> None:
-    """Disable YOLO mode (global auto-approve)."""
-    if not safety_override().is_active():
+    """Disable YOLO mode (global auto-approve).
+
+    Gated on ``has_grant()``, NOT ``is_active()``. The latter is policy-filtered and
+    reports False while the governance verdict is momentarily unknown, so gating an
+    explicit off on it skipped the teardown and let the grant resume once the refresh
+    settled -- the operator's revocation silently undone.
+    """
+    if not safety_override().has_grant():
         return
     safety_override().deactivate("slack")
     # Through the shared revoke, which undoes BOTH halves of each grant. Dropping
@@ -1425,7 +1443,16 @@ async def _handle_slash_command(
         parts = cmd_text.split()
         yolo_active = is_yolo_mode()
         if len(parts) >= 2 and parts[1].lower() == "off":
-            if yolo_active:
+            # ``has_grant()``, NOT ``yolo_active``. The two ask different questions
+            # and only one of them belongs here: ``is_yolo_mode`` is policy-filtered
+            # ("may a tool be auto-approved"), while an explicit off asks "is there
+            # something to tear down". While the governance verdict is momentarily
+            # unknown the filtered answer is False, so this branch reported "already
+            # off" and never called ``disable_yolo()`` -- and the retained grant then
+            # resumed once the refresh settled, silently undoing the operator's
+            # revocation. ``disable_yolo`` was already corrected to read
+            # ``has_grant``; this is its CALLER, which was still gating it out.
+            if safety_override().has_grant():
                 disable_yolo()
                 sel().log_api_access(
                     caller=user_id,
@@ -1439,19 +1466,59 @@ async def _handle_slash_command(
                 await slack.post_message(channel, "YOLO mode is already off.", reply_ts)
         elif len(parts) >= 2 and parts[1].lower() == "on":
             if not yolo_active:
-                _result = safety_override().activate("slack")
-                sel().log_api_access(
-                    caller=user_id,
-                    operation="slack.yolo_mode",
-                    outcome="allowed",
-                    source="slack",
-                    resources="yolo_on",
-                )
-                await slack.post_message(
-                    channel,
-                    f"🔓 YOLO mode enabled ({describe_new_grant(_result.ttl)}).",
-                    reply_ts,
-                )
+                # Off-loop like the sibling renew() below: activate() writes a
+                # SEL event, and that filesystem I/O must not run on the loop.
+                _result = await asyncio.to_thread(safety_override().activate, "slack")
+                if not _result.active:
+                    # Arming can now be REFUSED -- an ``approval_modes`` deny of
+                    # ``yolo`` turns the mode off entirely. Reporting "enabled" over
+                    # a refused arm would tell the operator auto-approve is on while
+                    # every tool still stops to ask, and would audit it as allowed.
+                    #
+                    # NAME THE ACTUAL CAUSE. ``activate`` refuses for two different
+                    # reasons and they send the operator to two different places, so a
+                    # single message is wrong for one of them:
+                    #
+                    # | verdict   | why the arm failed          | where to look     |
+                    # |-----------|-----------------------------|-------------------|
+                    # | denied    | an admin's policy forbids   | the org's policy  |
+                    # | permitted | the fail-closed SEL audit   | the audit system  |
+                    #
+                    # This branch used to post the policy line unconditionally, so a
+                    # solo operator with no policy at all was told a phantom
+                    # organization had blocked them and went hunting a file that does
+                    # not exist, while the real fault went unnamed. The verdict is a
+                    # memory read (pushed when the ceiling was installed), so no thread.
+                    if not yolo_policy_permits():
+                        _outcome, _error = "approval_mode_denied_by_policy", (
+                            "mode_disabled_by_policy"
+                        )
+                        _msg = "🔒 YOLO mode is disabled by your organization's policy."
+                    else:
+                        _outcome, _error = "activation_failed", "audit_unavailable"
+                        _msg = "❌ Failed to activate YOLO mode (audit system unavailable)."
+                    sel().log_api_access(
+                        caller=user_id,
+                        operation="slack.yolo_mode",
+                        outcome=_outcome,
+                        source="slack",
+                        resources="yolo_on",
+                        error=_error,
+                    )
+                    await slack.post_message(channel, _msg, reply_ts)
+                else:
+                    sel().log_api_access(
+                        caller=user_id,
+                        operation="slack.yolo_mode",
+                        outcome="allowed",
+                        source="slack",
+                        resources="yolo_on",
+                    )
+                    await slack.post_message(
+                        channel,
+                        f"🔓 YOLO mode enabled ({describe_new_grant(_result.ttl)}).",
+                        reply_ts,
+                    )
             else:
                 await slack.post_message(
                     channel, f"YOLO mode is already on ({describe_grant_lifetime()}).", reply_ts
@@ -2216,6 +2283,23 @@ async def _handle_compact_command(
             )
             return
 
+        # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+        # backend that cannot serve a manual /compact treats the prompt as
+        # ordinary text and never answers, so dispatching would strand the
+        # 120s wait below. Informational, never an error.
+        unsupported = compact_unsupported_backend(provider)
+        if unsupported:
+            await slack.post_message(channel, compact_unsupported_reply(unsupported), reply_ts)
+            sel().log_tool_invocation(
+                session_key=session_key,
+                source="slack",
+                tool_name="compact",
+                tool_kind="command",
+                outcome="auto_managed_backend",
+                metadata={"backend": unsupported},
+            )
+            return
+
         _t0 = time.monotonic()
 
         # --- Phase 1: Pre-compaction UI (cosmetic — log failures, don't abort) ---
@@ -2246,9 +2330,7 @@ async def _handle_compact_command(
                 outcome = "completed"
             elif cr["type"] == "failed":
                 error = cr.get("summary", "")
-                result_text = (
-                    f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
-                )
+                result_text = f"❌ Compaction failed: {error}" if error else "❌ Compaction failed."
                 outcome = "failed"
             else:
                 result_text = "⚠️ Compaction timed out."
@@ -2528,8 +2610,13 @@ async def maybe_route_linked_thread(
     # context). The LLM's own output is redacted before display.
     _safe_text, _ = redact_exfiltration_urls(text)
     _safe_text, _ = redact_credentials(_safe_text)
-    _linked_slot.append("user", _safe_text, "msg msg-u")
-    _dashboard_state.broadcast_ws("chat_message", {"slot": _linked_slot_key, "role": "user", "content": _safe_text, "cls": "msg msg-u"})  # type: ignore[attr-defined]
+    # Nothing rendered this Slack-typed row optimistically in the dashboard, so
+    # broadcast_user=True: append delivers the ONE identity-carrying frame
+    # (the old manual frame here carried no ``meta.mid``, so a client receiving
+    # the row through a second door rendered a duplicate — #5981 family).
+    append_and_surface(
+        _dashboard_state, _linked_slot, "user", _safe_text, "msg msg-u", broadcast_user=True  # type: ignore[arg-type]
+    )
     if not _linked_slot.running:
         from kiro_crew.dashboard.chat import _run_chat
 
@@ -3086,6 +3173,14 @@ async def handle_message(
         # mapping with it. So the asker becomes the session key outright.
         if asker_key:
             session_key = asker_key
+            # Same reason as the linked-thread reroute below: overrides are keyed
+            # BY SESSION and the hydration at entry ran for the PREVIOUS key, so
+            # without this the agent re-resolution reads a key nobody hydrated and
+            # falls through to the channel or default agent -- discarding a binding
+            # the asker's own metadata records correctly. The pinned path needs it
+            # exactly as much: `asker_key` is a different conversation, which is
+            # the whole reason it is substituted here.
+            _hydrate_thread_overrides(session_key, conversation_log)
     elif thread_owner_key and thread_owner_key != session_key:
         logger.info(
             "🔗 Slack thread %s linked to dashboard session %s — routing there",
@@ -3093,6 +3188,14 @@ async def handle_message(
             thread_owner_key,
         )
         session_key = thread_owner_key
+        # Thread overrides are keyed BY SESSION, and the hydration at entry ran
+        # for the previous key. Re-hydrate for the new owner in the same breath
+        # as the reroute -- otherwise the agent re-resolution below reads a key
+        # that was never hydrated and falls through to the channel or default
+        # agent, discarding a binding the session's own metadata records
+        # correctly. Same shape as transport_dispatch._resolve_thread_owner.
+        # The helper guards repeated I/O per session, so this is cheap.
+        _hydrate_thread_overrides(session_key, conversation_log)
 
     client: LLMProvider | None = None
     try:
@@ -3530,7 +3633,7 @@ async def handle_message(
                         continue
 
                 # auto_approve_subagent_spawn → auto-approve spawn_run tool calls
-                if _should_auto_approve_spawn(context_builder, event.title or ""):
+                if _should_auto_approve_spawn(context_builder, event):
                     await client.approve_tool(event.request_id)
                     Stats().inc_tool_auto_approved()
                     sel().log_tool_invocation(
@@ -3860,6 +3963,23 @@ async def handle_message(
                 "Redacted %d credential pattern(s) introduced by reply decorator", len(_cred_after)
             )
 
+    # Per-turn tally of redaction placeholders in the text actually SENT, so the
+    # user learns their pasteable text was rewritten. Read from the TAG in
+    # `clean_text` rather than from `cred_warnings`, which only reaches the log:
+    # on the streaming path that list is empty here because each chunk was already
+    # redacted upstream, so re-redacting `clean_text` reports nothing. Counting the
+    # artifact answers the question the user has -- "is what I am about to copy
+    # still what the assistant wrote?" -- and stays correct wherever the
+    # substitution happened (per-chunk, the StreamRedactor wire pass, the final
+    # render, or the post-decorator scan). Sum every tag the redactor can emit
+    # (`CREDENTIAL_REDACTION_TAGS`) so an encoded-credential-only reply is not
+    # missed.
+    #
+    # The thinking block (redacted separately below) adds to this SAME tally so a
+    # single warning covers the turn if either the answer or the thinking was
+    # rewritten -- one turn, one notice, never two identical warnings.
+    _cred_redactions = sum(clean_text.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
+
     # ── Review mode: ephemeral draft instead of public post ──
     if channel_activation == ACTIVATION_REVIEW:
         from kiro_crew.slack.blocks import review_draft_blocks
@@ -3955,6 +4075,12 @@ async def handle_message(
         thinking_mrkdwn, cred_warnings = redact_credentials(thinking_mrkdwn)
         for w in cred_warnings:
             logger.warning("Credential redacted in thinking: %s", w)
+        # Fold thinking redactions into the SAME per-turn tally as the answer so
+        # a single warning covers the turn (see the tally comment above the
+        # review-mode branch). Count the fully redacted text before it is
+        # condensed -- condensing can truncate, which would drop a placeholder
+        # from the count even though the credential was still rewritten.
+        _cred_redactions += sum(thinking_mrkdwn.count(tag) for tag in CREDENTIAL_REDACTION_TAGS)
         thinking_block = _condense_thinking(thinking_mrkdwn)
         if thinking_ts:
             try:
@@ -3974,6 +4100,20 @@ async def handle_message(
             await slack.delete_message(channel, thinking_ts)
         except Exception:
             logger.debug("Failed to delete empty thinking placeholder", exc_info=True)
+
+    # One notice per turn, AFTER the answer (and thinking) have been posted, so it
+    # reads below the text it describes. Posted as a SEPARATE threaded message
+    # rather than folded into the answer: Slack has already committed the rich
+    # answer via stop_stream/chat_update above and the answer text must stay
+    # exactly as redacted (never relaxed, never annotated inline). Best-effort --
+    # a failed notice must not turn a delivered answer into a failed turn.
+    if _cred_redactions > 0:
+        try:
+            await slack.post_message(
+                channel, credential_redaction_notice(_cred_redactions), reply_ts
+            )
+        except Exception:
+            logger.warning("Failed to post credential redaction notice", exc_info=True)
 
     # Persist the turn BEFORE posting anything that invites an answer to it.
     # The control below carries a staleness token derived from this session's last

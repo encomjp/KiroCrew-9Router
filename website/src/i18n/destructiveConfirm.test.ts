@@ -172,6 +172,9 @@ describe('destructive confirmations are translated', () => {
 export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'apps.awsControl.console.delete_confirm', // filename operand, quoted per locale
   'apps.awsControl.console.folder_delete_confirm', // folder-name operand, quoted per locale #4821
+  'apps.awsControl.console.library_remove_confirm', // artifact-name operand, quoted per locale #6987
+  'apps.awsControl.page.remove_account_confirm', // account-name operand, quoted per locale
+  'apps.awsControl.page.forget_key_confirm', // key-name operand, quoted per locale
   'apps.codeReviewSage.components.learningRail.confirm_delete', // quoted since #4653
   'apps.crewCompanion.gallery.deleteConfirm', // ASCII quotes → locale pair #4821
   'apps.mdNotebook.row.deleteTitle', // already quoted; pin + fr NNBSP fix #5725
@@ -183,6 +186,13 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'apps.papyrus.workspace.co_author_conflict_discard_confirm', // #4676
   'apps.papyrus.workspace.delete_file_confirm', // quoted by #4677
   'autoImprovement.commitConfirm', // bare {{branch}} #4821
+  // The code-execution grant's title AND body. #5725 quoted only the title, which left
+  // the scope sentence one line under it reading as prose about every app (#6016).
+  'components.appstore.trustAppModal.failed', // bare {{app}} #6016
+  'components.appstore.trustAppModal.failed_generic', // bare {{app}} #6016
+  'components.appstore.trustAppModal.intro', // bare {{app}} #6016
+  'components.appstore.trustAppModal.on_cancel', // bare {{app}} #6016
+  'components.appstore.trustAppModal.scope', // bare {{app}} #6016
   'components.appstore.trustAppModal.title', // bare {{app}} on the code-execution grant #5725
   'components.artifactFolderDeleteDialog.delete_folder', // already quoted; pin #5725
   'pages.artifactDeployPage.destroy_confirm',
@@ -195,6 +205,7 @@ export const QUOTED_OPERAND_CONFIRM_KEYS = [
   'pages.devFleetPage.make_name_live', // ASCII quotes → locale pair #5725
   'pages.devFleetPage.rebase_name', // ASCII quotes → locale pair #5725
   'pages.devFleetPage.remove_name', // ASCII quotes → locale pair #5725
+  'pages.overview.promptsTab.delete_confirm', // quoted in all catalogs at introduction (#4634)
   'pages.overview.skillsTab.delete_confirm',
   'pages.overview.skillsTab.dismiss_confirm',
   'pages.overview.steeringTab.delete_confirm',
@@ -241,6 +252,13 @@ export const EXEMPT_CONFIRM_PLACEHOLDER_NAMES = new Set([
  * kind-word form and record that decision.
  */
 export const CONFIRM_OPERAND_KEY_EXEMPTIONS: Record<string, string> = {
+  'components.awsConsentGate.confirmed_on':
+    'not a confirmation prompt: a past-tense receipt fragment whose only operand is a '
+    + 'machine-formatted date from fmtDate, never user-supplied text',
+  'apps.awsControl.console.library_remove_confirm_slug':
+    'the {{folder}} operand is an S3 key prefix rendered inside a <folder> tag as a '
+    + 'monospace <code> chip, so the tag already delimits it and glyph quotes would '
+    + 'double-decorate a path whose own slashes are the delimiter a reader checks',
   'apps.mochi.approval.inline_ask':
     'the {{tool}} operand renders as a styled <code> chip via renderAroundTool, '
     + 'so glyph quotes would double-decorate it (#5725)',

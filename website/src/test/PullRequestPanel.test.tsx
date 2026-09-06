@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import type { PullRequestSource } from '../types'
+import type { PullRequestSource, PullRequestStatus } from '../types'
 import { MAX_PULL_REQUEST_SOURCES } from '../utils/pullRequestLinks'
 
 const mockApi = vi.hoisted(() => ({
@@ -19,11 +19,13 @@ vi.mock('../components/MarkdownRenderer', () => ({
 
 import PullRequestPanel, {
   CHECK_POLL_MAX_FAILURES,
+  SOURCE_REMOUNT_REVALIDATE_MS,
   pullRequestCheckPollDelay,
   pullRequestCiSignal,
   pullRequestIsLive,
   pullRequestLifecycleState,
   pullRequestMergeBlocker,
+  selectedSourceStatus,
   shouldRetrySourceRead,
   sourceBusyRetryDelay,
   STATUS_FOLLOWUP_MAX,
@@ -349,6 +351,74 @@ describe('PullRequestPanel', () => {
     ])).toBe('failed')
   })
 
+  it('layers the selected payload over its cached chip status field by field', () => {
+    const cached = { state: 'open' as const, ci: 'running' as const, mergeable: 'conflicting', mergeStateStatus: 'dirty' }
+
+    // The payload speaks to every field here, so it wins outright -- that is
+    // the point of preferring it: the tab must not lag the header badge above.
+    expect(selectedSourceStatus({ ...github, mergeable: 'mergeable', mergeStateStatus: 'clean' }, cached))
+      .toEqual({ state: 'open', ci: 'passed', mergeable: 'mergeable', mergeStateStatus: 'clean' })
+
+    // A payload that does not settle the merge pair keeps the cached one. The
+    // provider reports '' for "no answer", so an empty string must not erase a
+    // value the backend settled earlier -- and the pair must survive AT ALL,
+    // which a whole-record rebuild from the payload silently dropped.
+    expect(selectedSourceStatus({ ...github, mergeable: '', mergeStateStatus: undefined }, cached))
+      .toEqual({ state: 'open', ci: 'passed', mergeable: 'conflicting', mergeStateStatus: 'dirty' })
+
+    // Any field this panel does not recompute rides along untouched, so a new
+    // status field does not need this function edited to survive selection.
+    expect(selectedSourceStatus(github, { ...cached, extra: 'keep' } as PullRequestStatus))
+      .toMatchObject({ extra: 'keep' })
+
+    // No cached entry at all: the payload alone still produces a usable status.
+    expect(selectedSourceStatus({ ...github, mergeable: 'mergeable' }, undefined))
+      .toEqual({ state: 'open', ci: 'passed', mergeable: 'mergeable', mergeStateStatus: undefined })
+
+    // Degraded checks section: CI falls back to the glyph the backend kept
+    // alive rather than being erased, and the merge pair is unaffected by it.
+    expect(selectedSourceStatus({ ...github, checks: [], partialSections: ['checks'] }, cached))
+      .toEqual({ state: 'open', ci: 'running', mergeable: 'conflicting', mergeStateStatus: 'dirty' })
+
+    // An empty checks section that is NOT flagged partial means "no CI here",
+    // so a stale glyph is cleared instead of kept.
+    expect(selectedSourceStatus({ ...github, checks: [] }, cached).ci).toBeUndefined()
+  })
+
+  it('treats an unsettled merge answer as absent and drops the pair once terminal', () => {
+    const cached = { state: 'open' as const, ci: 'passed' as const, mergeable: 'conflicting', mergeStateStatus: 'dirty' }
+
+    // `unknown` is GitHub still computing the merge commit -- a state every push
+    // re-enters -- so it must not overwrite a settled value, or the pair would
+    // flicker off and back on through the recompute window. Same rule as `''`.
+    expect(selectedSourceStatus({ ...github, mergeable: 'unknown', mergeStateStatus: 'unknown' }, cached))
+      .toMatchObject({ mergeable: 'conflicting', mergeStateStatus: 'dirty' })
+
+    // A cached value that is ITSELF unsettled is not a value either: the field
+    // reads absent rather than reporting 'unknown' as an answer.
+    const unsettledCache = { state: 'open' as const, mergeable: 'unknown', mergeStateStatus: '' }
+    const fromUnsettled = selectedSourceStatus({ ...github, mergeable: '', mergeStateStatus: '' }, unsettledCache)
+    expect(fromUnsettled.mergeable).toBeUndefined()
+    expect(fromUnsettled.mergeStateStatus).toBeUndefined()
+
+    // Merged or closed: mergeability is a question about a merge that can still
+    // happen, so a retained `conflicting` would be an answer to a question
+    // nobody asked. The pair is dropped even though the cache still carries it.
+    const merged = selectedSourceStatus({ ...gitlab, mergeable: '', mergeStateStatus: '' }, cached)
+    expect(merged.state).toBe('merged')
+    expect(merged.mergeable).toBeUndefined()
+    expect(merged.mergeStateStatus).toBeUndefined()
+
+    const closed = selectedSourceStatus({ ...github, state: 'CLOSED' }, cached)
+    expect(closed.state).toBe('closed')
+    expect(closed.mergeable).toBeUndefined()
+
+    // A state outside the known set is NOT terminal — it has no lifecycle glyph,
+    // and treating it as terminal would silently discard a settled pair.
+    expect(selectedSourceStatus({ ...github, state: 'locked' }, cached))
+      .toMatchObject({ mergeable: 'conflicting', mergeStateStatus: 'dirty' })
+  })
+
   it('shows an actionable warning when the local GitHub CLI is not logged in', async () => {
     mockApi.pullRequestSource.mockRejectedValueOnce(
       new Error('{"error":"not logged into any GitHub hosts. Run `gh auth login`, then retry."}'),
@@ -377,6 +447,51 @@ describe('PullRequestPanel', () => {
     expect(alert).toHaveTextContent('gh auth login')
     expect(alert).not.toHaveTextContent('GitHub CLI login required')
     expect(alert).not.toHaveTextContent('{"error"')
+  })
+
+  function renderWithRetained(dataUpdatedAt: number) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData<PullRequestSource>(['pull-request-source', github.url], github, {
+      updatedAt: dataUpdatedAt,
+    })
+    render(
+      <QueryClientProvider client={client}>
+        <PullRequestPanel
+          sources={[{ url: github.url, provider: 'github', number: 12, repo: 'widgets' }]}
+          selectedUrl={github.url}
+          onSelect={() => {}}
+          onAddToChat={() => {}}
+        />
+      </QueryClientProvider>,
+    )
+  }
+
+  it('revalidates a retained payload older than the gateway cache window on mount', async () => {
+    // Stale-while-revalidate: the retained payload paints at once (no spinner)
+    // and a background refetch runs, because this gateway's own events cannot
+    // see a teammate's review or comment.
+    renderWithRetained(Date.now() - SOURCE_REMOUNT_REVALIDATE_MS - 1_000)
+    expect(screen.getAllByText(github.title).length).toBeGreaterThan(0)
+    await waitFor(() => expect(mockApi.pullRequestSource).toHaveBeenCalledWith(github.url, false))
+  })
+
+  it('does not refetch a retained payload the gateway would still serve from cache', () => {
+    // Inside the window a refetch returns the same bytes; a sibling view that
+    // shares this key (Code Review Sage) would otherwise pay two reads per open.
+    renderWithRetained(Date.now() - 1_000)
+    expect(screen.getAllByText(github.title).length).toBeGreaterThan(0)
+    expect(mockApi.pullRequestSource).not.toHaveBeenCalled()
+  })
+
+  it('shows a compact notice, not the full error card, when a background revalidation fails', async () => {
+    mockApi.pullRequestSource.mockRejectedValue(apiError({ error: 'gh: HTTP 401 Bad credentials' }))
+    renderWithRetained(Date.now() - SOURCE_REMOUNT_REVALIDATE_MS - 1_000)
+    await screen.findByRole('status')
+    // The loaded pull request stays on screen with a one-line notice above it...
+    expect(screen.getAllByText(github.title).length).toBeGreaterThan(0)
+    expect(screen.getByRole('status')).toHaveTextContent(/showing the last loaded version/i)
+    // ...and the full-height "could not load" card never appears over it.
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('caps rendered source tabs at the per-slot limit', () => {

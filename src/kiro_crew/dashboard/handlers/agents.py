@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
+import hashlib
 import json
 import logging
 import os
 import re
+import stat
 import subprocess
 import uuid
 from pathlib import Path
 from typing import Any
 
-from aiohttp import web
+from aiohttp import BodyPartReader, web
 
 from kiro_crew import agent_state, model_registry
 from kiro_crew.acp.client import advertised_model_ids, model_is_unusable
@@ -22,6 +25,7 @@ from kiro_crew.agent import (
     AGENT_FILENAME,
     _spec_path_is_safe,
     clear_model_pin,
+    emission_eligible_mcp_servers,
     get_shipped_tools,
     install_agent,
     kiro_agents_dir_path,
@@ -34,19 +38,42 @@ from kiro_crew.agent_discovery import (
     spec_model,
     spec_str,
 )
+from kiro_crew.agent_sdk.drivers.acp import resolve_pin_spelling
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
+from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock
+from kiro_crew.apps.bridges import _registration_source
+from kiro_crew.apps.manager import (
+    INSTALLED_META_FILENAME,
+    app_dir,
+    app_enabled_state,
+    apps_dir,
+)
+from kiro_crew.atomic_write import replace_with_retry
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewAgentConfig,
     KiroCrewConfig,
     _safe_color,
+    coerce_effort,
+    inject_kiro_cli_api_key,
     normalize_agent_model,
-    read_config_for_update,
     resolve_agent_bindings,
     resolve_agent_config_path,
     resolve_effective_model,
+    update_config_locked,
     write_config_atomically,
 )
+from kiro_crew.config.paths import data_home
 from kiro_crew.config.schema import SCHEMA_REGISTRY, config_entry_to_dict
+from kiro_crew.config.sections import (
+    _AVATAR_FILE_PIN_RE,
+    _AVATAR_GHOST_BOOL_TRAITS,
+    _AVATAR_GHOST_STR_TRAITS,
+)
+from kiro_crew.config.sections import _AVATAR_IMAGE_EXTS as _LOADER_AVATAR_IMAGE_EXTS
+from kiro_crew.config.sections import (
+    _safe_avatar,
+)
 from kiro_crew.dashboard.chat_persistence import get_reasoning_effort_ordered
 from kiro_crew.dashboard.chat_utils import (
     _BLOCKED_SLASH_COMMANDS,
@@ -54,6 +81,7 @@ from kiro_crew.dashboard.chat_utils import (
     SLASH_COMMAND_DESCRIPTIONS,
     _history_key_for,
     is_deprecated_model,
+    run_config_write,
 )
 from kiro_crew.dashboard.handlers._shared import (
     MAX_AGENT_SKILLS,
@@ -63,10 +91,12 @@ from kiro_crew.dashboard.handlers._shared import (
     agent_skill_keys,
     agent_skill_views,
     apply_skill_mapping,
+    read_bounded_json,
 )
 from kiro_crew.dashboard.handlers.discover import _redact_external
 from kiro_crew.dashboard.kiro_readiness import reject_if_kiro_unverified
 from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.executors import discovery_executor, maintenance_executor, subprocess_executor
 from kiro_crew.loop_lock import LoopBoundLock
 from kiro_crew.sandbox import (
@@ -150,15 +180,6 @@ async def _require_owner(request: web.Request, operation: str) -> web.Response |
 # ── Agent Config ──
 
 
-def _auto_install_agent() -> None:
-    """Re-install agent config to kiro-cli so changes take effect immediately."""
-    try:
-        install_agent()
-        logger.info("Auto-applied agent config via dashboard")
-    except Exception:
-        logger.debug("Auto-apply agent config failed", exc_info=True)
-
-
 def _find_agent_config() -> Path:
     """Find agents/defaults.json — delegates to centralized resolver."""
     return resolve_agent_config_path()
@@ -173,21 +194,574 @@ def _installed_agent_config() -> Path:
     return kiro_agents_dir_path() / AGENT_FILENAME
 
 
-def _write_installed_config_locked(path: Path, config: dict[str, Any]) -> None:
-    """Write the installed agent spec while holding bridges' file lock.
+def _on_disk_mcp_servers(installed_path: Path) -> dict[str, Any] | None:
+    """The installed spec's ``mcpServers`` map, or ``None`` when it cannot be read.
 
-    Runs in a worker thread (see :func:`_commit_agent_config`, dispatched
-    through ``_offload_config_write``), which is what makes taking a synchronous
-    flock here legal — on the event loop it would stall the gateway whenever app
-    registration held the lock.
+    ONE read, TWO rules. ``_merge_unowned_servers`` (a name ABSENT from the
+    submission) and :func:`_drop_unbacked_app_entries` (a name PRESENT in a stale
+    submission) are two directions of one question -- what does on-disk state say
+    about this name -- so neither may read the file for itself. Two reads inside
+    one commit unit could only ever agree by luck, and a rule pair disagreeing
+    about its baseline is a defect that surfaces as a name both preserved and
+    dropped.
 
-    ``bridges._mcp_lock`` is imported lazily: ``apps.bridges`` imports back into
-    the dashboard handlers, so a module-level import is circular.
+    ``None`` AND ``{}`` ARE DIFFERENT ANSWERS and collapsing them is a defect --
+    in EITHER direction. ``{}`` means the spec was read and holds no bridge under
+    any name; ``None`` means it could not be interpreted at all. That distinction
+    only matters to the present-axis rule, and there it decides the verdict:
+    against ``{}`` every namespaced name the client submits is an addition the
+    platform never made, while against ``None`` nothing is known and nothing may be
+    decided. The absent-axis rule is indifferent -- it has nothing to preserve
+    either way -- which is why its own read conflated the two harmlessly for as long
+    as it was the only caller.
+
+    A MISSING ``mcpServers`` KEY IS ``{}``, NOT ``None``, and the difference is
+    load-bearing rather than cosmetic. A readable spec that simply carries no such
+    key holds no bridge, which is a definite answer; reading it as "unknown" hands
+    the stale-snapshot rule a reason to stand down and lets the resurrection
+    through. That state is reachable from this very handler: a PUT whose submission
+    omits ``mcpServers`` is persisted verbatim by ``_write_installed_config``, and
+    ``_deregister_mcp_servers`` pops its entries out of ``get("mcpServers", {})``
+    without ever adding the key back, so a spec can sit keyless while an old editor
+    tab still holds a bridge in its snapshot.
+
+    A ``mcpServers`` PRESENT BUT NOT AN OBJECT still answers ``None``, deliberately.
+    The file parsed, but that value cannot be interpreted, and the same
+    cannot-interpret state is what the submitted-side guard in
+    ``_merge_unowned_servers`` refuses to act on. Deleting the client's entries on
+    the strength of a value we cannot read is the guess this whole span exists to
+    avoid.
+
+    BEST-EFFORT ON AN UNREADABLE SPEC, deliberately. Missing (a first-ever write),
+    corrupt, or holding a non-object ``mcpServers`` all answer ``None``: there is
+    nothing authoritative to read, and this editor is the user's repair path for
+    exactly that state, so failing the PUT closed would leave a broken agent
+    unfixable from the dashboard. Neither rule then acts and the snapshot lands as
+    it did pre-fix; enabled apps re-register their servers on the next gateway
+    start (``reconcile_enabled_app_resources``), so the loss self-heals.
+
+    The CALLER holds bridges' flock across this read and the spec write, so no
+    in-gateway writer of this file can commit between them.
     """
-    from kiro_crew.apps.bridges import _mcp_lock as _agent_file_lock
+    try:
+        on_disk = json.loads(installed_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(on_disk, dict):
+        return None
+    if "mcpServers" not in on_disk:
+        return {}  # read cleanly and holds no bridge: a definite answer
+    servers = on_disk["mcpServers"]
+    return servers if isinstance(servers, dict) else None
 
-    with _agent_file_lock(target=path):
-        write_config_atomically(path, config)
+
+def _drop_unbacked_app_entries(
+    config: dict[str, Any], existing: dict[str, Any] | None
+) -> tuple[str, ...]:
+    """Drop submitted ``<app>:<server>`` entries the installed spec does not hold (#7089).
+
+    THE STALE-SNAPSHOT AXIS, the mirror of ``_merge_unowned_servers``. That rule
+    decides what happens to a name the submission OMITS. This one decides one
+    narrow question about a name the submission CONTAINS: may the client CREATE a
+    name in the app-namespace region THROUGH THIS PUT? Not while the installed spec
+    is READABLE -- so a submitted namespaced name with no row on disk is dropped.
+    The readability qualifier is not a hedge: an unreadable spec answers nothing, so
+    the submission lands as it did pre-fix, and a rule stated without it would
+    contradict the best-effort path below.
+
+    THE REGION IS RESERVED FROM THIS ENDPOINT, not owned by a single writer, and
+    the distinction is worth stating because the weaker claim is false. Two paths
+    legitimately write a ``:``-containing key into this spec: ``_register_mcp_servers``
+    builds every app bridge as ``f"{app_name}:{server_name}"``, and the MCP page's
+    ``handlers/mcp.py::_sync_mcp_to_agent_unlocked`` copies a global mcp.json server
+    in under ``mcp_server_alias``, which returns a slash-free name UNCHANGED and so
+    preserves a colon (``npm:foo`` stays ``npm:foo``). What this rule withholds is
+    the ability to introduce such a name through the RAW EDITOR, where the client's
+    copy is indistinguishable from a resurrection; a name either of those writers
+    has actually placed on disk is present, and therefore untouched.
+
+    THE ROW-BY-ROW TABLE LIVES IN THE SPEC, ``docs/system-specs/modules/app-kit-platform.md``
+    section 1a, which is this axis's designated home; the absent axis keeps its
+    table in :func:`_app_declared_server_names` instead. Only what a reader of this
+    code has to know to not undo it is repeated here.
+
+    ABSENCE FROM DISK IS A VERDICT, not a gap, and it is reached three ways --
+    which is why the client's copy cannot be trusted over it:
+
+    * the app was UNINSTALLED (``_deregister_mcp_servers`` removed the bridge and
+      the app directory is gone);
+    * the app is installed but DISABLED (same deregistration; startup
+      reconciliation deliberately never revisits it);
+    * the app is installed and ENABLED but the entry was SKIPPED on purpose --
+      ``_register_mcp_servers`` refuses to write an HTTP server with no resolvable
+      live port, and scrubs any stale entry for it, because a manifest's
+      illustrative port is a reachable-LOOKING dead URL that kiro-cli dials on
+      every request and that breaks EVERY kiro session, not just that app's.
+
+    WHAT THIS DELIBERATELY DOES NOT DO: it never rewrites a submitted value. Where
+    the name is on disk AND in the submission, the submitted row still wins
+    untouched -- the editor-snapshot-wins contract kept in #5899 and re-affirmed
+    for #6664, pinned by ``test_app_owned_entry_present_in_the_snapshot_is_updated``.
+    Reversing it needs a maintainer ruling and is tracked separately.
+
+    THE DECLARED-NAME CENSUS IS DELIBERATELY NOT CONSULTED, and this is the one
+    part a later change is most likely to undo, so the reason is here rather than
+    only in the spec. The absent-axis rule must name an owner because it decides
+    whether to KEEP something the client asked to remove; every candidate here is
+    one the client is asking to ADD to a region it does not author, which the
+    on-disk map answers by itself. A census consulted here would RESCUE the third
+    case above and write back the dead URL the registration path scrubbed on
+    purpose. It also keeps this rule free of manifest I/O, so it cannot raise
+    :class:`AppOwnershipUnreadable` and adds no new way for a PUT to fail.
+
+    Host-owned names are excluded, including an edition extra whose key contains
+    ``:``: that key is the HOST's, and the host axis is unchanged here. Order
+    against the absent-axis rule is immaterial -- a name this rule drops is by
+    definition not on disk, so it cannot enter that rule's absent set.
+
+    Returns the names it dropped, for the caller to log.
+    """
+    submitted = config.get("mcpServers")
+    if not isinstance(submitted, dict) or not submitted:
+        # Absent, empty, or a shape kiro-cli rejects outright: nothing to decide,
+        # and the existing verbatim-persist behaviour is unchanged.
+        return ()
+    if existing is None:
+        # The spec could not be read, so nothing is authoritative. See
+        # :func:`_on_disk_mcp_servers` for why this is best-effort rather than a
+        # refusal.
+        return ()
+    host = emission_eligible_mcp_servers()
+    dropped = tuple(
+        sorted(
+            name for name in submitted if ":" in name and name not in existing and name not in host
+        )
+    )
+    for name in dropped:
+        del submitted[name]
+    return dropped
+
+
+def _merge_unowned_servers(
+    config: dict[str, Any], existing: dict[str, Any] | None
+) -> tuple[str, ...]:
+    """Re-add ``mcpServers`` entries the submitting client does not own.
+
+    MERGE-ON-WRITE (#6664). This PUT persists a whole-file snapshot the client
+    read earlier, and ``apps/bridges.py::_register_mcp_servers`` writes app MCP
+    bridges into that same file under its own flock. A registration landing
+    between the client's read and its PUT was therefore silently clobbered, and
+    the app's tools simply stopped resolving with nothing logged anywhere.
+
+    The rule, in one sentence: **preservation requires positive evidence of app
+    or host ownership.** An on-disk entry absent from the submission is kept only
+    when :func:`_app_or_host_owned` can name its owner by EXACT name; everything
+    else is the client's and is deleted, which is what keeps an ordinary entry the
+    user typed into this editor deletable -- including one parked under an
+    installed app's namespace. If that evidence cannot be read the PUT is refused
+    rather than guessed; see :func:`_app_or_host_owned`.
+
+    The inverse test -- "keep anything no mcp.json scope declares" -- reads as
+    equivalent and is not. A server added through this same editor lives ONLY in
+    the installed spec, which is not a scope, so it looked unowned and was
+    re-inserted on every attempt to remove it: not merely preserved against the
+    user's wishes, but permanently undeletable, because each retry re-read the
+    same entry. Requiring evidence costs an app bridge nothing, since a bridge is
+    always positively identifiable.
+
+    The census is NOT consulted, and the reason is worth naming because an
+    earlier cut did consult it: it subtracted every scope-declared name from the
+    candidates ahead of the ownership test, as precedence carried over from the
+    prefix-matching era. With ownership matched by exact manifest name that
+    subtraction could only ever remove a name that IS provably owned, so a user
+    who also declared ``demo:notes`` in their own mcp.json made every stale PUT
+    delete app ``demo``'s live bridge. Proven ownership therefore outranks a
+    declaration, and a name with no proven owner is deleted whether a scope
+    declares it or not -- which leaves the census unable to change any verdict.
+
+    Two consequences worth naming rather than discovering:
+
+    * A host-MANAGED server the rebuild RE-ADDS (``agent.emission_eligible_mcp_servers``)
+      is preserved. That is not a new restriction -- the rebuild re-adds those
+      entries unconditionally, so removing one through this editor never stuck.
+      The qualifier is load-bearing: a managed entry the rebuild would NOT emit
+      (an ``opt_in`` grant, or one whose ``spec_gate`` is shut) is deleted like
+      any other absent entry, because nothing re-adds it and preserving it made
+      the grant unrevocable and the gated backend resurrectable.
+    * An app bridge cannot be removed through this endpoint. That is the issue's
+      explicit intent; the app lifecycle (disable/uninstall, which calls
+      ``_deregister_mcp_servers``) is what removes it.
+
+    BEST-EFFORT ON AN UNREADABLE SPEC, deliberately -- and the read itself now
+    lives in :func:`_on_disk_mcp_servers`, performed once on this rule's behalf and
+    on :func:`_drop_unbacked_app_entries`'s, so both directions decide from the
+    SAME bytes instead of from two reads that could disagree. A corrupt installed
+    spec has no parseable entries to preserve, and this editor is the user's repair
+    path for exactly that state -- failing the PUT closed would leave a broken
+    agent with no way to fix it from the dashboard. So an unreadable spec preserves
+    nothing and the snapshot lands as it did pre-fix; enabled apps re-register
+    their servers on the next gateway start
+    (``reconcile_enabled_app_resources``), so the loss self-heals.
+
+    WHAT REMAINS, now that the caller holds bridges' flock across this read and
+    the spec write (see :func:`_commit_agent_config`). Every writer of this file
+    INSIDE the gateway takes that same flock -- ``_register_mcp_servers``,
+    ``_deregister_mcp_servers``, ``reregister_app_mcp_servers``, the agent
+    rebuild, and ``handlers/mcp.py``'s spec syncs -- so no app registration or
+    deregistration can interleave with this read any more, in either direction.
+    The earlier writeup here claimed a bounded, self-healing residual for that
+    window; that was wrong twice over, and both halves are now moot: the
+    deregistration direction was never self-healing (startup reconciliation only
+    re-registers ENABLED apps, so a resurrected bridge from a disabled or
+    uninstalled app persisted indefinitely), and the window itself is closed
+    rather than narrowed.
+
+    The residual that is real is a writer OUTSIDE this process that does not take
+    the flock -- kiro-cli writing the spec itself, or a user editing the file by
+    hand. Nothing in the gateway can serialize against those, and the same
+    exposure applies to every other writer here, so it is a property of the file
+    rather than of this change. Torn reads are not part of it: the in-process
+    writers all go through ``atomic_write``, so a reader sees the whole old file
+    or the whole new one.
+
+    Returns the names it preserved, for the caller to log.
+    """
+    submitted = config.get("mcpServers")
+    if "mcpServers" in config and not isinstance(submitted, dict):
+        # A non-object ``mcpServers`` is a shape kiro-cli rejects outright.
+        # Merging into it would mean inventing a map the client never sent, so
+        # the submission is left exactly as-is and the existing verbatim-persist
+        # behaviour (and its rejection) is unchanged.
+        logger.warning(
+            "Skipping agent-config merge-on-write: submitted mcpServers is %s, not an object",
+            type(submitted).__name__,
+        )
+        return ()
+    submitted_servers: dict[str, Any] = submitted if isinstance(submitted, dict) else {}
+    if not existing:
+        # Unreadable (``None``) or read and empty (``{}``): either way there is
+        # nothing recoverable to preserve, so the two answers are equivalent HERE
+        # and only here. See :func:`_on_disk_mcp_servers` for why they are not
+        # equivalent to the present-axis rule, and for the BEST-EFFORT reasoning.
+        return ()
+    absent = {name: spec for name, spec in existing.items() if name not in submitted_servers}
+    if not absent:
+        return ()
+    # POSITIVE EVIDENCE decides, and nothing overrides it. An earlier cut
+    # subtracted every scope-declared name from the candidates BEFORE ownership
+    # was tested, as a precedence rule inherited from the prefix-matching era.
+    # Once ownership became the EXACT manifest-declared set, that subtraction
+    # could only ever remove a name that IS provably owned -- a user who also
+    # declares ``demo:notes`` in their own mcp.json made every stale PUT delete
+    # app ``demo``'s live bridge. A name with no proven owner is deleted whether
+    # a scope declares it or not, so the census cannot change any verdict and is
+    # no longer consulted.
+    owned = _app_or_host_owned(absent)
+    preserved = {name: spec for name, spec in absent.items() if name in owned}
+    if not preserved:
+        return ()
+    # Submitted first so the client's own key order is stable and the preserved
+    # entries append; the two maps are disjoint by construction, so which side
+    # wins is not in question.
+    config["mcpServers"] = {**submitted_servers, **preserved}
+    return tuple(sorted(preserved))
+
+
+class AppOwnershipUnreadable(RuntimeError):
+    """The app-ownership source could not be read, so nothing may be decided.
+
+    Raised by :func:`_app_or_host_owned` and turned into a 500 with
+    ``code: app_ownership_unreadable`` by the PUT. Deliberately NOT a guess in
+    either direction -- see that function.
+    """
+
+
+def _require_present_shape(path: Path, *, expect: str, what: str) -> bool:
+    """Whether *path* is genuinely ABSENT; raise when it is present but malformed.
+
+    ``Path.is_file()`` and ``Path.is_dir()`` answer False for BOTH "nothing is
+    there" and "something is there but it is the wrong kind of thing" -- a broken
+    or looping symlink, a directory where a file belongs, a fifo, or a path whose
+    parent denies the stat. Reading that False as absence is the
+    cannot-read-becomes-not-owned defect one shape further out: a malformed
+    ``installed.json`` would classify its app as not installed, and its live
+    bridges would become deletable.
+
+    Absence is proven ONLY by ``lstat`` raising ``FileNotFoundError`` -- the link
+    itself, not its target, so a dangling symlink counts as present. Anything
+    else that is present but not *expect* raises
+    :class:`AppOwnershipUnreadable`. The follow-up ``stat`` is what makes a
+    symlink to a VALID file still acceptable: ``lstat`` would call it a link and
+    reject it, while ``stat`` resolves to the regular file it names.
+
+    Returns True when the path is genuinely absent, so the caller can take its
+    own not-installed branch.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return True  # genuinely absent
+    except OSError as exc:
+        raise AppOwnershipUnreadable(f"{what} present but unstattable: {exc}") from exc
+    try:
+        st = os.stat(path)  # follows symlinks: a link to a valid target is fine
+    except OSError as exc:
+        # Dangling or looping symlink, or a permission fault on the target. The
+        # entry EXISTS, so this is unreadable rather than absent.
+        raise AppOwnershipUnreadable(f"{what} present but unresolvable: {exc}") from exc
+    ok = stat.S_ISDIR(st.st_mode) if expect == "dir" else stat.S_ISREG(st.st_mode)
+    if not ok:
+        raise AppOwnershipUnreadable(f"{what} present but not a {expect}")
+    return False
+
+
+def _app_declared_server_names() -> frozenset[str]:
+    """The exact ``<app>:<server>`` names installed, ENABLED apps DECLARE.
+
+    Ground truth, and it has to be exact. ``_register_mcp_servers`` builds every
+    key it writes as ``f"{app_name}:{server_name}"`` over
+    ``manifest.mcpServers.items()``, so the manifests' declared server lists name
+    precisely the entries an app can own -- nothing wider. A PREFIX test is not a
+    weaker version of this: with ``demo`` installed, a client entry named
+    ``demo:custom`` matches the prefix and becomes permanently undeletable.
+
+    Read through :func:`bridges._registration_source`, which resolves a shipped
+    builtin from its immutable package root rather than its mutable installed
+    snapshot, so installed metadata cannot borrow a builtin's name and claim
+    entries under it.
+
+    THE COMPLETE CLASSIFICATION TABLE for an entry ABSENT from the client's
+    submitted snapshot. Every reachable combination of name shape, install state,
+    enablement, declaration and manifest readability appears here, so the
+    classification of any absent entry is a table lookup rather than a judgement:
+
+    ===========================  ==========================  ==============================  =====================
+    Name shape                   App / metadata state        Verdict                         Pinned by
+    ===========================  ==========================  ==============================  =====================
+    host-managed, always-emitted  n/a (host, not an app)     PRESERVE                        test_host_managed_entry_is_preserved
+    host-managed, ``opt_in``     n/a (host, not an app)      DELETE                          test_an_opt_in_managed_server_omitted_from_the_snapshot_is_deleted
+    host-managed, gate CLOSED    n/a (host, not an app)      DELETE                          test_a_gate_closed_managed_server_omitted_from_the_snapshot_is_deleted
+    host-managed, gate OPEN      n/a (host, not an app)      PRESERVE                        test_a_gate_open_managed_server_is_still_preserved
+    host-managed, gate RAISES    n/a (host, not an app)      DELETE (gate reads closed)      test_a_managed_server_whose_gate_raises_is_deleted
+    edition extra                n/a (host, not an app)      PRESERVE                        test_an_edition_contributed_server_is_preserved
+    edition extra with ``:``     host-owned AND namespaced   PRESERVE (host outranks)        test_a_namespaced_edition_extra_is_preserved_by_host_ownership
+    host spec not a mapping      n/a (host-produced only)    PRESERVE (pre-fix verdict)      test_a_malformed_host_spec_does_not_fail_the_put
+    plain (no ``:``)             n/a -- no app can own it    DELETE                          test_direct_client_entry_deletes_on_a_sequential_add_then_remove
+    scope-declared, app-owned    enabled, declared           PRESERVE                        test_a_scope_declaration_does_not_defeat_proven_ownership
+    scope-declared, not owned    n/a -- no owner to name     DELETE                          test_a_scope_declared_name_with_no_proven_owner_is_deleted
+    ``<app>:<n>``                app dir absent entirely     DELETE                          test_a_namespaced_entry_of_an_uninstalled_app_is_deleted
+    ``<app>:<n>``                installed.json absent       DELETE                          test_absent_installed_metadata_is_still_skipped
+    ``<app>:<n>``                installed.json corrupt      FAIL ``app_ownership_unreadable``  test_corrupt_installed_metadata_fails_the_put_and_writes_nothing
+    ``<app>:<n>``                installed.json non-regular  FAIL ``app_ownership_unreadable``  test_installed_metadata_as_a_broken_symlink_fails_the_put, test_installed_metadata_as_a_directory_fails_the_put
+    ``<app>:<n>``                enabled=false (disabled)    DELETE                          test_disabled_app_bridge_is_deleted
+    ``<app>:<n>``                ``enabled`` field absent    treat as ENABLED, then declare  test_absent_enabled_field_counts_as_enabled
+    ``<app>:<n>``                enabled, manifest unreadable  FAIL ``app_ownership_unreadable``  test_unreadable_app_manifest_fails_the_put_and_writes_nothing
+    ``<app>:<n>``                enabled, NOT declared       DELETE                          test_client_entry_under_an_installed_apps_namespace_is_deleted
+    ``<app>:<n>``                enabled, declared           PRESERVE                        test_a_declared_app_server_is_still_preserved
+    any                          apps dir unreadable         FAIL ``app_ownership_unreadable``  test_unreadable_apps_directory_fails_the_put
+    any                          apps root not a directory   FAIL ``app_ownership_unreadable``  test_apps_root_as_a_regular_file_fails_the_put
+    any                          apps child unstattable      FAIL ``app_ownership_unreadable``  test_an_unstattable_apps_root_child_fails_the_put
+    ===========================  ==========================  ==============================  =====================
+
+    THE HOST ROWS ARE NOT ONE ROW, and collapsing them was a shipped defect. A
+    host-managed entry is preserved *because the rebuild re-adds it*, so the
+    justification only reaches the entries the rebuild actually emits. It does not
+    reach an ``opt_in`` server (``kirocrew-dashboard``: never auto-emitted, and a
+    refresh keeps an existing grant current without ever re-granting a removed
+    one), which preservation made undeletable through the only surface that can
+    revoke the grant; nor a server whose ``spec_gate`` is CLOSED
+    (``kirocrew-computer`` on an unsupported platform, or with computer use off),
+    which both spec writers ``pop`` — preserving it resurrects exactly the backend
+    the gate exists to keep unspawned, and the next rebuild removes it again. The
+    eligibility test is therefore the emitter's own
+    (``agent.emission_eligible_mcp_servers``), not a second copy here.
+
+    ABSENCE IS PROVEN BY ``lstat`` RAISING ``FileNotFoundError``, nothing weaker.
+    ``Path.is_file()`` and ``Path.is_dir()`` answer False for a malformed path as
+    readily as for a missing one, so screening on them alone read a broken
+    symlink, a directory-where-a-file-belongs, or an unstattable path as "not
+    installed" and made that app's live bridges deletable. Every present-but-wrong
+    shape raises instead -- see :func:`_require_present_shape`, which screens the
+    shape at the CALL SITE so ``manager.app_enabled_state`` keeps the contract its
+    other callers rely on. The ENUMERATION obeys the same rule: each child of the
+    apps root is stat'ed explicitly rather than filtered through ``is_dir()``,
+    because pathlib routes that fault through ``_ignore_error`` and hands back a
+    plain False for ENOENT, ENOTDIR, EBADF and ELOOP alike -- so a child that is a
+    symlink loop looked like a regular file and was skipped, deleting the bridges
+    of the app under that name. Only a resolved stat may exclude a child, and only
+    by proving it is not a directory.
+
+    Four justifications carry the rows that are not self-evident:
+
+    * A SCOPE DECLARATION DOES NOT OUTRANK PROVEN OWNERSHIP. An earlier cut
+      subtracted every scope-declared name from the candidates ahead of this test,
+      as precedence carried over from the prefix-matching era. Against EXACT
+      manifest names that subtraction could only ever remove a name that IS
+      provably owned: a user who also declares ``demo:notes`` in their own mcp.json
+      made every stale PUT delete app ``demo``'s live bridge. A declared name with
+      no proven owner is deleted anyway, by the general rule, so the census cannot
+      change a verdict and is not consulted.
+
+    * DISABLED ⇒ DELETE. The disable lifecycle owns bridge removal
+      (``_deregister_mcp_servers``), and a deregistration that FAILED during
+      disable leaves a stale entry behind. Startup reconciliation only
+      re-registers ENABLED apps, so it never revisits that entry: preserving it
+      would keep a disabled app's code launchable through the retained bridge
+      forever. Ownership therefore requires installed AND enabled.
+    * ABSENT ``enabled`` FIELD ⇒ ENABLED. This matches ``apps.manager``'s own
+      parse exactly -- ``InstalledApp.from_dict`` reads
+      ``bool(data.get("enabled", True))`` (manager.py:170) over a dataclass whose
+      default is ``enabled: bool = True`` (manager.py:114). A legacy record
+      written before the field existed is treated as enabled everywhere else in
+      the tree, and disagreeing here would delete the live bridges of an app the
+      rest of the system considers running.
+    * UNREADABLE ⇒ FAIL LOUD, never a guess. Preserving on an unreadable source
+      strands undeletable entries; deleting clobbers live bridges over a fault
+      that may be transient. The refusal is raised before any durable write.
+
+    Enablement comes from :func:`manager.app_enabled_state`, whose tri-state is
+    written for exactly this caller: its own docstring separates "not installed"
+    and "unreadable" *because* collapsing them is "the wrong [answer] for a
+    caller deciding whether to DELETE its files". ``True``/``False`` are definite
+    answers and ``None`` means the metadata could not be read. ``is_app_enabled``
+    and ``list_apps`` are both unusable here -- each collapses an unreadable
+    record into a plain "no", which silently narrows ownership and deletes that
+    app's bridges.
+    """
+    root = apps_dir()
+    if _require_present_shape(root, expect="dir", what="installed-apps directory"):
+        return frozenset()  # no apps directory at all: nothing is installed
+    try:
+        children = sorted(root.iterdir())
+    except OSError as exc:
+        raise AppOwnershipUnreadable(f"installed-apps directory unreadable: {exc}") from exc
+    entries: list[Path] = []
+    for child in children:
+        # ONE MORE SHAPE SCREEN, for the same reason as the two above. The filter
+        # here used to be ``p.is_dir()``, which routes its fault through pathlib's
+        # ``_ignore_error`` and returns a plain False for ENOENT, ENOTDIR, EBADF
+        # and ELOOP -- the same False a regular file gets. A child that is a
+        # symlink LOOP was therefore skipped as "not an app" and the absent bridges
+        # of the app under that name became deletable. Only a resolved stat may
+        # exclude a child, and only by PROVING it is not a directory.
+        try:
+            st = child.stat()  # follows symlinks, exactly as ``is_dir()`` did
+        except FileNotFoundError:
+            # Absence, and only absence, is a skip: an uninstall completing
+            # between the listing and this stat leaves precisely this state, and a
+            # DANGLING link lands here too -- unlike the metadata screen below,
+            # that is a definite answer rather than an unreadable one, because no
+            # app directory exists under the name at all.
+            continue
+        except OSError as exc:
+            raise AppOwnershipUnreadable(
+                f"installed-apps entry {child.name!r} present but unstattable: {exc}"
+            ) from exc
+        if stat.S_ISDIR(st.st_mode):
+            entries.append(child)
+    declared: set[str] = set()
+    for entry in entries:
+        # SHAPE before CONTENT. ``app_enabled_state`` reaches the metadata through
+        # ``Path.is_file()``, which answers False for a broken symlink, a
+        # directory, or any other non-regular file sitting at that path -- and its
+        # contract turns that False into "not installed", which here would make a
+        # live app's bridges deletable. Screening the shape first keeps that
+        # contract intact for its other callers while giving this one the
+        # present-but-malformed answer it needs.
+        if _require_present_shape(
+            app_dir(entry.name) / INSTALLED_META_FILENAME,
+            expect="file",
+            what=f"app {entry.name!r}: installed metadata",
+        ):
+            continue  # genuinely no installed.json: not an installed app
+        enabled = app_enabled_state(entry.name)
+        if enabled is None:
+            raise AppOwnershipUnreadable(
+                f"app {entry.name!r}: installed metadata present but unreadable"
+            )
+        if not enabled:
+            # Not installed, or installed and deliberately disabled. Both mean no
+            # ownership, so the conflation is harmless here: either way the entry
+            # is the client's and stays deletable.
+            continue
+        manifest, _app_root = _registration_source(entry.name)
+        if manifest is None:
+            # bridges returns None for a manifest it could not parse. That app's
+            # declared servers are UNKNOWN, not empty, and "empty" is what
+            # deletes its live bridges.
+            raise AppOwnershipUnreadable(f"app {entry.name!r}: manifest unreadable")
+        servers = manifest.mcpServers or {}
+        declared.update(f"{entry.name}:{server}" for server in servers)
+    return frozenset(declared)
+
+
+def _app_or_host_owned(names: dict[str, Any]) -> frozenset[str]:
+    """Which of *names* an APP or the HOST provably owns.
+
+    POSITIVE identification by EXACT NAME, and both halves of that matter. The
+    inverse test -- "preserve anything no mcp.json scope declares" -- made a
+    server the user typed into the raw editor permanently undeletable, because it
+    lives only in the installed spec and the spec is not a scope. A prefix test
+    over installed app ids reproduced the same defect for any name the client
+    parked under an app's namespace. Only an exact name an owner actually claims
+    is evidence.
+
+    Two sources, both narrow:
+
+    * HOST-managed, and only the entries a rebuild would actually RE-ADD:
+      ``agent.emission_eligible_mcp_servers()`` — the always-emitted managed
+      servers (cron/core) plus the edition's ``_extra_mcp_servers``. Preserving
+      one is justified BY that re-add, so the set has to be the emitter's, which
+      is why it is imported rather than recomputed here. The two managed entries
+      a rebuild does NOT re-add are excluded and stay deletable: an ``opt_in``
+      grant (``kirocrew-dashboard``) that no rebuild re-introduces, and a
+      server whose ``spec_gate`` is shut (``kirocrew-computer``), which both spec
+      writers actively ``pop``. Preserving those made a revocation impossible
+      through the only surface that can revoke it, and resurrected a backend the
+      gate exists to keep unspawned.
+    * APP-declared: the exact ``<app>:<server>`` set from installed manifests --
+      see :func:`_app_declared_server_names`.
+
+    ON A FAILED READ THIS RAISES rather than guessing, because both guesses are
+    wrong and each one is a defect this span has already shipped. Preserving
+    every namespaced entry makes entries permanently undeletable; treating the
+    declared set as empty deletes live app bridges over a fault that may be
+    transient -- the very clobber #6664 exists to fix. The PUT turns the raise
+    into a 500 the client can retry, and because this runs at step (0a) before
+    any durable write, all three targets stay byte-identical.
+
+    That branch IS reachable: manifests are separate files under the apps
+    directory, not covered by the installed-spec flock this unit holds, so a
+    corrupt ``app.json`` or an unreadable apps directory reaches it and persists
+    until repaired. It is reached whenever ANY candidate is namespaced, host-owned
+    or not: the refusal is per-PUT rather than per-entry, so an edition extra
+    whose name contains ``:`` is refused alongside a genuinely app-shaped one. That
+    is the fail-loud direction and it is retryable, so it stays as it is.
+    """
+    host = emission_eligible_mcp_servers()
+    owned = {name for name in names if name in host}
+    namespaced = {name for name in names if ":" in name}
+    if not namespaced:
+        # No candidate can be app-owned, so the manifests cannot change the
+        # answer and their readability is not this PUT's problem.
+        return frozenset(owned)
+    return frozenset(owned | (namespaced & _app_declared_server_names()))
+
+
+def _write_installed_config(path: Path, config: dict[str, Any]) -> None:
+    """Write the installed agent spec. The CALLER holds bridges' file lock.
+
+    The lock used to be taken here. It moved out to
+    :func:`_commit_agent_config`, which now holds it across the merge's on-disk
+    READ as well as this write -- reacquiring it here would deadlock, because
+    ``flock`` is per open file description and a second fd on the same file
+    blocks against the first from the same thread.
+
+    Still runs in a worker thread, which is what makes the caller's synchronous
+    flock legal -- on the event loop it would stall the gateway whenever app
+    registration held it.
+    """
+    write_config_atomically(path, config)
 
 
 def _commit_agent_config(
@@ -223,7 +797,15 @@ def _commit_agent_config(
     order, are:
 
     0. the governance filter raises — nothing durable, and the caller's 500 is
-       exact (it fails closed, so a raise withholds rather than grants);
+       exact (it fails closed, so a raise withholds rather than grants). The
+       merge-on-write step ahead of it (0a) adds one prefix of its own, and it is
+       the harmless end: it can raise :class:`AppOwnershipUnreadable` while
+       having mutated only the in-memory *config*, so the caller's 500 is exact
+       and all three targets are byte-identical (see
+       :func:`_app_or_host_owned` for why refusing beats guessing). The
+       stale-snapshot rule shares that step and adds NO prefix of its own: it
+       performs no I/O beyond the one read they share and cannot raise, so its
+       only effect is on the in-memory *config*;
     1. the ``config.json`` read raises :class:`ConfigReadError` — nothing
        durable, and the caller's 500 is exact;
     2. the ``config.json`` write fails — nothing durable;
@@ -234,11 +816,17 @@ def _commit_agent_config(
        updated, the spec unchanged.
 
     Order inside the unit is chosen to make the *earliest* prefixes the *least*
-    harmful, and three steps are load-bearing rather than incidental:
+    harmful, and four steps are load-bearing rather than incidental:
 
-    * The governance filter is FIRST, and it is in here at all so that the grant
-      decision cannot be made against a ceiling that changes before the write
-      publishes it — see step (0). First because it persists nothing, so its own
+    * The merge (0a) precedes the governance filter, so the entries it re-adds
+      are governed like any other — see step (0a). It is in the unit at all for
+      the same reason as the read at (1): its on-disk read must be adjacent to
+      the write it feeds, or an app registration landing during the flock wait
+      is clobbered exactly as it was pre-fix.
+    * The governance filter is FIRST among the steps that decide what is
+      persisted, and it is in here at all so that the grant decision cannot be
+      made against a ceiling that changes before the write publishes it — see
+      step (0). Ahead of every write because it persists nothing, so its own
       fail-closed raise costs no partial write.
     * The read is FIRST among the writes' own inputs. It is the only
       fallible-by-decision I/O step, and running it here — immediately adjacent
@@ -278,24 +866,113 @@ def _commit_agent_config(
     #
     # Imported lazily: platform.governance is not a module-level dependency of
     # the dashboard handlers.
+    # ── THE BRIDGE-FILE LOCK SPANS THE WHOLE UNIT ─────────────────────────────
+    # Acquired here rather than at the spec write, because merge-on-write reads
+    # this same file and that read is only meaningful if no app writer can
+    # commit between it and the write it feeds. ``_deregister_mcp_servers``
+    # (app disable / uninstall / health demotion) read-modify-writes the spec
+    # under exactly this flock, so an unlocked read let a PUT resurrect a bridge
+    # that had just been removed -- and that direction does NOT self-heal,
+    # because ``reconcile_enabled_app_resources`` only re-registers ENABLED apps
+    # and skips the one whose bridge came back.
+    #
+    # LOCK ORDER IS UNCHANGED: transaction -> config -> bridge-file. The caller
+    # already holds the outer two before dispatching this unit, so widening the
+    # innermost hold adds no edge and inverts nothing. The cost is that app
+    # registration now waits on the ``config.json`` and bookkeeping writes too --
+    # the same accepted trade ``remove_provider_entry`` documents for holding the
+    # MCP lock across its unlinks, and the alternative (a second, later lock hold
+    # for just the spec write) is what reopens the window above.
+    #
+    # Taken once. ``_write_installed_config`` deliberately no longer locks: with
+    # ``flock`` being per open file description, a nested reacquisition from this
+    # same thread would block against this hold forever.
     from kiro_crew.platform.governance import sanitize_agent_config_governance
 
-    sanitize_agent_config_governance(config)
-    # (1) The one fallible READ, and it precedes every write.
+    with _agent_file_lock(target=installed_path):
+        return _commit_agent_config_locked(
+            config=config,
+            name=name,
+            mc_cfg_path=mc_cfg_path,
+            removed_per_key=removed_per_key,
+            installed_path=installed_path,
+            sanitize=sanitize_agent_config_governance,
+        )
+
+
+def _commit_agent_config_locked(
+    *,
+    config: dict[str, Any],
+    name: str,
+    mc_cfg_path: Path,
+    removed_per_key: dict[str, list[str]],
+    installed_path: Path,
+    sanitize: Any,
+) -> bool:
+    """The commit unit's steps, with bridges' file lock already held.
+
+    Split out only so the lock acquisition reads as one statement; every
+    invariant documented on :func:`_commit_agent_config` applies here, and this
+    is never called from anywhere else.
+    """
+    # (0a) ON-DISK STATE DECIDES BOTH DIRECTIONS, immediately before the filter
+    # that governs the map they produce. Inside the unit for the same reason as
+    # (0) and (1): the on-disk read has to be adjacent to the write it feeds, or a
+    # bridge registration landing during the (unbounded, cross-process) flock wait
+    # is clobbered exactly as before the fix. BEFORE the filter, not after, so the
+    # entries the merge re-adds are governed too -- re-injecting them afterwards
+    # would hand an ``autoApprove`` on a preserved entry a path around step (0).
     #
-    # Fail closed: writing back a {} baseline would drop every other setting
-    # just to record removedTools (see read_config_for_update).
-    mc_cfg = read_config_for_update(mc_cfg_path)
-    if removed_per_key:
-        mc_cfg["removedTools"] = removed_per_key
-    else:
-        mc_cfg.pop("removedTools", None)
-    # (2) config.json — the snapshot the read above produced, still current.
-    write_config_atomically(mc_cfg_path, mc_cfg)
+    # ONE read for the two rules, so they cannot disagree about their baseline:
+    # #6664's merge decides names ABSENT from the submission, #7089's rule decides
+    # namespaced names PRESENT in a stale one. Their order is immaterial (see
+    # :func:`_drop_unbacked_app_entries`).
+    existing = _on_disk_mcp_servers(installed_path)
+    dropped = _drop_unbacked_app_entries(config, existing)
+    if dropped:
+        # WARNING, not info: the client submitted these and they are not being
+        # persisted, which is the one outcome here a user could be surprised by.
+        logger.warning(
+            "agent-config PUT: dropped %d app-namespaced mcpServers entry/entries the "
+            "installed spec does not hold, so a stale snapshot cannot resurrect them: %s",
+            len(dropped),
+            ", ".join(dropped),
+        )
+    preserved = _merge_unowned_servers(config, existing)
+    if preserved:
+        logger.info(
+            "agent-config PUT: kept %d mcpServers entry/entries the client does not own: %s",
+            len(preserved),
+            ", ".join(preserved),
+        )
+    sanitize(config)
+
+    # (1)+(2) config.json, read AND written inside one hold of the
+    # ``<config>.json.lock`` sidecar. The caller's ``_get_config_lock()`` is an
+    # asyncio lock: it serializes this against sibling handlers on this event
+    # loop and nothing else. The ~69 ``update_config_locked`` writers -- the CLI,
+    # the boot refresh, another gateway process -- take the advisory lock
+    # instead, so without this the two families could interleave and whichever
+    # renamed second published a document that never saw the other's change.
+    #
+    # Still the one fallible READ, and it still precedes every write: with the
+    # default ``on_corrupt="fail"`` an unreadable config raises
+    # :class:`ConfigReadError` out of here before anything durable happens, so
+    # the caller's 500 stays exact. Failing closed is the point -- writing back a
+    # {} baseline would drop every other setting just to record removedTools
+    # (see read_config_for_update).
+    def _record_removed_tools(mc_cfg: dict) -> dict:
+        if removed_per_key:
+            mc_cfg["removedTools"] = removed_per_key
+        else:
+            mc_cfg.pop("removedTools", None)
+        return mc_cfg
+
+    update_config_locked(mc_cfg_path, mutate=_record_removed_tools, stamp_meta=False)
     # (3) agent_model_state.json bookkeeping — after (2), before (4).
     changed = agent_state.lift_and_strip_bookkeeping(config, name)
-    # (4) the installed spec, under bridges' file lock.
-    _write_installed_config_locked(installed_path, config)
+    # (4) the installed spec, under the caller's bridge-file lock.
+    _write_installed_config(installed_path, config)
     return changed
 
 
@@ -317,10 +994,10 @@ async def api_agent_config(request: web.Request) -> web.Response:
         denied = await _require_owner(request, "agent_config.write")
         if denied is not None:
             return denied
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        body, body_err = await read_bounded_json(request, max_bytes=None)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
         config = body.get("config")
         if not isinstance(config, dict):
             return web.json_response({"error": "config must be an object"}, status=400)
@@ -408,9 +1085,12 @@ async def api_agent_config(request: web.Request) -> web.Response:
             # api_mcp_server_detail, mcp_discover, api_capability_mcp_install),
             # and no config-lock or file-lock holder in the tree acquires the
             # transaction lock inside, so there is no ABBA cycle. The file lock is
-            # taken inside the worker thread (by _write_installed_config_locked,
-            # reached from _commit_agent_config) — a blocking flock on the event
-            # loop would freeze the gateway while app registration holds it.
+            # taken inside the worker thread (by ``_commit_agent_config``, which
+            # holds it across the whole unit so merge-on-write's on-disk READ and
+            # the spec write cannot be split by an app writer) — a blocking flock
+            # on the event loop would freeze the gateway while app registration
+            # holds it. Widening that innermost hold changes no ORDER: the outer
+            # two are already held before the unit is dispatched.
             # Nothing else in this branch takes a cross-process lock: governance +
             # SEL and agent_state take none, so running the filter inside the
             # worker adds no lock edge to the transaction → config → file order.
@@ -444,9 +1124,11 @@ async def api_agent_config(request: web.Request) -> web.Response:
             )
 
             # Governance floor on the WHOLE-object write path: this handler
-            # persists the request's config verbatim, so a dashboard PUT could
-            # otherwise restore a ceiling-governed @denied grant or a governed
-            # server's autoApprove that the per-ref writers strip.
+            # persists the request's config as submitted (plus the ``mcpServers``
+            # entries merge-on-write re-adds, which the filter therefore also
+            # governs — see ``_commit_agent_config`` step (0a)), so a dashboard
+            # PUT could otherwise restore a ceiling-governed @denied grant or a
+            # governed server's autoApprove that the per-ref writers strip.
             #
             # NOT in phase 1. The filter used to run here, and that placed the
             # grant decision BEFORE both lock acquisitions: the transaction flock
@@ -495,6 +1177,20 @@ async def api_agent_config(request: web.Request) -> web.Response:
                             removed_per_key=removed_per_key,
                             installed_path=installed_path,
                         )
+                    except AppOwnershipUnreadable:
+                        # Step (0a), ahead of every durable write, so all three
+                        # targets are byte-identical and this 500 is exact.
+                        # Refusing is the only honest answer: guessing preserved
+                        # would make entries undeletable, guessing deleted would
+                        # clobber live app bridges. The client can retry.
+                        logger.exception("Refusing agent-config PUT: app ownership unreadable")
+                        return web.json_response(
+                            {
+                                "error": "cannot determine app-owned MCP entries",
+                                "code": "app_ownership_unreadable",
+                            },
+                            status=500,
+                        )
                     except ConfigReadError:
                         # The unit's FIRST step, so this 500 is exact: no write of
                         # the unit has run and all three targets are unchanged.
@@ -529,10 +1225,10 @@ async def api_default_agent(request: web.Request) -> web.Response:
         denied = await _require_owner(request, "default_agent.write")
         if denied is not None:
             return denied
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "invalid JSON"}, status=400)
+        body, body_err = await read_bounded_json(request, max_bytes=None)
+        if body_err is not None:
+            return body_err
+        assert body is not None  # read_bounded_json returns (dict, None) on success
         name = body.get("agent", "")
         # Reject non-strings before any use: a JSON list/object here would make
         # the membership check below raise (unhashable) into a 500, and a
@@ -569,6 +1265,7 @@ async def api_default_agent(request: web.Request) -> web.Response:
                 status=400,
             )
         path = _h.config_path()
+
         # This read-modify-write must hold the SAME in-process lock every other
         # ``config.json`` RMW in the dashboard takes (agent create/update/delete,
         # capability install/uninstall, the agent-config PUT). The event loop no
@@ -577,24 +1274,36 @@ async def api_default_agent(request: web.Request) -> web.Response:
         # can capture a baseline the worker is about to republish — and the last
         # atomic rename silently reverts the other side's unrelated settings.
         #
-        # Loop-side ``async with`` rather than an offload: the lock is an
-        # asyncio lock (``LoopBoundLock``) acquired exactly this way by every
-        # sibling RMW in this module, and the read and write below are
-        # synchronous with NO await between them, so once the lock is held the
-        # pair is already indivisible — a worker hop would add a cancellation
-        # point where today there is none.
-        async with _get_config_lock():
-            try:
-                data = read_config_for_update(path)
-            except ConfigReadError:
-                # Fail closed: writing back a {} baseline would drop every other setting.
-                logger.exception("Refusing to set default agent: config unreadable")
-                return web.json_response(
-                    {"error": "failed to read config file", "code": "config_unreadable"},
-                    status=500,
-                )
+        # That lock is not sufficient on its own, though: it is an asyncio lock,
+        # so it serializes only same-loop callers. The read-modify-write itself
+        # goes through ``update_config_locked``, which holds the
+        # ``<config>.json.lock`` sidecar across its own read and write and so
+        # also serializes against the CLI, worker threads and other processes.
+        #
+        # ``run_config_write`` is the one async entry point that holds BOTH --
+        # its own docstring says so -- and it is what every other converted
+        # dashboard writer uses. It takes the loop-side lock, dispatches the
+        # synchronous read-modify-write to a worker thread so an unbounded
+        # advisory-flock wait never stalls the gateway, and SHIELDS that worker
+        # in a drain loop so the lock cannot be released with a write still in
+        # flight. Composing those three by hand here would be a third copy of a
+        # helper that already exists, free to drift from it.
+        def _set_default(data: dict) -> dict:
             data["default_agent"] = name
-            write_config_atomically(path, data)
+            return data
+
+        try:
+            await run_config_write(
+                update_config_locked, path, mutate=_set_default, stamp_meta=False
+            )
+        except ConfigReadError:
+            # Fail closed: writing back a {} baseline would drop every other
+            # setting. Nothing durable ran, so this 500 is exact.
+            logger.exception("Refusing to set default agent: config unreadable")
+            return web.json_response(
+                {"error": "failed to read config file", "code": "config_unreadable"},
+                status=500,
+            )
         return web.json_response({"ok": True, "default_agent": name})
     cfg = KiroCrewConfig.load()
     return web.json_response({"default_agent": cfg.default_agent})
@@ -611,8 +1320,8 @@ def _supply_live_enum(entry: dict) -> None:
 
     The field carries no static ``enum`` on purpose (see ``AgentConfig``): an
     edition registers its backends at boot, strictly after ``SCHEMA_REGISTRY`` is
-    built, so a frozen list could only be wrong — it would call a registered
-    backend "not enabled in this build" while the PATCH allowlist accepted it.
+    built, so a frozen list could only be wrong — it would omit a registered
+    backend from the dashboard while the PATCH allowlist accepted it.
 
     Resolved from the same owner as the PATCH allowlist and the config load path,
     so the three cannot disagree. One binding today, so it is spelled once rather
@@ -722,10 +1431,10 @@ async def api_capability_mcp_install(request: web.Request) -> web.Response:
     denied = await _require_owner(request, "capability_mcp_install")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     server_id = body.get("server_id", "").strip()
     if not server_id:
         return web.json_response({"error": "server_id required"}, status=400)
@@ -758,10 +1467,10 @@ async def api_capability_mcp_uninstall(request: web.Request) -> web.Response:
     denied = await _require_owner(request, "capability_mcp_uninstall")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     server_id = body.get("server_id", "").strip()
     if not server_id:
         return web.json_response({"error": "server_id required"}, status=400)
@@ -810,10 +1519,10 @@ async def api_capability_skills_install(request: web.Request) -> web.Response:
     denied = await _require_owner(request, "capability_skills_install")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     package = body.get("package", "").strip()
     if not package:
         return web.json_response({"error": "package required"}, status=400)
@@ -840,10 +1549,10 @@ async def api_capability_skills_uninstall(request: web.Request) -> web.Response:
     denied = await _require_owner(request, "capability_skills_uninstall")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     package = body.get("package", "").strip()
     if not package:
         return web.json_response({"error": "package required"}, status=400)
@@ -1117,7 +1826,14 @@ def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict
     "this account can run" means. A local comparison would be a second spelling
     of that question — the exact drift that predicate exists to prevent — and any
     difference in how the two fold spelling variants shows up as a row the picker
-    offers and the wire then withholds.
+    offers and the wire then withholds. A literal miss is retried through
+    ``resolve_pin_spelling``, the same namespace fold the wire sites apply
+    before withholding — but the row is REWRITTEN to the advertised spelling
+    the fold answers with (and dropped when another row already offers that
+    spelling): the selection sinks (the agent/crew pin validator and
+    ``set_model``'s pre-flight) compare the picked value literally, so a row
+    must carry an id they accept verbatim, not the catalog's stale
+    ``<namespace>::<bare-id>`` qualifier it resolved from.
 
     The ``auto`` sentinel is never filtered: it means "inherit whatever the
     session already resolved", so it stays selectable even on a backend that does
@@ -1155,19 +1871,39 @@ def _entitled_kiro_models(request: web.Request, models: list[dict]) -> list[dict
     if not advertised:
         return models
     advertises_auto = any(_normalize_model_key(i) == "auto" for i in advertised)
-    kept = [
-        m
+    offered: set[str] = {
+        _normalize_model_key(m.get("model_name", ""))
         for m in models
         if _normalize_model_key(m.get("model_name", "")) == "auto"
         or not model_is_unusable(m.get("model_name", ""), advertised)
-    ]
+    }
+    kept: list[dict] = []
+    for m in models:
+        name = m.get("model_name", "")
+        if _normalize_model_key(name) == "auto" or not model_is_unusable(name, advertised):
+            kept.append(m)
+            continue
+        resolved = resolve_pin_spelling(name, advertised)
+        if not resolved:
+            continue
+        key = _normalize_model_key(resolved)
+        # Another row (literal or already-rewritten) offers this advertised
+        # spelling: emitting a second one would show duplicate rows for one
+        # model, so the qualified duplicate drops.
+        if key in offered:
+            continue
+        offered.add(key)
+        kept.append({**m, "model_name": resolved})
     # Tell "not comparable" apart from "entitled to almost nothing". A backend
     # that advertises `auto` shares a namespace with the catalog by definition, so
     # `auto` alone is a real answer — the most restricted tier there is — and must
     # narrow the picker to it. Only when nothing at all lines up, `auto` included,
     # is this a namespace mismatch (bare vs prefixed provider ids) where showing
     # the whole catalog beats emptying the picker. `auto` is always kept, so it can
-    # never serve as the evidence that the two sides are comparable.
+    # never serve as the evidence that the two sides are comparable. A row
+    # rewritten through the ``resolve_pin_spelling`` retry IS such evidence: a
+    # peeled match proves the two vocabularies line up once the qualifier is
+    # removed.
     if not advertises_auto and not any(
         _normalize_model_key(m.get("model_name", "")) != "auto" for m in kept
     ):
@@ -1586,7 +2322,17 @@ async def api_models(request: web.Request) -> web.Response:
         try:
             env = {**os.environ}
             env["PATH"] = augmented_path(env.get("PATH", ""))
-            _resolve_ssh_auth_sock(env)
+            # OFF the loop: the resolver globs /tmp/ssh-*/agent.* and stats
+            # every hit, so its latency scales with the /tmp entry count. Its
+            # sibling wrapper's contract states it must never run on the event
+            # loop, and this endpoint is polled every 8s while degraded.
+            await asyncio.to_thread(_resolve_ssh_auth_sock, env)
+            # The Docker entrypoint removes credentials from the long-lived
+            # gateway environment.  This fixed-argv child is the official
+            # kiro-cli and KIRO_API_KEY is its own model credential, so settle
+            # the same single key the interactive ACP spawn receives.  Keep
+            # the protected .env read off the gateway loop.
+            await asyncio.to_thread(inject_kiro_cli_api_key, env)
             env = scrub_agent_subprocess_env(env)
             proc = await create_subprocess_limited(
                 *argv,
@@ -1728,7 +2474,7 @@ async def api_effort_levels(request: web.Request) -> web.Response:
 async def api_slash_commands(request: web.Request) -> web.Response:
     """GET /api/slash-commands — list available slash commands (provider-aware)."""
     cfg = KiroCrewConfig.load()
-    if cfg.agent.provider == "claude_code":
+    if is_claude_code(cfg.agent.provider):
         state: DashboardState = request.app["state"]
         cc_commands: list[str] = []
         for provider in state.sessions.active_providers():
@@ -2080,6 +2826,283 @@ async def api_capability_mcp_registry(request: web.Request) -> web.Response:
 # ── KiroCrew Agent CRUD API ──
 
 
+def _roster_mask(value: object) -> str:
+    """Render ONE agent-record value for a roster row, masking what cannot be shown.
+
+    Every record value is agent- or package-writable: an agent can edit
+    ``config.json`` directly, and ``_do_agents_sync`` copies ``description``
+    straight off a discovered agent spec, so a third-party package controls that
+    string. A value the redactors would alter -- credential- or
+    exfiltration-URL-shaped text -- is therefore replaced WHOLESALE by
+    ``_SENSITIVE_MASK``, the sentinel ``_masked_config_dict`` already uses for
+    the same job on ``GET /api/config/kirocrew``. A non-string (the loader lets
+    an object through five declared-``str`` fields) is masked too: it is not
+    renderable, so there is nothing to show. Benign content is byte-identical.
+
+    **A fixed sentinel rather than redacting in place, and that is the whole
+    design.** An in-place scrub makes the browser's view a FUNCTION of the
+    stored value, so the write-side rule that keeps a read-modify-write from
+    persisting that view (``_carries_mask``) has to recognise it by
+    recomputing the transform -- which breaks in two ways a sentinel does not:
+
+    * **Redaction-chain drift.** #8465 wraps this same response in
+      ``redact_record_strings``, whose order differs from ``_redact_external``'s.
+      A recomputed-equality rule would stop matching and silently persist the
+      redacted text; an exact sentinel survives, because scrubbing
+      ``_SENSITIVE_MASK`` leaves it unchanged.
+    * **Stale-view skew.** If the stored value changes between the GET and the
+      PUT (an agent editing ``config.json``, a second dashboard tab), a
+      recomputed rule compares the old view against the NEW value, fails to
+      match, and writes ``[REDACTED ...]`` text into the config as though the
+      operator had typed it. The sentinel does not depend on the stored value at
+      all, so this cannot happen.
+
+    Named cost: a value containing one credential-shaped token is masked
+    entirely, so the owner loses the benign remainder of that string rather than
+    seeing it partially redacted. That is the same trade ``_masked_config_dict``
+    already makes, and it is the price of a view that cannot be mistaken for
+    content.
+    """
+    # Function-local for the reason recorded at the ``_validate_role_model``
+    # import below: ``handlers.core`` resolves ``_get_config_lock`` from THIS
+    # module, so a module-level import here would close the cycle.
+    from kiro_crew.dashboard.handlers.core import _SENSITIVE_MASK
+
+    if not isinstance(value, str):
+        return _SENSITIVE_MASK
+    return value if _redact_external(value) == value else _SENSITIVE_MASK
+
+
+def _carries_mask(incoming: object) -> bool:
+    """True when *incoming* still CARRIES the mask, so it is not real content.
+
+    The write-side half of ``_roster_mask``. A client that read a roster row and
+    echoed it back sends the mask; persisting it would destroy the operator's
+    stored value. Such a field is treated as UNCHANGED instead.
+
+    **Containment, not equality.** An exact-match rule closes only the
+    echo-it-back case. The editor renders the mask into a text input, so an
+    operator who APPENDS to it submits ``"<mask> and also X"`` -- not equal to the
+    sentinel, so an equality rule would persist the redaction glyphs plus the
+    addition, replacing the stored original. Any string still containing the
+    sentinel is therefore refused as content.
+
+    Consequence, stated because it is a real limitation and not a free win: a
+    genuine replacement must OMIT the sentinel entirely -- clear the field, then
+    type the new value. An edit that keeps the mask and adds to it is dropped
+    rather than half-applied. That is lossy in the operator's INTENT, but it never
+    destroys what is stored, and the alternative writes redaction glyphs into
+    ``config.json`` over the real value.
+
+    This is the remedy ``_masked_config_dict``'s docstring prescribes -- "MUST
+    treat ``_SENSITIVE_MASK`` as 'unchanged' and keep the stored value" -- read
+    the strict way. Because the comparison is against a FIXED sentinel and never
+    against a recomputation of the stored value, it is immune to which redaction
+    chain produced the view and to the stored value having changed since the read.
+
+    Accepted residual, identical in kind to the config endpoint's: an operator
+    cannot store a value containing the mask string. It is eight U+2022 bullets.
+
+    **Recursive, because one shipped field is STRUCTURED.** ``avatar`` is a dict
+    whose ``traits`` values are masked (``_roster_avatar``), so an echoed avatar
+    carries the sentinel one level DOWN. A top-level-only check sees a ``dict``,
+    answers "not a mask", and lets ``_safe_avatar`` persist the sentinel over the
+    stored trait -- the exact corruption this predicate exists to prevent, one
+    level deeper than the flat fields. Any string anywhere inside the value
+    therefore counts.
+
+    Cost of the recursive form, stated because it is sharper than the flat one: if
+    an avatar carries ANY masked trait, the whole avatar field is treated as
+    unchanged, so an edit to a DIFFERENT trait in the same avatar is dropped too.
+    A partial merge would be the alternative, and it is worse: it would have to
+    decide field-by-field which half of a structured value is authoritative, and
+    getting that wrong writes glyphs into stored config. Refusing the whole field
+    never destroys what is stored.
+    """
+    from kiro_crew.dashboard.handlers.core import _SENSITIVE_MASK
+
+    if isinstance(incoming, str):
+        return _SENSITIVE_MASK in incoming
+    if isinstance(incoming, dict):
+        return any(_carries_mask(val) for val in incoming.values())
+    if isinstance(incoming, (list, tuple)):
+        return any(_carries_mask(val) for val in incoming)
+    return False
+
+
+def _roster_avatar(value: object) -> dict:
+    """The one STRUCTURED field a roster row ships: shape-allowlisted, not masked.
+
+    ``avatar`` is a ``dict``, so ``_roster_mask``'s non-string rule would blank it
+    wholesale -- and the dashboard needs it: ``AgentSelector.tsx`` declares
+    ``avatar?: unknown`` commented "verbatim from the backend", and ``main``'s
+    roster still ships it via the ``asdict`` spread this PR replaces. Withholding
+    it would REGRESS a live feature rather than narrow a disclosure, so it is
+    named in the allowlist like every other shipped field.
+
+    **A shape allowlist, with masking confined to the leaves that can carry user
+    text.** ``_safe_avatar`` is the config's own validator, so only
+    ``{"kind": "ghost", "traits": {...}}`` and ``{"kind": "image", "v": ...,
+    "file": "<digest>.<ext>"}`` survive and junk collapses to ``{}``. Within that,
+    ONLY ``traits`` values are masked:
+
+    - ``kind`` and ``v`` are structural. Mask ``kind`` and the dashboard can no
+      longer tell a ghost from an uploaded picture.
+    - ``file`` is PINNED by ``_AVATAR_FILE_PIN_RE`` to ``<16-hex>.<ext>``, so it is
+      not arbitrary text. A value constrained by a regex is safer than a masked
+      one: the pin REFUSES a bad value where masking would destroy a good one, and
+      a masked ``file`` makes the per-crew avatar endpoint resolve nothing --
+      silently breaking the image.
+    - ``traits`` values, and the ``eyes``/``mouth`` values of each
+      ``expressions`` state, are the only user-authored strings here, so they go
+      through ``_roster_mask`` like any other roster string. The renderer resolves
+      an unrecognized trait to absent (``EYES[k] ?? ''``), so a masked trait
+      degrades that axis rather than breaking the face.
+    - ``sounds`` values are constrained by ``_safe_sounds`` to a shipped preset
+      name, so they are pinned rather than masked -- the same reason ``file`` is.
+
+    Honest limit on how far the two rules can be told apart: because
+    ``_safe_avatar`` already pins every non-``traits`` leaf to a shape the redactors
+    do not alter (a literal ``kind``, a digest ``file``, a hex ``tile``), a blanket
+    mask over the validated dict would behave the SAME as this targeted one today.
+    The targeted rule is chosen for intent and for the day that pin loosens, not
+    because a live defect separates them -- and no test can pin the difference
+    while the shape validator holds.
+
+    No host path is disclosed by any of this. The picture's bytes live under the
+    data home's agent-fenced ``run/avatars/`` dir and are served by the per-crew
+    avatar endpoint; the config field only marks the choice.
+    """
+    safe = _safe_avatar(value)
+    traits = safe.get("traits")
+    if isinstance(traits, dict):
+        safe = dict(safe)
+        safe["traits"] = {
+            axis: (_roster_mask(val) if isinstance(val, str) else val)
+            for axis, val in traits.items()
+        }
+    expressions = safe.get("expressions")
+    if isinstance(expressions, dict):
+        safe = dict(safe)
+        safe["expressions"] = {
+            state: {
+                axis: (_roster_mask(val) if isinstance(val, str) else val)
+                for axis, val in axes.items()
+            }
+            for state, axes in expressions.items()
+            if isinstance(axes, dict)
+        }
+    return safe
+
+
+def _name_would_be_masked(name: str) -> bool:
+    """True when *name* is credential-shaped, so a roster row would mask it.
+
+    Keyed on ``_roster_mask`` itself rather than on a second detector, so the
+    create-time rule and the read-time rule cannot drift apart: a name that would
+    arrive masked is a name that can never be stored in the first place.
+    """
+    return _roster_mask(name) != name
+
+
+def _agent_roster_row(
+    name: str, scope: str, agent_cfg: KiroCrewAgentConfig, *, redact: bool
+) -> dict[str, object]:
+    """Serialize ONE ``GET /api/agents`` roster row.
+
+    **Key half.** Explicit allowlist -- never a ``dataclasses.asdict`` spread,
+    mirroring the rule ``handlers/members.py`` already documents for
+    ``GET /api/members``. The response is a network-boundary contract, and a
+    spread makes that contract "every field ``KiroCrewAgentConfig`` has now, plus
+    every field anyone adds later", automatically -- so a field added by someone
+    who never looked at this endpoint (internal bookkeeping, a filesystem path, a
+    capability hint, a credential-shaped one) ships to the browser by omission.
+    Naming each field inverts the default: nothing leaves unless it is added here
+    deliberately (#8454). Both row sources go through this one function, so the
+    ``cfg.agents`` rows and the project-scope rows cannot drift into different
+    key sets.
+
+    **Value half.** Every record value goes through ``_roster_mask``, for every
+    caller, uniformly -- see there for why they are all untrusted and why the
+    mask is a fixed sentinel. ``_carries_mask`` is its write-side half in
+    ``api_kirocrew_agent_update``; neither is correct alone, and an end-to-end
+    test does the GET then the PUT to prove the pair.
+
+    Uniform rather than per-field on purpose: an earlier revision exempted the
+    fields the agents page happens to write back today, which encoded a claim
+    about the CLIENT that this side could not enforce -- and it was already
+    wrong, because ``api_kirocrew_agent_update`` accepts ``description`` and
+    ``source`` too.
+
+    ``name`` is the single exception, and only for the owner: it is the row's
+    IDENTITY, addressing ``/api/agents/{name}`` for edit and delete and keying
+    the usage sort, and it travels in the URL rather than the body so the
+    write-side rule cannot protect it. Masking it would make the row
+    unaddressable. An ``app`` token cannot reach those owner-gated routes, so the
+    exemption buys it nothing and ``name`` is masked there. A credential-shaped
+    name is now refused at CREATION (``_name_would_be_masked``), closing the hazard
+    at its source rather than at this one read site -- but only for names arriving
+    through that route, so an already-stored one still reaches here and is still
+    masked for every caller but the owner. Named cost: an app that feeds a roster name to another route sees the
+    mask, which happens only for a name containing credential- or URL-shaped
+    text.
+
+    ``scope`` is never masked: it is a literal written here, not record content.
+    The annotation is ``dict[str, object]`` rather than ``dict[str, str]`` because
+    of ONE field: ``avatar`` is a structured ``dict`` the dashboard needs verbatim
+    (see ``_roster_avatar``). Every other value is a ``str`` -- ``_roster_mask``
+    returns one for every input, including the non-strings the loader lets
+    through.
+
+    Excluded on purpose, each verified to have NO consumer in ``website/src``:
+    ``watchdog_tool_stall_suspect_secs`` and ``watchdog_tool_stall_hard_cap_secs``
+    (per-agent watchdog windows -- backend scheduling knobs the roster does not
+    render) and ``telegram_account`` (deprecated and inert, and the one record
+    field naming an external messaging binding). Adding any of them back is a
+    one-line change plus the pinned key set.
+    """
+    return {
+        # ``name`` is masked for an app token (which can address nothing) and for
+        # every PROJECT row (which nothing can address either: both
+        # ``api_kirocrew_agent_update`` and ``api_kirocrew_agent_delete`` 404 on a
+        # name absent from ``cfg.agents``, and a scanned project agent never is).
+        # A GLOBAL row's name survives for a non-app caller because it is that
+        # row's only handle -- it addresses ``/api/agents/{name}`` for edit and
+        # delete and keys the usage sort -- and masking it there would buy
+        # nothing: the same names are readable unmasked from
+        # ``GET /api/config/kirocrew``, where they are the ``agents`` map's KEYS
+        # and ``_masked_config_dict`` masks only schema-``sensitive`` VALUES.
+        # That last argument does NOT extend to project rows, whose names come
+        # from a filesystem scan and appear in no config, which is why they are
+        # masked here rather than reasoned away.
+        #
+        # Named cost: a project agent whose FILENAME is credential- or
+        # URL-shaped is no longer selectable, because the picker dispatches by
+        # this value (``AgentSelector.tsx:127`` ``onChange(a.name)``). That is
+        # confined to names the redactors would alter; an ordinary project agent
+        # name is byte-identical.
+        "name": _roster_mask(name) if (redact or scope == "project") else name,
+        # The #1684 project-scope tag: "project" rows dispatch only from the
+        # slot whose project they were scanned from. Handler-added, not a
+        # record field.
+        "scope": scope,
+        "kiro_agent": _roster_mask(agent_cfg.kiro_agent),
+        "workspace": _roster_mask(agent_cfg.workspace),
+        "memory_store": _roster_mask(agent_cfg.memory_store),
+        "model": _roster_mask(agent_cfg.model),
+        "reasoning_effort": _roster_mask(agent_cfg.reasoning_effort),
+        "description": _roster_mask(agent_cfg.description),
+        "triggers": _roster_mask(agent_cfg.triggers),
+        "source": _roster_mask(agent_cfg.source),
+        "session_color": _roster_mask(agent_cfg.session_color),
+        # The one STRUCTURED value a row carries -- shape-allowlisted by
+        # ``_safe_avatar`` with masking confined to user-authored ``traits``
+        # values, so ``kind``/``v``/``file`` survive as the pinned shapes the
+        # dashboard and the per-crew avatar endpoint need. See ``_roster_avatar``.
+        "avatar": _roster_avatar(getattr(agent_cfg, "avatar", {})),
+    }
+
+
 async def api_kirocrew_agents(request: web.Request) -> web.Response:
     """GET /api/agents — list all Kiro Crew agent definitions, most-used first.
 
@@ -2091,8 +3114,28 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     dispatch resolves aliases first, so the alias is what would answer.
     """
     cfg = KiroCrewConfig.load()
+    # Caller class, resolved once for the whole response. It decides only VALUE
+    # treatment, never the key set -- see ``_roster_mask``.
+    #
+    # The OWNER predicate, not an app-token check. `request.get("app", "")` alone
+    # asks "is this an app?", and a non-owner DASHBOARD session answers no: an
+    # allow-listed messaging user running `!dashboard` holds a dashboard token
+    # with `app == ""` and would have sailed through, which is the same
+    # caller-class hole that keeps reappearing when this question is hand-rolled
+    # per class instead of delegated to the one predicate that already answers
+    # it. `is_owner_dashboard_request` is what `_require_owner` resolves to for
+    # the mutating routes in this module, so the read and write sides now agree
+    # on who the owner is.
+    #
+    # Fails CLOSED -- treated as NOT the owner, so masked -- when the app carries
+    # no state to resolve an owner against. The predicate subscripts
+    # `app["state"]`, and for a disclosure control "unknown caller" must mean
+    # "mask", not "show".
+    from kiro_crew.dashboard.handlers.source_providers import is_owner_dashboard_request
+
+    redact = request.app.get("state") is None or not is_owner_dashboard_request(request)
     agents = [
-        {"name": name, "scope": "global", **dataclasses.asdict(agent_cfg)}
+        _agent_roster_row(name, "global", agent_cfg, redact=redact)
         for name, agent_cfg in cfg.agents.items()
     ]
 
@@ -2105,14 +3148,23 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
     if project_dir:
         try:
             project_names = await asyncio.get_running_loop().run_in_executor(
-                discovery_executor(), project_agent_names, project_dir
+                discovery_executor(),
+                functools.partial(
+                    project_agent_names,
+                    project_dir,
+                    operation="api_kirocrew_agents",
+                    source="dashboard",
+                ),
             )
         except Exception:
             logger.warning("Failed to list project agents for %s", project_dir, exc_info=True)
             project_names = frozenset()
-        base = dataclasses.asdict(KiroCrewAgentConfig())
+        # One shared default record for every project row — they carry no
+        # per-agent config of their own (nothing on disk to read without a
+        # second scan), so the row is the default record under a project tag.
+        project_default = KiroCrewAgentConfig()
         agents.extend(
-            {"name": name, "scope": "project", **base}
+            _agent_roster_row(name, "project", project_default, redact=redact)
             for name in sorted(project_names - set(cfg.agents.keys()))
         )
 
@@ -2128,9 +3180,12 @@ async def api_kirocrew_agents(request: web.Request) -> web.Response:
             # their config-insertion index and form a stable bottom block.
             sorted_agents = sorted(
                 enumerate(agents),
+                # ``str(...)`` because the row's value type widened to ``object``
+                # for ``avatar`` (the one structured field); ``name`` is always a
+                # ``str`` -- masked or verbatim, ``_roster_mask`` returns one.
                 key=lambda item: (
-                    -usage.get(item[1]["name"], (0, 0.0))[0],
-                    -usage.get(item[1]["name"], (0, 0.0))[1],
+                    -usage.get(str(item[1]["name"]), (0, 0.0))[0],
+                    -usage.get(str(item[1]["name"]), (0, 0.0))[1],
                     item[0],
                 ),
             )
@@ -2199,6 +3254,27 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
                 # filesystem, and on a populated agents directory this per-agent
                 # check (in a loop) would stall the gateway loop and heartbeat.
                 _dn = disc.name
+                # The OTHER way a name reaches `cfg.agents`, and the one the
+                # create-route check cannot see. A discovered spec's name is
+                # package-controlled rather than typed by the owner, so "the owner
+                # is reading a string the owner wrote" does not hold for it: a
+                # package could land a credential-shaped name that then reaches
+                # the roster. Refused here, at the second source, for the same
+                # reason it is refused at the first.
+                #
+                # Skipped rather than masked: masking would leave an
+                # unselectable, unrenameable row, and this row has no owner to
+                # rename it -- it comes back on every sync until the PACKAGE is
+                # fixed. The name is deliberately absent from the log line, since
+                # writing it into the log is the disclosure being avoided.
+                if _name_would_be_masked(_dn):
+                    logger.warning(
+                        "refusing to sync a discovered agent whose name is "
+                        "credential- or URL-shaped (source=%s); name withheld "
+                        "from this log deliberately -- fix the providing package",
+                        getattr(disc, "source", "?"),
+                    )
+                    continue
                 _has_on_disk = await asyncio.to_thread(
                     lambda: (kiro_agents_dir_path() / f"{_dn}.json").exists()
                     or _namespaced_agent_file_exists(_dn)
@@ -2225,6 +3301,12 @@ async def _do_agents_sync(request: web.Request) -> web.Response:
         # Skip pruning if scan returned nothing -- likely a transient issue.
         # Invariant: for package-sourced entries, kiro_agent == dict key == agent name.
         # ("aim" is also accepted for backward-compat with older configs.)
+        # A STARRED package crew is pruned like any other -- a registry row with
+        # no spec on disk is not spawnable. The star goes with the row: a
+        # reinstalled crew comes back un-starred and one click restores it
+        # (deliberately no parking list -- a permanent config key is not worth
+        # a re-click, and a name-keyed list would pre-star an unrelated future
+        # package that reused the name).
         if discovered_names:
             for name, agent_cfg in list(cfg.agents.items()):
                 if agent_cfg.source in ("package", "aim") and (
@@ -2303,6 +3385,14 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
     # filesystem work off the event loop.
     model = await asyncio.to_thread(resolve_effective_model, cfg, agent_name or None)
     bindings = resolve_agent_bindings(cfg, agent_name or None)
+    # Effort resolves through its own chain, served from the SAME resolver the
+    # provider factory calls so the pane cannot disagree with what a session will
+    # actually run at -- including the role-aware default, which a crew bound to a
+    # background worker agent takes instead of the chat default. Keyed on what the
+    # bindings resolved, which is what makes an omitted `agent` answer for the
+    # configured default crew rather than for no crew at all.
+    crew_effort = cfg.crew_pinned_effort(None, bindings.resolved_alias)
+    session_effort = cfg.resolve_session_effort(bindings.kiro_agent, bindings.resolved_alias)
     return web.json_response(
         {
             "model": model,
@@ -2310,8 +3400,84 @@ async def api_kirocrew_agent_resolved_model(request: web.Request) -> web.Respons
             "kiro_agent": bindings.kiro_agent,
             # Whether the agent itself pins the model, vs inheriting it.
             "pinned": bool(bindings.model),
+            # The effort a new session on this crew starts at, and whether the
+            # crew pinned it or inherited a default. "" means no tier pins one
+            # and the model's own default applies.
+            "reasoning_effort": session_effort,
+            "effort_pinned": bool(crew_effort),
         }
     )
+
+
+def _effort_inputs(crew: KiroCrewAgentConfig | None) -> tuple[str, str] | None:
+    """The crew fields `resolve_session_effort` reads, or ``None`` for no crew.
+
+    Derived from the resolver's inputs rather than enumerated per call site. The
+    chain reads two things off the record -- the pin itself, and the bound
+    ``kiro_agent`` the role default keys on -- and the factory answers from the
+    config it captured, so ANY change to either (including a crew appearing or
+    disappearing) must invalidate that capture. Three rounds of review found the
+    per-condition version incomplete one case at a time (an unpinned crew whose
+    binding makes it a background worker; a re-bound `kiro_agent`); comparing this
+    tuple before and after a write is the invariant those cases are instances of,
+    and a future field the chain starts reading is added here once instead of at
+    every handler.
+    """
+    if crew is None:
+        return None
+    return (crew.kiro_agent, coerce_effort(crew.reasoning_effort))
+
+
+async def _refresh_session_defaults(request: web.Request, crew: str) -> None:
+    """Rebuild the provider factory so a crew's new effort pin reaches new sessions.
+
+    The factory resolves the pin from the config it captured when it was built, so
+    a write alone stays invisible until a restart. That is the same staleness
+    ``api_kirocrew_config_patch`` already handles for ``agent.reasoning_effort``
+    and ``agent.role_efforts.*``, and for the same reason it uses
+    ``refresh_defaults()`` rather than ``reload_provider_factory()``: the factory
+    is rebuilt and the warm pool drained WITHOUT touching live sessions, so an
+    in-flight turn is not killed because a default changed. The pool must drain
+    either way -- a pre-warmed child carries the old effort overlay, and the claim
+    path never re-pushes effort.
+
+    Best-effort: the write is already durable, so a crew save must not fail
+    because the refresh did. A failure costs one gateway lifetime of staleness,
+    which is what the behaviour was before this call existed.
+    """
+    state = request.app.get("state")
+    sessions = getattr(state, "sessions", None)
+    if sessions is None:
+        return
+    try:
+        await sessions.refresh_defaults()
+    except Exception:
+        logger.warning(
+            "Could not refresh session defaults after saving crew %r; the pin "
+            "applies from the next gateway start",
+            crew,
+            exc_info=True,
+        )
+
+
+def _crew_effort_rejected(raw: object) -> str | None:
+    """Reason a crew's reasoning-effort pin is unusable, or ``None`` to allow it.
+
+    Rejects rather than coercing, which is the opposite of the config-file load
+    path (:func:`coerce_effort`). The difference is who is watching: a typo in a
+    hand-edited file must not stop the gateway from booting, but a typo sent by
+    the crew form has an author on the other end, and silently storing ``""``
+    would read back as "inherits" and look like the save was lost.
+
+    ``""`` is the inherit sentinel and always allowed -- it is how a pin is
+    cleared.
+    """
+    if not isinstance(raw, str):
+        return "reasoning_effort must be a string"
+    val = raw.strip()
+    if val in EFFORT_VALUES:
+        return None
+    return "reasoning_effort must be one of: " + ", ".join(("(empty)", *EFFORT_LEVELS))
 
 
 def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str | None:
@@ -2342,7 +3508,7 @@ def _model_pin_rejected(model: str, request: web.Request, provider: str) -> str 
     # intentionally map away from. Its entitlement guard lives in its own
     # provider path, where full configured ids and bare advertised ids can be
     # canonicalized before comparison.
-    if provider == "claude_code":
+    if is_claude_code(provider):
         return None
 
     # The registry knows each model under several spellings and only one is what
@@ -2389,6 +3555,34 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
     name = body.get("name", "").strip()
     if not name:
         return web.json_response({"error": "Agent name is required"}, status=400)
+    # Refused at the SOURCE, not masked at one read site. Once such a name is
+    # stored it reaches logs, error messages, telemetry and every other surface
+    # that prints a crew name -- none of which this module controls -- so closing
+    # it here closes it once, where masking a read closes one of N. Keyed on
+    # ``_roster_mask`` via ``_name_would_be_masked``, so this rule and the
+    # roster's cannot drift apart.
+    #
+    # BOUNDARY, stated because it is real and narrower than "the hazard is
+    # closed": this covers only names created THROUGH this route, from now on. A
+    # crew already present in `config.json`, one written there by hand, and one
+    # added by ``_do_agents_sync`` from a discovered spec are NOT retroactively
+    # renamed. That is the reason the owner keeps reading a stored name verbatim:
+    # renaming is the remediation, and a name must be legible to be renamed.
+    #
+    # The name is deliberately NOT echoed back. Reflecting a credential-shaped
+    # string into a response body -- and from there into the request log -- is the
+    # disclosure this rule exists to prevent.
+    if _name_would_be_masked(name):
+        return web.json_response(
+            {
+                "error": (
+                    "Agent name looks like a credential or a URL carrying one. "
+                    "Pick a name that identifies the crew instead."
+                ),
+                "code": "credential_shaped_name",
+            },
+            status=400,
+        )
     # The template pointer must be EXPLICIT. It used to default to "kirocrew",
     # which made every crew created without naming a template an alias for the
     # DEFAULT agent: dispatch flattens an alias to its `kiro_agent`
@@ -2453,6 +3647,40 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             {"error": "session_color must be #rrggbb or empty", "code": "invalid_color_hex"},
             status=400,
         )
+    _raw_effort = body.get("reasoning_effort", "")
+    effort_reason = _crew_effort_rejected(_raw_effort)
+    if effort_reason:
+        return web.json_response(
+            {"error": effort_reason, "code": "invalid_reasoning_effort"}, status=400
+        )
+    reasoning_effort = _raw_effort.strip()
+    # Same convention as session_color: a non-empty raw value that the coercer
+    # collapses to "no override" is a caller mistake worth a 400, not a silent
+    # fallback to the name-derived face. The one exception is a well-formed
+    # ghost override whose traits all coerce to absent: that collapse is the
+    # validator's own all-empty→reset rule, not caller junk, so it stores as
+    # the canonical reset rather than being refused.
+    _raw_avatar = body.get("avatar")
+    avatar = _safe_avatar(_raw_avatar)
+    if _raw_avatar not in (None, {}) and not avatar and not _is_ghost_shaped(_raw_avatar):
+        return web.json_response(
+            {
+                "error": "avatar must be {'kind': 'ghost', 'traits': {...}}, {'kind': 'image'}, or empty",
+                "code": "invalid_avatar",
+            },
+            status=400,
+        )
+    if avatar.get("kind") == "image":
+        # A crew that does not exist yet cannot have staged a picture (the
+        # upload endpoint 404s for unknown names), so an image override on
+        # create can never have a file to commit.
+        return web.json_response(
+            {
+                "error": "upload the picture after creating the crew",
+                "code": "avatar_file_missing",
+            },
+            status=400,
+        )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name in cfg.agents:
@@ -2465,12 +3693,20 @@ async def api_kirocrew_agents_create(request: web.Request) -> web.Response:
             workspace=body.get("workspace", "default"),
             memory_store=body.get("memory_store", "default"),
             model=model,
+            reasoning_effort=reasoning_effort,
             description=body.get("description", ""),
             triggers=body.get("triggers", ""),
             source=body.get("source", "kirocrew"),
             session_color=session_color,
+            avatar=avatar,
         )
         cfg.save()
+    # A crew APPEARING changes what the effort chain resolves even with no pin of
+    # its own: the factory's captured config does not know the crew, so it cannot
+    # read the binding the role default keys on, and a scheduled or messaging
+    # session naming that crew would take the chat default instead. Creation is
+    # therefore always a change by `_effort_inputs` (None -> a tuple).
+    await _refresh_session_defaults(request, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.create",
@@ -2496,8 +3732,46 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "body must be an object", "code": "body_not_object"}, status=400
         )
+    # WRITE-SIDE HALF of the roster mask, and it runs FIRST -- immediately after
+    # the body-object check, before any validation. `GET /api/agents` replaces a
+    # value it cannot show verbatim with `_SENSITIVE_MASK` (`_roster_mask`), and
+    # a client that echoes the record back -- the agents page sends every field
+    # on every save, so that `""` can clear a pin -- would otherwise persist the
+    # mask over the stored original. A field carrying the mask therefore means
+    # "unchanged" and is dropped here, which is the remedy
+    # `_masked_config_dict`'s docstring prescribes verbatim: "MUST treat
+    # `_SENSITIVE_MASK` as 'unchanged' and keep the stored value".
+    #
+    # Ordering is load-bearing, not cosmetic: `model` and `reasoning_effort` are
+    # validated below and would REJECT an echoed mask with a 400, failing an edit
+    # to some unrelated field. Dropping the masked entries before those checks
+    # means a mask can never be validated as if it were content.
+    #
+    # It can run this early only because the predicate matches a FIXED sentinel
+    # and needs no access to the stored record -- a rule that recognised the view
+    # by recomputing the redaction of `agent` would have to wait for the config
+    # load inside the lock, and would therefore sit after these validations.
+    body = {key: val for key, val in body.items() if not _carries_mask(val)}
     if "model" in body:
         pending_model = normalize_agent_model(body["model"])
+    # Rejected before the config is even loaded: the check is pure, and every
+    # validation must land before the first field assignment below so a bad value
+    # cannot leave the in-memory record half-updated.
+    if "reasoning_effort" in body:
+        effort_reason = _crew_effort_rejected(body["reasoning_effort"])
+        if effort_reason:
+            return web.json_response(
+                {"error": effort_reason, "code": "invalid_reasoning_effort"}, status=400
+            )
+    # Same placement rule as reasoning_effort: validated up here, before the
+    # lock and before any field or avatar-file mutation. A body that pairs a
+    # bad `starred` with an avatar promotion would otherwise move the staged
+    # picture and then 400 without rolling it back. Strictly a bool: a string
+    # "false" from a hand-typed request must not read as truthy and star the crew.
+    if "starred" in body and not isinstance(body["starred"], bool):
+        return web.json_response(
+            {"error": "starred must be a boolean", "code": "invalid_starred"}, status=400
+        )
     async with _get_config_lock():
         cfg = KiroCrewConfig.load()
         if name not in cfg.agents:
@@ -2511,6 +3785,8 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                     {"error": model_reason, "code": "invalid_model"}, status=400
                 )
         agent = cfg.agents[name]
+        # Captured BEFORE any mutation: what the effort chain reads today.
+        effort_inputs_before = _effort_inputs(agent)
         changed: list[str] = []
         if "kiro_agent" in body:
             agent.kiro_agent = body["kiro_agent"]
@@ -2527,6 +3803,10 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
             # str()-coerced — see the create path for why.
             agent.model = normalize_agent_model(body["model"])
             changed.append("model")
+        if "reasoning_effort" in body:
+            # Already validated above; "" is the inherit sentinel and clears a pin.
+            agent.reasoning_effort = body["reasoning_effort"].strip()
+            changed.append("reasoning_effort")
         if "description" in body:
             agent.description = body["description"]
             changed.append("description")
@@ -2546,10 +3826,141 @@ async def api_kirocrew_agent_update(request: web.Request) -> web.Response:
                 )
             agent.session_color = _norm
             changed.append("session_color")
+        _avatar_promoted = False
+        _avatar_pin = ""
+        _prior_pin: object = None
+        _remove_files_after_save = False
+        if "avatar" in body:
+            _raw_av = body["avatar"]
+            _av = _safe_avatar(_raw_av)
+            # Same 400 convention as session_color: junk that coerces to "no
+            # override" is refused rather than silently clearing the face.
+            # None/{} are the explicit "reset to name-derived" spellings, and
+            # a well-formed ghost override that collapses all-empty is the
+            # validator's own reset rule, not caller junk.
+            if _raw_av not in (None, {}) and not _av and not _is_ghost_shaped(_raw_av):
+                return web.json_response(
+                    {
+                        "error": "avatar must be {'kind': 'ghost', 'traits': {...}}, {'kind': 'image'}, or empty",
+                        "code": "invalid_avatar",
+                    },
+                    status=400,
+                )
+            if _av.get("kind") == "image":
+                # THE commit point for pictures, under this same config lock.
+                # `promote` is a wire-only directive (never persisted — the
+                # validator drops it): the client sets it exactly when THIS
+                # save staged a fresh upload. Without it, a leftover staging
+                # from an earlier failed or abandoned save must NOT ride along
+                # into an unrelated edit — it is discarded instead, and the
+                # crew keeps wearing its current picture.
+                _tok = _raw_av.get("token") if isinstance(_raw_av, dict) else None
+                _wants_promote = isinstance(_raw_av, dict) and _raw_av.get("promote") is True
+                _prior_pin = agent.avatar.get("file")
+                if _wants_promote and not isinstance(_tok, str):
+                    # `promote` without its staging token must not slide into
+                    # the picture-keeping branch: that would discard the
+                    # staged replacement and report success for a save that
+                    # installed nothing.
+                    return web.json_response(
+                        {
+                            "error": "promote requires the staging token from the upload",
+                            "code": "avatar_file_missing",
+                        },
+                        status=400,
+                    )
+                if _wants_promote and isinstance(_tok, str):
+                    _promoted = await _drained_to_thread(_promote_pending_avatar, name, _tok)
+                    _avatar_promoted = _promoted is not None
+                    if _promoted is None:
+                        # The bytes THIS save staged are gone (a newer save
+                        # re-staged the slot, or staging was cleaned up).
+                        # Falling back to the current live picture would
+                        # report success while silently dropping the user's
+                        # selected replacement — fail the commit instead.
+                        return web.json_response(
+                            {
+                                "error": "staged avatar no longer matches this save"
+                                " — upload the picture again",
+                                "code": "avatar_file_missing",
+                            },
+                            status=400,
+                        )
+                    stamp, _avatar_pin = _promoted
+                else:
+                    await _drained_to_thread(_discard_pending_avatar, name)
+                    # A picture-keeping edit (no fresh upload): stamp from the
+                    # file the config's pin already selects.
+                    _live = await asyncio.to_thread(_live_avatar_file, name, _prior_pin)
+                    stamp = None
+                    if _live is not None:
+                        _avatar_pin = _live.name[len(_avatar_stem(name)) + 1 :]
+                        try:
+                            stamp = int((await asyncio.to_thread(_live.stat)).st_mtime_ns)
+                        except OSError:
+                            stamp = None
+                if stamp is None:
+                    return web.json_response(
+                        {
+                            "error": "no uploaded avatar file to commit — POST the picture first",
+                            "code": "avatar_file_missing",
+                        },
+                        status=400,
+                    )
+                # Rebuilt, not mutated, so the record carries exactly the
+                # committed stamp and pin. The per-state keys are validated
+                # input rather than commit output, so they have to be carried
+                # across explicitly -- otherwise saving a sound on a crew that
+                # wears a picture reports success and stores nothing.
+                _av = {
+                    "kind": "image",
+                    "v": stamp,
+                    "file": _avatar_pin,
+                    **{k: v for k, v in _av.items() if k in ("expressions", "sounds")},
+                }
+            elif agent.avatar.get("kind") == "image":
+                # Leaving the picture tier: the stored file must not linger
+                # as a silently-retrievable orphan — but only once the config
+                # write that stops selecting it has actually succeeded.
+                _remove_files_after_save = True
+            agent.avatar = _av
+            changed.append("avatar")
         if "source" in body:
             agent.source = body["source"]
             changed.append("source")
-        cfg.save()
+        if "starred" in body:
+            # Already validated above, before any mutation.
+            agent.starred = body["starred"]
+            changed.append("starred")
+        effort_inputs_after = _effort_inputs(agent)
+        # The config write is the transaction's point of no return: on
+        # failure the orphaned install is removed; on success the commit
+        # reaps every variant except the newly pinned one.
+        # `Exception`, NOT `BaseException`: a cancellation arriving here does
+        # not mean the save failed — the drained worker runs to completion,
+        # so on cancellation the save either fully landed (config and pin
+        # consistent; only the commit-time reap is skipped, leaving orphan
+        # variants the pin never serves) or raised a real exception, which
+        # takes the rollback path below. Rolling back on the cancellation
+        # itself would delete the file a completed save now pins.
+        try:
+            await _drained_to_thread(cfg.save)
+        except Exception:
+            if _avatar_promoted:
+                await _drained_to_thread(_rollback_promoted_avatar, name, _avatar_pin, _prior_pin)
+            raise
+        if _avatar_promoted:
+            await _drained_to_thread(_commit_promoted_avatar, name, _avatar_pin)
+        if _remove_files_after_save:
+            await _drained_to_thread(_remove_avatar_files, name)
+    # Compared, not merely "the body carried the field": the crew form sends
+    # reasoning_effort on every save (that is what makes clearing a pin possible)
+    # and refresh_defaults drains the warm pool, so refreshing on presence would
+    # cost a cold start on every unrelated crew edit. A re-bound kiro_agent counts
+    # too -- the role default reads it. Outside the config lock, because the
+    # refresh takes the session locks.
+    if effort_inputs_after != effort_inputs_before:
+        await _refresh_session_defaults(request, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.update",
@@ -2577,7 +3988,16 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
                 status=409,
             )
         del cfg.agents[name]
-        cfg.save()
+        await _drained_to_thread(cfg.save)
+        # The crew is gone; its uploaded picture must not outlive it. Inside
+        # the same lock so the cleanup cannot run AFTER a concurrent
+        # same-name recreation has already uploaded and committed a new
+        # picture under the same digest stem.
+        await _drained_to_thread(_remove_avatar_files, name)
+    # A crew DISAPPEARING is the other half of the same invariant: the captured
+    # config still holds the record, so a cron or messaging job still naming the
+    # crew would keep resolving its old pin and binding.
+    await _refresh_session_defaults(request, name)
     _sel().log_api_access(
         caller=request.get("user", "dashboard"),
         operation="agent.delete",
@@ -2586,6 +4006,508 @@ async def api_kirocrew_agent_delete(request: web.Request) -> web.Response:
         resources=name,
     )
     return web.json_response({"ok": True})
+
+
+# ── Per-crew uploaded avatars ────────────────────────────────────────
+#
+# The "image" tier of per-crew custom avatars: the picture lives as a file
+# under the data home, the config field only records `{"kind": "image"}`
+# (see config.sections._safe_avatar). Serving goes through the authenticated API —
+# never a raw filesystem path — so remote dashboards work unchanged.
+
+#: Accepted image formats, sniffed from magic bytes — the client-sent
+#: Content-Type is attacker-controlled and is deliberately ignored. The set
+#: itself lives in the config loader, which validates the ``ext`` pin the
+#: committed config carries against the same vocabulary.
+_AVATAR_IMAGE_EXTS = _LOADER_AVATAR_IMAGE_EXTS
+_AVATAR_CONTENT_TYPES = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}
+#: Upload ceiling. The client downscales to 512px before upload, so a
+#: compliant upload is tens of KB; 1 MB tolerates a generous margin while
+#: keeping a hostile body from ballooning memory (parts accumulate in RAM).
+_AVATAR_MAX_BYTES = 1024 * 1024
+
+
+def _is_ghost_shaped(value: object) -> bool:
+    """True when ``value`` is a structurally well-formed ghost override
+    whose trait values all carry their schema types.
+
+    Used to tell the validator's all-empty→reset collapse apart from caller
+    junk at the 400 gate. Structure alone is not enough: the validator
+    coerces a wrong-TYPE trait value (``{"eyes": 7}``) to absent, so a
+    malformed payload would collapse to reset and — when the crew currently
+    wears an uploaded picture — silently delete it. A payload only earns the
+    reset collapse when every trait it names is validly typed (string axes
+    are strings, boolean axes are real booleans), i.e. it is genuinely
+    empty, not mistyped.
+    """
+    if not (
+        isinstance(value, dict)
+        and value.get("kind") == "ghost"
+        and isinstance(value.get("traits"), dict)
+    ):
+        return False
+    traits = value["traits"]
+    known = set(_AVATAR_GHOST_STR_TRAITS) | set(_AVATAR_GHOST_BOOL_TRAITS) | {"tile"}
+    if any(k not in known for k in traits):
+        # An unknown axis name is a typo'd or version-skewed caller, not an
+        # empty override — it must not earn the reset collapse.
+        return False
+    for key in _AVATAR_GHOST_STR_TRAITS:
+        if key in traits and not isinstance(traits[key], str):
+            return False
+    for key in _AVATAR_GHOST_BOOL_TRAITS:
+        if key in traits and not isinstance(traits[key], bool):
+            return False
+    tile = traits.get("tile", "")
+    if not isinstance(tile, str):
+        return False
+    if tile and not _safe_color(tile):
+        # A nonempty tile the color validator coerces to absent is junk,
+        # not an intentionally empty axis.
+        return False
+    return True
+
+
+def _avatars_dir() -> Path:
+    """Uploaded-avatar directory, resolved against the live data home.
+
+    Lives under ``run/`` — the data-home subtree the security layer fences
+    from agent file tools (read AND write) — because the config's ``file``
+    pin only proves which path was committed, not what is inside it: an
+    agent that could write the pinned path would have its bytes served to
+    the owner's authenticated dashboard as the saved picture. The gateway's
+    own handlers open these paths directly in-process and do not route
+    through that gate, so upload/serve/reap all work unchanged.
+
+    Resolved per call, never captured at import — an import-time binding
+    freezes the data home and defeats pod isolation and test isolation
+    (dashboard/handlers/files.py is the precedent).
+    """
+    return data_home() / "run" / "avatars"
+
+
+def _avatar_stem(name: str) -> str:
+    """Path-safe filename stem for a crew's avatar.
+
+    Crew names are display strings (spaces, CJK, anything) — a digest
+    sidesteps every path-traversal and encoding question rather than
+    answering them one by one. Full digest: truncating buys nothing and a
+    shorter stem is the only thing a collision would need.
+    """
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()
+
+
+def _avatar_variant_paths(name: str) -> list[Path]:
+    """Every digest-named stored variant of ``name``'s picture on disk."""
+    stem = _avatar_stem(name)
+    d = _avatars_dir()
+    out: list[Path] = []
+    for p in d.glob(f"{stem}.*"):
+        suffix = p.name[len(stem) + 1 :]
+        if _AVATAR_FILE_PIN_RE.fullmatch(suffix) and p.is_file():
+            out.append(p)
+    return sorted(out)
+
+
+def _pending_avatar_path(name: str) -> Path | None:
+    """Return the STAGED (uploaded, not yet committed) file, or None."""
+    stem = _avatar_stem(name)
+    for ext in _AVATAR_IMAGE_EXTS:
+        p = _avatars_dir() / f"{stem}.pending.{ext}"
+        if p.is_file():
+            return p
+    return None
+
+
+def _remove_avatar_files(name: str) -> None:
+    """Delete every stored variant (installed + staged) of ``name``'s
+    avatar, best-effort — a failed unlink is logged, never raised, because
+    both callers (saving ``avatar: {}`` and crew deletion) have already
+    cleared the config field, so the file is unreachable either way.
+    """
+    stem = _avatar_stem(name)
+    for ext in _AVATAR_IMAGE_EXTS:
+        try:
+            (_avatars_dir() / f"{stem}.pending.{ext}").unlink(missing_ok=True)
+        except OSError:
+            logger.debug("could not remove staged avatar for %s (.%s)", name, ext)
+    for p in _avatar_variant_paths(name):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("could not remove avatar file %s for %s", p.name, name)
+
+
+def _discard_pending_avatar(name: str) -> None:
+    """Remove any staged-but-uncommitted upload (best-effort)."""
+    stem = _avatar_stem(name)
+    for ext in _AVATAR_IMAGE_EXTS:
+        try:
+            (_avatars_dir() / f"{stem}.pending.{ext}").unlink(missing_ok=True)
+        except OSError:
+            logger.debug("could not discard pending avatar for %s (.%s)", name, ext)
+
+
+def _read_avatar_file(path: Path) -> bytes | None:
+    """Bounded, symlink-refusing read of a stored avatar file.
+
+    The avatars dir sits behind the ``run/`` agent fence, but a stored file
+    is still not trusted just because it is where an upload would have
+    landed (defense in depth): a
+    planted symlink must not let the authenticated GET read an arbitrary
+    file, and a planted oversized blob must not be slurped unbounded into
+    gateway memory. ``None`` means "treat as absent".
+    """
+    try:
+        if path.is_symlink() or not stat.S_ISREG(path.lstat().st_mode):
+            logger.warning("refusing non-regular avatar file %s", path.name)
+            return None
+        with path.open("rb") as fh:
+            data = fh.read(_AVATAR_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(data) > _AVATAR_MAX_BYTES:
+        logger.warning("refusing oversized avatar file %s", path.name)
+        return None
+    return data
+
+
+def _staging_token(data: bytes) -> str:
+    """Identity of a staged upload: a content digest the PUT must echo.
+
+    Staging is keyed by crew, so overlapping saves share the slot; the token
+    is what stops save A's commit from promoting save B's bytes.
+    """
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _promote_pending_avatar(name: str, token: str) -> tuple[int, str] | None:
+    """Install the staged upload at its digest-named path; return
+    ``(cache stamp, file pin)``.
+
+    Installs only when the staged bytes match ``token`` (the digest the
+    upload response handed THIS save) — a slot overwritten by a newer save's
+    staging returns None instead of committing someone else's bytes. The
+    install target is ``<stem>.<token>.<ext>``: content-addressed, so it can
+    never collide with (or overwrite) the currently committed file — a
+    process kill anywhere before the config save leaves the committed
+    picture byte-identical at its own pinned path, and the orphaned install
+    is reaped by the next successful commit. The caller MUST follow with
+    :func:`_commit_promoted_avatar` (save succeeded) or
+    :func:`_rollback_promoted_avatar` (save failed). Runs synchronous
+    filesystem work: call via ``asyncio.to_thread``.
+    """
+    pending = _pending_avatar_path(name)
+    if pending is None:
+        return None
+    staged = _read_avatar_file(pending)
+    if staged is None or _staging_token(staged) != token:
+        return None
+    stem = _avatar_stem(name)
+    d = _avatars_dir()
+    pin = f"{token}{pending.suffix}"
+    final = d / f"{stem}.{pin}"
+    # replace_with_retry rides out the Windows sharing-violation window an
+    # AV scanner or indexer opens on either path. Re-uploading bytes already
+    # committed lands on the same digest path with identical content.
+    replace_with_retry(pending, final)
+    # Best-effort: a scanner holding a pending sibling open must not fail a
+    # promotion whose install already landed.
+    for other in _AVATAR_IMAGE_EXTS:
+        try:
+            (d / f"{stem}.pending.{other}").unlink(missing_ok=True)
+        except OSError:
+            logger.debug("could not remove staged avatar for %s (.%s)", name, other)
+    # Nanosecond mtime: a same-size same-second replacement must still get a
+    # fresh ?v= or the browser keeps showing the old bytes.
+    return int(final.stat().st_mtime_ns), pin
+
+
+def _commit_promoted_avatar(name: str, keep_pin: str) -> None:
+    """After the config save succeeded: reap every variant except the one
+    the config now pins — the previous picture and any orphaned installs.
+    """
+    for p in _avatar_variant_paths(name):
+        if p.name[len(_avatar_stem(name)) + 1 :] == keep_pin:
+            continue
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("could not reap avatar variant %s for %s", p.name, name)
+
+
+def _rollback_promoted_avatar(name: str, installed_pin: str, keep_pin: object) -> None:
+    """Undo an install whose config save failed: remove the installed file.
+
+    The committed picture was never touched — installs are content-addressed
+    — so rollback is a single unlink, skipped when the install landed on the
+    committed pin itself (a re-upload of identical bytes).
+    """
+    if installed_pin == keep_pin:
+        return
+    try:
+        (_avatars_dir() / f"{_avatar_stem(name)}.{installed_pin}").unlink(missing_ok=True)
+    except OSError:
+        logger.debug("could not remove installed avatar %s for %s", installed_pin, name)
+
+
+def _live_avatar_file(name: str, pin: object) -> Path | None:
+    """The avatar file the config's ``file`` pin selects, or None.
+
+    Only the exact pinned file counts. There is deliberately NO fallback for a
+    record without a valid pin (a hand-edited ``{"kind": "image"}``): every
+    writer stamps ``file`` at the commit, so a pinless record never names a
+    committed picture, and "any stored variant" would include an orphaned
+    install left by a crash between the install and the config save — the
+    one file this pin exists to keep out of the roster. A pinless record
+    therefore serves nothing (the frontend falls back to the seeded ghost)
+    and a picture-keeping save on it fails with ``avatar_file_missing``
+    rather than adopting an unknown file.
+    """
+    if isinstance(pin, str) and _AVATAR_FILE_PIN_RE.fullmatch(pin):
+        p = _avatars_dir() / f"{_avatar_stem(name)}.{pin}"
+        return p if p.is_file() else None
+    return None
+
+
+async def _drained_to_thread(fn, /, *args):
+    """``asyncio.to_thread`` that a cancellation cannot abandon mid-mutation.
+
+    A plain ``await to_thread(...)`` raises ``CancelledError`` at the await
+    while the worker THREAD keeps running — inside ``async with
+    _get_config_lock()`` that releases the lock with the filesystem/config
+    mutation still in flight, so a concurrent save interleaves with it.
+    Shielding the task keeps the await alive until the worker actually
+    finishes, then re-raises the cancellation, so the lock is only ever
+    released with no mutation in flight.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            # OUR await was cancelled, not the worker: remember it, keep
+            # draining the still-running thread.
+            cancelled = exc
+    if cancelled is not None:
+        raise cancelled
+    return result
+
+
+def _sniff_image_ext(head: bytes) -> str:
+    """Return the format of ``head`` by magic bytes, or ``""``.
+
+    PNG / JPEG / WEBP only — the formats every target browser renders in an
+    ``<img>`` and none of which can carry active content the way SVG can.
+    """
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    return ""
+
+
+def _image_body_complete(ext: str, body: bytes) -> bool:
+    """Whether ``body`` is a structurally complete image of format ``ext``.
+
+    Magic bytes alone accept a body cut off mid-stream (a client that died
+    mid-upload, or a hand-built request), and committing one would reap the
+    crew's previous picture in exchange for a file no browser can decode. A
+    full decoder is not a dependency of this package, so this checks the one
+    property every truncation breaks — that the container is closed:
+
+    - PNG: the stream ends with the ``IEND`` chunk (its 4-byte CRC is fixed).
+    - JPEG: the stream ends with the ``FFD9`` end-of-image marker.
+    - WEBP: the RIFF header's declared payload length matches the body.
+
+    Trailing padding after the terminator is not tolerated either: an
+    ``<img>`` renders it fine, but it is exactly the shape a smuggled payload
+    takes, and no encoder this endpoint accepts pictures from emits it.
+    """
+    if ext == "png":
+        return body.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")
+    if ext == "jpg":
+        return body.endswith(b"\xff\xd9")
+    if ext == "webp":
+        if len(body) < 12:
+            return False
+        declared = int.from_bytes(body[4:8], "little")
+        # RIFF length counts everything after the 8-byte RIFF header. A
+        # single pad byte is legal when the payload length is odd.
+        return declared + 8 in (len(body), len(body) - 1)
+    return False
+
+
+async def api_kirocrew_agent_avatar_get(request: web.Request) -> web.Response:
+    """GET /api/agents/{name}/avatar — serve the crew's uploaded picture.
+
+    Owner-gated and SEL-audited like its POST/DELETE peers. ``ETag`` derives
+    from the bytes served, so a replaced picture invalidates even when size
+    and second-granularity mtime coincide.
+    """
+    denied = await _require_owner(request, "agent.avatar_get")
+    if denied is not None:
+        return denied
+    name = request.match_info["name"]
+    # The file is served only while the crew's config actually selects it —
+    # a leftover file after an out-of-band config edit or a failed cleanup
+    # must not remain silently retrievable. The file pin narrows that further:
+    # only the exact committed file is served, so an uncommitted install left
+    # by a mid-save crash cannot impersonate the saved picture.
+    cfg = await asyncio.to_thread(KiroCrewConfig.load)
+    agent = cfg.agents.get(name)
+    if agent is None or agent.avatar.get("kind") != "image":
+        return web.json_response(
+            {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
+        )
+    path = await asyncio.to_thread(_live_avatar_file, name, agent.avatar.get("file"))
+    if path is None:
+        return web.json_response(
+            {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
+        )
+    data = await asyncio.to_thread(_read_avatar_file, path)
+    if data is None:
+        return web.json_response(
+            {"error": "no uploaded avatar", "code": "avatar_not_found"}, status=404
+        )
+    _sel().log_api_access(
+        caller=request.get("user", "dashboard"),
+        operation="agent.avatar_get",
+        outcome="success",
+        source="dashboard",
+        resources=name,
+    )
+    etag = f'"{hashlib.sha256(data).hexdigest()[:32]}"'
+    if request.headers.get("If-None-Match") == etag:
+        return web.Response(status=304, headers={"ETag": etag})
+    return web.Response(
+        body=data,
+        content_type=_AVATAR_CONTENT_TYPES[path.suffix.lstrip(".")],
+        headers={"ETag": etag, "Cache-Control": "private, max-age=0, must-revalidate"},
+    )
+
+
+async def api_kirocrew_agent_avatar_upload(request: web.Request) -> web.Response:
+    """POST /api/agents/{name}/avatar — STAGE the crew's picture (multipart).
+
+    Staging only: the file lands as ``<stem>.pending.<ext>`` and nothing the
+    roster serves changes. The commit point is the ordinary agent update
+    (`PUT /api/agents/{name}` with ``avatar: {"kind": "image"}``), which
+    promotes the staged file and writes the field under one config lock —
+    so a failed or abandoned Save can never have replaced the live picture,
+    and the editor's Apply→Save two-step holds for images exactly as it
+    does for ghost traits.
+    """
+    denied = await _require_owner(request, "agent.avatar_upload")
+    if denied is not None:
+        return denied
+    name = request.match_info["name"]
+    if not (request.content_type or "").startswith("multipart/"):
+        return web.json_response(
+            {"error": "expected multipart/form-data", "code": "not_multipart"}, status=400
+        )
+    data = bytearray()
+    try:
+        reader = await request.multipart()
+        part = await reader.next()
+        # `next()` may yield a nested MultipartReader (multipart/mixed); only
+        # a concrete body part carries a file, so anything else is skipped.
+        while part is not None and (not isinstance(part, BodyPartReader) or part.name != "file"):
+            part = await reader.next()
+        if part is None:
+            return web.json_response(
+                {"error": "missing 'file' part", "code": "missing_file_part"}, status=400
+            )
+        while True:
+            chunk = await part.read_chunk(64 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > _AVATAR_MAX_BYTES:
+                return web.json_response(
+                    {
+                        "error": f"avatar exceeds {_AVATAR_MAX_BYTES // 1024} KB limit",
+                        "code": "avatar_too_large",
+                    },
+                    status=413,
+                )
+    except (ValueError, AssertionError):
+        # aiohttp raises plain ValueError for a bad/missing boundary or a
+        # body truncated mid-part; that is caller junk, not a server error.
+        return web.json_response(
+            {"error": "malformed multipart body", "code": "invalid_multipart"}, status=400
+        )
+    ext = _sniff_image_ext(bytes(data[:16]))
+    if not ext:
+        return web.json_response(
+            {
+                "error": "avatar must be a PNG, JPEG, or WEBP image",
+                "code": "avatar_bad_format",
+            },
+            status=400,
+        )
+    # Valid magic bytes on a truncated body must not stage: promotion would
+    # reap the committed picture and serve an undecodable file in its place.
+    if not _image_body_complete(ext, bytes(data)):
+        return web.json_response(
+            {
+                "error": "avatar image is truncated or malformed — re-export and upload again",
+                "code": "avatar_bad_format",
+            },
+            status=400,
+        )
+
+    def _stage() -> None:
+        d = _avatars_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        staged = d / f"{_avatar_stem(name)}.pending.{ext}"
+        # Atomic even for the staging file: a crash mid-write must not leave
+        # a truncated body a later promote would install. replace_with_retry
+        # rides out the Windows sharing-violation window an AV scanner or
+        # indexer opens on either path.
+        tmp = staged.with_suffix(f".{ext}.tmp-{uuid.uuid4().hex[:8]}")
+        try:
+            tmp.write_bytes(bytes(data))
+            replace_with_retry(tmp, staged)
+        finally:
+            tmp.unlink(missing_ok=True)
+        # A re-pick with a different format supersedes the previous staging.
+        # Best-effort: a scanner holding a stale sibling open must not fail
+        # the upload that already staged its bytes.
+        for other in _AVATAR_IMAGE_EXTS:
+            if other != ext:
+                try:
+                    (d / f"{_avatar_stem(name)}.pending.{other}").unlink(missing_ok=True)
+                except OSError:
+                    logger.debug("could not remove stale staging for %s (.%s)", name, other)
+
+    # Staging happens under the config lock, with the crew's existence
+    # re-checked inside it: an upload racing a crew deletion must not write
+    # an orphan file the deletion's cleanup already missed. The multipart
+    # body was fully read above, so the lock is held only for the short
+    # filesystem commit.
+    async with _get_config_lock():
+        cfg = await asyncio.to_thread(KiroCrewConfig.load)
+        if name not in cfg.agents:
+            return web.json_response(
+                {"error": f"Agent '{name}' not found", "code": "agent_not_found"},
+                status=404,
+            )
+        await _drained_to_thread(_stage)
+    _sel().log_api_access(
+        caller=request.get("user", "dashboard"),
+        operation="agent.avatar_upload",
+        outcome="success",
+        source="dashboard",
+        resources=name,
+    )
+    return web.json_response({"ok": True, "staged": True, "token": _staging_token(bytes(data))})
 
 
 # ── Conductor skill regeneration ────────────────────────────────────

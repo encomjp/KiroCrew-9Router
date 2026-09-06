@@ -31,6 +31,13 @@ import pytest
 
 from kiro_crew import platform_compat as pc
 
+#: The REAL same-group probe, bound at module import so this file can test it.
+#: The rootdir conftest pins ``pc._shares_own_process_group`` for every test
+#: (see ``_pin_kill_and_reap_group_probe``), and that pin lands after this
+#: import -- so reaching for the module attribute inside a test would exercise
+#: the stub instead of the function.
+_real_shares_own_process_group = pc._shares_own_process_group
+
 
 def _fake_windows_bins(monkeypatch):
     """Resolve Windows system binaries while ``IS_WINDOWS`` is faked on POSIX.
@@ -647,7 +654,7 @@ class TestFindPythonInterpreter:
 
     def test_returns_none_when_only_stub_or_too_old(self, monkeypatch):
         # No usable interpreter: which() yields only the stub (Windows) / nothing,
-        # or an interpreter that reports < 3.10. Either way → None, never the stub.
+        # or an interpreter that reports < 3.12. Either way → None, never the stub.
         if pc.IS_WINDOWS:
             stub = r"C:\Users\me\AppData\Local\Microsoft\WindowsApps\python3.EXE"
             monkeypatch.setattr("shutil.which", lambda name: stub)
@@ -858,6 +865,19 @@ class TestResourceShims:
         # truncated without argtypes, so GetProcessTimes failed and this read 0.0.
         assert pc.proc_cpu_seconds() > 0.0
 
+    def test_proc_cpu_nanos_for_pid_reads_a_running_process(self):
+        # Linux /proc, macOS libproc, Windows GetProcessTimes: a live interpreter
+        # has consumed CPU on all three. None is reserved for a platform with no
+        # per-pid counter at all, where the caller keeps its prior behavior.
+        ns = pc.proc_cpu_nanos_for_pid(os.getpid())
+        if ns is None:
+            pytest.skip("no per-pid CPU counter on this platform")
+        assert ns > 0
+
+    def test_proc_cpu_nanos_for_pid_refuses_a_reserved_pid(self):
+        assert pc.proc_cpu_nanos_for_pid(0) is None
+        assert pc.proc_cpu_nanos_for_pid(-1) is None
+
     def test_raise_nofile_soft_limit_is_safe(self):
         # No-op on Windows; best-effort raise on POSIX. Must never raise.
         pc.raise_nofile_soft_limit(4096)
@@ -1034,8 +1054,8 @@ class TestDirLinkShims:
         assert pc.is_link_or_junction(link)
         # 0xA0000003 = IO_REPARSE_TAG_MOUNT_POINT, spelled literally rather than
         # read from the module under test (so the assertion is independent of it)
-        # and rather than via os.path.isjunction (3.12+ only; this project
-        # supports 3.10).
+        # and rather than via os.path.isjunction, which would couple the
+        # assertion to the same stdlib helper the module itself may use.
         assert os.lstat(str(link)).st_reparse_tag == 0xA0000003
         pc.unlink_link_or_junction(link)
         assert not link.exists()
@@ -1051,6 +1071,63 @@ class TestDirLinkShims:
 
         assert link.is_symlink()
         assert os.readlink(str(link)) == str(target)
+
+
+class TestPinDirectory:
+    """``pin_directory``: hold a directory so a child written by PATH stays put.
+
+    Every platform: the open refuses anything that is not a real directory.
+    Windows only: the held handle blocks rename/delete -- the property the
+    caller relies on when a same-UID watcher could otherwise swap the directory
+    for a junction between a check and a child process's open.
+    """
+
+    def test_a_real_directory_pins_and_releases(self, tmp_path):
+        target = tmp_path / "dir"
+        target.mkdir()
+        fd = pc.pin_directory(target)
+        try:
+            assert fd >= 0
+            assert stat.S_ISDIR(os.fstat(fd).st_mode)
+        finally:
+            os.close(fd)
+        # Released: the directory is ordinary again.
+        target.rename(tmp_path / "moved")
+
+    def test_a_file_at_the_name_is_refused(self, tmp_path):
+        regular = tmp_path / "f.txt"
+        regular.write_text("x")
+        with pytest.raises(NotADirectoryError):
+            pc.pin_directory(regular)
+
+    def test_a_link_at_the_name_is_refused_not_followed(self, tmp_path):
+        # A watcher's whole move is to put a link where the directory was; the
+        # pin must fail on it rather than pin the link's TARGET in its place.
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        pc.symlink_or_junction(target, link)
+        with pytest.raises(OSError):
+            pc.pin_directory(link)
+
+    @pytest.mark.skipif(not pc.IS_WINDOWS, reason="a held handle blocks rename only on Windows")
+    def test_a_pinned_directory_cannot_be_renamed_or_removed(self, tmp_path):
+        # The pin is on the DIRECTORY: its children can still be removed (the
+        # caller holds its own file open for that), but the directory itself
+        # can be neither renamed nor deleted until the handle is released.
+        target = tmp_path / "dir"
+        target.mkdir()
+        fd = pc.pin_directory(target)
+        try:
+            with pytest.raises(OSError):
+                target.rename(tmp_path / "swapped")
+            with pytest.raises(OSError):
+                target.rmdir()
+            assert target.is_dir()
+        finally:
+            os.close(fd)
+        target.rename(tmp_path / "swapped")
+        assert (tmp_path / "swapped").is_dir()
 
 
 # ---------------------------------------------------------------------------
@@ -1597,6 +1674,40 @@ class TestOwnProcessStartTime:
 
         monkeypatch.setattr(pc, "_darwin_libproc_handle", lambda: _ShortLib())
         assert pc._darwin_process_start_microtime(4242) is None
+
+    def test_darwin_cpu_nanos_parses_the_taskinfo_layout(self, monkeypatch):
+        """user+system CPU are sliced from the pinned ``proc_taskinfo`` offsets."""
+
+        class _FakeLib:
+            @staticmethod
+            def proc_pidinfo(_pid, _flavor, _arg, buf, size):
+                raw = bytearray(size)
+                raw[pc._DARWIN_PTI_TOTAL_USER_OFFSET : pc._DARWIN_PTI_TOTAL_USER_OFFSET + 8] = (
+                    7_000_000_000
+                ).to_bytes(8, "little")
+                raw[pc._DARWIN_PTI_TOTAL_SYSTEM_OFFSET : pc._DARWIN_PTI_TOTAL_SYSTEM_OFFSET + 8] = (
+                    500_000_000
+                ).to_bytes(8, "little")
+                buf.raw = bytes(raw)
+                return size
+
+        monkeypatch.setattr(pc, "_darwin_libproc_handle", lambda: _FakeLib())
+        assert pc._darwin_process_cpu_nanos(4242) == 7_500_000_000
+
+    def test_darwin_cpu_nanos_refuses_a_mismatched_struct_size(self, monkeypatch):
+        """Same layout check as the start-time probe: a partial fill answers None."""
+
+        class _ShortLib:
+            @staticmethod
+            def proc_pidinfo(_pid, _flavor, _arg, _buf, _size):
+                return 64
+
+        monkeypatch.setattr(pc, "_darwin_libproc_handle", lambda: _ShortLib())
+        assert pc._darwin_process_cpu_nanos(4242) is None
+
+    def test_darwin_cpu_nanos_without_libproc_is_none(self, monkeypatch):
+        monkeypatch.setattr(pc, "_darwin_libproc_handle", lambda: None)
+        assert pc._darwin_process_cpu_nanos(4242) is None
 
     def test_reads_the_platform_once_then_serves_the_cache(self, monkeypatch):
         first = pc.own_process_start_time()  # populate the cache for THIS pid
@@ -2562,7 +2673,7 @@ class TestFindPythonInterpreterReal:
         # The selection-side twin of test_origin_probe_ignores_pythonpath: at
         # child startup the ``site`` module imports any ``sitecustomize.py``
         # found on the caller's PYTHONPATH, and that module can monkeypatch
-        # ``sys.version_info`` — here forcing this real >= 3.10 interpreter to
+        # ``sys.version_info`` — here forcing this real >= 3.12 interpreter to
         # report 3.4, which would make the version gate reject it and steer
         # selection. The gate runs the probe isolated (-I), so the decoy is
         # never imported and the candidate is judged by its REAL version.
@@ -2576,7 +2687,7 @@ class TestFindPythonInterpreterReal:
         )
         monkeypatch.setenv("PYTHONPATH", str(decoy))
         # Every candidate name resolves to this suite's own interpreter — a
-        # real, runnable >= 3.10 CPython on every platform CI runs.
+        # real, runnable >= 3.12 CPython on every platform CI runs.
         monkeypatch.setattr("shutil.which", lambda name: sys.executable)
 
         assert pc.find_python_interpreter() == sys.executable
@@ -4193,6 +4304,64 @@ class TestKillAndReap:
         tree.assert_awaited_once()
         assert tree.await_args.args == (4242, pc.SIGKILL)
         proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_skips_the_group_kill_for_a_same_group_child(self) -> None:
+        """A child sharing OUR group leads no tree, so the group signal is
+        skipped and the pid-scoped kill covers it -- otherwise every routine
+        timeout would trip ``kill_process_tree``'s broadcast refusal.
+
+        Also the escape hatch for the rootdir conftest's autouse pin of this
+        probe: a test that wants the skip patches the seam itself and wins.
+        """
+        from unittest import mock
+
+        proc = self._proc()
+        with (
+            mock.patch.object(pc, "_shares_own_process_group", lambda _pid: True),
+            mock.patch.object(pc, "kill_process_tree_async", mock.AsyncMock()) as tree,
+        ):
+            await pc.kill_and_reap(proc)
+        tree.assert_not_awaited()
+        proc.kill.assert_called_once()
+        proc.communicate.assert_awaited_once()
+
+    @pytest.mark.skipif(not pc.IS_POSIX, reason="POSIX only")
+    def test_group_probe_reports_our_own_group(self) -> None:
+        """Our own pid is in our own group by construction."""
+        assert _real_shares_own_process_group(os.getpid()) is True
+
+    @pytest.mark.skipif(not pc.IS_POSIX, reason="POSIX only")
+    def test_group_probe_fails_closed_for_an_unreadable_pid(self, monkeypatch) -> None:
+        """Fail-closed, so a vanished or unreadable pid still gets its tree
+        signalled rather than silently skipping the kill."""
+        monkeypatch.setattr(
+            pc.os,
+            "getpgid",
+            lambda _pid: (_ for _ in ()).throw(ProcessLookupError()),
+        )
+        assert _real_shares_own_process_group(4242) is False
+
+    def test_group_probe_is_posix_only(self, monkeypatch) -> None:
+        """Windows has no process groups to compare, so nothing is ever skipped
+        there -- and the probe must not reach a missing ``os.getpgid``.
+
+        This case runs on EVERY platform on purpose -- the non-POSIX branch is
+        what it covers -- so the tripwire is installed with ``raising=False``:
+        ``os.getpgid`` is Unix-only, and a strict ``setattr`` raises
+        ``AttributeError`` during the test's own arrangement on Windows, which
+        is where the assertion matters most. With ``raising=False`` the sentinel
+        is created where the attribute is absent, never called (that is the
+        assertion), and removed at teardown.
+        """
+        monkeypatch.setattr(pc, "IS_POSIX", False)
+        monkeypatch.setattr(
+            pc.os,
+            "getpgid",
+            lambda _pid: (_ for _ in ()).throw(AssertionError("probed on Windows")),
+            raising=False,
+        )
+        assert _real_shares_own_process_group(os.getpid()) is False
 
     @pytest.mark.asyncio
     async def test_reaps_via_communicate_never_wait(self) -> None:

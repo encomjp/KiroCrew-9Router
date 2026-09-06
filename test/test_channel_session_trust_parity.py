@@ -47,6 +47,7 @@ from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, AcpEve
 from kiro_crew.hooks import TOOL_DENY
 from kiro_crew.messaging.renderer import Renderer, TransportCapabilities
 from kiro_crew.safety_override import safety_override
+from kiro_crew.session_allocation import SessionClosingError
 
 # ── Channel-neutral doubles ───────────────────────────────────────────────────
 
@@ -136,6 +137,12 @@ class _Sessions:
         # is_new=False deliberately: it keeps the turn off the dashboard-surfacing
         # and set_channel paths, neither of which this suite is about.
         return self._p, False, False
+
+    def begin_turn(self, key: str) -> None:
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns = getattr(self, "begin_turns", 0) + 1
+        if getattr(self, "closing", False):
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key: str, channel_id: str) -> None:
         return None

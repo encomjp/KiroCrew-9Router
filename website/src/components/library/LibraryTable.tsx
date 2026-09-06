@@ -1,5 +1,5 @@
 import type * as React from 'react'
-import { useState, useRef } from 'react'
+import { useId, useState, useRef } from 'react'
 import { ChevronRight, ChevronDown, ChevronUp, MoreVertical, Pencil, Trash2, Star, ExternalLink, Loader2, X, Share2, FileText, FolderOpen, Folder as FolderIcon } from 'lucide-react'
 import { openPopout } from '../../utils/artifactPopout'
 import { Badge, Btn, Input, IconButton } from '../ui'
@@ -12,6 +12,7 @@ import { useImeGuard } from '../../hooks/useImeGuard'
 import { useScrollEdges } from '../../hooks/useScrollEdges'
 import { FOLDER_COLOR_PALETTE } from '../folderColorCatalog'
 import { i18nT } from '../../i18n/t'
+import { publishNoticeKey } from '../PublishHub'
 import type { Artifact, ArtifactFolder, SessionDoc } from '../../types'
 
 export type SortKey = 'name' | 'slug' | 'kind' | 'source' | 'version' | 'tags' | 'updated'
@@ -245,7 +246,21 @@ export const ARTIFACT_COLUMNS: LibraryColumn[] = [
   { key: 'updated', label: 'pages.artifactsPage.updated', className: 'w-[110px]' },
 ]
 
-export function LibraryTableHead({ sort, onSort, edgeRight = false, columns = ARTIFACT_COLUMNS, actionsLabelKey = 'pages.artifactsPage.actions' }: {
+/**
+ * The surface a pinned cell sits ON, so its opaque fill and its seam gradient
+ * paint the same colour as the page behind the table. `--card` and `--bg`
+ * differ in every theme, so a cell that always paints `bg-card` inside a table
+ * with no card fill renders as a permanently tinted right-hand stripe.
+ */
+export type TableSurface = 'card' | 'bg'
+
+/** The opaque fill + `right-full` gradient pair for a pinned cell on a surface. */
+export const PINNED_SURFACE: Record<TableSurface, { fill: string; seam: string }> = {
+  card: { fill: 'bg-card', seam: 'from-card' },
+  bg: { fill: 'bg-bg', seam: 'from-bg' },
+}
+
+export function LibraryTableHead({ sort, onSort, edgeRight = false, columns = ARTIFACT_COLUMNS, actionsLabelKey = 'pages.artifactsPage.actions', surface = 'card' }: {
   sort: SortState
   onSort: (key: SortKey) => void
   edgeRight?: boolean
@@ -253,7 +268,10 @@ export function LibraryTableHead({ sort, onSort, edgeRight = false, columns = AR
    *  written literally below because its pin is the fragile part. */
   columns?: LibraryColumn[]
   actionsLabelKey?: string
+  /** What the table sits on; the pinned cell paints that colour. */
+  surface?: TableSurface
 }) {
+  const pinned = PINNED_SURFACE[surface]
   const th = 'text-left text-muted text-[12px] uppercase tracking-[.04em] px-2.5 py-2 border-b border-border font-medium'
   const sortable = (key: SortKey, label: string, extra: string) => {
     const active = sort?.key === key
@@ -306,9 +324,9 @@ export function LibraryTableHead({ sort, onSort, edgeRight = false, columns = AR
             left of the pin (says "columns continue"). Same treatment as the
             hooks and schedule tables, adapted for auto layout where a
             wrapper-anchored cue cannot know the pinned column's left edge. */}
-        <th className={`${th} w-[120px] sticky right-0 bg-card`}>
+        <th className={`${th} w-[120px] sticky right-0 ${pinned.fill}`}>
           {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 w-px bg-border" />}
-          {edgeRight && <div aria-hidden="true" className="pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l from-card to-transparent" />}
+          {edgeRight && <div aria-hidden="true" className={`pointer-events-none absolute right-full top-0 bottom-0 w-6 bg-gradient-to-l ${pinned.seam} to-transparent`} />}
           {i18nT(actionsLabelKey)}
         </th>
       </tr>
@@ -373,8 +391,8 @@ export function ArtifactRow({ a, onOpen, onDelete, deletingSlug, onTogglePin, pi
               {a.publication && (
                 <Share2
                   size={12}
-                  className={a.publication.last_error ? 'text-danger' : 'text-ok'}
-                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
+                  className={a.publication.last_error ? 'text-danger' : a.publication.notice ? 'text-warn' : 'text-ok'}
+                  aria-label={a.publication.last_error ? i18nT('pages.artifactsPage.published_sync_issue') : a.publication.notice ? i18nT(publishNoticeKey({ rolling_out: 'pages.artifactsPage.published_rolling_out', distribution_disabled: 'pages.artifactsPage.published_distribution_disabled', notice_generic: 'pages.artifactsPage.published_notice_generic' }, a.publication.notice_code)) : i18nT('pages.artifactsPage.published', { visibility: a.publication.visibility.toLowerCase() })}
                 />
               )}
             </div>
@@ -484,6 +502,7 @@ export function SessionDocRow({ d, busy, onMaterialize, edgeRight = false }: { d
       <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted">{ftype}</td>
       <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted truncate max-w-[180px]" title={d.session_title}>{d.session_title}</td>
       <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted">—</td>
+      {/* eslint-disable-next-line jsx-a11y/control-has-associated-label -- the Tags column, empty because a session document carries none. A cell of a plain data <table> has role `cell`: it is named by its contents and an empty one is legitimately unnamed, associated with the column by the header's `th`. The rule reads every `td` as a grid's `gridcell` widget. */}
       <td className="px-2.5 py-2 border-b border-border"></td>
       <td className="px-2.5 py-2 border-b border-border text-[12px] text-muted whitespace-nowrap">{_timeAgo(isoToTs(d.updated_at))}</td>
       {/* This row has no Actions controls, but it shares the pinned column, so
@@ -637,6 +656,11 @@ export function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggl
   // See LibraryTable: the pinned Actions seam is gated on measured overflow,
   // and auto layout makes the table (not the scroller's box) the content node.
   const [attachScroller, edges, , attachTable] = useScrollEdges<HTMLDivElement>()
+  // Names the Unfiled drop lane from its own visible "Unfiled N" text rather
+  // than a duplicate translated string. Instance-scoped because two trees can
+  // mount at once (library page + a side panel) and a repeated id would point
+  // both lanes at the first one's label.
+  const unfiledLabelId = useId()
   const folderIds = new Set(folders.map(f => f.id))
   const byFolder = new Map<string, Artifact[]>()
   for (const a of items) {
@@ -698,12 +722,12 @@ export function LibraryTree({ items, sort, onSort, folders, expandedIds, onToggl
           {folders.length > 0 && (
             <DndDroppable id="unfiled-lane" data={{ type: 'folder-drop', folderId: '' }}>
               {({ setNodeRef, isOver }) => (
-                <tr ref={setNodeRef} className={`transition-colors ${isOver || unfiledHot ? 'bg-accent/15' : ''}`}>
+                <tr ref={setNodeRef} aria-labelledby={unfiledLabelId} className={`transition-colors ${isOver || unfiledHot ? 'bg-accent/15' : ''}`}>
                   <td colSpan={9} className="px-2.5 border-b border-border" style={{ paddingTop: dragActive ? 10 : 6, paddingBottom: dragActive ? 10 : 6 }}>
                     <div className={`flex items-center gap-2 rounded transition-all ${
                       dragActive ? `border border-dashed px-2 py-1.5 ${isOver || unfiledHot ? 'border-accent text-text' : 'border-border text-muted'}` : ''
                     }`}>
-                      <span className="text-[11px] uppercase tracking-[.04em] text-muted font-medium">
+                      <span id={unfiledLabelId} className="text-[11px] uppercase tracking-[.04em] text-muted font-medium">
                         {i18nT('pages.artifactsPage.unfiled')} {unfiled.length}
                       </span>
                       {dragActive && (

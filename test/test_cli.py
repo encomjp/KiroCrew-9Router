@@ -2350,6 +2350,19 @@ class TestRestart:
         return MagicMock(pid=pid, poll=MagicMock(return_value=None))
 
     @pytest.fixture(autouse=True)
+    def _no_active_service(self):
+        # The denied-service branch consults ``is_service_active()`` after a
+        # refused ``restart_service()``. The real implementation shells out to
+        # systemctl/launchctl, so an unmocked call would make these tests
+        # depend on whether the BUILD HOST runs a kirocrew service. Pin it
+        # False; the denied-branch tests override it per-test.
+        with patch(
+            "kiro_crew.cli_server.service_controller.is_service_active",
+            return_value=False,
+        ):
+            yield
+
+    @pytest.fixture(autouse=True)
     def _tool_available(self):
         # ``_restart`` enters ``_stop`` when the port-lookup tool is ABSENT
         # (find_listening_pids() returns [] both for "nothing listening" and
@@ -2385,6 +2398,80 @@ class TestRestart:
         # And must not poke at the port lookup (the supervisor owns the lifecycle).
         mock_ports.assert_not_called()
         assert "Restarted" in capsys.readouterr().out
+
+    def test_active_service_restart_denied_fails_loud_with_remedy(self, capsys):
+        # A system-scope unit refuses an unprivileged `systemctl restart`
+        # ("Interactive authentication required"), while the unit stays
+        # active. Falling through to the listener path is a silent no-op on a
+        # unix-socket deployment: nothing listens on TCP, so nothing is
+        # stopped, and the ORIGINAL gateway keeps running while the command
+        # reads like a restart. The command must instead fail loudly and name
+        # the privileged command the operator has to run themselves.
+        from kiro_crew import cli_server
+
+        mock_sel = MagicMock()
+
+        with (
+            patch("kiro_crew.cli_server.sel", return_value=mock_sel),
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=False,
+            ),
+            patch(
+                "kiro_crew.cli_server.service_controller.is_service_active",
+                return_value=True,
+            ),
+            patch(
+                "kiro_crew.cli_server.service_controller.manual_restart_hint",
+                return_value="sudo systemctl restart kirocrew",
+            ),
+            patch("kiro_crew.cli_server.platform_compat.find_listening_pids") as mock_ports,
+            patch("kiro_crew.cli_server._stop") as mock_stop,
+            patch("kiro_crew.cli_server._spawn_detached_gateway") as mock_spawn,
+        ):
+            with pytest.raises(SystemExit) as exc:
+                cli_server._restart(None)
+
+        assert exc.value.code == 1
+        # The listener fallback must never be entered: it cannot see a
+        # unix-socket service gateway and would spawn a doomed competitor.
+        mock_ports.assert_not_called()
+        mock_stop.assert_not_called()
+        mock_spawn.assert_not_called()
+        out = capsys.readouterr().out
+        assert "NOT restarted" in out
+        assert "sudo systemctl restart kirocrew" in out
+        audit = mock_sel.log_api_access.call_args.kwargs
+        assert audit["outcome"] == "denied"
+        assert "reason=service_restart_denied" in audit["resources"]
+
+    def test_inactive_service_still_falls_through_after_refused_restart(self):
+        # ``restart_service()`` returning False because NO service is active
+        # must keep taking the foreground path — the denied diagnostic is only
+        # for a unit that is active right now yet refused the restart.
+        from kiro_crew import cli_server
+
+        with (
+            self._mock_sel(),
+            patch(
+                "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=False,
+            ),
+            patch(
+                "kiro_crew.cli_server.service_controller.is_service_active",
+                return_value=False,
+            ),
+            patch(
+                "kiro_crew.cli_server.platform_compat.find_listening_pids",
+                return_value=[],
+            ),
+            patch(
+                "kiro_crew.cli_server._spawn_detached_gateway",
+                return_value=self._fake_proc(4321),
+            ) as mock_spawn,
+        ):
+            cli_server._restart(None)
+        mock_spawn.assert_called_once()
 
     def test_no_service_no_running_gateway_spawns_fresh(self, capsys):
         # Restart should be tolerant of a crashed gateway: if the user runs
@@ -2841,6 +2928,12 @@ class TestRestartReadinessVerdict:
             patch("kiro_crew.cli_server.sel", return_value=mock_sel),
             patch(
                 "kiro_crew.cli_server.service_controller.restart_service",
+                return_value=False,
+            ),
+            # Keep the denied-service branch out of these verdict tests (and
+            # keep them off the host's real systemctl/launchctl state).
+            patch(
+                "kiro_crew.cli_server.service_controller.is_service_active",
                 return_value=False,
             ),
             patch(
@@ -4073,9 +4166,21 @@ class TestDoctorStt:
                 return None
             return f"/usr/local/bin/{binary}"
 
+        # `ffmpeg` has to answer BOTH routes into `transcribe._find_ffmpeg`. The
+        # bundled-interpreter branch never probes PATH: it lists the imageio-ffmpeg
+        # package resource, which is a really-installed dev dependency here, so a
+        # bundled arm left unpinned reports the test environment's decoder instead of
+        # the arrangement it asked for -- and reports it as PRESENT, the permissive
+        # answer. The value is unused: the report prints availability, not a path.
+        packaged_decoder = "/kirocrew-bundle/Resources/ffmpeg" if ffmpeg else None
+
         code = 0
         with (
             patch("kiro_crew.cli_doctor.shutil.which", side_effect=_which),
+            patch(
+                "kiro_crew.transcribe._packaged_ffmpeg_resource",
+                return_value=packaged_decoder,
+            ),
             patch("kiro_crew.cli_doctor.KIRO_AGENTS_DIR", tmp_path),
             patch("kiro_crew.cli_doctor.subprocess.run", return_value=mock_run),
             patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no gateway")),
@@ -4197,7 +4302,10 @@ class TestDoctorStt:
         )
 
         assert "ffmpeg:      ❌ not found" in out
-        assert "drop a static ffmpeg build into ~/.local/bin" in out
+        # The wiring assertion: doctor must print the module constant the
+        # resolvable-hint tests hold against the resolver's candidate list, so
+        # nobody can inline a literal back into the _os_fix_hint call (#8897).
+        assert _doc._FFMPEG_LINUX_HINT in out
         assert "reinstall Kiro Crew" not in out
         assert "❌ Fix these issues: " in out
         assert "ffmpeg" in out.split("❌ Fix these issues: ", 1)[1]
@@ -4264,7 +4372,11 @@ class TestDoctorStt:
         out, code = self._report(tmp_path, capsys, modules={"amazon_transcribe.client": None})
 
         assert "transcribe:  ⏹ optional cloud STT not installed" in out
-        assert "pip install 'kirocrew[voice]'" in out
+        # The cloud dependencies by name: `pip install kirocrew[voice]` resolves
+        # nowhere (this project is on no index), and it would also drag in the
+        # local recogniser this provider does not use.
+        assert "amazon-transcribe" in out
+        assert "kirocrew[" not in out
         assert code == 0
 
     def test_doctor_stt_transcribe_boto3_missing(self, tmp_path, capsys, monkeypatch):
@@ -4283,7 +4395,11 @@ class TestDoctorStt:
         )
 
         assert "boto3:       ⏹ optional AWS SDK not installed" in out
-        assert "pip install 'kirocrew[voice]'" in out
+        # The cloud dependencies by name: `pip install kirocrew[voice]` resolves
+        # nowhere (this project is on no index), and it would also drag in the
+        # local recogniser this provider does not use.
+        assert "amazon-transcribe" in out
+        assert "kirocrew[" not in out
         assert code == 0
 
     def test_doctor_stt_apple_unsupported_host_names_its_code(self, tmp_path, capsys, monkeypatch):
@@ -4729,6 +4845,35 @@ class TestArtifactCli:
     `--content-file`).
     """
 
+    def test_save_parses_an_explicit_slug(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A subparser that never declared the flag exits at parse time, so this
+        # pins the whole argv -> namespace -> command hop rather than the
+        # forwarding alone.
+        seen: dict[str, object] = {}
+        from kiro_crew import cli
+
+        monkeypatch.setattr(
+            "kiro_crew.cli_commands._artifact",
+            lambda args: seen.update(slug=args.slug, name=args.name),
+        )
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "kirocrew",
+                "artifact",
+                "save",
+                "--name",
+                "Run Summary",
+                "--slug",
+                "chosen-by-hand",
+                "--content",
+                "body",
+            ],
+        )
+        cli.main()
+        assert seen == {"slug": "chosen-by-hand", "name": "Run Summary"}
+
     def test_save_refuses_sensitive_content_file(
         self, capsys: pytest.CaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -4833,15 +4978,19 @@ class TestSeedDispatch:
         """When --seed is provided, seed_cmd should be called before gateway."""
         monkeypatch.setattr(sys, "argv", ["kirocrew", "gateway", "--seed", "demo"])
         mock_seed = MagicMock(return_value=0)
+        gateway_call = object()
+        mock_gateway = MagicMock(return_value=gateway_call)
         with (
             patch("kiro_crew.cli.seed_cmd", mock_seed),
-            patch("kiro_crew.cli_server._gateway"),
-            patch("kiro_crew.cli.asyncio.run"),
+            patch("kiro_crew.cli_server._gateway", mock_gateway),
+            patch("kiro_crew.cli.asyncio.run") as mock_run,
         ):
             from kiro_crew.cli import main
 
             main()
         mock_seed.assert_called_once()
+        mock_gateway.assert_called_once()
+        mock_run.assert_called_once_with(gateway_call)
 
     def test_seed_nonzero_exits(self, monkeypatch):
         """When seed_cmd returns non-zero, CLI should sys.exit with that code."""
@@ -4858,15 +5007,19 @@ class TestSeedDispatch:
         """When --seed is not provided, seed_cmd should not be called."""
         monkeypatch.setattr(sys, "argv", ["kirocrew", "gateway"])
         mock_seed = MagicMock()
+        gateway_call = object()
+        mock_gateway = MagicMock(return_value=gateway_call)
         with (
             patch("kiro_crew.cli.seed_cmd", mock_seed),
-            patch("kiro_crew.cli_server._gateway"),
-            patch("asyncio.run"),
+            patch("kiro_crew.cli_server._gateway", mock_gateway),
+            patch("kiro_crew.cli.asyncio.run") as mock_run,
         ):
             from kiro_crew.cli import main
 
             main()
         mock_seed.assert_not_called()
+        mock_gateway.assert_called_once()
+        mock_run.assert_called_once_with(gateway_call)
 
     def test_seed_with_replace_flag(self, monkeypatch):
         """--seed with --seed-replace should call seed_cmd."""
@@ -4876,15 +5029,19 @@ class TestSeedDispatch:
             ["kirocrew", "gateway", "--seed", "demo", "--seed-replace"],
         )
         mock_seed = MagicMock(return_value=0)
+        gateway_call = object()
+        mock_gateway = MagicMock(return_value=gateway_call)
         with (
             patch("kiro_crew.cli.seed_cmd", mock_seed),
-            patch("kiro_crew.cli_server._gateway"),
-            patch("asyncio.run"),
+            patch("kiro_crew.cli_server._gateway", mock_gateway),
+            patch("kiro_crew.cli.asyncio.run") as mock_run,
         ):
             from kiro_crew.cli import main
 
             main()
         mock_seed.assert_called_once()
+        mock_gateway.assert_called_once()
+        mock_run.assert_called_once_with(gateway_call)
 
 
 class TestDoctorEmbeddings:

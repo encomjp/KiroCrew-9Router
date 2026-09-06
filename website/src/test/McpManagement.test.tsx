@@ -10,7 +10,7 @@
 // - sharing cannot be enabled while nothing is stubbed (it would do nothing),
 //   but can always be disabled
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, cleanup, waitFor } from '@testing-library/react'
+import { render, screen, cleanup, waitFor, fireEvent } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 import { McpManagement } from '../pages/settings/McpManagement'
@@ -313,7 +313,9 @@ describe('sharing assessment', () => {
   async function openAssessment() {
     mount()
     const tab = await screen.findByRole('tab', { name: /sharing assessment/i })
-    tab.click()
+    // Radix's tab trigger activates on mousedown (so a drag off the rail cannot
+    // leave the selection half-applied); a bare `.click()` never synthesises it.
+    fireEvent.mouseDown(tab)
   }
 
   it('shows the verdict and its reason instead of only a yes or no', async () => {
@@ -613,7 +615,15 @@ describe('sharing assessment', () => {
       { running: true, done: 0, measured: 0, total: 5 } as never,
     )
     vi.spyOn(api, 'mcpMeasureProgress')
-      .mockResolvedValueOnce({ running: true, done: 0, measured: 0, total: 5 } as never)
+      // MeasureControl reads progress on MOUNT, before this test presses Start --
+      // a pass already running there would disable the button and the press would
+      // be a no-op. So the mount read reports an idle gateway; the pass only
+      // starts on the press.
+      .mockResolvedValueOnce({ running: false, done: 0, measured: 0, total: 0 } as never)
+      // The press arms the poll (mcpMeasureStart reports running); the first poll
+      // after it already reports the finished pass, so this test spends one poll
+      // interval rather than two. What it pins is the CLOSING number, and the
+      // intermediate running readout is pinned by its own test above.
       .mockResolvedValue(
         { running: false, done: 5, measured: 2, total: 5 } as never,
       )
@@ -687,7 +697,7 @@ describe('sharing assessment evidence cell', () => {
       ],
     } as never)
     mount()
-    ;(await screen.findByRole('tab', { name: /sharing assessment/i })).click()
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: /sharing assessment/i }))
 
     expect(await screen.findByText(/every tool declares itself read-only/i)).toBeTruthy()
     // The generic line is gone from the cell; the legend still carries the caveat.
@@ -709,7 +719,7 @@ describe('sharing assessment evidence cell', () => {
       ],
     } as never)
     mount()
-    ;(await screen.findByRole('tab', { name: /sharing assessment/i })).click()
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: /sharing assessment/i }))
 
     // An empty Evidence cell beside a filled verdict would read as missing data.
     expect(await screen.findByText(/nothing disqualifying was found/i)).toBeTruthy()
@@ -1073,7 +1083,7 @@ describe('stub every server the evidence allows', () => {
       servers: [{ ...server({ name: 'good-mcp' }), recommendation: measured }],
     } as never)
     mount()
-    ;(await screen.findByRole('tab', { name: /sharing assessment/i })).click()
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: /sharing assessment/i }))
     // An unmapped tier falls back to "not measured", which would read as the
     // measurement having never happened.
     expect(await screen.findByText(/measured, no divergence/i)).toBeTruthy()
@@ -1101,7 +1111,7 @@ describe('stub every server the evidence allows', () => {
     } as never)
 
     mount()
-    ;(await screen.findByRole('tab', { name: /sharing assessment/i })).click()
+    fireEvent.mouseDown(await screen.findByRole('tab', { name: /sharing assessment/i }))
     expect(await screen.findByText('direct (env)', { selector: 'span' })).toBeTruthy()
     const def = await screen.findByText(
       /direct \(env\) — the server declares an environment key/i,
@@ -1377,5 +1387,22 @@ describe('state chip honours the rewriter, not just the allowlist', () => {
     mount()
     expect(await screen.findByText('direct', { selector: 'span' })).toBeTruthy()
     expect(screen.getByText('no stdio', { selector: 'span' })).toBeTruthy()
+  })
+
+  it('gaps the servers panel cards the same way the assessment view does', async () => {
+    // The lede header, the two inline banners and the three cards are SIBLINGS
+    // inside the servers tab panel. The `space-y-4` on the <Tabs> root only gaps
+    // the tab rail from the panel; it cannot reach inside the panel, so without a
+    // gap class ON the panel the cards render flush against each other -- the
+    // inconsistency this fix removes. Assert the panel carries the spacing class
+    // so a later refactor that drops it fails here rather than only on screen.
+    vi.spyOn(api, 'mcpGatewayStatus').mockResolvedValue(status() as never)
+    vi.spyOn(api, 'mcpGatewayServers').mockResolvedValue({ servers: [server()] } as never)
+
+    mount()
+    // The active tab panel is the servers view (the default). Radix renders it
+    // with role="tabpanel"; the inactive assessment panel is not in the DOM.
+    const panel = await screen.findByRole('tabpanel')
+    expect(panel.className).toContain('space-y-4')
   })
 })

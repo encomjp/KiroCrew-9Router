@@ -163,7 +163,11 @@ class TestLinuxUnitRendering:
         # `in unit` check for the prefix passes even if the flag is dropped,
         # because the prefix is still a substring of the shorter line.
         assert 'ExecStart="/home/u/.toolbox/bin/kirocrew" gateway --no-open' in unit
-        assert "Restart=on-failure" in unit
+        # `always`, not `on-failure`: the stale-asset watchdog exits the
+        # gateway cleanly so the supervisor relaunches a fresh install, and
+        # on-failure never restarts an exit 0 (gateway stranded for hours).
+        assert "Restart=always" in unit
+        assert "Restart=on-failure" not in unit
         assert "RestartSec=10" in unit
         # System-level unit must run as the invoking user with the user's
         # actual primary group (which on Amazon Linux is `amazon`, not the
@@ -648,6 +652,172 @@ class TestLinuxEnvironmentFile:
         assert str(env_file) in removed
 
 
+def _text_writes_missing_encoding(source: str) -> list[str]:
+    """Return ``"<line>: <call>"`` for every TEXT-mode open in ``source`` that
+    does not name an explicit ``encoding=``.
+
+    Binary mode is skipped -- it has no encoding to name. A call whose mode is
+    not a literal is treated as text, which is the conservative direction: a
+    dynamic mode still needs an encoding on the text branch.
+    """
+    import ast
+
+    found: list[str] = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name):
+            name = func.id
+        elif isinstance(func, ast.Attribute):
+            name = func.attr
+        else:
+            continue
+        if name not in ("open", "fdopen"):
+            continue
+        # Mode is the second positional arg for both builtins.open and
+        # os.fdopen, or the `mode=` keyword.
+        mode = None
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+            mode = node.args[1].value
+        for kw in node.keywords:
+            if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                mode = kw.value.value
+        if isinstance(mode, str) and "b" in mode:
+            continue
+        if any(kw.arg == "encoding" for kw in node.keywords):
+            continue
+        found.append(f"{node.lineno}: {name}(...)")
+    return found
+
+
+class TestLinuxServiceWritesUtf8:
+    """systemd reads unit and environment files as UTF-8. The writers here must
+    therefore EMIT UTF-8, not whatever ``locale.getpreferredencoding()`` happens
+    to return on the installing host.
+
+    Both staging writes went through ``os.fdopen(fd, "w")`` with no
+    ``encoding=``, so the bytes handed to ``sudo install`` were locale-dependent
+    while the consumer's contract is fixed. The same module already reads its
+    environment file back with ``encoding="utf-8"`` (``linux.py:448``), so the
+    round trip crossed two different encodings.
+
+    Reviewer-counted residual from merged #7164, which made the identical
+    argument for the drop-in it did fix.
+    """
+
+    def _capture_staged_bytes(self, call, contents: str) -> bytes:
+        """Run ``call(contents)`` with the privileged step stubbed, and return
+        the raw bytes of the temp file it staged.
+
+        The bytes must be read from inside the stub: both writers unlink the
+        temp file in a ``finally``, so by the time the call returns there is
+        nothing left to inspect.
+        """
+        import subprocess
+        from pathlib import Path
+
+        staged: dict[str, bytes] = {}
+
+        def _fake_run(argv, *a, **kw):
+            # The staged temp path is the second-to-last argv entry for both
+            # writers (`install -m MODE -o root -g root <tmp> <dest>`).
+            staged["raw"] = Path(argv[-2]).read_bytes()
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with (
+            patch("kiro_crew.service.linux.subprocess.run", side_effect=_fake_run),
+            patch("kiro_crew.service.linux._privilege_prefix", return_value=["sudo"]),
+        ):
+            call(contents)
+        return staged["raw"]
+
+    def test_a_non_ascii_home_reaches_the_unit_writer(self, monkeypatch):
+        """Premise, not a regression pin: the unit is not ASCII by construction.
+
+        ``render_unit`` interpolates the account name and its home directory
+        into ``User=``, ``WorkingDirectory=`` and every ``Environment=`` line,
+        and both are ordinary UTF-8 filesystem values on Linux. So the string
+        handed to the writer can legitimately carry non-ASCII, which is what
+        makes the writer's encoding load-bearing rather than cosmetic.
+        """
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setenv("USER", "usuário")
+        gid_result = MagicMock(returncode=0, stdout="usuário\n", stderr="")
+        with (
+            patch(
+                "kiro_crew.service.common.shutil.which", return_value="/home/usuario/bin/kirocrew"
+            ),
+            patch("kiro_crew.service.linux.subprocess.run", return_value=gid_result),
+            patch("kiro_crew.service.linux._home_for_user", return_value="/home/usuario"),
+        ):
+            unit = svc_linux.render_unit()
+
+        assert not unit.isascii(), "expected the rendered unit to carry the non-ASCII home"
+        assert "User=usuário" in unit
+
+    def test_the_unit_write_stages_utf8_bytes(self):
+        """``_write_unit_via_sudo`` must hand ``install`` UTF-8 bytes."""
+        from kiro_crew.service import linux as svc_linux
+
+        contents = "[Service]\nWorkingDirectory=/home/usuario\nEnvironment=USER=usuário\n"
+        raw = self._capture_staged_bytes(svc_linux._write_unit_via_sudo, contents)
+
+        # Assert the ENCODING, not the line terminator: text mode translates
+        # newlines on Windows, which this Linux-only module never sees in
+        # production but a developer box does.
+        assert "usuário".encode("utf-8") in raw
+        assert raw.decode("utf-8").replace("\r\n", "\n") == contents
+
+    def test_the_install_file_write_stages_utf8_bytes(self, tmp_path):
+        """``_install_file_via_sudo`` is the same staging shape and the same
+        contract. Its one current caller seeds an ASCII template, so this is a
+        contract pin rather than a live-harm test -- but the helper takes
+        arbitrary ``contents`` and publishes to a root-owned path, so the
+        encoding must not be left to the host."""
+        from kiro_crew.service import linux as svc_linux
+
+        contents = "# Kiro Crew — überschrift\nKIROCREW_PORT=5477\n"
+        raw = self._capture_staged_bytes(
+            lambda c: svc_linux._install_file_via_sudo(c, tmp_path / "env"), contents
+        )
+
+        assert "— überschrift".encode("utf-8") in raw
+        assert raw.decode("utf-8").replace("\r\n", "\n") == contents
+
+    def test_every_text_write_in_the_linux_service_names_its_encoding(self):
+        """Ratchet. This is the assertion that goes red on the unfixed tree, and
+        it is what stops the seam decaying again -- the two sites here were
+        themselves the residue of an earlier pass that fixed a sibling."""
+        from pathlib import Path
+
+        from kiro_crew.service import linux as svc_linux
+
+        source = Path(svc_linux.__file__).read_text(encoding="utf-8")
+        offenders = _text_writes_missing_encoding(source)
+
+        assert offenders == [], (
+            "text-mode open without encoding= in service/linux.py: "
+            + "; ".join(offenders)
+            + " — systemd reads these files as UTF-8, so the writer must not "
+            "depend on the installing host's locale"
+        )
+
+    def test_the_encoding_ratchet_can_actually_fail(self):
+        """A scan that matches nothing passes as green and proves nothing. Pin
+        that the detector fires on a violation and stays quiet on the fixed
+        form and on binary mode."""
+        offending = 'import os\nwith os.fdopen(fd, "w") as fh:\n    fh.write(x)\n'
+        fixed = 'import os\nwith os.fdopen(fd, "w", encoding="utf-8") as fh:\n    fh.write(x)\n'
+        binary = 'import os\nwith os.fdopen(fd, "wb") as fh:\n    fh.write(x)\n'
+
+        assert len(_text_writes_missing_encoding(offending)) == 1
+        assert _text_writes_missing_encoding(fixed) == []
+        assert _text_writes_missing_encoding(binary) == []
+
+
 class TestMacOSPlistRendering:
     def test_plist_and_unit_never_auto_open_a_browser(self, monkeypatch, tmp_path):
         """Both installers pass `--no-open`.
@@ -984,6 +1154,54 @@ class TestControllerDispatch:
             return_value=Platform.UNSUPPORTED,
         ):
             assert controller.restart_service() is False
+
+    def test_manual_restart_hint_systemd_names_sudo_systemctl(self):
+        # The hint is printed precisely when the CLI restart path just failed
+        # for privileges, so it must name the privileged command — never a
+        # circular "kirocrew restart".
+        from kiro_crew.service import controller
+
+        with patch(
+            "kiro_crew.service.controller.current_platform",
+            return_value=Platform.SYSTEMD,
+        ), patch(
+            "kiro_crew.service.common.current_platform",
+            return_value=Platform.SYSTEMD,
+        ):
+            hint = controller.manual_restart_hint()
+        assert hint == "sudo systemctl restart kirocrew"
+
+    def test_manual_restart_hint_launchd_names_a_recovery_pair(self):
+        # Not kickstart: macos.restart() already ran kickstart and it was
+        # refused, so the hint must be a different mechanism (bootout +
+        # bootstrap from the installed plist), not a retry of the failure.
+        from kiro_crew.service import controller
+        from kiro_crew.service import macos as svc_macos
+        from kiro_crew.service.common import LAUNCHD_LABEL
+
+        with patch(
+            "kiro_crew.service.controller.current_platform",
+            return_value=Platform.LAUNCHD,
+        ), patch("kiro_crew.service.controller.os.getuid", return_value=501, create=True):
+            hint = controller.manual_restart_hint()
+        assert "kickstart" not in hint
+        assert f"launchctl bootout gui/501/{LAUNCHD_LABEL}" in hint
+        assert f'launchctl bootstrap gui/501 "{svc_macos.PLIST_PATH}"' in hint
+
+    def test_manual_restart_hint_never_circular(self):
+        # Whatever the platform, the hint must not send the operator back into
+        # the command that just failed.
+        from kiro_crew.service import controller
+
+        for plat in (Platform.SYSTEMD, Platform.LAUNCHD, Platform.UNSUPPORTED):
+            with patch(
+                "kiro_crew.service.controller.current_platform",
+                return_value=plat,
+            ), patch(
+                "kiro_crew.service.common.current_platform",
+                return_value=plat,
+            ):
+                assert controller.manual_restart_hint() != "kirocrew restart"
 
     def test_install_systemd_handles_install_error(self, capsys):
         """If linux.install raises ServiceInstallError, controller catches it,
@@ -4039,7 +4257,7 @@ class TestHeadlessApiKeyWarning:
         assert warning, "a dropped credential must produce a warning"
         assert self.API_KEY in warning
         assert str(dotenv) in warning, "the warning must name the file to edit"
-        assert "kirocrew service restart" in warning
+        assert common.restart_command_hint() in warning
 
     def test_the_signed_out_claim_is_qualified(self, monkeypatch, tmp_path):
         """A login credential store under the baked `HOME` can still authenticate.

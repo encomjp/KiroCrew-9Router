@@ -34,6 +34,7 @@ from kiro_crew.config.loader import (
     KiroCrewConfig,
     config_path,
 )
+from kiro_crew.constants import CHANNEL_SEND_NAMESPACES
 from kiro_crew.cron import CronStoreBusy, CronStoreUnreadable
 from kiro_crew.dashboard.channel_folders import (
     LIVE_RELOAD_FIELDS,
@@ -41,11 +42,12 @@ from kiro_crew.dashboard.channel_folders import (
     ensure_channel_folder,
     stored_folder_name,
 )
-from kiro_crew.dashboard.chat_persistence import _rehydrate_slot_from_history
+from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_utils import (
     CRON_NOTIFICATION_KIND,
     _remove_queued_by_id,
     dashboard_slot_key,
+    effective_session_key,
     mint_options_token,
     remember_slack_options,
     slack_options_owner_key,
@@ -63,7 +65,7 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.dashboard.token_auth import caller_names_a_missing_slot
 from kiro_crew.messaging.display_safety import redact_for_display
-from kiro_crew.messaging.link import CHANNEL_SESSION_NAMESPACES, SLACK_NAMESPACE, ChannelLink
+from kiro_crew.messaging.link import SLACK_NAMESPACE, ChannelLink
 from kiro_crew.messaging.renderer import (
     chunk_for_transport,
     chunk_text,
@@ -86,7 +88,9 @@ from kiro_crew.subagent_persistence import _agent_dir, read_state
 from kiro_crew.validation import (
     _EMOJI_NAME_RE,
     CHANNEL_ID_RE,
+    CHANNEL_MAX_LEN,
     CRON_SESSION_RE,
+    SLACK_THREAD_TS_RE,
     SPAWN_RUN_SCHEMA,
     ValidationError,
     validate_tool_args,
@@ -95,26 +99,44 @@ from kiro_crew.validation import (
 #: Seconds to wait for Slack when verifying a pasted token at save time.
 _TOKEN_VERIFY_TIMEOUT = 8
 
+#: A Slack message timestamp is `<10-digit epoch>.<6-digit sequence>` -- 17
+#: characters. The cap is what BOUNDS the value: these routes forward `ts` to
+#: Slack and write it into a SEL audit line, and the allowlist check that
+#: rejects an untracked channel runs AFTER that line is written.
+_SLACK_TS_MAX_LEN = 30
+
+
+def _is_slack_ts(value: object) -> bool:
+    """True for a Slack message timestamp that is safe to forward.
+
+    Uses the shared ``SLACK_THREAD_TS_RE`` rather than an inline
+    ``^\\d+\\.\\d+$``: ``\\d`` is Unicode-aware, so a string of Arabic-Indic
+    numerals satisfied the old check and was forwarded verbatim. The shared
+    pattern spells the class ``[0-9]`` to avoid precisely that.
+    """
+    return (
+        isinstance(value, str)
+        and len(value) <= _SLACK_TS_MAX_LEN
+        and bool(SLACK_THREAD_TS_RE.match(value))
+    )
+
+
 #: Public field name -> .env credential key for the two Slack secrets.
 _SLACK_SECRET_FIELDS = {
     "bot_token": "SLACK_BOT_TOKEN",
     "app_token": "SLACK_APP_TOKEN",
 }
 
-#: Transports ``send_message``'s ``channel_type`` may name. Derived from the
-#: channel namespaces rather than hand-listed so a new transport is covered by
-#: adding it in one place, minus two members that cannot be a send target:
-#:
-#: * ``slack`` has its own client and streaming path and is deliberately absent
-#:   from ``state.channel_transports``, so ``_resolve_channel_target`` skips it —
-#:   accepting it here would fail every such send closed with no useful reason.
-#:   ``session="slack"`` is the Slack spelling.
-#: * ``unified`` is the session-key bucket ``dm_scope="unified"`` collapses DMs
-#:   into, not a transport; no ``ChannelLink`` ever carries it as a channel type.
-_SEND_MESSAGE_CHANNEL_TYPES: frozenset[str] = frozenset(CHANNEL_SESSION_NAMESPACES) - {
-    SLACK_NAMESPACE,
-    "unified",
-}
+#: Transports ``send_message``'s ``channel_type`` may name, which is also the set
+#: its channel ``session`` values may name. Reads the shared
+#: ``CHANNEL_SEND_NAMESPACES`` rather than subtracting the two non-targets here:
+#: that subtraction was spelled at three separate readers, which is the same drift
+#: shape that left a Webex owner DM unreachable while this module's own leg already
+#: served it (#6514). The exclusions and their reasons are documented at the
+#: definition — ``slack`` has its own client and streaming path and is deliberately
+#: absent from ``state.channel_transports`` (``session="slack"`` is its spelling),
+#: and ``unified`` is a session-key bucket rather than a transport.
+_SEND_MESSAGE_CHANNEL_TYPES: frozenset[str] = frozenset(CHANNEL_SEND_NAMESPACES)
 logger = logging.getLogger(__name__)
 
 
@@ -137,6 +159,13 @@ def _sel():
 
 
 # ── Subagents ──
+
+#: Generic ``code`` for a spawn rejection that mints no identifier of its own.
+#: Spelled once for the two handlers that answer with it (``api_spawn`` and
+#: ``api_spawn_continue``), so the pair cannot drift apart. A rejection a client
+#: acts on differently gets its OWN code at the decision instead -- see
+#: ``subagent.AGENT_NOT_FOUND_CODE``.
+_SPAWN_REJECTED_CODE = "spawn_rejected"
 
 
 async def api_spawn(request: web.Request) -> web.Response:
@@ -245,7 +274,21 @@ async def api_spawn(request: web.Request) -> web.Response:
         # batch members) announced through the completion consumer
         # (_announce_rejection). "counted" tells spawn_run's client-side
         # reconcile to skip this member.
-        return web.json_response({"error": info.error, "counted": True}, status=400)
+        #
+        # ``code`` is what the client switches on; ``error`` is advisory prose
+        # (RFC 9457 3.1.3). Only the unknown-agent refusal mints its own
+        # identifier today, because it is the only rejection a client treats
+        # differently — spawn_run stops re-posting a name already refused. Every
+        # other rejection reports the generic code, matching the sibling
+        # /continue handler below.
+        return web.json_response(
+            {
+                "error": info.error,
+                "code": info.error_code or _SPAWN_REJECTED_CODE,
+                "counted": True,
+            },
+            status=400,
+        )
     resp: dict[str, object] = {"id": info.id, "task": task, "status": "spawned"}
     # Server-side effort verdict: only this side knows the model the factory's
     # effort gate will see (explicit per-call value, else the subagent role
@@ -335,7 +378,7 @@ async def api_spawn_continue(request: web.Request) -> web.Response:
             return web.json_response({"error": info.error, "code": "conversation_busy"}, status=409)
         if info.error.startswith("conversation_gone"):
             return web.json_response({"error": info.error, "code": "conversation_gone"}, status=404)
-        return web.json_response({"error": info.error, "code": "spawn_rejected"}, status=400)
+        return web.json_response({"error": info.error, "code": _SPAWN_REJECTED_CODE}, status=400)
     return web.json_response({"id": info.id, "conversation": conv_id, "status": "spawned"})
 
 
@@ -618,7 +661,49 @@ async def api_spawn_status(request: web.Request) -> web.Response:
         data["turns"] = info.turns
         data["last_tool"] = _redact(info.last_tool)
         data["elapsed"] = round(time.time() - info.started)
+        # Same predicate, same present-only-while-true convention as
+        # api_spawn_list. This endpoint is the one a blocking `kirocrew spawn
+        # run` polls every 2s (cli_commands.py), so leaving it out is what kept
+        # the CLI reproduction of #6484 silent: the caller sat on "waiting for
+        # result..." while the answer ("a prompt is waiting for you") was only
+        # discoverable from a separate `spawn list` or a log grep.
+        if _awaiting_spawn_approval(info):
+            data["awaiting_approval"] = True
     return web.json_response(data)
+
+
+def _awaiting_spawn_approval(info: object) -> bool:
+    """True only while a run is parked on the SPAWN-approval gate.
+
+    ``_awaiting_approval`` alone is NOT sufficient: ``run.py`` sets the same
+    flag for TOOL approvals raised INSIDE a running subagent (three sites), so
+    reading it bare would report a run at turn 5 waiting on a tool prompt as
+    though it were waiting to START -- rendering "waiting for spawn approval"
+    and telling a caller to approve it "to start this run" that already
+    started. ``_exec_started`` is the permanent discriminator: it is stamped
+    once when execution begins, so ``None`` means the run never entered
+    execution, which for a registered run is only reachable via the spawn gate.
+
+    Both read paths go through this ONE predicate rather than repeating the
+    pair, because the two handlers build their payloads independently and a
+    drift between them is invisible to a behavioural test.
+
+    ``subagent_manager/terminal.py`` computes the same pair for the reap message
+    (#7325). Deliberately not extracted onto ``SubagentInfo``: that read is a
+    plain attribute read on a live run inside the manager package, whereas this
+    one must survive the info doubles the handlers are tested with (below), and
+    unifying them would mean editing a reap path this change does not otherwise
+    touch. The duplication is two lines and both sites name each other.
+
+    ``getattr`` with a strict ``is True`` / ``is None``: these handlers are
+    exercised with lightweight info doubles (SimpleNamespace / MagicMock) that
+    carry only the fields a case cares about, so a bare attribute read raises
+    and a truthy Mock would otherwise advertise a wait that isn't happening.
+    """
+    return (
+        getattr(info, "_awaiting_approval", False) is True
+        and getattr(info, "_exec_started", None) is None
+    )
 
 
 async def api_spawn_list(request: web.Request) -> web.Response:
@@ -645,6 +730,14 @@ async def api_spawn_list(request: web.Request) -> web.Response:
             entry["turns"] = info.turns
             entry["last_tool"] = _redact(info.last_tool)
             entry["elapsed"] = round(time.time() - info.started)
+            # Present only while the run is parked on its spawn-approval
+            # prompt, so the default payload is unchanged. Without it a run
+            # waiting for a human is byte-identical to one that is executing --
+            # which is how #6484 presented: `kirocrew spawn list` showed the
+            # same hourglass for a run that had no child process and was only
+            # ever waiting to be approved.
+            if _awaiting_spawn_approval(info):
+                entry["awaiting_approval"] = True
         # Present only when a group was actually withheld, so the default
         # (everything on) payload is unchanged.
         withheld = [
@@ -791,6 +884,45 @@ async def api_spawn_delete(request: web.Request) -> web.Response:
         state.subagents._agents.pop(agent_id, None)
         state.subagents._tasks.pop(agent_id, None)
     return web.json_response({"ok": True, "cancelled": cancelled})
+
+
+async def api_spawn_stop_all(request: web.Request) -> web.Response:
+    """POST /api/spawn/stop-all — stop one chat's running and queued subagents."""
+    state: DashboardState = request.app["state"]
+    request_app = request.get("app", "")
+    if "app" not in request or request_app:
+        _sel().log_api_access(
+            caller=request_app or "unknown",
+            operation="spawn.stop_all",
+            outcome="denied",
+            source="app_isolation",
+            resources="dashboard-only bulk cancellation",
+            error="app tokens cannot stop dashboard subagent waves",
+        )
+        return web.json_response(
+            {"error": "app token not allowed", "code": "app_token_forbidden"}, status=403
+        )
+    if not state.subagents:
+        return web.json_response(
+            {"error": "subagents not available", "code": "subagents_unavailable"},
+            status=503,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    slot_name = body.get("slot") if isinstance(body, dict) else None
+    if not isinstance(slot_name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", slot_name):
+        return web.json_response(
+            {"error": "valid slot is required", "code": "invalid_slot"}, status=400
+        )
+    slot = state.get_slot(slot_name)
+    if slot is None:
+        return web.json_response({"error": "slot not found", "code": "slot_not_found"}, status=404)
+    running, queued = await state.subagents.cancel_for_parent(effective_session_key(slot))
+    return web.json_response(
+        {"ok": True, "stopped": running + queued, "running": running, "queued": queued}
+    )
 
 
 async def api_spawn_clear(request: web.Request) -> web.Response:
@@ -1839,7 +1971,7 @@ async def api_send_message(request: web.Request) -> web.Response:
 
     thread_ts = body.get("thread_ts")
     if thread_ts is not None:
-        if not isinstance(thread_ts, str) or not re.match(r"^\d+\.\d+$", thread_ts):
+        if not _is_slack_ts(thread_ts):
             return web.json_response(
                 {"error": "thread_ts must be a Slack timestamp string like '1712793600.123456'"},
                 status=400,
@@ -2051,7 +2183,7 @@ async def api_send_message(request: web.Request) -> web.Response:
         # "Origin reachable" = one of:
         #   - Hot: slot in state._slots (user has the tab open) → fast path
         #   - Cold: slot not loaded but JSONL exists without closed=true →
-        #     _rehydrate_slot_from_history restores it from disk, tab reappears
+        #     rehydrate_slot_from_history_async restores it from disk, tab reappears
         #
         # "Origin unreachable" = any of:
         #   - User clicked ✕ on the tab (closed=true in JSONL metadata) —
@@ -2100,15 +2232,17 @@ async def api_send_message(request: web.Request) -> web.Response:
             slot_key, job_name = _resolve_session_target(state, target_session, caller_session)
             if slot_key:
                 # Resolve the origin slot. get_slot is the hot path (fast,
-                # O(1) dict lookup). On miss, _rehydrate_slot_from_history
-                # restores from disk if the session exists and isn't closed.
+                # O(1) dict lookup). On miss, rehydrate_slot_from_history_async
+                # restores from disk if the session exists and isn't closed,
+                # with the transcript read on a worker thread so a large store
+                # does not stall the loop for every other request.
                 # Truly-gone sessions (never persisted, deleted, or closed)
                 # return None and delivery falls through to the Slack DM
                 # path below — no phantom empty tab is ever created.
                 slot = state.get_slot(slot_key)
                 was_loaded = slot is not None
                 if slot is None:
-                    slot = _rehydrate_slot_from_history(state, slot_key)
+                    slot = await rehydrate_slot_from_history_async(state, slot_key)
                 logger.info(
                     "send_message session=origin resolved slot_key=%s job=%s was_loaded=%s rehydrated=%s",
                     slot_key,
@@ -2200,9 +2334,27 @@ async def api_send_message(request: web.Request) -> web.Response:
                     state,
                     channel_target,
                     channel_text,
-                    # Only a well-formed cron key is trusted as a governance
-                    # identity; anything else is an out-of-band host action.
-                    caller_session=caller_session if is_cron_caller else "",
+                    # Vet on the CALLER's real identity so the fail-closed
+                    # ``channels`` re-vet inside the leg resolves that caller's own
+                    # profile rather than the permissive ``HOST_SESSION_KEY``
+                    # default. Filtering to ``cron:`` here discarded every non-cron
+                    # caller's identity, and the MCP-side channel vet fails OPEN on
+                    # an evaluation error, so a non-cron session whose own profile
+                    # denies the transport could reach a host-permitted target --
+                    # the same hole the ``channel_type``/``target_id`` leg above
+                    # already closed, on the leg that was not migrated with it.
+                    #
+                    # The two arms take their identity from where each is trustworthy,
+                    # matching ``_channel_delivery_key`` on this same path: a cron's
+                    # body key is format-validated above before it may escalate
+                    # routing, and a non-cron caller is identified by the
+                    # ``X-Session-Key`` header, which ``token_auth._verify_unix_peer``
+                    # kernel-attests against the peer's own process ancestry -- never
+                    # the body, which a tool arg could name. So the governance vet and
+                    # the delivery key resolve the SAME principal. Absent (a direct
+                    # operator send naming no session) still degrades to the host
+                    # sentinel inside the leg, unchanged.
+                    caller_session=caller_session if is_cron_caller else declared_session,
                 )
             if channel_type:
                 sent_channel = await _deliver_to_channel(
@@ -2445,12 +2597,12 @@ async def api_slack_pins(request: web.Request) -> web.Response:
     if not isinstance(channel, str):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     channel = channel.strip()
-    if not channel or not CHANNEL_ID_RE.match(channel):
+    if not channel or len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
 
     ts = body.get("ts", "")
     if action in ("add", "remove"):
-        if not isinstance(ts, str) or not re.match(r"^\d+\.\d+$", ts):
+        if not _is_slack_ts(ts):
             return web.json_response(
                 {"error": "ts must be a Slack timestamp string like '1712793600.123456'"},
                 status=400,
@@ -2540,10 +2692,10 @@ async def api_slack_reactions(request: web.Request) -> web.Response:
     if not isinstance(channel, str):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     channel = channel.strip()
-    if not channel or not CHANNEL_ID_RE.match(channel):
+    if not channel or len(channel) > CHANNEL_MAX_LEN or not CHANNEL_ID_RE.match(channel):
         return web.json_response({"error": "invalid channel ID format"}, status=400)
     ts = body.get("ts", "")
-    if not isinstance(ts, str) or not re.match(r"^\d+\.\d+$", ts):
+    if not _is_slack_ts(ts):
         return web.json_response(
             {"error": "ts must be a Slack timestamp string like '1712793600.123456'"},
             status=400,
@@ -4596,17 +4748,15 @@ async def api_teams_activity(request: web.Request) -> web.Response:
     source = request.remote or "unknown"
     throttled_source = "" if is_proxied_request(request) else source
     if throttled_source and webhooks.auth_throttle_blocked(throttled_source):
-        # Off the loop: the first ``sel()`` of a process CONSTRUCTS the log
-        # (trust-dir creation, key validation — blocking file IO), and this
-        # route can be the first request a fresh gateway ever serves.
-        await asyncio.to_thread(
-            lambda: _sel().log_api_access(
-                caller=source,
-                operation="teams.activity",
-                outcome="denied",
-                source="teams",
-                error="auth failures throttled",
-            )
+        # A bare enqueue: SEL is warmed at gateway startup
+        # (sel.warm_sel_singleton, #8608), so even when this route is the
+        # first request a fresh gateway serves, no construction runs here.
+        _sel().log_api_access(
+            caller=source,
+            operation="teams.activity",
+            outcome="denied",
+            source="teams",
+            error="auth failures throttled",
         )
         return web.json_response(
             {"error": "too many failed attempts", "code": "auth_throttled"}, status=429

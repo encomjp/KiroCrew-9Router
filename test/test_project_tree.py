@@ -185,6 +185,45 @@ class TestProjectTree:
         assert sorted(data["paths"]) == ["docs/readme.md", "top.txt"]
 
     @pytest.mark.asyncio
+    async def test_redaction_collision_paths_are_deduplicated(self, repo, mock_sel):
+        """Two genuinely-different paths that redact() collapses to one string
+        must not appear twice in the listing.
+
+        Uses a real ls-files collision: two files whose only differing segment is
+        a credential-shaped token (distinct AKIA... ids, each 4-letter prefix +
+        16 uppercase alphanumerics) both flatten to
+        ``[REDACTED: credential]_model.txt``. Without server-side de-dup the
+        dashboard tree hands @pierre/trees two adjacent identical entries and its
+        ``appendPresortedPaths`` throws ``Duplicate path``.
+        """
+        # Two DISTINCT keys are the point: the test proves two different
+        # credential-shaped names collapse to ONE placeholder. key_a is the
+        # documented example id Semgrep allowlists; key_b must stay a split
+        # literal because detected-aws-access-key-id-value matches an
+        # AKIA-shaped literal and cannot tell a fixture from a real leak. Do
+        # not re-join it -- the runtime value is identical and CI, not the
+        # test, is what breaks.
+        key_a = "AKIAIOSFODNN7EXAMPLE"
+        key_b = "AKIA" + "JKLMNOPQRSTUVWXY"
+        (repo / f"{key_a}_model.txt").write_text("one\n")
+        (repo / f"{key_b}_model.txt").write_text("two\n")
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/tree?path={repo}")
+            data = await resp.json()
+        paths = data["paths"]
+        # Both filenames collapsed to the same redacted placeholder...
+        assert "[REDACTED: credential]_model.txt" in paths
+        # ...but it appears exactly once (first occurrence kept), and the raw
+        # credential-shaped tokens never leak.
+        assert paths.count("[REDACTED: credential]_model.txt") == 1
+        assert len(paths) == len(set(paths))
+        assert key_a not in "\n".join(paths)
+        assert key_b not in "\n".join(paths)
+        # Non-colliding entries survive unchanged.
+        assert "a.txt" in paths
+        assert "src/mod.py" in paths
+
+    @pytest.mark.asyncio
     async def test_walk_caps_entries_and_flags_truncation(self, tmp_path, mock_sel, monkeypatch):
         from kiro_crew.dashboard.handlers import files as files_mod
 
@@ -198,3 +237,48 @@ class TestProjectTree:
             data = await resp.json()
         assert data["truncated"] is True
         assert len(data["paths"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_cap_does_not_drop_the_whole_tracked_block(self, tmp_path, mock_sel, monkeypatch):
+        """A fat UNTRACKED subtree must not evict every tracked file.
+
+        ``git ls-files --cached --others`` emits all untracked entries as one
+        complete block and only then the tracked ones, so capping with a plain
+        prefix cut never reaches the tracked block once untracked alone fill it
+        -- the whole source tree loses its rows. The listing is sorted before
+        the cut so the budget is spent by path, not by which block git happened
+        to emit first.
+        """
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        monkeypatch.setattr(files_mod, "_PROJECT_TREE_MAX_ENTRIES", 20)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git(repo, "init", "-q", ".")
+        tracked = ("README.md", "docs/real.py", "src/real.py")
+        for rel in tracked:
+            p = repo / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("x")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "init")
+        # Untracked (NOT ignored) and larger than the cap on its own. Named to
+        # sort after every tracked path, so a sorted cut reaches them all.
+        fat = repo / "zz_vendor" / "deep"
+        fat.mkdir(parents=True)
+        for i in range(40):
+            (fat / f"u{i:04d}.txt").write_text("x")
+
+        async with TestClient(TestServer(_make_app(str(repo)))) as client:
+            resp = await client.get(f"/api/project/tree?path={repo}")
+            data = await resp.json()
+
+        assert data["repo"] is True
+        assert data["truncated"] is True
+        assert len(data["paths"]) == 20
+        # The point of the fix: every tracked file keeps a row.
+        for rel in tracked:
+            assert rel in data["paths"], f"{rel} was evicted by the untracked block"
+        # ...and the fix does not merely invert the loss: the untracked subtree
+        # still spends the remaining budget, so it keeps a row too.
+        assert any(p.startswith("zz_vendor/") for p in data["paths"])

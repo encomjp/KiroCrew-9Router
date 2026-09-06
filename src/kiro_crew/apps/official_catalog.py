@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.apps.manifest import KEBAB_RE, app_name_error
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 
 logger = logging.getLogger(__name__)
@@ -110,8 +111,7 @@ def _read_cache() -> dict[str, Any] | None:
 def _write_cache(doc: dict[str, Any]) -> None:
     path = _cache_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(doc), encoding="utf-8")
+        atomic_write(path, json.dumps(doc))
     except OSError:
         logger.debug("could not cache the official catalog", exc_info=True)
 
@@ -119,6 +119,22 @@ def _write_cache(doc: dict[str, Any]) -> None:
 def _write_failure() -> None:
     """Remember that the fetch just failed, so the next caller does not wait again."""
     _write_cache({_FAILED_KEY: time.time()})
+
+
+def forget_cache() -> None:
+    """Drop the cached document AND any failure memory, so the next read re-fetches.
+
+    The server half of the store's manual refresh: deleting the file is the one
+    operation that clears both a stale document (``CACHE_TTL`` not yet expired)
+    and a ``_fetchFailedAt`` sentinel (``FAILURE_TTL`` back-off) in a single
+    step. It never fetches anything itself -- the caller's next read pays the
+    fetch, so a refresh that cannot reach the CDN degrades exactly like a cold
+    start rather than inventing a third failure mode.
+    """
+    try:
+        _cache_path().unlink(missing_ok=True)
+    except OSError:
+        logger.debug("could not drop the official catalog cache", exc_info=True)
 
 
 class _NoRedirects(urllib.request.HTTPRedirectHandler):
@@ -312,6 +328,33 @@ def _curated_tags(value: Any) -> list[str]:
     return [t for t in value if isinstance(t, str)]
 
 
+#: The largest integer JavaScript can represent exactly (2**53 - 1). A star
+#: count above this is not a plausible count, and forwarding one lets a
+#: hostile document render hundreds of digits into the store's layout.
+_STARS_MAX = 9_007_199_254_740_991
+
+
+def _curated_stars(entry: dict[str, Any]) -> int | None:
+    """The entry's baked ``stargazersCount``, or ``None`` when absent/invalid.
+
+    The publisher generates this field for git-source entries only, so a
+    non-git entry never yields one here regardless of what the document says.
+    ``bool`` is excluded explicitly (it subclasses ``int``), and the value is
+    bounded to the JS safe-integer range: the document arrived over the
+    network, so its types and magnitudes are as untrusted as its content.
+    Absence means "unknown", never zero.
+    """
+    source = entry.get("source")
+    if not isinstance(source, dict) or source.get("type") != "git":
+        return None
+    stars = entry.get("stargazersCount")
+    if isinstance(stars, bool) or not isinstance(stars, int):
+        return None
+    if stars < 0 or stars > _STARS_MAX:
+        return None
+    return stars
+
+
 #: A git object name as the published document must spell it: sha1 (40 hex) or
 #: sha256 (64 hex). Defined here rather than imported from ``registry`` because
 #: that module imports THIS one; the duplication is one regex against a circular
@@ -468,6 +511,8 @@ def inventory(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        if (stars := _curated_stars(entry)) is not None:
+            row["stargazersCount"] = stars
         seen.add(name)
         rows.append(row)
     return rows
@@ -651,6 +696,14 @@ def annotate(rows: list[dict[str, Any]], entries: list[dict[str, Any]]) -> None:
             row["iconUrlDark"] = dark
         if hero := _resolve_ref(entry.get("heroRef")):
             row["heroImage"] = hero
+        # ``stargazersCount`` is deliberately NOT overlaid here. This function
+        # matches rows by NAME, and a same-name SEED row can pin a DIFFERENT
+        # repository than the catalog entry (seed collisions keep the pin by
+        # design) — overlaying the catalog repository's star count onto a row
+        # that installs another repository would forge a trust cue. Mismatched
+        # display copy is survivable; a popularity number beside Install is
+        # not. The count therefore flows through ``inventory()`` alone, where
+        # a row's identity and its count come from the same catalog entry.
 
 
 def list_catalog_rows() -> list[dict[str, Any]]:
@@ -702,5 +755,11 @@ def list_catalog_rows() -> list[dict[str, Any]]:
             stype = _curated_str(source.get("type"))
             if stype in ("builtin", "git"):
                 row["source"] = {"type": stype}
+        # ``stargazersCount`` is deliberately NOT projected here: this function
+        # reads ``load_official_catalog()``, which serves the agent-writable
+        # CACHE — display copy degrading from a poisoned cache is survivable,
+        # but a trust cue rendered beside Install is not, so the count flows
+        # only through the projections fed by a fresh TLS fetch
+        # (``inventory``/``annotate`` via ``fetch_inventory_entries``).
         rows.append(row)
     return rows

@@ -27,7 +27,6 @@ from kiro_crew.subagent import compute_max_subagents
 from kiro_crew.task_executor import (
     build_task_prompt,
     execute_single_task,
-    run_tests,
 )
 from kiro_crew.task_executor import self_review as self_review_fn
 
@@ -819,7 +818,7 @@ class TaskRunner:
             run.status = "planned"
             await self._apersist_runs()
 
-        self._grant_run_trust(run, bool(auto_approve))
+        await self._grant_run_trust(run, bool(auto_approve))
         await self._apersist_runs()
 
         self._agent = agent
@@ -934,7 +933,7 @@ class TaskRunner:
         run.task_id = task_id
         run.name = name or auto_name(spec_content, str(spec_path))
         run.work_dir = str(task_dir)
-        self._grant_run_trust(run, bool(auto_approve))
+        await self._grant_run_trust(run, bool(auto_approve))
         self._runs[task_id] = run
         watchdog_task: asyncio.Task | None = None  # type: ignore[type-arg]
         history_key = f"taskrunner:run:{spec_path.stem}"
@@ -1453,18 +1452,31 @@ class TaskRunner:
         # down (one kiro-cli process for the whole run).
         await self._release_run_runtime(run)
 
-    def _grant_run_trust(self, run: Project, enabled: bool) -> None:
+    async def _grant_run_trust(self, run: Project, enabled: bool) -> None:
         """Single owner of per-run trust — sets the persisted UI intent flag AND
         the authoritative SafetyOverride scoped grant together, so the two
         representations can never diverge at a call site. Enable activates an
         audited, TTL-bounded scoped grant; disable revokes it.
+
+        Async, and both halves are offloaded: each writes a SEL event, and arming
+        additionally consults the ``approval_modes`` policy. Both callers are async
+        methods, so running either inline put that filesystem work on the gateway's
+        event loop.
+
+        The flag is set FROM the activation result, never ahead of it. Arming can
+        now be refused -- an ``approval_modes`` deny of ``yolo`` disables scoped
+        grants too -- and assigning the flag first meant a refused arm still
+        persisted and reported ``auto_approve: True`` with no authoritative grant
+        behind it. That is the exact divergence this function exists to prevent,
+        so the refusal has to reach the flag.
         """
-        run.auto_approve = bool(enabled)
         scope = _auto_approve_scope(run.task_id)
-        if run.auto_approve:
-            safety_override().activate_scoped(scope, source="dashboard")
+        if enabled:
+            result = await asyncio.to_thread(safety_override().activate_scoped, scope, "dashboard")
+            run.auto_approve = bool(result.active)
         else:
-            safety_override().deactivate_scope(scope)
+            await asyncio.to_thread(safety_override().deactivate_scope, scope)
+            run.auto_approve = False
 
     async def _release_run_runtime(self, run: Project) -> None:
         """Kill the run's shared AcpRuntime once (idempotent) at run teardown.
@@ -1834,13 +1846,6 @@ class TaskRunner:
                 stall_notified = False
                 self._stall_cancelled_ids.discard(run.task_id)
 
-    # ── Test Verification ──
-
-    async def _run_tests(self) -> tuple[bool, str]:
-        if not self._test_cmd:
-            return True, "no test command configured"
-        return await run_tests(self._test_cmd, self._work_dir)
-
     # ── Runs Persistence ──
 
     _RUNS_FILE = "runs.json"
@@ -1891,6 +1896,27 @@ class TaskRunner:
                         "tokens_used": run.tokens_used,
                         "replan_count": run.replan_count,
                         "work_dir": run.work_dir,
+                        # Git-workspace identity. `work_dir` alone is NOT enough:
+                        # init_workspace() OVERWRITES it with the worktree path,
+                        # so a restored run pointed at a worktree while every
+                        # field that says which worktree it is -- and whether git
+                        # coordination is even on -- came back at its default.
+                        # git_coord reads all six after a restart.
+                        "branch_name": run.branch_name,
+                        "base_branch": run.base_branch,
+                        "worktree_path": run.worktree_path,
+                        "repo_root": run.repo_root,
+                        "git_enabled": run.git_enabled,
+                        "commit_hashes": run.commit_hashes,
+                        # Produced once by `_extract_lesson` during the run and
+                        # NOT recomputable: the lesson text is separately
+                        # durable in the lesson store, but that corpus is
+                        # global and keyed by category, so this per-run
+                        # attribution exists only here. Two consumers read it
+                        # after a restart -- the status payload
+                        # (task_reporter.build_status) and the to-chat
+                        # continuation prompt.
+                        "lessons_learned": run.lessons_learned,
                         "original_input": run.original_input,
                         "source": run.source,
                         "spec_content": run.spec_content,
@@ -2020,6 +2046,7 @@ class TaskRunner:
                     )
                     for t in item.get("task_details", item.get("tasks", []))
                 ]
+                _worktree_path = item.get("worktree_path", "")
                 run = Project(
                     spec_path=item["spec_path"],
                     spec_content=item.get("spec_content", ""),
@@ -2032,6 +2059,22 @@ class TaskRunner:
                     tokens_used=item.get("tokens_used", 0),
                     replan_count=item.get("replan_count", 0),
                     work_dir=item.get("work_dir", ""),
+                    branch_name=item.get("branch_name", ""),
+                    base_branch=item.get("base_branch", ""),
+                    worktree_path=_worktree_path,
+                    repo_root=item.get("repo_root", ""),
+                    # An entry written before the git identity was persisted
+                    # carries none of these, and `git_enabled` defaults to True
+                    # -- the one combination that must not survive: git ops
+                    # enabled while nothing records WHICH worktree they target.
+                    # Absent an explicit value, enable git coordination only
+                    # when the worktree location is actually known; otherwise
+                    # fall back to the documented "task continues without git
+                    # coordination" behaviour instead of committing into a path
+                    # no longer identified.
+                    git_enabled=bool(item.get("git_enabled", bool(_worktree_path))),
+                    commit_hashes=list(item.get("commit_hashes", [])),
+                    lessons_learned=list(item.get("lessons_learned", [])),
                     original_input=item.get("original_input", ""),
                     source=item.get("source", ""),
                     tasks=tasks,

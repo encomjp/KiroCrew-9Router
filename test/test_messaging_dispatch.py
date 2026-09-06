@@ -8,28 +8,41 @@ finalization itself fails.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from kiro_crew.messaging import dispatch as D
 from kiro_crew.messaging.dispatch import ChannelTurn, drive_turn
 from kiro_crew.messaging.renderer import SilentRenderer
+from kiro_crew.session_allocation import SessionClosingError
 
 
 class _Sessions:
     """Minimal stand-in that counts the calls this contract is about."""
 
-    def __init__(self, raise_on_acquire: bool = False):
+    def __init__(self, raise_on_acquire: bool = False, closing: bool = False):
         self.released = 0
         self.successes = 0
         self.failures = 0
         self.resets = 0
         self._raise_on_acquire = raise_on_acquire
+        #: Mirrors SessionManager._closing. When set, begin_turn refuses the
+        #: dispatch exactly as the real gate does once close_all has run.
+        self.closing = closing
+        self.begin_turns = 0
 
     async def get_or_create(self, key, agent=None, channel_id=None):
         if self._raise_on_acquire:
             raise RuntimeError("cold start failed")
         return object(), False, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, channel_id):
         pass
@@ -78,9 +91,15 @@ class _Driver:
     last_stop_reason = ""
 
     def __init__(self, *a, **kw):
-        pass
+        # Mirrors the real TurnDriver: the shutdown gate is supplied at
+        # construction and invoked by run(), immediately before the provider
+        # stream would open. A stand-in that swallowed it would let these tests
+        # pass while the gate was wired nowhere.
+        self._closing_gate = kw.get("closing_gate")
 
     async def run(self, message):
+        if self._closing_gate is not None:
+            self._closing_gate()
         return "the reply"
 
 
@@ -184,6 +203,115 @@ def test_the_happy_path_releases_exactly_once(monkeypatch) -> None:
     assert renderer.closed == 1
     assert sessions.released == 1
     assert sessions.successes == 1
+    # Pins that the gate is actually consulted on the normal path, so it cannot
+    # be dropped or renamed into a no-op without a test noticing.
+    assert sessions.begin_turns == 1
+
+
+def test_every_turn_open_site_is_gated_on_the_shutdown_state() -> None:
+    """Ratchet: the shutdown gate is wired at every site AND placed atomically.
+
+    Two halves, because either alone is satisfiable while the race stays open.
+
+    A gate at the CALL SITE is not enough, which is what the first version of
+    this change got wrong: ``TurnDriver.run`` awaits ``renderer.on_turn_start()``
+    -- a platform round-trip -- before opening the provider stream, so a restart
+    landing there still let the prompt register behind ``close_all``'s drain
+    snapshot. The only atomic placement is inside ``run()``, immediately before
+    the stream, so the gate lives there and each dispatcher passes it in.
+
+    So: every ``TurnDriver(...)`` construction must pass ``closing_gate``, and in
+    the driver no await may occur between the gate and provider stream. A
+    structured monitor may synchronously mark its claim accepted in that span;
+    because it cannot yield, shutdown still cannot take a drain snapshot there.
+    """
+    src = Path(D.__file__).resolve().parent.parent
+
+    # Half 1 -- every construction wires a gate.
+    unwired: list[str] = []
+    sites = 0
+    for path in sorted(src.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if "TurnDriver(" not in text:
+            continue
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "TurnDriver"
+            ):
+                continue
+            sites += 1
+            if not any(keyword.arg == "closing_gate" for keyword in node.keywords):
+                unwired.append(f"{path.relative_to(src)}:{node.lineno}")
+    assert not unwired, "TurnDriver built without a shutdown gate:\n" + "\n".join(unwired)
+    assert sites >= 4, f"expected the known TurnDriver sites, found {sites}"
+
+    # Half 2 -- the gate is atomic with the stream the driver opens.
+    driver_lines = (src / "messaging" / "driver.py").read_text(encoding="utf-8").splitlines()
+    opens = [i for i, ln in enumerate(driver_lines) if "self.provider.stream(" in ln]
+    assert opens, "could not find the provider stream in the driver"
+    for idx in opens:
+        window = driver_lines[max(0, idx - 12) : idx]
+        gates = [i for i, line in enumerate(window) if "self.closing_gate()" in line]
+        assert gates, f"messaging/driver.py:{idx + 1} opens a turn without the gate"
+        after_gate = window[gates[-1] + 1 :]
+        assert not any(
+            "await " in line for line in after_gate
+        ), f"messaging/driver.py:{idx + 1} yields between the gate and stream"
+
+
+def test_a_shutdown_between_the_claim_and_the_dispatch_never_opens_the_turn(
+    monkeypatch,
+) -> None:
+    """The lease-dispatch race gate.
+
+    ``get_or_create`` guards the CLAIM, but the turn only opens at
+    ``driver.run``, and everything between them awaits: ``set_channel``, the
+    origin/mirror bind's thread hop, ``publish_turn_identity``, and the whole
+    context build. A restart landing in that span used to leave this pipeline
+    opening a turn that ``close_all`` had already taken its drain snapshot
+    without -- killed mid-flight holding its native lock, which reaches the user
+    as an empty response. The dashboard runner and the Slack handler each carry
+    this gate already; every channel on the shared pipeline had no equivalent.
+    """
+    ran: list[str] = []
+
+    class _RecordingDriver(_Driver):
+        async def run(self, message):
+            # Gate first, then record -- the real driver runs the gate
+            # immediately BEFORE the provider stream opens, so a refused turn
+            # must never reach the recording below.
+            if self._closing_gate is not None:
+                self._closing_gate()
+            ran.append(message)
+            return "the reply"
+
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(D, "TurnDriver", _RecordingDriver)
+    sessions = _Sessions()
+    renderer = _Renderer()
+    # The fake's get_or_create deliberately does NOT consult ``closing``, so the
+    # claim still succeeds here. That is the race being pinned: a refused CLAIM
+    # was already handled, an accepted claim whose DISPATCH races the shutdown
+    # was not.
+    sessions.closing = True
+
+    asyncio.run(drive_turn(_turn(renderer), sessions=sessions, ctx_builder=_CtxBuilder()))
+
+    assert ran == [], "the turn must not open behind close_all's drain snapshot"
+    assert sessions.begin_turns == 1
+    # Refused is not leaked: the renderer is still finalized (so the user gets
+    # this channel's notice rather than a hanging placeholder) and the
+    # session-keyed semaphore is still given back.
+    assert renderer.closed == 1
+    assert sessions.released == 1
+    # A restart is not a session fault. Charging it to the circuit breaker via
+    # record_failure would count toward tripping a reset on a session that never
+    # misbehaved, and it is not a success either.
+    assert sessions.failures == 0
+    assert sessions.successes == 0
 
 
 def test_a_compaction_failed_terminal_resets_the_session(monkeypatch) -> None:

@@ -30,6 +30,8 @@ from kiro_crew.config.paths import config_dir
 from kiro_crew.mcp_cron import _log_cron_denial, _vet_shell_command
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.snapshot import (
+    NotificationCopyUnsupported,
+    _copy_notifications,
     _copy_tree_no_overwrite,
     _do_replace,
     _merge_crons,
@@ -542,8 +544,17 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
 
             if (snap / "crons.json").is_file():
                 if (mc / "crons.json").is_file():
-                    _merge_crons(snap / "crons.json", mc / "crons.json")
-                    summary["items"].append("crons (merged)")
+                    if _merge_crons(snap / "crons.json", mc / "crons.json"):
+                        summary["items"].append("crons (merged)")
+                    else:
+                        # A refused merge imported zero jobs. Appending
+                        # "crons (merged)" here regardless was issue #8217: the
+                        # dashboard rendered a success over a restore that
+                        # brought no job back. The refusal is named in the
+                        # items and flagged machine-readably so the handler can
+                        # log the import as partial rather than a flat ok.
+                        summary["items"].append("crons (skipped: unreadable or invalid cron store)")
+                        summary.setdefault("refused_merges", []).append("crons")
                 else:
                     shutil.copy2(str(snap / "crons.json"), str(mc / "crons.json"))
                     summary["items"].append("crons (copied)")
@@ -564,8 +575,22 @@ def apply_import_zip(zip_path: Path, mode: str = "merge") -> dict:
                     _merge_notifications(snap / "notifications.jsonl", mc / "notifications.jsonl")
                     summary["items"].append("notifications (merged)")
                 else:
-                    shutil.copy2(str(snap / "notifications.jsonl"), str(mc / "notifications.jsonl"))
-                    summary["items"].append("notifications (copied)")
+                    # Not `copy2`: it installed records the live file's own reader
+                    # refuses, and that reader loses the whole file to one of them.
+                    # Same abort posture as the merge branch above.
+                    #
+                    # The platform refusal is NOT that abort: it says this platform
+                    # can never do this safely, so it skips one item and lets the
+                    # import proceed. Recorded in the summary as skipped WITH the
+                    # reason -- reporting "copied" for a refusal, or saying nothing,
+                    # would be the silent-install bug class this change removes.
+                    try:
+                        _copy_notifications(
+                            snap / "notifications.jsonl", mc / "notifications.jsonl"
+                        )
+                        summary["items"].append("notifications (copied)")
+                    except NotificationCopyUnsupported as exc:
+                        summary["items"].append(f"notifications (SKIPPED: {exc})")
 
             for dirname in ("workspace", "plan_memory"):
                 sd = snap / dirname

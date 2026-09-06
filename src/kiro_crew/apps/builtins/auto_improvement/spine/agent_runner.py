@@ -41,6 +41,7 @@ from typing import Any
 
 from kiro_crew.config import KiroCrewConfig
 from kiro_crew.hooks import TOOL_DENY, HookManager, hooks_config_from_config_dict
+from kiro_crew.platform.context import redact_via_context
 from kiro_crew.platform_compat import SIGKILL, kill_process_tree
 from kiro_crew.sandbox import popen_limited, sandboxed_spawn_argv
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
@@ -893,8 +894,14 @@ class AgentRunner:
 
         dur = time.monotonic() - t0
         if proc.returncode != 0:
+            # Redact BEFORE the tail cut: a credential straddling the bound keeps its
+            # right half otherwise, a fragment no downstream pass can match. Tail (not
+            # a head bound) because the END of stderr carries the
+            # actionable error; slicing redacted text can at worst split a marker.
             return AgentResult(
-                ok=False, error=f"exit {proc.returncode}: {proc.stderr[-400:]}", duration_s=dur
+                ok=False,
+                error=f"exit {proc.returncode}: {redact_via_context(proc.stderr or '')[-400:]}",
+                duration_s=dur,
             )
         try:
             envelope = json.loads(proc.stdout)
@@ -1012,7 +1019,8 @@ class AgentRunner:
         except Exception:  # noqa: BLE001
             self._terminate_group(popen)
         stderr_thread.join(timeout=2.0)  # let the drain finish; tail comes from its buffer
-        stderr_tail = ("".join(stderr_chunks))[-400:]
+        # Redact BEFORE the tail cut, same reason as the non-streaming path above.
+        stderr_tail = redact_via_context("".join(stderr_chunks))[-400:]
 
         dur = time.monotonic() - t0
         with self._cost_lock:
@@ -1172,13 +1180,26 @@ class SessionAgentRunner:
     @staticmethod
     def available() -> bool:
         """True iff a Kiro Crew provider factory can be built (a backend is configured).
-        Lets the backend prefer this runner and fall back to the subprocess ``claude -p``
-        runner only when no provider is available."""
+        Lets the backend prefer this runner; there is no subprocess fallback left, so a
+        False here means the backend stays offline."""
         try:
 
             cfg = KiroCrewConfig.load()
             return cfg.create_provider_factory() is not None
         except Exception:  # noqa: BLE001 — any failure → not available, caller falls back
+            # Do NOT discard this. ``create_provider_factory`` has a single method-level
+            # return and cannot yield None, so False is reachable ONLY from this handler —
+            # i.e. only when something raised. The backend's offline reason already tells
+            # the operator that "the gateway config load or the provider-factory
+            # construction raised", and without this line it can never say WHAT raised.
+            # The realistic cause is the acp → client → session → config.loader circular
+            # import the loader documents, which resolves only when ``acp`` is imported
+            # first, and it was previously invisible in every log.
+            logger.warning(
+                "SessionAgentRunner.available(): provider factory could not be built, "
+                "reporting the agent runner as unavailable",
+                exc_info=True,
+            )
             return False
 
     def ensure_agent_registered(self) -> bool:
@@ -1625,7 +1646,7 @@ def _repro_test_dir(worktree: Path) -> str:
     The prompt used to hard-code ``test/``, but a repo using ``tests/`` (plural) then got
     a reproducing test written into a directory that does not exist, so T2 could never
     collect it and EVERY candidate failed ``test_invalid`` regardless of fix quality.
-    Found by running docs/system-specs/modules/auto-improvement-test-plan.md against Zedmor/chess_test, which uses ``tests/``.
+    Found by running docs/system-specs/modules/auto-improvement.md against Zedmor/chess_test, which uses ``tests/``.
 
     The edit fence already permits both (``_ADDABLE_TEST_GLOBS``), so only the
     instruction was wrong. Prefers an EXISTING directory; falls back to ``test``.

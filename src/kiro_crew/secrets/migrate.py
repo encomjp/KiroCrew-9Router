@@ -50,12 +50,15 @@ from pathlib import Path
 from kiro_crew import platform_compat
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import _JIRA_TOKEN_RE, CRED_JIRA_API_TOKEN, config_dir, env_path
+from kiro_crew.mcp_gateway.secret_uri import SECRET_URI_PREFIX
 from kiro_crew.secrets import SecretVault
 
 logger = logging.getLogger(__name__)
 
 #: ``secret://`` scheme prefix a migrated ``.env`` value is rewritten to.
-_SECRET_URI_PREFIX = "secret://"
+#: Imported from the resolver (single source of truth) so the writer here and
+#: the reader there can never drift.
+_SECRET_URI_PREFIX = SECRET_URI_PREFIX
 
 
 def _env_lock_path(ep: Path) -> Path:
@@ -122,7 +125,7 @@ class MigrationReport:
     whether this pass wrote anything. ``orphaned_vault_keys`` names any keys
     whose rollback-delete raised an error during a failed apply — those vault
     entries may still exist and could shadow future rotations; manual cleanup
-    via ``kirocrew secrets rm <key>`` is recommended.
+    under Settings > Secrets in the dashboard is recommended.
     """
 
     env_file: Path
@@ -322,7 +325,8 @@ def migrate_env_secrets(
                 f"vault already has an entry for {key!r} whose value differs "
                 f"from the plaintext in the .env; refusing to migrate so neither "
                 f"value is silently discarded. Reconcile them (update the .env to "
-                f"match the vault, or `kirocrew secrets set {key}`), then re-run "
+                f"match the vault, or overwrite the vault entry under "
+                f"Settings > Secrets in the dashboard), then re-run "
                 f"`kirocrew secrets import --apply`."
             )
         already_in_vault.add(key)
@@ -562,12 +566,12 @@ def migrate_env_secrets(
                                 logger.warning(
                                     "secrets import rollback: failed to delete vault"
                                     " entry for %r (%s: %s). The entry may persist"
-                                    " and shadow future rotations — run"
-                                    " `kirocrew secrets rm %s` to clean it up.",
+                                    " and shadow future rotations — delete it under"
+                                    " Settings > Secrets in the dashboard to clean"
+                                    " it up.",
                                     _k,
                                     type(_rb_exc).__name__,
                                     _rb_exc,
-                                    _k,
                                 )
 
                     _rollback_loop.run_until_complete(_rollback())

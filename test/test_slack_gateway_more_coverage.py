@@ -136,6 +136,108 @@ def _probe_proc(communicate: Any, *, returncode: int = 0) -> MagicMock:
 class TestWarnIfKiroCliOutdated:
     """The boot-time kiro-cli version probe never raises and never hangs."""
 
+    @pytest.fixture(autouse=True)
+    def _resolvable_kiro_cli(self):
+        """Every arm below exercises the spawn, which now needs a resolved path.
+
+        The probe resolves kiro-cli from the fixed install directories before
+        spawning, so without this the arms would take the "not installed" early
+        return on a host that has no kiro-cli and assert against a spawn that
+        never happened. The refusal path itself is covered separately by
+        :meth:`test_unresolvable_binary_never_spawns`.
+        """
+        with patch(
+            "kiro_crew.slack.gateway.resolve_kiro_cli", return_value="/opt/pinned/bin/kiro-cli"
+        ):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_binary_never_spawns(self, capsys):
+        """An unresolvable kiro-cli is not spawned by bare name.
+
+        This probe runs unattended at gateway boot, so falling back to a bare
+        argv0 would let a `PATH`-planted shim execute here — the `--version`
+        argument is no protection. Nothing to warn about, so nothing runs.
+        """
+        orch = _make_orchestrator()
+        with patch("kiro_crew.slack.gateway.resolve_kiro_cli", return_value=None):
+            with patch("asyncio.create_subprocess_exec") as spawn:
+                await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "outdated" not in capsys.readouterr().out
+
+    @pytest.mark.asyncio
+    async def test_probe_execs_resolved_absolute_path(self):
+        """The resolved absolute path is argv0, and `PATH` is out of the lookup."""
+
+        async def _communicate() -> tuple[bytes, bytes]:
+            return (b"kiro-cli 9.9.9", b"")
+
+        proc = _probe_proc(_communicate)
+        orch = _make_orchestrator()
+        with patch(
+            "kiro_crew.slack.gateway.resolve_kiro_cli", return_value="/opt/pinned/bin/kiro-cli"
+        ) as mock_resolve:
+            with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)) as spawn:
+                await orch._warn_if_kiro_cli_outdated()
+        assert spawn.await_args.args[0] == "/opt/pinned/bin/kiro-cli"
+        mock_resolve.assert_called_once_with(include_inherited_path=False)
+
+    @pytest.mark.asyncio
+    async def test_path_only_install_is_refused_but_reported(self, caplog):
+        """A PATH-only install is refused for the spawn AND named in the log.
+
+        Refusing is the point of the pin, but silence about it would leave a
+        host that never auto-updates and never warns it is outdated with nothing
+        in `gateway.log` to say why. The line has to name the override, which is
+        the operator's way out.
+        """
+        orch = _make_orchestrator()
+
+        def _resolve(**kwargs: Any) -> str | None:
+            # Pinned lookup misses; the unpinned one (PATH included) hits.
+            return None if kwargs.get("include_inherited_path") is False else "/w/venv/bin/kiro-cli"
+
+        with caplog.at_level("WARNING"):
+            with patch("kiro_crew.slack.gateway.resolve_kiro_cli", side_effect=_resolve):
+                with patch("asyncio.create_subprocess_exec") as spawn:
+                    await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "KIROCREW_KIRO_BIN" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_absent_backend_is_refused_quietly(self, caplog):
+        """No kiro-cli anywhere is not a problem to report — the backend is optional."""
+        orch = _make_orchestrator()
+        with caplog.at_level("WARNING"):
+            with patch("kiro_crew.slack.gateway.resolve_kiro_cli", return_value=None):
+                with patch("asyncio.create_subprocess_exec") as spawn:
+                    await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "KIROCREW_KIRO_BIN" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_slow_home_directory_cannot_stall_boot(self, caplog):
+        """A wedged path lookup is bounded, and the refusal keeps boot moving.
+
+        `_init_services` awaits this probe BEFORE `_init_dashboard` binds its
+        socket, so an unbounded lookup on an unresponsive network-mounted home
+        would mean the dashboard never comes up at all.
+        """
+        orch = _make_orchestrator()
+
+        def _hang(**kwargs: Any) -> str:
+            time.sleep(5)  # outlives the budget pinned below
+            return "/opt/pinned/bin/kiro-cli"
+
+        with caplog.at_level("WARNING"):
+            with patch.object(gw, "_KIRO_CLI_RESOLVE_TIMEOUT_SECS", 0.01):
+                with patch("kiro_crew.slack.gateway.resolve_kiro_cli", side_effect=_hang):
+                    with patch("asyncio.create_subprocess_exec") as spawn:
+                        await orch._warn_if_kiro_cli_outdated()
+        spawn.assert_not_called()
+        assert "exceeded" in caplog.text
+
     @pytest.mark.asyncio
     async def test_unspawnable_binary_is_silent(self, capsys):
         orch = _make_orchestrator()
@@ -742,6 +844,195 @@ class TestNotifyNudgeExpired:
             message="keep checking",
             max_cycles=4,
             cycle_count=4,
+        )
+        orch._notify_nudge_expired(loop)
+        assert ds.notify.call_args.args[1] == "Monitoring loop hit its cycle cap"
+
+    def test_a_terminal_subject_outranks_the_wall_clock_budget(self):
+        """Terminal outranks EVERY early-stop reading, not just the cap.
+
+        Removing the cap guard was not enough: the runtime-budget branch is evaluated
+        before the terminal one, so a merge landing after the wall-clock budget expired
+        was reported as "its budget ran out without reporting done, its goal may still be
+        unmet" about a finished subject. The rule is expressed once now, as a ``terminal``
+        flag the earlier branches defer to.
+        """
+        from kiro_crew.autonudge import MONITOR_TERMINAL_REASON
+        from kiro_crew.monitoring.models import MonitorOutcome, MonitorState
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-terminal-past-budget",
+            slot_key="chat-4",
+            message="watch https://github.com/acme/widgets/pull/42 until green",
+            max_cycles=0,
+            cycle_count=7,
+            max_runtime_secs=60,
+            created_ts=time.time() - 600,
+            stopped_reason=MONITOR_TERMINAL_REASON,
+            monitor=MonitorState(
+                kind="gh-pr",
+                target="acme/widgets#42",
+                objective="watch until green",
+                created_ts=0.0,
+                outcome=MonitorOutcome.SUCCESS,
+            ),
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        assert "time budget" not in title, "a finished subject is not a spent budget"
+        assert "finished" in title
+
+    def test_a_terminal_subject_outranks_the_cycle_cap(self):
+        """A merge that lands ON the capping delivery must not read as an unmet goal.
+
+        The delivery carrying the terminal news increments ``cycle_count`` before the
+        settlement records ``stopped_reason`` -- deliberately, so a cancelled write
+        cannot lose the turn's accounting. So a pull request merging on the delivery
+        that reaches ``max_cycles`` made ``capped_out`` true, the terminal branch was
+        skipped, and the operator was told the goal was possibly unmet and to restart
+        a watch whose subject had merged.
+        """
+        from kiro_crew.autonudge import MONITOR_TERMINAL_REASON
+        from kiro_crew.monitoring.models import MonitorOutcome, MonitorState
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-terminal-at-cap",
+            slot_key="chat-3",
+            message="watch https://github.com/acme/widgets/pull/42 until green",
+            max_cycles=4,
+            cycle_count=4,
+            stopped_reason=MONITOR_TERMINAL_REASON,
+            monitor=MonitorState(
+                kind="gh-pr",
+                target="acme/widgets#42",
+                objective="watch until green",
+                created_ts=0.0,
+                outcome=MonitorOutcome.SUCCESS,
+            ),
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        assert "cycle cap" not in title, "a finished subject is terminal, cap or no cap"
+        assert "finished" in title, "and a merged one is reported as done"
+
+    def test_an_owed_terminal_turn_outranks_the_cycle_cap(self):
+        """A channel loop's UNSETTLED terminal subject must not read as a spent cap.
+
+        The third instance of the class the two tests above closed, and the one they
+        cannot cover: both of those settle first, so ``stopped_reason`` already carries
+        ``MONITOR_TERMINAL_REASON``. A CHANNEL-bound loop deliberately does NOT settle
+        on observation -- it learns its watch finished from a delivered turn, so the
+        probe records the OWED turn in ``monitor.terminal_pending`` and leaves the loop
+        active with no outcome. If that final turn is refused (a busy thread, the
+        ordinary case) and the retry finds the cap spent, ``_timer`` deactivates with
+        ``stopped_reason="cycle_cap"`` before the settlement that would have promoted
+        the debt ever runs.
+
+        So the truth is already durably persisted on disk and the notice contradicts
+        it: a watch whose subject MERGED reports the same signal as one that ran out of
+        cycles with its goal unmet. ``terminal`` therefore cannot be read from
+        ``stopped_reason`` alone -- an owed terminal turn is terminal news too.
+        """
+        from kiro_crew.monitoring.models import MonitorState
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-owed-terminal-at-cap",
+            slot_key="slack:C123:456.789",
+            message="watch https://github.com/acme/widgets/pull/42 until green",
+            max_cycles=4,
+            cycle_count=4,
+            stopped_reason="cycle_cap",
+            monitor=MonitorState(
+                kind="gh-pr",
+                target="acme/widgets#42",
+                objective="watch until green",
+                created_ts=0.0,
+                # The settlement never ran, so there is no ``outcome`` and no
+                # ``MONITOR_TERMINAL_REASON`` -- only the owed turn, on disk.
+                terminal_pending="success",
+            ),
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        body = ds.notify.call_args.args[2]
+        assert "cycle cap" not in title, (
+            "the subject merged and the debt says so on disk -- reporting a spent cap "
+            "is a false status report"
+        )
+        assert "finished" in title
+        assert "merged" in body
+
+    def test_an_owed_blocked_turn_is_not_reported_as_a_merge(self):
+        """The debt carries SUCCESS vs BLOCKED, and the wording must follow it.
+
+        ``terminal_pending`` is set to ``"success" if merged else "blocked"``, the same
+        vocabulary as ``MonitorOutcome``. Treating any owed turn as a finish would tell
+        the operator "no action needed" about a pull request that was closed UNMERGED --
+        which stopped on a question only they can answer.
+        """
+        from kiro_crew.monitoring.models import MonitorState
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-owed-blocked-at-cap",
+            slot_key="slack:C123:456.790",
+            message="watch https://github.com/acme/widgets/pull/43 until green",
+            max_cycles=4,
+            cycle_count=4,
+            stopped_reason="cycle_cap",
+            monitor=MonitorState(
+                kind="gh-pr",
+                target="acme/widgets#43",
+                objective="watch until green",
+                created_ts=0.0,
+                terminal_pending="blocked",
+            ),
+        )
+        orch._notify_nudge_expired(loop)
+        title = ds.notify.call_args.args[1]
+        body = ds.notify.call_args.args[2]
+        assert "cycle cap" not in title
+        assert "closed unmerged" in title
+        assert "WITHOUT being" in body
+
+    def test_a_spent_cap_with_no_owed_turn_still_reports_the_cap(self):
+        """The control: the carve-out must not swallow a genuine cap.
+
+        A loop that really did run out of cycles has an empty ``terminal_pending``, and
+        must keep the cap wording -- otherwise the fix for a misleading finish would
+        manufacture a finish that never happened, which is the same defect pointing the
+        other way.
+        """
+        from kiro_crew.monitoring.models import MonitorState
+
+        orch = _make_orchestrator()
+        ds = _mock_dashboard_state()
+        orch.dashboard_state = ds
+        loop = NudgeLoop(
+            id="loop-genuine-cap",
+            slot_key="slack:C123:456.791",
+            message="watch https://github.com/acme/widgets/pull/44 until green",
+            max_cycles=4,
+            cycle_count=4,
+            stopped_reason="cycle_cap",
+            monitor=MonitorState(
+                kind="gh-pr",
+                target="acme/widgets#44",
+                objective="watch until green",
+                created_ts=0.0,
+                terminal_pending="",
+            ),
         )
         orch._notify_nudge_expired(loop)
         assert ds.notify.call_args.args[1] == "Monitoring loop hit its cycle cap"

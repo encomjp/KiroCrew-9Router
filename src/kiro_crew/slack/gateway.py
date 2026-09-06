@@ -44,15 +44,18 @@ import kiro_crew
 import kiro_crew.crash_guard as crash_guard
 from kiro_crew import agent_scratch, beacon, dep_sync, name_grant, platform_compat, shutdown_event
 from kiro_crew.acp.client import AcpError, AcpProcessDied
+from kiro_crew.agent_sdk import AgentTurnUsage
 from kiro_crew.agents_janitor import sweep_agents_dir
 from kiro_crew.autonudge import (
     APPROVAL_STALL_REASON,
+    MONITOR_TERMINAL_REASON,
     AutoNudgeService,
     NudgeLoop,
 )
 from kiro_crew.autonudge import enabled as autonudge_enabled
 from kiro_crew.autonudge import (
     is_channel_key,
+    is_structured_monitor_loop,
     runtime_budget_exceeded,
 )
 from kiro_crew.beacon import distribution
@@ -80,7 +83,7 @@ from kiro_crew.config.loader import (
     data_home,
 )
 from kiro_crew.config.paths import kiro_agents_dir
-from kiro_crew.constants import DATA_WARNING, SUBAGENT_COMPLETION_META_KEY
+from kiro_crew.constants import DATA_WARNING, SUBAGENT_COMPLETION_META_KEY, strip_control_comments
 from kiro_crew.context import ContextBuilder
 from kiro_crew.context_management import summarize_result
 from kiro_crew.cron import (
@@ -92,7 +95,7 @@ from kiro_crew.cron import (
     build_cron_session_context,
     effective_wake_budget,
 )
-from kiro_crew.cron_script import run_command_sandboxed, run_script_sandboxed
+from kiro_crew.cron_script import delivery_fingerprint, run_command_sandboxed, run_script_sandboxed
 from kiro_crew.dashboard import cautious_boot, start_dashboard
 from kiro_crew.dashboard.chat_persistence import rehydrate_slot_from_history_async
 from kiro_crew.dashboard.chat_runner import (
@@ -111,10 +114,14 @@ from kiro_crew.dashboard.chat_utils import (
 from kiro_crew.dashboard.cron_inject import (
     context_meter_reading,
     inject_cron_result_to_dashboard,
+    prefetch_cron_history,
 )
 from kiro_crew.dashboard.handlers import MAX_PROMPT_BYTES
-from kiro_crew.dashboard.handlers.autonudge import compose_nudge_body
-from kiro_crew.dashboard.handlers.messaging import _rehydrate_slot_from_history
+from kiro_crew.dashboard.handlers.autonudge import (
+    _redact_monitor_value,
+    compose_nudge_body,
+    render_nudge_message,
+)
 from kiro_crew.dashboard.handlers.updates import remediation_command as _remediation_command
 from kiro_crew.dashboard.handlers.usage import (
     persist_token_record_async,
@@ -128,7 +135,10 @@ from kiro_crew.dashboard.origin import (
     parse_dashboard_url,
     resolve_dashboard_host,
 )
-from kiro_crew.dashboard.stale_asset_watchdog import run_stale_asset_watchdog
+from kiro_crew.dashboard.stale_asset_watchdog import (
+    run_stale_asset_watchdog,
+    shutdown_exit_code,
+)
 from kiro_crew.dashboard.state import (
     SUBAGENT_BATCH_COMPLETION_PREFIX,
     SUBAGENT_COMPLETION_PREFIX,
@@ -149,6 +159,7 @@ from kiro_crew.executors import (
     CronQueueTimeout,
     configure_default_executor,
     cron_gate_budget,
+    embed_executor,
     maintenance_executor,
     run_in_cron_gate_pool,
     run_in_cron_pool,
@@ -165,6 +176,7 @@ from kiro_crew.heartbeat import (
 )
 from kiro_crew.history import ConversationLog, HistoryConsolidator
 from kiro_crew.hooks import HookManager, HooksConfig, hooks_config_from_config_dict
+from kiro_crew.kiro_cli import resolve_kiro_cli
 from kiro_crew.learn import LessonStore
 from kiro_crew.llm_helpers import (
     PromptBusyExhaustedError,
@@ -191,10 +203,12 @@ from kiro_crew.mcp_gateway.rewriter import (
     resolve_overlay_dir,
     rewrite_agents,
 )
+from kiro_crew.mcp_hot_reload import parse_kiro_cli_version
 from kiro_crew.memory import MemoryStore
-from kiro_crew.messaging import registry
+from kiro_crew.messaging import APPROVAL_INTERACTIVE, TurnDriver, registry
+from kiro_crew.messaging.dispatch import build_directive_consumer, build_tool_gate
 from kiro_crew.messaging.display_safety import redact_for_display
-from kiro_crew.messaging.identity import publish_turn_identity
+from kiro_crew.messaging.identity import channel_inbound_permitted, publish_turn_identity
 from kiro_crew.messaging.link import (
     CHANNEL_SESSION_NAMESPACES,
     CHAT_TYPE_DIRECT,
@@ -204,12 +218,23 @@ from kiro_crew.messaging.link import (
     channel_namespace_of,
     parse_session_key,
 )
-from kiro_crew.messaging.renderer import chunk_for_transport
+from kiro_crew.messaging.renderer import SilentRenderer, chunk_for_transport
 from kiro_crew.messaging.transport import InboundMessage, delivery_confirmed
+from kiro_crew.monitoring.completion import (
+    MonitorCompletionHook,
+    disposition_for_stop_reason,
+    is_monitor_completion_evidence,
+)
+from kiro_crew.monitoring.models import (
+    MonitorActionDisposition,
+    MonitorDispatchResult,
+    monitor_state_public_dict,
+)
 from kiro_crew.platform import boot_platform
 from kiro_crew.platform.context import (
     PlatformCompositionError,
     current_context,
+    redact_log_via_context,
     redact_via_context,
     safe_context_call,
 )
@@ -236,12 +261,22 @@ from kiro_crew.platform.update_governance import (
     update_blocked_reason,
 )
 from kiro_crew.providers.base import LLMEvent
-from kiro_crew.safety_override import safety_override
+from kiro_crew.safety_override import flush_breadcrumb_writes, safety_override
 from kiro_crew.sandbox import ensure_agents_slice_limits, warm_backend
-from kiro_crew.security import redact, redact_credentials, redact_exfiltration_urls
+from kiro_crew.security import (
+    redact,
+    redact_and_truncate,
+    redact_credentials,
+    redact_exfiltration_urls,
+)
 from kiro_crew.sel import sel
 from kiro_crew.service.common import restart_command_hint
-from kiro_crew.session import HEARTBEAT_KEY, SessionManager
+from kiro_crew.session import (
+    HEARTBEAT_KEY,
+    SessionBusyError,
+    SessionClosingError,
+    SessionManager,
+)
 from kiro_crew.skills import SkillsLoader
 from kiro_crew.slack.client import RealSlackClient
 from kiro_crew.slack.format import (
@@ -264,6 +299,7 @@ from kiro_crew.subagent import (
     _TRANSIENT_CONTINUE_MSG,
     DIGEST_HOLD_SECS,
     INJECTION_TIMEOUT,
+    SpawnApprovalUnreachable,
     SubagentInfo,
     SubagentManager,
     ToolApprovalCallback,
@@ -306,6 +342,7 @@ async def _persist_turn_row(
     surface: str,
     agent_fallback: Callable[[], str],
     t0: float,
+    usage: AgentTurnUsage | None = None,
 ) -> None:
     """Persist one per-turn usage row for a background dispatch surface.
 
@@ -333,7 +370,7 @@ async def _persist_turn_row(
         await persist_token_record_async(
             session_key,
             "",
-            provider_last_turn_usage(client),
+            provider_last_turn_usage(client) if usage is None else usage,
             provider=provider,
             surface=surface,
             agent=read_effective_agent(client) or agent_fallback(),
@@ -413,6 +450,17 @@ _MAX_INJECT_ATTEMPTS = 2
 # (Slack/Discord babysit loops). Mirrors HEARTBEAT_TASK_TIMEOUT_SECS / cron's
 # _JOB_TIMEOUT_SECS: no human is present, so the turn MUST be bounded.
 _NUDGE_TURN_TIMEOUT = 1800.0  # 30 min
+
+
+def _delivery_result(
+    wake_message: str | None,
+    result: MonitorDispatchResult,
+) -> bool | MonitorDispatchResult:
+    """Keep legacy bool semantics while structured delivery stays typed."""
+    if wake_message is not None:
+        return result
+    return result is MonitorDispatchResult.DISPATCHED
+
 
 # Budget for awaiting the in-flight run-marker write during shutdown. Bounded
 # so a stalled write can never eat into GRACEFUL_SHUTDOWN_SECS (which saves
@@ -1420,6 +1468,73 @@ def _channel_transport_permitted(member: str) -> bool:
         return False
 
 
+#: Budget for pinning kiro-cli's path before an unattended spawn. The lookup is
+#: a handful of `stat` calls, but they are under the home directory and
+#: `_warn_if_kiro_cli_outdated` awaits them BEFORE `_init_dashboard` binds its
+#: socket — so on an unresponsive network-mounted home an unbounded lookup would
+#: keep the gateway from ever coming up. Overrunning the budget refuses the
+#: spawn, exactly as an absent binary does.
+_KIRO_CLI_RESOLVE_TIMEOUT_SECS = 5.0
+
+
+def _kiro_cli_pin_probe() -> tuple[str | None, bool]:
+    """``(pinned path, an unpinned install exists)`` — the sync half of the pin.
+
+    The second element separates the two ways the pin can come back empty, which
+    a caller must report differently: kiro-cli is not installed at all (nothing
+    to say — the backend is optional), or it IS installed somewhere the pin does
+    not accept, which is a state an operator needs told about.
+    """
+
+    pinned = resolve_kiro_cli(include_inherited_path=False)
+    if pinned is not None:
+        return pinned, False
+    return None, resolve_kiro_cli() is not None
+
+
+async def _pinned_kiro_cli(purpose: str) -> str | None:
+    """kiro-cli's absolute path for an unattended spawn, or ``None`` to refuse.
+
+    Neither unattended spawn may exec a bare argv0: the gateway's inherited
+    ``PATH`` can lead with an agent-writable directory (a worktree venv's
+    ``bin``), and whatever that names would decide the payload. So the candidate
+    set is the fixed known install directories plus the operator's own
+    ``KIROCREW_KIRO_BIN``, with the inherited ``PATH`` excluded.
+
+    That set does not cover every install: a system-wide one outside
+    ``known_kiro_cli_dirs`` — a root-owned ``/usr/local/bin`` on Linux — is
+    refused here while sessions keep launching it off ``PATH``. Refusing is the
+    right default for a spawn with no operator present, but being SILENT about
+    it is not: the resulting host never auto-updates and never warns it is
+    outdated, with nothing in the log to say why. Hence the warning naming the
+    override, and hence its condition — an install the pin declined is worth a
+    line, a backend that simply is not installed is not.
+
+    Off the loop and bounded: see :data:`_KIRO_CLI_RESOLVE_TIMEOUT_SECS`.
+    """
+
+    try:
+        pinned, unpinned_exists = await asyncio.wait_for(
+            asyncio.to_thread(_kiro_cli_pin_probe),
+            timeout=_KIRO_CLI_RESOLVE_TIMEOUT_SECS,
+        )
+    except (TimeoutError, asyncio.TimeoutError):
+        logger.warning(
+            "kiro-cli: path lookup exceeded %.0fs (unresponsive home?), skipping %s",
+            _KIRO_CLI_RESOLVE_TIMEOUT_SECS,
+            purpose,
+        )
+        return None
+    if pinned is None and unpinned_exists:
+        logger.warning(
+            "kiro-cli resolves only through PATH, which an unattended spawn does "
+            "not trust, so %s is skipped. Point KIROCREW_KIRO_BIN at the binary "
+            "to have it used here.",
+            purpose,
+        )
+    return pinned
+
+
 class GatewayOrchestrator:
     """Manages the lifecycle of all gateway services.
 
@@ -1607,6 +1722,12 @@ class GatewayOrchestrator:
         self.consolidator: HistoryConsolidator | None = None
         self.cron_svc: CronService | None = None
         self.heartbeat_svc: HeartbeatService | None = None
+        # Declared here, not just assigned in `_init_autonudge`: that method
+        # returns early when `KIROCREW_AUTONUDGE=0`, BEFORE its only assignment,
+        # so with the flag off the attribute never existed at all -- and the
+        # seven `if self.autonudge_svc:` sites in the loop-CRUD handlers below
+        # would raise AttributeError rather than read a default.
+        self.autonudge_svc: AutoNudgeService | None = None
         # Secretary runtime service removed (Amazon-internal). Attribute stays
         # as an inert None so other modules referencing it degrade gracefully.
         self.secretary_svc: object | None = None
@@ -1698,11 +1819,53 @@ class GatewayOrchestrator:
     # Tool approval callback (shared by cron, heartbeat, subagent, task)
     # ------------------------------------------------------------------
 
+    def _dashboard_client_attached(self) -> bool:
+        """Report whether an attached dashboard client could answer a prompt NOW.
+
+        Asked at exactly one place: the dashboard-only fallback in
+        ``_interactive_approval``. Reaching it means Slack has already had its
+        turn — either no owner DM was configured, or posting the prompt to it
+        raised and the callback fell through — so the question left is only about
+        the dashboard, and a Slack term here would report a surface that
+        demonstrably did NOT receive the prompt.
+
+        Counts DASHBOARD-USER sockets, not every ``/api/ws`` registration. An app
+        token registers as a client too, and the broadcast chokepoint sends it an
+        owner-surface frame only if its manifest declared that event -- so an open
+        app UI is not somebody who can answer the prompt, for the same reason a
+        configured-but-failed Slack DM is not.
+
+        Deliberately narrow, because a false "attached" merely restores today's
+        behaviour while a false "detached" refuses a spawn a human WOULD have
+        approved:
+
+        * an unreadable client count is treated as attached;
+        * no ``dashboard_state`` at all is genuinely no surface, but the caller
+          reaches its own no-UI branch before asking, so that answer is never
+          used to refuse anything.
+
+        A relay reader is not a false positive here: it consumes the SSE stream
+        (``dashboard/remote_mirror``), never registers on ``/api/ws``, and so is
+        not in ``_ws_clients`` at all.
+        """
+        if self.dashboard_state is None:
+            return False
+        try:
+            return int(self.dashboard_state.dashboard_user_ws_count()) > 0
+        except Exception:
+            logger.debug(
+                "dashboard_user_ws_count failed; treating the dashboard as attached",
+                exc_info=True,
+            )
+            return True
+
     def _interactive_approval(
         self,
         source: str,
         slot_resolver: Callable[[str], str] | None = None,
         nudge_key: str = "",
+        *,
+        raise_when_unreachable: bool = False,
     ) -> ToolApprovalCallback:
         """Return an approval callback that races dashboard vs Slack DM.
 
@@ -1715,6 +1878,12 @@ class GatewayOrchestrator:
         through the dashboard runner, so without it an unanswered prompt on this
         path records no evidence and such a loop keeps waking, being declined and
         spending its cycle cap -- while the expiry notice still promises a stop.
+
+        ``raise_when_unreachable`` opts this callback into raising
+        ``SpawnApprovalUnreachable`` instead of parking on a prompt no surface
+        received. Only the spawn gate sets it, because only the spawn gate has a
+        terminal path that can report the refusal to the calling agent; a mid-run
+        tool approval has no such path and keeps parking exactly as before.
         """
 
         is_background = source in _BACKGROUND_APPROVAL_SOURCES
@@ -2074,6 +2243,14 @@ class GatewayOrchestrator:
 
             # Fallback: dashboard only
             if self.dashboard_state:
+                # The single park-with-nobody-attached point. Every non-human
+                # shortcut above has already been evaluated and skipped, and the
+                # Slack branch either was not taken or fell through after failing
+                # to post — so "nobody received this prompt" is now the only
+                # remaining reading, which is what makes the check sound here and
+                # nowhere else.
+                if raise_when_unreachable and not self._dashboard_client_attached():
+                    raise SpawnApprovalUnreachable("no dashboard client is connected")
                 return await self.dashboard_state.request_approval(
                     request_id,
                     source,
@@ -2117,7 +2294,7 @@ class GatewayOrchestrator:
         # Tool titles are LLM-originated input. Redact before any external
         # surface — SEL audit AND dashboard-visible logger warnings —
         # per the security-controls "never trust LLM output" guideline.
-        safe_title = redact_exfiltration_urls(redact_credentials(title)[0])[0]
+        safe_title = redact(title)
 
         def _audit(outcome: str, *, critical: bool = False, **metadata: str) -> None:
             """Emit a SEL ``log_tool_invocation`` event.
@@ -2360,10 +2537,18 @@ class GatewayOrchestrator:
         stall every other callback for the 5s budget, and a timeout is logged
         (not silently swallowed) so a wedged kiro-cli that costs 5s on every
         boot is diagnosable from gateway.log.
+
+        Pinned the same way the auto-update pins it, via `_pinned_kiro_cli`:
+        this probe runs unattended at boot, so a shim planted on `PATH` would
+        execute here regardless of the `--version` argument. A binary the pin
+        refuses has no version worth warning about — and the pin logs why.
         """
+        kiro_cli_bin = await _pinned_kiro_cli("the kiro-cli version check")
+        if kiro_cli_bin is None:
+            return
         try:
             proc = await asyncio.create_subprocess_exec(
-                "kiro-cli",
+                kiro_cli_bin,
                 "--version",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -2401,10 +2586,9 @@ class GatewayOrchestrator:
             return
         try:
             if proc.returncode == 0:
-                # e.g. "kiro-cli 1.25.0" -> (1, 25, 0)
-                parts = out.decode(errors="replace").strip().split()[-1].split(".")
-                major, minor = int(parts[0]), int(parts[1])
-                if (major, minor) < (1, 26):
+                version = parse_kiro_cli_version(out.decode(errors="replace"))
+                if version is not None and version[:2] < (1, 26):
+                    major, minor = version[0], version[1]
                     print(
                         f"⚠️  kiro-cli {major}.{minor} is outdated (1.26+ required). "
                         "Update kiro-cli, or use the default claude-agent-acp backend."
@@ -2531,6 +2715,7 @@ class GatewayOrchestrator:
             episodic_limit=self._cfg.memory.episodic_max_results,
             embedding_dim=self._cfg.memory.embedding_dim,
             decay_rates=self._cfg.memory.decay_rates or None,
+            dedup_threshold=self._cfg.memory.episodic_dedup_threshold,
         )
         # Off-loop: init() connects sqlite and runs schema migrations, which
         # scale with store size (VectorMemoryStore's own docs say async
@@ -2921,7 +3106,12 @@ class GatewayOrchestrator:
             # ``redact_via_context`` stays the redactor rather than the neutral
             # ``display_safe``: it is context-aware, and the shared sink's default
             # pair would silently drop that.
-            safe_text, _ = redact_for_display(text, redact_via_context)
+            #
+            # Trailing control-tag lines are stripped FIRST (#7948): this is the
+            # proactive egress chokepoint for cron results and subagent
+            # completions authored under dashboard rules, and Slack renders
+            # HTML comments literally. Strip-then-redact matches display_safe.
+            safe_text, _ = redact_for_display(strip_control_comments(text), redact_via_context)
             # ``chunk_for_transport``: the transport's OWN unit (bytes for a
             # byte-capped channel like Webex, chars otherwise) and fence-safe on
             # both paths. A blind slice through a code block leaves part two with
@@ -3057,6 +3247,138 @@ class GatewayOrchestrator:
             origin_key, text, resolved_link=resolved, caller="cron"
         )
 
+    # ── One spelling of the cron failure-alert mechanism ───────────────────
+    #
+    # Two call sites alert on a failed cron run: the script/command helper
+    # (`_alert_cron_failure`) and the message path's own `except` block. They
+    # legitimately differ in control flow (one re-raises), in who owns
+    # `record_failure()`, and in wording. What they must NOT differ in is the
+    # mechanism below -- the dedup window, the Slack-sink hardening, the
+    # one-surface delivery rule, and when the dedup anchor advances.
+    #
+    # That used to rest on a docstring promising the two "cannot drift", which
+    # is prose, not a mechanism: the message path's DM was once left saying only
+    # "check logs" while the helper already carried the reason, and review caught
+    # it rather than a test. These four helpers are the mechanism, so a change
+    # lands on both surfaces or on neither.
+
+    def _failure_alert_is_duplicate(self, job: CronJob, failure_hash: str) -> bool:
+        """Whether this failure repeats the last one inside the reminder window.
+
+        A job that fails identically every minute alerts once per
+        ``_FAILURE_REMINDER_SECS`` rather than once per fire. Both surfaces read
+        the SAME ``last_failure_hash`` / ``last_failure_at`` pair; a job is
+        exactly one kind, so the two writers never interleave on one job.
+        """
+        return (
+            failure_hash == job.last_failure_hash
+            and time.time() - job.last_failure_at < _FAILURE_REMINDER_SECS
+        )
+
+    def _slack_safe_fenced(self, text: str) -> str:
+        """Make *text* safe to interpolate into a Slack mrkdwn code fence.
+
+        Two hazards, one of which escaping alone does not cover. Slack PARSES
+        entity markup, and both halves of a failure alert are attacker-shaped --
+        the job name is user-authored and the reason carries subprocess output, so
+        a job named ``<!channel>`` would notify a whole channel the moment it
+        failed. And three backticks inside the reason would CLOSE the fence early
+        and hand the remainder to the parser as markup, which escaping does not
+        prevent.
+
+        Slack-facing sinks only. The dashboard bell is not a mrkdwn sink and
+        escaping there would render a literal ``&lt;``.
+        """
+        return escape_mrkdwn(text).replace("```", "'''")
+
+    async def _deliver_failure_alert(
+        self,
+        job: CronJob,
+        *,
+        mrkdwn: str,
+        plain: str,
+        actor_key: str,
+        silent: bool = False,
+    ) -> tuple[bool, bool, bool]:
+        """Deliver a failure alert on exactly ONE surface.
+
+        Returns ``(channel_delivered, slack_delivered, slack_failed)``.
+        ``slack_failed`` names a real delivery exception, never an unresolved
+        channel -- the caller's dedup decision turns on that split.
+
+        The one-surface rule: when the conversation that scheduled the job will
+        hear about the failure, the owner DM would be a second alert for one
+        event. An explicit ``job.channel`` is a destination the user pinned and
+        still wins, so the channel leg is skipped for it -- without that guard the
+        channel leg reports a delivery, stands the Slack leg down, and the alert
+        lands on the origin conversation instead of the destination the user
+        named.
+
+        *mrkdwn* and *plain* are composed by the caller and are deliberately two
+        strings: Slack's markup is not another transport's dialect, so a shared
+        string would show ``&lt;`` and stray backticks to a channel reader.
+
+        Never raises. Both callers are inside an ``except`` whose exception is the
+        real story, and one of them re-raises it.
+        """
+        channel_delivered = False
+        slack_delivered = False
+        slack_failed = False
+        if not silent and not job.channel:
+            try:
+                channel_delivered = await self._deliver_cron_to_channel(
+                    job.session_key, plain, actor_key=actor_key
+                )
+            except Exception:
+                logger.error(
+                    "Cron '%s': channel failure-alert delivery failed",
+                    job.name,
+                    exc_info=True,
+                )
+        if self.slack and not silent and not channel_delivered:
+            try:
+                channel = job.channel
+                if not channel and (job.created_by or self._owner_id):
+                    channel = await self._open_dm_with_retry(
+                        job.created_by or self._owner_id, job.name
+                    )
+                if channel:
+                    await self.slack.post_message(channel, mrkdwn)
+                    slack_delivered = True
+                else:
+                    logger.warning("Cron '%s': no channel resolved for failure alert", job.name)
+            except Exception:
+                slack_failed = True
+                logger.error(
+                    "Cron '%s': Slack failure-alert delivery failed",
+                    job.name,
+                    exc_info=True,
+                )
+        return channel_delivered, slack_delivered, slack_failed
+
+    def _advance_failure_dedup(
+        self,
+        job: CronJob,
+        failure_hash: str,
+        *,
+        channel_delivered: bool,
+        slack_failed: bool,
+    ) -> None:
+        """Advance the dedup anchor once the reason actually reached someone.
+
+        "No channel available" counts as delivered -- the bell rang -- so a
+        Slack-less install does not re-notify the dashboard on every fire. A
+        confirmed channel delivery counts for the same reason: the reason reached
+        the user even when the Slack leg threw. Only a REAL Slack exception holds
+        the anchor back, so the next identical failure tries again.
+
+        Only the dedup fields move here. ``record_failure()`` has its own owner
+        per run and is deliberately not touched.
+        """
+        if channel_delivered or not slack_failed:
+            job.last_failure_hash = failure_hash
+            job.last_failure_at = time.time()
+
     def _cron_job_is_silent(self, parent_key: str) -> bool:
         """Return True if *parent_key* maps to a cron job marked silent.
 
@@ -3090,7 +3412,12 @@ class GatewayOrchestrator:
                     slot_key = job.session_key.removeprefix("dashboard:")
                     slot = self.dashboard_state.get_slot(slot_key)
                     if slot is None:
-                        slot = _rehydrate_slot_from_history(self.dashboard_state, slot_key)
+                        # Async form: the sync one parses the whole transcript on
+                        # the loop, which stalls every other session's frames on
+                        # a large store.
+                        slot = await rehydrate_slot_from_history_async(
+                            self.dashboard_state, slot_key
+                        )
                     label = redact(job.name)
                     if slot:
                         wrapped = f'[Cron notification: "{label}"]\n{message}\n[/Cron notification]'
@@ -3211,10 +3538,7 @@ class GatewayOrchestrator:
                 # Denials and failures hash apart so a policy denial does not read
                 # as a dup of a same-worded crash (and vice versa).
                 fh = _result_hash(f"{'denied' if denied else 'failed'}:{text}")
-                if (
-                    fh == job.last_failure_hash
-                    and time.time() - job.last_failure_at < _FAILURE_REMINDER_SECS
-                ):
+                if self._failure_alert_is_duplicate(job, fh):
                     logger.info(
                         "Cron '%s': duplicate failure alert suppressed (%s)",
                         job.name,
@@ -3254,96 +3578,34 @@ class GatewayOrchestrator:
                 # alert is the only place the user learns which one failed. Read
                 # once, ahead of both delivery legs, so they cannot disagree.
                 host = socket.gethostname().split(".")[0]
-                slack_failed = False  # real delivery exceptions only
-                # A configured Slack is not a delivered Slack. The one-surface
-                # rule skips the owner DM when the originating channel already
-                # heard, no channel may resolve at all, and the post can raise --
-                # so the audit trail has to name what LANDED, not what exists.
-                # `self.slack` as the predicate makes every Discord-only alert
-                # read as a Slack egress, which is the one question this record
-                # is kept to answer.
-                slack_delivered = False
-                # The channel that scheduled the job hears about its failures
-                # too. Plain text: the mrkdwn escaping and code fence below are a
-                # Slack rendering concern, and no other transport parses them, so
-                # a shared string would show `&lt;` and stray backticks there.
-                # `label` and `text` are already scrubbed above, and the
-                # transport leg redacts again at its own egress.
-                channel_delivered = False
-                # A pinned `job.channel` wins here exactly as it does on the
-                # result leg. Without this guard the channel leg runs anyway,
-                # reports a delivery, and stands the Slack leg down -- so the
-                # alert lands on the origin conversation and NOT on the
-                # destination the user named, which is the one place they asked to
-                # be told. The comment on the crash leg below claimed this
-                # behaviour before either leg implemented it.
-                if not job.channel:
-                    try:
-                        channel_delivered = await self._deliver_cron_to_channel(
-                            job.session_key,
-                            f"⏰ Cron: {label} {mark} {headline} on {host}\n{text}",
-                            actor_key=f"cron:{job.id}",
-                        )
-                    except Exception:
-                        # Every caller of this alert is inside an ``except``
-                        # whose exception is the real story; a failed alert must
-                        # not replace it.
-                        logger.warning(
-                            "Cron '%s': channel run-failure alert delivery failed",
-                            job.name,
-                            exc_info=True,
-                        )
-                # Same one-surface rule as the result delivery: when the
-                # channel that scheduled the job already heard about the failure,
-                # the Slack owner DM would be a second alert for one event.
-                if self.slack and not channel_delivered:
-                    # Slack PARSES entity markup in a message's text, and both
-                    # halves of this one are attacker-shaped: the job name is
-                    # user-authored and the reason carries subprocess output. A job
-                    # named `<!channel>` would notify every member of the channel
-                    # the moment it failed. Escape at the Slack-facing sink only --
-                    # the dashboard body above is not a mrkdwn sink, and escaping
-                    # there would show a literal `&lt;`.
-                    safe_label = escape_mrkdwn(label)
-                    # Escaping does not neutralize a fence: three backticks inside
-                    # the reason would close this one early and hand the remainder
-                    # to the mrkdwn parser as markup.
-                    safe_text = escape_mrkdwn(text).replace("```", "'''")
-                    msg = (
-                        f"⏰ *Cron: {safe_label}* {mark} "
-                        f"_{headline} on {escape_mrkdwn(host)}_\n```{safe_text}```"
+                # Slack PARSES entity markup and a fence can be closed early by
+                # the reason's own backticks; `_slack_safe_fenced` is the one
+                # spelling of that hardening. `label` and `text` are already
+                # scrubbed above, and the transport leg redacts again at egress.
+                safe_label = self._slack_safe_fenced(label)
+                safe_text = self._slack_safe_fenced(text)
+                msg = (
+                    f"⏰ *Cron: {safe_label}* {mark} "
+                    f"_{headline} on {escape_mrkdwn(host)}_\n```{safe_text}```"
+                )
+                msg, _ = redact_exfiltration_urls(msg)
+                msg, _ = redact_credentials(msg)
+                # Plain twin for a non-Slack transport: mrkdwn is not another
+                # channel's dialect, so a shared string would show `&lt;` and
+                # stray backticks there.
+                plain = f"⏰ Cron: {label} {mark} {headline} on {host}\n{text}"
+                # Silent jobs returned above, so this leg is never suppressed here.
+                channel_delivered, slack_delivered, slack_failed = (
+                    await self._deliver_failure_alert(
+                        job,
+                        mrkdwn=msg,
+                        plain=plain,
+                        actor_key=f"cron:{job.id}",
                     )
-                    msg, _ = redact_exfiltration_urls(msg)
-                    msg, _ = redact_credentials(msg)
-                    try:
-                        channel = job.channel
-                        if not channel and (job.created_by or self._owner_id):
-                            channel = await self._open_dm_with_retry(
-                                job.created_by or self._owner_id, job.name
-                            )
-                        if channel:
-                            await self.slack.post_message(channel, msg)
-                            slack_delivered = True
-                        else:
-                            logger.warning(
-                                "Cron '%s': no channel resolved for run-failure alert", job.name
-                            )
-                    except Exception:
-                        slack_failed = True
-                        logger.error(
-                            "Cron '%s': Slack run-failure alert delivery failed",
-                            job.name,
-                            exc_info=True,
-                        )
-                # Advance dedup only once the reason actually reached someone.
-                # "No channel available" counts as delivered (the bell rang), the
-                # same skip-vs-failure split the message path draws — otherwise a
-                # Slack-less install re-notifies the dashboard on every fire. A
-                # confirmed channel delivery counts for the same reason: the
-                # reason reached the user even when the Slack leg threw.
-                if channel_delivered or not slack_failed:
-                    job.last_failure_hash = fh
-                    job.last_failure_at = time.time()
+                )
+                self._advance_failure_dedup(
+                    job, fh, channel_delivered=channel_delivered, slack_failed=slack_failed
+                )
                 try:
                     # Name every surface the alert actually left on, so the trail
                     # does not read "none" for a run answered on Discord.
@@ -3478,11 +3740,39 @@ class GatewayOrchestrator:
                         job.command,
                         cmd_timeout,
                         job.id,
+                        job.secret_env,
+                        job.secret_env_pin,
                         timeout=_claim_backstop(job, cmd_timeout),
                     )
                     if result.get("status") == "cancelled":
                         # User-initiated cancel: CronService.cancel() owns the
                         # bookkeeping/history — no failure counting, no delivery.
+                        return None
+                    if result.get("status") == "skipped":
+                        # Overlapping wake refused because this job is already
+                        # spawning or running. Not a job defect, so no failure
+                        # counting and no delivery -- counting it would strike a
+                        # job for a transient scheduling overlap.
+                        #
+                        # But returning None alone is NOT neutral: _execute treats
+                        # any non-"error" last_status as success, so it would set
+                        # last_status="ok" AND call record_success(), fabricating a
+                        # run that never happened and refilling the auto-pause
+                        # budget. The cancelled branch above escapes that only
+                        # because _execute additionally checks self._cancelled_jobs
+                        # membership, and a refused overlap is not in that set.
+                        #
+                        # So use the established deliberately-neutral shape of the
+                        # starvation and fire-time-denial paths: last_status="error"
+                        # to skip the success branch, run_never_started=True as the
+                        # retention marker, and DELIBERATELY NOT record_failure() --
+                        # a strike is only ever counted by that explicit call, never
+                        # by last_status, so this spends no budget and refills none.
+                        logger.info("Cron '%s': overlapping run refused, skipping", job.name)
+                        job.clear_carried_result()
+                        job.last_status = "error"
+                        job.last_error = "Another run of this job was already starting or running"
+                        job.run_never_started = True
                         return None
                     output = result.get("output", "")
                     if not output.strip():
@@ -3805,12 +4095,34 @@ class GatewayOrchestrator:
                         job.id,
                         job.message,
                         script_timeout,
+                        job.secret_env,
+                        job.secret_env_pin,
+                        delivery_fingerprint(
+                            job.session_key,
+                            job.silent,
+                            job.channel or "",
+                            job.thread_ts or "",
+                        ),
                         timeout=_claim_backstop(job, script_timeout),
                     )
                     status = result.get("status", "error")
                     if status == "cancelled":
                         # User-initiated cancel: CronService.cancel() owns the
                         # bookkeeping/history — no failure counting, no delivery.
+                        return None
+                    if status == "skipped":
+                        # Overlapping wake refused because this job is already
+                        # spawning or running -- no failure counting, no delivery.
+                        # See the command path for why returning None alone would
+                        # be recorded as a SUCCESS: last_status="error" skips
+                        # _execute's success branch, run_never_started=True is the
+                        # retention marker, and record_failure() is deliberately
+                        # NOT called so the overlap costs no auto-pause strike.
+                        logger.info("Cron '%s': overlapping run refused, skipping", job.name)
+                        job.clear_carried_result()
+                        job.last_status = "error"
+                        job.last_error = "Another run of this job was already starting or running"
+                        job.run_never_started = True
                         return None
                     if status == "ok":
                         job.clear_carried_result()
@@ -4501,6 +4813,7 @@ class GatewayOrchestrator:
                                 self.dashboard_state,
                                 job,
                                 result_text,
+                                history=await prefetch_cron_history(self.dashboard_state, job.id),
                                 context_reading=_ctx_reading,
                             )
                         return result_text
@@ -4525,6 +4838,7 @@ class GatewayOrchestrator:
                             self.dashboard_state,
                             job,
                             result_text,
+                            history=await prefetch_cron_history(self.dashboard_state, job.id),
                             context_reading=_ctx_reading,
                         )
                     return result_text
@@ -4803,8 +5117,11 @@ class GatewayOrchestrator:
                 # skipped walk has no story at all), and a hash keyed on it
                 # would miss the duplicate and re-page the user.
                 fh = _result_hash(_exc_text)
+                # Kept separately from the suppression gate below: `is_dup` still
+                # selects the "still failing" wording on an alert that DOES go out
+                # because the reminder window has expired.
                 is_dup = fh == job.last_failure_hash
-                if is_dup and time.time() - job.last_failure_at < _FAILURE_REMINDER_SECS:
+                if self._failure_alert_is_duplicate(job, fh):
                     # record_failure() is the counter's sole owner: a suppressed
                     # duplicate is still a failed run, so it must count toward
                     # the auto-pause threshold like every other failure path —
@@ -4887,16 +5204,14 @@ class GatewayOrchestrator:
                 host = socket.gethostname().split(".")[0]
                 # Slack PARSES entity markup here, and job.name is user-authored:
                 # a job named `<!channel>` notifies the whole channel on failure.
-                # Same sink and same source as the script/command alert above, so
-                # it gets the same escaping rather than being left as the one
-                # unescaped Slack interpolation of a cron name.
-                safe_name = escape_mrkdwn(job.name)
+                # Same sink and same source as the script/command alert, so it
+                # goes through the one shared spelling of that hardening.
+                safe_name = self._slack_safe_fenced(job.name)
                 # Carry the reason here too. The dashboard body above and the
                 # script/command DM both do, so leaving this one at "check logs"
                 # made the DM the only failure surface that still withheld what
-                # the caller already knows. Escaped and fence-neutralized for the
-                # same reasons as the script/command alert.
-                safe_reason = escape_mrkdwn(exc_detail).replace("```", "'''")
+                # the caller already knows.
+                safe_reason = self._slack_safe_fenced(exc_detail)
                 if is_dup:
                     # +1: this run's failure is recorded below, after the
                     # awaited Slack attempt, so the display count must include
@@ -4940,63 +5255,24 @@ class GatewayOrchestrator:
                 # AND Slack DMs). The failure is still logged at warning level
                 # and counted toward auto-pause above — we just skip
                 # user-facing noise.
-                slack_failed = False  # track real delivery exceptions only
-                # Same reason as the run-failure path: the audit names the
-                # surface the alert LEFT ON, and a silent job or an unresolved
-                # channel means Slack was never one of them.
-                slack_delivered = False
-                # One surface per event, matching the result and run-failure
-                # legs: when the conversation that scheduled the job will hear
-                # about the crash, the Slack owner DM is a second alert for one
-                # failure. An explicit `job.channel` is a destination the user
-                # pinned and still wins.
-                # The channel that scheduled the job hears about its crashes too.
-                # ``channel_fail_msg`` rather than ``fail_msg``: that string is mrkdwn,
-                # no other transport parses it, and the channel form also carries the
+                # One spelling of the one-surface rule and both delivery legs,
+                # shared with the script/command alert. `channel_fail_msg` rather
+                # than `fail_msg` for the channel leg: that string is mrkdwn, no
+                # other transport parses it, and the channel form also carries the
                 # repeat-failure wording and both egress redaction passes.
-                # Placed before record_failure() for the same reason the Slack
-                # leg is: every await in this handler must precede the counter, so
-                # a cancellation mid-alert cannot leave the run counted twice.
-                channel_delivered = False
-                if not job.silent and not job.channel:
-                    try:
-                        channel_delivered = await self._deliver_cron_to_channel(
-                            job.session_key,
-                            channel_fail_msg,
-                            actor_key=session_key,
-                        )
-                    except Exception:
-                        # This handler re-raises the run's own exception below; a
-                        # failed alert must not replace it.
-                        logger.error(
-                            "Cron job '%s': channel failure-notification delivery failed",
-                            job.name,
-                            exc_info=True,
-                        )
-                if self.slack and not job.silent and not channel_delivered:
-
-                    try:
-                        channel = job.channel
-                        if not channel and (job.created_by or self._owner_id):
-                            channel = await self._open_dm_with_retry(
-                                job.created_by or self._owner_id, job.name
-                            )
-                        if channel:
-                            # fail_msg already redacted at construction above.
-                            await self.slack.post_message(channel, fail_msg)
-                            slack_delivered = True
-                        else:
-                            logger.warning(
-                                "Cron '%s': no channel resolved for error notification", job.name
-                            )
-
-                    except Exception:
-                        slack_failed = True
-                        logger.error(
-                            "Cron job '%s': Slack failure-notification delivery failed",
-                            job.name,
-                            exc_info=True,
-                        )
+                #
+                # Placed before record_failure() deliberately: every await in this
+                # handler must precede the counter, so a cancellation mid-alert
+                # cannot leave the run counted twice.
+                channel_delivered, slack_delivered, slack_failed = (
+                    await self._deliver_failure_alert(
+                        job,
+                        mrkdwn=fail_msg,
+                        plain=channel_fail_msg,
+                        actor_key=session_key,
+                        silent=job.silent,
+                    )
+                )
                 # record_failure() is the counter's sole owner: it continues an
                 # accumulation another writer (gate verdict, timeout) already
                 # built up instead of restarting at 1, and it is deliberately
@@ -5015,16 +5291,20 @@ class GatewayOrchestrator:
                         job.name,
                         job.consecutive_failures,
                     )
-                # Advance dedup state unless Slack delivery raised. "No channel
-                # available" is treated as a skip (not a failure), so dedup still
-                # advances — otherwise every identical failure re-notifies the
-                # dashboard, which is what dedup is supposed to prevent. Only the
-                # dedup fields are gated here; the failure count was already
-                # recorded above. A confirmed channel delivery also advances it:
-                # the reason reached the user even when the Slack leg threw.
+                # One spelling of the advance rule, shared with the
+                # script/command alert: the anchor moves once the reason reached
+                # someone, and only a REAL Slack exception holds it back.
+                self._advance_failure_dedup(
+                    job, fh, channel_delivered=channel_delivered, slack_failed=slack_failed
+                )
+                # The SEL record was nested INSIDE the advance condition before
+                # this refactor, so a Slack exception suppressed the audit line as
+                # well as the anchor. Preserved verbatim rather than quietly
+                # widened -- whether the audit should be unconditional (the
+                # script/command alert logs it either way) is a behaviour question,
+                # not a consolidation one. Restating the condition is what makes
+                # that gating visible instead of implied by indentation.
                 if channel_delivered or not slack_failed:
-                    job.last_failure_hash = fh
-                    job.last_failure_at = time.time()
                     # SEL logging is best-effort — never mask the original
                     # exception if audit logging itself fails.
                     try:
@@ -5237,10 +5517,21 @@ class GatewayOrchestrator:
             # Only notify when task is complete — suppress delivery for
             # incomplete tasks (HEARTBEAT_KEEP) to avoid spamming every cycle.
             if is_keep_response(result_safe):
-                logger.info("Heartbeat task incomplete, suppressing delivery: %s", task_text[:80])
+                # Gate-side LOG line, so it takes the context spelling: a host with
+                # a companion loaded must not have this text scanned with the
+                # weaker OSS pass. Truncation comes AFTER redaction — the
+                # invariant #7424 established, and the one
+                # ``redact_log_via_context`` hands to its callers by contract:
+                # slicing first would leave a credential as an unmatchable
+                # fragment. The sibling below stays on ``redact_and_truncate``
+                # because it feeds a DELIVERY, not a log, and the two want
+                # different failure modes on a non-composable host.
+                logger.info(
+                    "Heartbeat task incomplete, suppressing delivery: %s",
+                    redact_log_via_context(task_text)[:80],
+                )
             else:
-                task_safe, _ = redact_exfiltration_urls(task_text[:100])
-                task_safe, _ = redact_credentials(task_safe)
+                task_safe = redact_and_truncate(task_text, 100)
                 await self._deliver_result(
                     "💓 Heartbeat",
                     task_safe,
@@ -5276,7 +5567,9 @@ class GatewayOrchestrator:
         )
         await self.heartbeat_svc.start()
 
-    async def _fire_slack_nudge(self, loop: NudgeLoop) -> bool:
+    async def _fire_slack_nudge(
+        self, loop: NudgeLoop, wake_message: str | None = None
+    ) -> bool | MonitorDispatchResult:
         """Drive one unattended nudge turn in a Slack thread session.
 
         Mirrors the subagent-completion Slack injection: acquire the session,
@@ -5287,10 +5580,16 @@ class GatewayOrchestrator:
         """
         key = loop.slot_key
         if self.sessions is None or self.slack is None:
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        if wake_message is not None and not await channel_inbound_permitted("slack"):
+            logger.warning(
+                "AutoNudge: Slack inbound policy denied structured wake for loop %s",
+                loop.id,
+            )
+            return MonitorDispatchResult.UNAVAILABLE
         if self.sessions.is_busy(key):
             logger.info("AutoNudge skip: slack session %s busy (loop %s)", key, loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         channel = self.sessions.get_channel(key)
         thread_ts = self.sessions.get_thread(key)
         if not thread_ts and key.startswith("slack:"):
@@ -5300,11 +5599,16 @@ class GatewayOrchestrator:
             logger.warning(
                 "AutoNudge: slack session %s unroutable — removing loop %s", key, loop.id
             )
-            if self.autonudge_svc:
+            if self.autonudge_svc and wake_message is None:
                 await self.autonudge_svc.remove(loop.id)
-            return False
-        msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
-        tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+            return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
+        if wake_message is None:
+            msg_body = await compose_nudge_body(
+                loop.message, loop.stop_sentinel_path, loop.slot_key
+            )
+            tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+        else:
+            tagged = wake_message
         # Fail closed: an unattended turn MUST run under the HookManager
         # PreToolUse governance gate (mirrors cron's default approval path).
         # Without ctx_builder there are no hooks to enforce the gate — skip.
@@ -5315,36 +5619,114 @@ class GatewayOrchestrator:
                 key,
                 loop.id,
             )
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         response: str | None = None
         _acquired = False
+        _turn_started = False
+        _driver_completion_hook: MonitorCompletionHook | None = None
+        _completion_hook: MonitorCompletionHook | None = None
+        _raw_dispositions: list[MonitorActionDisposition] = []
+        _completion_reported = False
         try:
-            client, is_new, _resumed = await self.sessions.get_or_create(key)
+            if wake_message is None:
+                client, is_new, _resumed = await self.sessions.get_or_create(key)
+            else:
+                client, is_new, _resumed = await self.sessions.get_or_create(
+                    key, wait_if_busy=False
+                )
             _acquired = True
             _provider = self._cfg.agent.provider if hasattr(self, "_cfg") else "acp"
             full_msg, _ = await run_in_embed_pool(
                 self.ctx_builder.build_message, tagged, is_new, key, provider_type=_provider
             )
+            _completion_hook = self._monitor_completion_hook(loop)
+            if wake_message is not None and _completion_hook is None:
+                return MonitorDispatchResult.UNAVAILABLE
             # Clock started outside wait_for so BOTH the success path and the
             # TimeoutError branch below can report the real elapsed time. acp
             # never assigns TurnUsage.duration_ms, so the row needs this.
             _turn_t0 = time.monotonic()
-            response = await asyncio.wait_for(
-                stream_and_collect(
-                    client,
-                    full_msg,
-                    retry_transient=False,
-                    # Same governance contract as unattended cron turns: the
-                    # HookManager PreToolUse gate decides tool approvals, and
-                    # anything it can't decide goes to the deny-fast
-                    # background-approval window (source "autonudge").
-                    approval_policy=ToolApprovalPolicy.HOOK_BASED,
-                    hooks=self.ctx_builder.hooks,
-                    on_tool_approval=self._interactive_approval("autonudge", nudge_key=key),
-                ),
-                timeout=_NUDGE_TURN_TIMEOUT,
-            )
+            _turn_started = True
+            if wake_message is None:
 
+                def _capture_raw_completion(event: LLMEvent) -> None:
+                    if is_monitor_completion_evidence(
+                        event.stop_reason,
+                        synthetic=event.synthetic_completion,
+                    ):
+                        _raw_dispositions.append(disposition_for_stop_reason(event.stop_reason))
+
+                response = await asyncio.wait_for(
+                    stream_and_collect(
+                        client,
+                        full_msg,
+                        retry_transient=False,
+                        # Same governance contract as unattended cron turns: the
+                        # HookManager PreToolUse gate decides tool approvals, and
+                        # anything it can't decide goes to the deny-fast
+                        # background-approval window (source "autonudge").
+                        approval_policy=ToolApprovalPolicy.HOOK_BASED,
+                        hooks=self.ctx_builder.hooks,
+                        on_tool_approval=self._interactive_approval("autonudge", nudge_key=key),
+                        on_complete=_capture_raw_completion,
+                    ),
+                    timeout=_NUDGE_TURN_TIMEOUT,
+                )
+            else:
+
+                async def _capture_completion(completion: Any) -> None:
+                    _raw_dispositions.append(completion.disposition)
+
+                approval = self._interactive_approval("autonudge", nudge_key=key)
+                sessions = self.sessions
+                assert sessions is not None
+                driver = TurnDriver(
+                    client,
+                    SilentRenderer(channel_type="slack"),
+                    approval_mode=APPROVAL_INTERACTIVE,
+                    decider=approval,
+                    tool_gate=build_tool_gate(
+                        self.ctx_builder,
+                        session_key=key,
+                        agent=_get_agent_for_session(key) or "",
+                    ),
+                    directive_consumer=build_directive_consumer(
+                        session_key=key,
+                        sessions=self.sessions,
+                    ),
+                    monitor_completion=(
+                        (
+                            _driver_completion_hook := MonitorCompletionHook(
+                                _completion_hook.monitor_id,
+                                _completion_hook.fingerprint,
+                                _capture_completion,
+                                authorization_callback=_completion_hook.authorization_callback,
+                                acceptance_callback=_completion_hook.mark_accepted,
+                            )
+                        )
+                        if _completion_hook is not None
+                        else None
+                    ),
+                    closing_gate=lambda: sessions.begin_turn(key),
+                )
+                response = await asyncio.wait_for(
+                    driver.run(full_msg),
+                    timeout=_NUDGE_TURN_TIMEOUT,
+                )
+                if _driver_completion_hook is None or not _driver_completion_hook.accepted:
+                    return MonitorDispatchResult.UNAVAILABLE
+                assert _completion_hook is not None
+                _completion_hook.mark_accepted()
+            _turn_usage = provider_last_turn_usage(client)
+
+            if _raw_dispositions:
+                await self._report_monitor_completion(
+                    loop,
+                    _raw_dispositions[-1],
+                    _turn_usage,
+                    hook=_completion_hook,
+                )
+                _completion_reported = True
             # ── Per-turn usage row: attribute monitor spend. ──
             await _persist_turn_row(
                 client,
@@ -5353,7 +5735,31 @@ class GatewayOrchestrator:
                 surface="monitor",
                 agent_fallback=lambda: _get_agent_for_session(key),
                 t0=_turn_t0,
+                usage=_turn_usage,
             )
+        except SessionBusyError:
+            logger.info(
+                "AutoNudge skip: slack session %s won by another turn (loop %s)",
+                key,
+                loop.id,
+            )
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        except SessionClosingError:
+            logger.info(
+                "AutoNudge: refusing Slack monitor turn for %s during shutdown",
+                key,
+            )
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        except asyncio.CancelledError:
+            if _turn_started and _raw_dispositions and not _completion_reported:
+                _turn_usage = provider_last_turn_usage(client)
+                await self._report_monitor_completion(
+                    loop,
+                    _raw_dispositions[-1],
+                    _turn_usage,
+                    hook=_completion_hook,
+                )
+            raise
         except asyncio.TimeoutError:
             # ── Timeout spend is REAL spend (issue #874 follow-up). ──
             # A timed-out nudge turn previously fell through to the generic
@@ -5370,6 +5776,14 @@ class GatewayOrchestrator:
                 key,
                 loop.id,
             )
+            _turn_usage = provider_last_turn_usage(client)
+            if _raw_dispositions:
+                await self._report_monitor_completion(
+                    loop,
+                    _raw_dispositions[-1],
+                    _turn_usage,
+                    hook=_completion_hook,
+                )
             await _persist_turn_row(
                 client,
                 key,
@@ -5377,11 +5791,26 @@ class GatewayOrchestrator:
                 surface="monitor",
                 agent_fallback=lambda: _get_agent_for_session(key),
                 t0=_turn_t0,
+                usage=_turn_usage,
             )
-            return False
+            if wake_message is None:
+                return False
+            if _driver_completion_hook is not None and _driver_completion_hook.accepted:
+                return MonitorDispatchResult.DISPATCHED
+            return MonitorDispatchResult.BUSY
         except Exception:
             logger.exception("AutoNudge: slack nudge turn failed for %s (loop %s)", key, loop.id)
-            return False
+            if (
+                wake_message is not None
+                and _driver_completion_hook is not None
+                and _driver_completion_hook.accepted
+            ):
+                assert _completion_hook is not None
+                _completion_hook.mark_accepted()
+                return MonitorDispatchResult.DISPATCHED
+            if wake_message is None:
+                return False
+            return MonitorDispatchResult.BUSY
         finally:
             if _acquired:
                 try:
@@ -5418,9 +5847,11 @@ class GatewayOrchestrator:
                 )
             except Exception:
                 logger.warning("AutoNudge: failed to persist nudge turn for %s", key, exc_info=True)
-        return True
+        return _delivery_result(wake_message, MonitorDispatchResult.DISPATCHED)
 
-    async def _fire_discord_nudge(self, loop: NudgeLoop) -> bool:
+    async def _fire_discord_nudge(
+        self, loop: NudgeLoop, wake_message: str | None = None
+    ) -> bool | MonitorDispatchResult:
         """Drive one unattended nudge turn in a Discord DM session.
 
         Synthesizes an ``InboundMessage`` and routes it through the Discord
@@ -5435,14 +5866,14 @@ class GatewayOrchestrator:
         dispatcher = transport.dispatcher if transport is not None else None
         if transport is None or dispatcher is None:
             logger.info("AutoNudge skip: discord transport not running (loop %s)", loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         # Key shape: discord:{agent}:direct:{user_id}[:genN]
         parts = key.split(":")
         if len(parts) < 4 or parts[2] != "direct":
             logger.warning("AutoNudge: unsupported discord key %s — removing loop %s", key, loop.id)
-            if self.autonudge_svc:
+            if self.autonudge_svc and wake_message is None:
                 await self.autonudge_svc.remove(loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         user_id = parts[3]
         # Defense-in-depth: re-check the inbound allowlist at fire time (the
         # create endpoint enforces it too, but the allowlist can shrink after
@@ -5457,9 +5888,9 @@ class GatewayOrchestrator:
                 user_id,
                 loop.id,
             )
-            if self.autonudge_svc:
+            if self.autonudge_svc and wake_message is None:
                 await self.autonudge_svc.remove(loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         # Generation guard: the dispatcher derives the CURRENT key for this
         # user (dm_scope + `!new` generation). If it no longer matches the
         # loop's stored key, the monitored conversation is gone — a synthetic
@@ -5477,31 +5908,65 @@ class GatewayOrchestrator:
                 current_key,
                 loop.id,
             )
-            if self.autonudge_svc:
+            if self.autonudge_svc and wake_message is None:
                 await self.autonudge_svc.remove(loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
         sessions = getattr(dispatcher, "sessions", None)
         if sessions is not None and sessions.is_busy(key):
             logger.info("AutoNudge skip: discord session %s busy (loop %s)", key, loop.id)
-            return False
-        msg_body = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
-        tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        if wake_message is None:
+            msg_body = await compose_nudge_body(
+                loop.message, loop.stop_sentinel_path, loop.slot_key
+            )
+            tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg_body}"
+        else:
+            tagged = wake_message
         try:
             conversation_id = await transport.resolve_conversation(user_id)
+        except Exception:
+            logger.exception(
+                "AutoNudge: discord conversation lookup failed for %s (loop %s)",
+                key,
+                loop.id,
+            )
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
+        completion_hook: MonitorCompletionHook | None = None
+        try:
             synthetic = InboundMessage(
                 channel_type="discord",
                 user_id=user_id,
                 conversation_id=conversation_id,
                 text=tagged,
             )
-            await asyncio.wait_for(
-                dispatcher.handle_message(synthetic, interpret_commands=False),
+            dispatch_kwargs: dict[str, Any] = {"interpret_commands": False}
+            completion_hook = self._monitor_completion_hook(loop)
+            if wake_message is not None and completion_hook is None:
+                return MonitorDispatchResult.UNAVAILABLE
+            if completion_hook is not None:
+                dispatch_kwargs["monitor_completion"] = completion_hook
+                dispatch_kwargs["monitor_session_key"] = key
+            dispatch = dispatcher.handle_message(synthetic, **dispatch_kwargs)
+            dispatch_result = await asyncio.wait_for(
+                dispatch,
                 timeout=_NUDGE_TURN_TIMEOUT,
             )
+            if wake_message is not None:
+                return (
+                    dispatch_result
+                    if isinstance(dispatch_result, MonitorDispatchResult)
+                    else MonitorDispatchResult.UNAVAILABLE
+                )
+            if completion_hook is not None and isinstance(dispatch_result, MonitorDispatchResult):
+                return dispatch_result is MonitorDispatchResult.DISPATCHED
             return True
         except Exception:
             logger.exception("AutoNudge: discord nudge failed for %s (loop %s)", key, loop.id)
-            return False
+            if wake_message is None:
+                return False
+            if completion_hook is not None and completion_hook.accepted:
+                return MonitorDispatchResult.DISPATCHED
+            return MonitorDispatchResult.UNAVAILABLE
 
     async def _fire_webex_nudge(self, loop: NudgeLoop) -> bool:
         """Drive one unattended nudge turn in a Webex DM session.
@@ -5599,7 +6064,9 @@ class GatewayOrchestrator:
             logger.exception("AutoNudge: webex nudge failed (loop %s)", loop.id)
             return False
 
-    async def _fire_dashboard_nudge(self, loop: NudgeLoop) -> bool:
+    async def _fire_dashboard_nudge(
+        self, loop: NudgeLoop, wake_message: str | None = None
+    ) -> bool | MonitorDispatchResult:
         """Drive one nudge turn in a dashboard chat slot.
 
         Sibling of :meth:`_fire_slack_nudge` / :meth:`_fire_discord_nudge`; a
@@ -5615,7 +6082,7 @@ class GatewayOrchestrator:
         # entirely in --no-dashboard mode. Mirrors _observer's guard.
         if self.dashboard_state is None:
             logger.warning("AutoNudge: dashboard not ready — skipping fire for loop %s", loop.id)
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         # Slot resolution mirrors the cron→origin delivery contract in
         # dashboard/handlers/messaging.py: get_slot() is the hot path, and a
         # miss falls back to restoring the session from its persisted history
@@ -5664,15 +6131,55 @@ class GatewayOrchestrator:
                     loop.slot_key,
                     loop.id,
                 )
-                await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
-                return False
+                if wake_message is None:
+                    await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
+                return _delivery_result(wake_message, MonitorDispatchResult.UNAVAILABLE)
             logger.info(
                 "AutoNudge: rehydrated session %s from history for loop %s",
                 loop.slot_key,
                 loop.id,
             )
-        msg = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
-        tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
+        if wake_message is None:
+            msg = await compose_nudge_body(loop.message, loop.stop_sentinel_path, loop.slot_key)
+            tagged = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{msg}"
+        else:
+            tagged = wake_message
+        # ONE STRING, TWO CONSUMERS, and only an opt-in ``banner`` splits them.
+        # ``tagged`` is the PROMPT and is never shortened — re-delivering the
+        # whole instruction every cycle is the guarantee the nudge exists to
+        # provide. ``visible`` is the transcript row, which a reader consults
+        # only to learn that a cycle happened. Without a banner it IS ``tagged``,
+        # so an existing loop's row is byte-identical to today's.
+        #
+        # A banner deliberately skips ``compose_nudge_body``: that composer
+        # prefixes the work-ledger snapshot, which the model wants and a display
+        # line does not. ``render_nudge_message`` still applies, so
+        # ``{{STOP_FILE}}`` resolves in a banner as it does in a message.
+        #
+        # A banner is a MESSAGE-loop concept: a monitor wake (``wake_message``)
+        # shows its own actionable-wake row, so the banner only splits the row
+        # on the ``wake_message is None`` arm.
+        #
+        # ``isinstance`` rather than a bare falsiness test: ``banner: str`` is a
+        # plain dataclass annotation, unenforced at runtime, and ``_load`` builds
+        # a loop straight from parsed JSON — so a store carrying ``"banner": 5``
+        # yields ``loop.banner == 5`` and ``.strip()`` on it would raise
+        # ``AttributeError``, killing the fire and (since the service re-arms an
+        # undelivered cycle) rearming the loop forever. A whitespace-only banner
+        # is truthy too and its blank row is worse than the verbose one, so both
+        # fall through to ``tagged``.
+        banner = loop.banner.strip() if isinstance(loop.banner, str) else ""
+        if banner and wake_message is None:
+            # Credential redaction lives at the banner's single owner — the
+            # authorized write paths (incl. /goal via ``normalize_banner``) and
+            # ``_load`` for a hand-edited store — so ``loop.banner`` is already
+            # scrubbed here and every egress (this row, ``GET /api/autonudge``,
+            # the WS broadcast) serves the same scrubbed value. No per-fire,
+            # per-field scrub at this sink.
+            shown = render_nudge_message(banner, loop.stop_sentinel_path)
+            visible = f"[auto-nudge cycle {loop.cycle_count + 1}]\n{shown}"
+        else:
+            visible = tagged
         from kiro_crew.dashboard.chat import (
             _run_chat,  # circular import: gateway -> dashboard.chat -> gateway (chat dispatch references GatewayOrchestrator)
         )
@@ -5691,55 +6198,209 @@ class GatewayOrchestrator:
                 loop.id,
                 loop.cycle_count,
             )
-            return False
+            return _delivery_result(wake_message, MonitorDispatchResult.BUSY)
         # Show nudge as a distinct "nudge" role message in the slot history.
         # The structured meta lets the dashboard render a compact cycle chip
         # instead of echoing the whole instruction payload as a chat bubble.
         # The tag stays in ``content`` because that is what the model reads,
         # and the body is deliberately NOT duplicated into meta — the client
         # derives it from content, so a multi-KB payload is stored and
-        # broadcast once rather than twice.
-        slot.append(
-            "nudge",
-            tagged,
-            "msg msg-nudge",
-            meta={
-                "nudge": {
-                    "cycle": loop.cycle_count + 1,
-                    "loop_id": loop.id,
-                }
-            },
-        )
+        # broadcast once rather than twice. ``visible`` rather than ``tagged``
+        # in the appended row: identical unless the loop opted into a ``banner``,
+        # in which case this transcript row is the only thing shortened while the
+        # full ``tagged`` prompt still reaches ``_run_chat``.
+        nudge_meta: dict[str, Any] = {
+            "nudge": {
+                "cycle": loop.cycle_count + 1,
+                "loop_id": loop.id,
+            }
+        }
+        if wake_message is not None and loop.monitor is not None:
+            nudge_meta["monitor"] = {
+                "id": loop.id,
+                "fingerprint": loop.monitor.last_wake_fingerprint,
+                "classification": (
+                    loop.monitor.last_decision.value
+                    if loop.monitor.last_decision is not None
+                    else "actionable"
+                ),
+            }
+        completion_hook = self._monitor_completion_hook(loop)
+        if wake_message is not None and completion_hook is None:
+            return MonitorDispatchResult.UNAVAILABLE
+        dashboard_state = self.dashboard_state
+        turn_slot = slot
+        assert dashboard_state is not None and turn_slot is not None
+
+        def _append_nudge() -> None:
+            turn_slot.append(
+                "nudge",
+                visible,
+                "msg msg-nudge",
+                meta=nudge_meta,
+            )
+
+        if completion_hook is None:
+            _append_nudge()
         # FIX 2: an unattended app-owned nudge turn runs under the background
         # concurrency cap. This is the fleet's hot path — N armed loops fire
         # independently and would otherwise put N turns on the runtime at once.
         # An attended slot (any user session with a monitor loop) is passed
         # straight through, so babysit loops on human sessions are unaffected.
-        task = spawn_guarded_turn(
-            self.dashboard_state,
-            slot,
-            self.dashboard_state.run_background_turn(
-                slot,
-                _run_chat(
-                    self.dashboard_state,
-                    slot,
-                    tagged,
-                    _directive_user_origin=False,
-                ),
-            ),
-        )
+        admission: asyncio.Future[MonitorDispatchResult] | None = None
+        if completion_hook is not None:
+            admission = asyncio.get_running_loop().create_future()
+
+        def _settle_admission(result: MonitorDispatchResult) -> None:
+            if admission is not None and not admission.done():
+                admission.set_result(result)
+
+        if completion_hook is not None:
+            base_hook = completion_hook
+
+            async def _authorize_dashboard_turn(monitor_id: str, fingerprint: str) -> bool:
+                current_slot = dashboard_state.get_slot(loop.slot_key)
+                if (
+                    current_slot is not turn_slot
+                    or getattr(turn_slot, "_closing", False)
+                    or str(getattr(turn_slot, "mode", "")) in {"crew", "member"}
+                    or str(getattr(turn_slot, "memory_mode", "persistent")) != "persistent"
+                ):
+                    _settle_admission(MonitorDispatchResult.UNAVAILABLE)
+                    return False
+                callback = base_hook.authorization_callback
+                authorized = True if callback is None else await callback(monitor_id, fingerprint)
+                if not authorized:
+                    _settle_admission(MonitorDispatchResult.UNAVAILABLE)
+                return authorized
+
+            def _accept_dashboard_turn() -> None:
+                callback = base_hook.acceptance_callback
+                if callback is not None:
+                    callback()
+                _append_nudge()
+                _settle_admission(MonitorDispatchResult.DISPATCHED)
+
+            completion_hook = MonitorCompletionHook(
+                base_hook.monitor_id,
+                base_hook.fingerprint,
+                base_hook.callback,
+                authorization_callback=_authorize_dashboard_turn,
+                acceptance_callback=_accept_dashboard_turn,
+            )
+
+        run_kwargs: dict[str, Any] = {}
+        if completion_hook is not None:
+            run_kwargs["monitor_completion"] = completion_hook
+            # Structured monitor turns own a single durable budgeted turn.
+            # Nested depth disables dashboard recovery paths that would enqueue
+            # an additional provider turn outside that accounting boundary.
+            run_kwargs["_prompt_depth"] = 1
+
+        async def _run_dashboard_turn() -> None:
+            # Unattended slots can wait behind the background-turn semaphore.
+            # Reject a revoked structured claim before entering ``_run_chat``:
+            # prompt-submit hooks run during its setup and must not observe a
+            # monitor the user stopped while this turn waited for admission.
+            # The runner retains its own final recheck immediately before
+            # provider entry to cover revocation during that setup.
+            if completion_hook is not None and not await completion_hook.authorize():
+                return
+            await _run_chat(
+                dashboard_state,
+                turn_slot,
+                tagged,
+                _directive_user_origin=False,
+                **run_kwargs,
+            )
+
+        async def _run_background_turn() -> None:
+            try:
+                await dashboard_state.run_background_turn(turn_slot, _run_dashboard_turn())
+            except TimeoutError:
+                _settle_admission(MonitorDispatchResult.BUSY)
+            except asyncio.CancelledError:
+                _settle_admission(MonitorDispatchResult.BUSY)
+                raise
+            except Exception:
+                _settle_admission(MonitorDispatchResult.UNAVAILABLE)
+                raise
+
+        if admission is not None:
+            turn_coro = _run_background_turn()
+        else:
+            turn_coro = dashboard_state.run_background_turn(
+                turn_slot,
+                _run_dashboard_turn(),
+            )
+        task = spawn_guarded_turn(dashboard_state, turn_slot, turn_coro)
         # Mirror dashboard /api/chat/send path so slot.running == True and sidebar
         # shows the "turn active" three-dots indicator immediately.
         slot.task = task
         self._session_tasks[slot.key] = task
         self.dashboard_state.push_slots_update()
-        return True
+        if admission is not None:
+
+            def _settle_unstarted_admission(_task: asyncio.Task[Any]) -> None:
+                _settle_admission(MonitorDispatchResult.BUSY)
+
+            task.add_done_callback(_settle_unstarted_admission)
+            return _delivery_result(wake_message, await admission)
+        return _delivery_result(wake_message, MonitorDispatchResult.DISPATCHED)
+
+    def _monitor_completion_hook(self, loop: NudgeLoop) -> MonitorCompletionHook | None:
+        """Bind a structured loop's in-flight identity to controller accounting."""
+        state = getattr(loop, "monitor", None)
+        if state is None:
+            return None
+        service = self.autonudge_svc
+        if service is None or not state.wake_in_flight or not state.last_wake_fingerprint:
+            return None
+        mark_accepted = getattr(service, "mark_monitor_turn_accepted", None)
+        return MonitorCompletionHook(
+            loop.id,
+            state.last_wake_fingerprint,
+            service.record_monitor_turn_completion,
+            authorization_callback=getattr(service, "monitor_dispatch_is_authorized", None),
+            acceptance_callback=(
+                (lambda: mark_accepted(loop.id, state.last_wake_fingerprint))
+                if mark_accepted is not None
+                else None
+            ),
+        )
+
+    async def _report_monitor_completion(
+        self,
+        loop: NudgeLoop,
+        disposition: MonitorActionDisposition,
+        usage: AgentTurnUsage | None,
+        *,
+        hook: MonitorCompletionHook | None = None,
+    ) -> None:
+        """Best-effort monitor accounting that cannot change delivery outcome."""
+        if hook is None:
+            hook = self._monitor_completion_hook(loop)
+        if hook is None:
+            return
+        try:
+            await hook.complete(disposition, usage)
+        except Exception:
+            logger.warning(
+                "monitor turn completion callback failed for loop %s",
+                loop.id,
+                exc_info=True,
+            )
 
     async def _init_autonudge(self) -> None:
         """Initialize and start the auto-nudge service (feature-flagged)."""
         if not autonudge_enabled():
             logger.info("AutoNudge disabled via feature flag")
             return
+
+        # Keep the disabled gateway boot path free of controller and provider
+        # imports. Provider adapters load credentials and client dependencies
+        # that a gateway with automation disabled never uses.
+        from kiro_crew.monitoring.controller import MonitorController
 
         async def _fire(loop: NudgeLoop) -> bool:
             """Inject nudge message into the bound session.
@@ -5755,9 +6416,13 @@ class GatewayOrchestrator:
             """
             if is_channel_key(loop.slot_key):
                 if loop.slot_key.startswith("slack:"):
-                    return await self._fire_slack_nudge(loop)
+                    result = await self._fire_slack_nudge(loop)
+                    assert isinstance(result, bool)
+                    return result
                 if loop.slot_key.startswith("discord:"):
-                    return await self._fire_discord_nudge(loop)
+                    result = await self._fire_discord_nudge(loop)
+                    assert isinstance(result, bool)
+                    return result
                 if loop.slot_key.startswith("webex:"):
                     return await self._fire_webex_nudge(loop)
                 logger.warning(
@@ -5767,32 +6432,80 @@ class GatewayOrchestrator:
                 )
                 await self.autonudge_svc.remove(loop.id)  # type: ignore[union-attr]
                 return False
-            return await self._fire_dashboard_nudge(loop)
+            result = await self._fire_dashboard_nudge(loop)
+            assert isinstance(result, bool)
+            return result
+
+        async def _fire_monitor(loop: NudgeLoop, envelope: str) -> MonitorDispatchResult:
+            """Route one controller-owned envelope without legacy decoration."""
+            if loop.slot_key.startswith("slack:"):
+                result = await self._fire_slack_nudge(loop, envelope)
+                if not isinstance(result, MonitorDispatchResult):
+                    logger.error("Slack monitor dispatcher returned an untyped result")
+                    return MonitorDispatchResult.UNAVAILABLE
+                return result
+            if loop.slot_key.startswith("discord:"):
+                result = await self._fire_discord_nudge(loop, envelope)
+                if not isinstance(result, MonitorDispatchResult):
+                    logger.error("Discord monitor dispatcher returned an untyped result")
+                    return MonitorDispatchResult.UNAVAILABLE
+                return result
+            if is_channel_key(loop.slot_key):
+                return MonitorDispatchResult.UNAVAILABLE
+            result = await self._fire_dashboard_nudge(loop, envelope)
+            if not isinstance(result, MonitorDispatchResult):
+                logger.error("Dashboard monitor dispatcher returned an untyped result")
+                return MonitorDispatchResult.UNAVAILABLE
+            return result
+
+        controller: MonitorController | None = None
+
+        async def _monitor_tick(loop: NudgeLoop) -> None:
+            if controller is not None:
+                await controller.tick(loop, now=time.time())
 
         def _observer(event: str, loop: NudgeLoop | None) -> None:
             if event == "expired" and loop is not None:
                 self._notify_nudge_expired(loop)
             if self.dashboard_state and loop is not None:
-                self.dashboard_state.broadcast_ws(
+                loop_payload: dict[str, Any] = {
+                    "id": loop.id,
+                    "slot_key": loop.slot_key,
+                    "message": loop.message,
+                    "idle_secs": loop.idle_secs,
+                    "max_cycles": loop.max_cycles,
+                    "max_runtime_secs": loop.max_runtime_secs,
+                    "cycle_count": loop.cycle_count,
+                    "active": loop.active,
+                    "last_fire_ts": loop.last_fire_ts,
+                }
+                if is_structured_monitor_loop(loop):
+                    assert loop.monitor is not None
+                    loop_payload["monitor"] = _redact_monitor_value(
+                        monitor_state_public_dict(loop.monitor)
+                    )
+                    loop_payload["next_due_ts"] = loop.next_due_ts
+                    loop_payload["stopped_reason"] = loop.stopped_reason
+                broadcast = (
+                    self.dashboard_state.broadcast_ws_owners
+                    if is_structured_monitor_loop(loop)
+                    else self.dashboard_state.broadcast_ws
+                )
+                broadcast(
                     "autonudge_state",
                     {
                         "event": event,
                         "slot": loop.slot_key,
-                        "loop": {
-                            "id": loop.id,
-                            "slot_key": loop.slot_key,
-                            "message": loop.message,
-                            "idle_secs": loop.idle_secs,
-                            "max_cycles": loop.max_cycles,
-                            "max_runtime_secs": loop.max_runtime_secs,
-                            "cycle_count": loop.cycle_count,
-                            "active": loop.active,
-                            "last_fire_ts": loop.last_fire_ts,
-                        },
+                        "loop": loop_payload,
                     },
                 )
 
-        self.autonudge_svc = AutoNudgeService(base_dir=data_home(), on_fire=_fire)
+        self.autonudge_svc = AutoNudgeService(
+            base_dir=data_home(),
+            on_fire=_fire,
+            on_monitor_tick=_monitor_tick,
+        )
+        controller = MonitorController(self.autonudge_svc, _fire_monitor)
         self.autonudge_svc.subscribe(_observer)
         await self.autonudge_svc.start()
 
@@ -5832,7 +6545,33 @@ class GatewayOrchestrator:
             # get a working jump-to-source slot link.
             meta = None if is_channel_key(key) else self._notif_meta(f"dashboard:{key}")
             capped_out = loop.max_cycles and loop.cycle_count >= loop.max_cycles
-            if not capped_out and runtime_budget_exceeded(loop):
+            # Every branch below except the terminal one explains why the loop stopped
+            # SHORT of its goal. A terminal subject is not short of anything, so it
+            # outranks all of them -- expressed ONCE here rather than as a guard added to
+            # each branch after a reviewer finds it, which is how the cap and then the
+            # wall-clock budget each came to preempt it in turn.
+            #
+            # An OWED terminal turn is terminal news too, and it is the third way this
+            # same precedence has been lost. A CHANNEL-bound loop deliberately does not
+            # settle on observation -- it learns its watch finished from a delivered turn,
+            # so the probe records the owed turn in ``terminal_pending`` and leaves the
+            # loop active with no ``outcome`` and no ``MONITOR_TERMINAL_REASON``. If that
+            # final turn is refused (a busy thread, the ordinary case) and the retry finds
+            # a bound spent, ``_timer`` deactivates on the bound before the settlement
+            # that would have promoted the debt ever runs. Reading ``stopped_reason``
+            # alone then contradicts a fact already durably on disk, and announces a watch
+            # that SUCCEEDED with the same signal as one that ran out of cycles.
+            #
+            # Scope: the debt is consulted for the WORDING only. The bound that actually
+            # stopped the loop keeps its own ``stopped_reason`` untouched -- so the spent
+            # cap stays observable, and every consumer of that literal (notably the
+            # monitor_update revival affordance, which revives a ``cycle_cap`` loop when
+            # the cap is raised) behaves exactly as before.
+            owed = ""
+            if loop.monitor:
+                owed = str(getattr(loop.monitor, "terminal_pending", "") or "")
+            terminal = loop.stopped_reason == MONITOR_TERMINAL_REASON or bool(owed)
+            if not terminal and not capped_out and runtime_budget_exceeded(loop):
                 title = "Monitoring loop spent its time budget"
                 body = (
                     f"The loop stopped after {loop.cycle_count} cycles because "
@@ -5841,7 +6580,7 @@ class GatewayOrchestrator:
                     "unmet. Restart it from the goal popover, or ask the agent "
                     "to raise the budget (monitor_update)."
                 )
-            elif not capped_out and loop.stopped_reason == APPROVAL_STALL_REASON:
+            elif not terminal and not capped_out and loop.stopped_reason == APPROVAL_STALL_REASON:
                 title = "Monitoring loop stopped — it could not get tool approval"
                 body = (
                     f"The loop stopped after {loop.cycle_count} cycles because a "
@@ -5854,6 +6593,56 @@ class GatewayOrchestrator:
                     "agent.yolo_duration has an 'until_shutdown' option that "
                     "has no timed expiry."
                 )
+            elif terminal:
+                # Reached only when no earlier branch claimed the notice, which the two
+                # ``not terminal`` guards above guarantee. FIRST in effect, ahead of every "why it stopped early" reading. Removing the cap
+                # guard from this branch was not enough: the runtime-budget and
+                # approval-stall branches are evaluated before it, so a terminal
+                # delivery that also exhausted the wall-clock budget still reported
+                # "its budget ran out without reporting done, its goal may still be
+                # unmet" about a finished subject. Every other branch here explains why
+                # the loop stopped SHORT of its goal; a terminal subject is not short of
+                # anything, so it outranks all of them rather than needing a guard added
+                # to each one as that one is found.
+                #
+                # It also cannot depend on ``capped_out``: the delivery that CARRIES the
+                # terminal news increments ``cycle_count`` before the settlement records
+                # the reason -- deliberately, so a cancelled write cannot lose the turn's
+                # accounting -- so a subject merging on the capping delivery would
+                # otherwise be announced as a cap with the goal possibly unmet.
+                #
+                # MERGED and CLOSED-UNMERGED are both terminal but they are not the same
+                # news. "No action needed" is true of the first and false of the second,
+                # which stopped on a question the operator has to answer: reopen, or
+                # abandon. The monitor's outcome carries the distinction (SUCCESS vs
+                # BLOCKED), so the wording follows it rather than lumping both under a
+                # finish.
+                settled = getattr(loop.monitor, "outcome", None) if loop.monitor else None
+                # A settled outcome wins. An UNSETTLED one falls back to the owed turn,
+                # which draws the same distinction from the same vocabulary -- the probe
+                # records ``"success" if merged else "blocked"``, matching
+                # ``MonitorOutcome.SUCCESS``/``BLOCKED``. Without this fallback a merged
+                # subject reaching here on the debt alone would take the else branch and
+                # be announced as closed-unmerged: the misleading-ending defect moved
+                # rather than fixed.
+                decided = getattr(settled, "value", settled) or owed
+                if decided == "success":
+                    title = "Monitoring loop finished — what it was watching is done"
+                    body = (
+                        f"The loop stopped after {loop.cycle_count} cycles because "
+                        "the pull request it was watching was merged, so there is "
+                        "nothing left to observe. No action needed; arm a new loop "
+                        "if you want to watch something else."
+                    )
+                else:
+                    title = "Monitoring loop stopped — its subject was closed unmerged"
+                    body = (
+                        f"The loop stopped after {loop.cycle_count} cycles because "
+                        "the pull request it was watching was closed WITHOUT being "
+                        "merged. Nothing is left to observe, but the work is not "
+                        "finished: decide whether to reopen it or abandon it, then "
+                        "arm a new loop if you reopen."
+                    )
             else:
                 title = "Monitoring loop hit its cycle cap"
                 body = (
@@ -7019,7 +7808,7 @@ class GatewayOrchestrator:
                                     _slot_name,
                                 )
                                 # Bounded by the configured turn ceiling
-                                # (chat_turn_timeout_secs, 7200s default):
+                                # (chat_turn_timeout_secs, 14400s default):
                                 # _run_chat's finally block drains slot._queue
                                 # on any exit path.
                                 # Carry the structured completion facts so the
@@ -7585,12 +8374,20 @@ class GatewayOrchestrator:
         _approve_subagent = self._interactive_approval(
             "subagent", slot_resolver=_spawn_slot_resolver
         )
+        # A SECOND instance of the same callback, differing only in the
+        # unreachable behaviour. It is a separate closure because the one above is
+        # also wired as ``on_tool_approval``: a mid-run tool prompt has no
+        # terminal path that could report the refusal, so raising there would turn
+        # a recoverable park into a lost turn.
+        _approve_spawn_gate = self._interactive_approval(
+            "subagent", slot_resolver=_spawn_slot_resolver, raise_when_unreachable=True
+        )
 
         async def _spawn_approve(
             request_id: str, description: str, parent_session_key: str = ""
         ) -> bool:
             event = LLMEvent(kind="permission_request", request_id=request_id, title=description)
-            return await _approve_subagent(event, parent_session_key)
+            return await _approve_spawn_gate(event, parent_session_key)
 
         # Debounced slots push: keep slots[].subagents_running live for every
         # SSE consumer (composer busy affordance, Board "working" lane, and
@@ -7630,8 +8427,7 @@ class GatewayOrchestrator:
                 # Show error in UI + queue for LLM context on next turn.
                 slot = self.dashboard_state.get_slot(slot_name)
                 if slot:
-                    task_preview, _ = redact_exfiltration_urls((info.task or "")[:100])
-                    task_preview, _ = redact_credentials(task_preview)
+                    task_preview = redact_and_truncate(info.task or "", 100)
                     error_text, _ = redact_exfiltration_urls(extra.get("error", "timed out"))
                     error_text, _ = redact_credentials(error_text)
                     # The visible transcript card must state the run's real
@@ -8133,7 +8929,19 @@ class GatewayOrchestrator:
                 reconcile_store_embedding_space(store)
                 return store.backfill_missing_embeddings()
 
-            await loop.run_in_executor(maintenance_executor(), _wait_then_backfill)
+            # embed_executor(), NOT maintenance_executor(): pacing turns this
+            # from a ~72-minute worst case into a multi-hour one, and mc-maint is
+            # a 4-worker pool documented as "reserved for the FAST periodic
+            # sweeps + overlay rewrites" — parking one of its four slots
+            # (mostly asleep) for a working day is a regression the pacing
+            # introduced. mc-embed is the bulkhead built for exactly this: its
+            # rationale is that embed work "queues behind ITSELF instead of
+            # starving" everything else, it has 8 workers, and the same
+            # atexit shutdown hook already covers it. Interactive embeds are
+            # unaffected either way — LlamaCppEmbedder serializes every call
+            # onto one owned inference thread, so the model lock is the
+            # bottleneck there, not a pool slot.
+            await loop.run_in_executor(embed_executor(), _wait_then_backfill)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -8647,6 +9455,14 @@ class GatewayOrchestrator:
         from kiro_crew.platform.update_governance import min_version, update_required
         from kiro_crew.platform.update_provider import UpdateProvider
 
+        # Loaded BEFORE provider.apply(): the legacy-nested-venv migration the
+        # resolver exists for deletes the venv this process imports from, so a
+        # deferred import after a successful apply would raise
+        # ModuleNotFoundError and leave a closed-session gateway un-restarted
+        # (found in review). The module stays off the boot path either way —
+        # this method runs from the update timer, not from gateway start.
+        from kiro_crew.platform.wheel_engine import respawn_executable
+
         assert isinstance(provider, UpdateProvider)
 
         result = await provider.check()
@@ -8685,7 +9501,7 @@ class GatewayOrchestrator:
                 self.dashboard_state.push_update_progress("pulling", "Applying mandatory update…")
             success = await provider.apply()
             if success:
-                await self._restart_after_update()
+                await self._restart_after_update(respawn_executable)
             else:
                 if self.dashboard_state:
                     self.dashboard_state.push_update_progress(
@@ -8707,7 +9523,7 @@ class GatewayOrchestrator:
                     self.dashboard_state.push_update_progress("pulling", "Downloading update…")
                 success = await provider.apply()
                 if success:
-                    await self._restart_after_update()
+                    await self._restart_after_update(respawn_executable)
                 else:
                     if self.dashboard_state:
                         self.dashboard_state.push_update_progress(
@@ -8720,8 +9536,16 @@ class GatewayOrchestrator:
         else:
             print("👻 Already on latest version")
 
-    async def _restart_after_update(self) -> None:
-        """Save state and restart the process after a successful update apply."""
+    async def _restart_after_update(self, respawn: Callable[[], str]) -> None:
+        """Save state and restart the process after a successful update apply.
+
+        ``respawn`` is :func:`kiro_crew.platform.wheel_engine.respawn_executable`,
+        imported by the caller BEFORE ``provider.apply()`` ran: the apply may
+        have deleted the venv this process imports from, so nothing here may
+        import from disk. Calling it is still deferred to this point, because
+        the answer (stable link vs. ``sys.executable``) is only right after the
+        apply has repointed the link.
+        """
         logger.info("Update applied, restarting gateway")
         if self.dashboard_state:
             self.dashboard_state.push_update_progress("restarting", "Restarting server…")
@@ -8743,7 +9567,17 @@ class GatewayOrchestrator:
                 )
         if self.sessions:
             await self.sessions.close_all()
-        platform_compat.reexec_python_module("kiro_crew", sys.argv[1:])
+        # Same reason as the dashboard restart path: the safety-override record
+        # publishes on a worker thread, and os.execv does not drain it, so a
+        # grant activated just before a self-update would lose its notice
+        # (found in review). Offloaded and bounded so a stalled write can
+        # neither block the loop nor hold up the restart.
+        try:
+            await asyncio.to_thread(flush_breadcrumb_writes, 2.0)
+        except Exception:
+            logger.debug("Breadcrumb flush before update restart failed", exc_info=True)
+        exe = await asyncio.to_thread(respawn)
+        platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
 
     async def _check_for_updates_legacy(self) -> None:
         """Legacy update check — the existing layout-aware logic."""
@@ -8954,6 +9788,12 @@ class GatewayOrchestrator:
         # implementation of it (issue #4210 exists to close the two-conventions
         # gap, not to add a second helper).
         from kiro_crew.platform.update_provider import _kill_and_reap
+
+        # Loaded before the reinstall below for the same reason as the provider
+        # path: `pip install -e .` rewrites the package this process imports
+        # from, so the resolver must already be in memory when the restart
+        # needs it. Called only after the install succeeded (see the exec below).
+        from kiro_crew.platform.wheel_engine import respawn_executable
 
         try:
             # Every git call below reads a tree an agent can write, and several of
@@ -9458,12 +10298,17 @@ class GatewayOrchestrator:
                 return
             logger.info("Auto-update: reset to origin/%s, rebuilding", branch)
 
-            # Update the optional kiro-cli backend if present.
-            if shutil.which("kiro-cli"):
+            # Update the optional kiro-cli backend, by the pinned absolute path
+            # `_pinned_kiro_cli` returns — never a bare argv0 this unattended
+            # path would let `PATH` answer. `None` means do not spawn it,
+            # skipped like any absent backend, which this step already treats as
+            # non-fatal.
+            kiro_cli_bin = await _pinned_kiro_cli("the optional kiro-cli backend update")
+            if kiro_cli_bin is not None:
                 kiro_update: asyncio.subprocess.Process | None = None
                 try:
                     kiro_update = await asyncio.create_subprocess_exec(
-                        "kiro-cli",
+                        kiro_cli_bin,
                         "update",
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
@@ -9648,10 +10493,18 @@ class GatewayOrchestrator:
                     )
             if self.sessions:
                 await self.sessions.close_all()
+            # Drain the safety-override record before exec, for the same reason
+            # the other restart paths do: os.execv does not drain the publish
+            # worker, so a grant activated just before this would lose its notice.
+            try:
+                await asyncio.to_thread(flush_breadcrumb_writes, 2.0)
+            except Exception:
+                logger.debug("Breadcrumb flush before auto-update restart failed", exc_info=True)
             # Use -m kiro_crew rather than sys.argv[0] so the restart resolves
             # the freshly reinstalled entry point regardless of how the
             # original process was launched.
-            platform_compat.reexec_python_module("kiro_crew", sys.argv[1:])
+            exe = await asyncio.to_thread(respawn_executable)
+            platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
         except Exception:
             logger.warning("Auto-update failed", exc_info=True)
             if self.dashboard_state:
@@ -9685,6 +10538,12 @@ class GatewayOrchestrator:
         to a temp dir and atomically replaces via ``ln -sf``).
         """
         from kiro_crew.dashboard.handlers import _update_info
+
+        # Loaded before cli.sh runs: the installer's legacy-venv migration
+        # `rm -rf`s the venv this process imports from once the new tree is
+        # linked, so a deferred import after it would not find the module.
+        # Called only after the installer succeeded (see the exec below).
+        from kiro_crew.platform.wheel_engine import respawn_executable
 
         # Read the command through the SAME accessor the caller selected this
         # branch with. Reading a bare `_update_info["update_command"]` here is
@@ -9869,8 +10728,15 @@ class GatewayOrchestrator:
                 )
         if self.sessions:
             await self.sessions.close_all()
+        # Same drain as the other restart paths: exec does not empty the publish
+        # worker, and a just-activated grant would otherwise lose its notice.
+        try:
+            await asyncio.to_thread(flush_breadcrumb_writes, 2.0)
+        except Exception:
+            logger.debug("Breadcrumb flush before install restart failed", exc_info=True)
         # Restart into the freshly-installed version.
-        platform_compat.reexec_python_module("kiro_crew", sys.argv[1:])
+        exe = await asyncio.to_thread(respawn_executable)
+        platform_compat.reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
 
     # ------------------------------------------------------------------
     # Main run loop
@@ -10007,6 +10873,40 @@ class GatewayOrchestrator:
         from kiro_crew.session import cleanup_orphaned_sessions
 
         cleanup_orphaned_sessions()
+
+        # Same "previous run left residue" concern as the orphan sweep above, for
+        # telemetry rather than processes: any open-session crumb on disk belongs
+        # to a session that never reached a teardown path, so it is emitted as
+        # end_reason=crashed.
+        #
+        # Deliberately NOT awaited here. The scan is a glob plus a read/stat/unlink
+        # per crumb, so its cost scales with accumulated user data, and running it
+        # inline would delay readiness in proportion to that. It goes to a worker
+        # thread on a tracked task instead, and the process-start cutoff means it
+        # cannot mistake a session THIS process opens in the meantime for a
+        # casualty of the last one -- so it no longer has to finish before the
+        # gateway starts serving.
+        _telemetry_backfill_cutoff = time.time()
+
+        async def _backfill_unclean_session_telemetry() -> None:
+            try:
+                from kiro_crew.metrics.sessions import backfill_crashed_sessions
+
+                count = await asyncio.to_thread(
+                    backfill_crashed_sessions, _telemetry_backfill_cutoff
+                )
+                if count:
+                    logger.info(
+                        "Telemetry: back-filled %d unclean session lifetime(s) "
+                        "from the previous run",
+                        count,
+                    )
+            except Exception:  # telemetry must never break boot
+                logger.debug("unclean-session telemetry backfill failed", exc_info=True)
+
+        _backfill_task = asyncio.create_task(_backfill_unclean_session_telemetry())
+        self._background_tasks.add(_backfill_task)
+        _backfill_task.add_done_callback(self._background_tasks.discard)
 
         # Fill the sandbox probe cache BEFORE any on-loop spawn path can reach
         # detect_backend(). Waiting (off-loop) rather than firing-and-forgetting
@@ -10162,6 +11062,28 @@ class GatewayOrchestrator:
                 register_post_install_hook(reproject_for_ceiling_change)
                 await asyncio.to_thread(start_refresher)
 
+        # Claim the install-scoped telemetry reporter role for this process.
+        # Install-level inventory (crons, skills, knowledge, config toggles) is the
+        # same for every process in the install, so if each telemetry-enabled
+        # process published it -- the gateway, gatewayd, spawned agents -- an
+        # aggregate over installs would count this install once per process. This
+        # is the gateway, so it is the one that publishes.
+        #
+        # It lives in run() itself, unconditionally: the claim belongs to being the
+        # gateway, not to any single service, and a feature-flagged host would take
+        # the whole subsystem down with it. _init_autonudge() below returns early
+        # under KIROCREW_AUTONUDGE=0, so a claim made in there means no process ever
+        # publishes inventory -- and nothing says so, because the gauge callbacks
+        # bail before probing and leave probe.failures empty, which reads exactly
+        # like a host that stopped exporting. test_reporter_claim_is_unconditional
+        # pins the call site. Best-effort: telemetry is never a boot blocker.
+        try:
+            from kiro_crew.metrics.inventory_gauges import mark_install_reporter
+
+            mark_install_reporter()
+        except Exception:  # noqa: BLE001 -- telemetry must never break gateway boot
+            logger.debug("could not claim the telemetry inventory role", exc_info=True)
+
         # AutoNudge must run after dashboard init — _fire callback dereferences
         # self.dashboard_state. In --no-dashboard mode the guard inside _fire
         # early-returns so persisted loops are harmless until a dashboard
@@ -10170,7 +11092,17 @@ class GatewayOrchestrator:
 
         # Wire up event routing and interactive handlers
         init_interactions(self)
-        init_socket_mode(self, seen)
+        # Offloaded WHOLE rather than at the yolo line inside it. The blocking work
+        # this PR introduced is ``set_yolo_mode`` -> ``grant_declared_yolo`` ->
+        # a profiles-dir walk, and that call sits between two of the function's early
+        # returns (owner check, enterprise validation), so hoisting just it out here
+        # would grant YOLO on a Slack-DISABLED gateway that currently never reaches
+        # it. Offloading the call preserves every one of those returns in order.
+        # The function was already doing network I/O on the loop
+        # (``validate_enterprise``), so moving it off is strictly an improvement; it
+        # only mutates ``orch`` attributes and module globals, at startup, with
+        # nothing running concurrently.
+        await asyncio.to_thread(init_socket_mode, self, seen)
 
         await self._start_channel_transports()
 
@@ -10389,6 +11321,17 @@ class GatewayOrchestrator:
         await shutdown_event.wait()
         print("👻 Shutting down…")
 
+        # Exit status for the os._exit below. 0 for an operator stop (SIGTERM,
+        # `systemctl stop`, Ctrl-C) so a restart-on-failure supervisor leaves
+        # the gateway down as asked. Non-zero when the stale-asset watchdog is
+        # what set the event: that shutdown exists ONLY to be restarted, and
+        # a supervisor with `Restart=on-failure` semantics never relaunches an
+        # exit 0 — a unit generated before `Restart=always` landed stranded a
+        # gateway for hours on exactly this path. The watchdog has already
+        # returned (True on the vanish path) by the time it sets the event, so
+        # its task result is the signal; see shutdown_exit_code.
+        exit_code = shutdown_exit_code(_watchdog)
+
         # Drop this gateway's run-marker BEFORE _shutdown() releases the
         # listener: once the port is free a replacement gateway can bind it
         # and publish its own marker + credential, which this clear would
@@ -10448,7 +11391,7 @@ class GatewayOrchestrator:
         from kiro_crew.cli import drain_log_queue_before_hard_exit
 
         await drain_log_queue_before_hard_exit()
-        os._exit(0)
+        os._exit(exit_code)
 
     async def _start_channel_transports(
         self, descriptors: "tuple[ChannelDescriptor, ...] | None" = None

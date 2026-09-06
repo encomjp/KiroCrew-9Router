@@ -12,6 +12,7 @@ from kiro_crew.dashboard.chat_persistence import save_slot_off_loop, session_was
 from kiro_crew.dashboard.chat_utils import (
     _sync_dashboard_slots,
     effective_session_key,
+    history_corpus_unreadable,
     slot_history_key,
 )
 from kiro_crew.dashboard.state import (
@@ -20,6 +21,7 @@ from kiro_crew.dashboard.state import (
     request_slot_origin,
 )
 from kiro_crew.history import carry_provenance
+from kiro_crew.history_projection import drop_persisted_tail_prefix as _drop_persisted_tail_prefix
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.sel import sel
 
@@ -37,6 +39,16 @@ _SNAPSHOT_ATTEMPTS = 4
 _FORK_DIRECTION_HEAD = "head"
 _FORK_DIRECTION_TAIL = "tail"
 _FORK_DIRECTIONS = (_FORK_DIRECTION_HEAD, _FORK_DIRECTION_TAIL)
+_MAX_MESSAGE_ID_CHARS = 256
+
+
+def drop_persisted_tail_prefix(full_disk: list[dict], tail: list[dict]) -> list[dict]:
+    """Re-exported from ``history_projection``, which owns the identity rule.
+
+    Kept importable from here because this module was its first consumer and is
+    where callers and tests reach for it.
+    """
+    return _drop_persisted_tail_prefix(full_disk, tail)
 
 
 async def api_chat_slot_fork(request: web.Request) -> web.Response:
@@ -47,8 +59,8 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     only the messages after ``at_message_index``; the head is dropped.
     An optional ``prompt`` is returned so the frontend can send it.
 
-    Body: ``{ at_message_index?: number, prompt?: string, mode?: string,
-    direction?: "head"|"tail" }``
+    Body: ``{ at_message_index?: number, at_message_id?: string, prompt?: string,
+    mode?: string, direction?: "head"|"tail" }``
     """
 
     state: DashboardState = request.app["state"]
@@ -137,6 +149,22 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     else:
         body = {}
     at_index = body.get("at_message_index")
+    at_message_id = body.get("at_message_id")
+    if at_message_id is not None and (
+        not isinstance(at_message_id, str)
+        or not at_message_id.strip()
+        or len(at_message_id) > _MAX_MESSAGE_ID_CHARS
+    ):
+        return web.json_response(
+            {
+                "error": (
+                    "at_message_id must be a non-empty string of at most "
+                    f"{_MAX_MESSAGE_ID_CHARS} characters"
+                ),
+                "code": "invalid_field_type",
+            },
+            status=400,
+        )
     prompt = body.get("prompt")
     mode_override = body.get("mode")
     if mode_override is not None and mode_override not in ("", "orchestrator", "crew"):
@@ -186,11 +214,11 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # Read disk FIRST (full history). Use chained read so the index space
-    # matches what the frontend renders against — slot detail (chat_handlers)
-    # also uses read_messages_chained, and visibleIndexMap is built off that.
-    # Without this, indices past the current session-file boundary error out
-    # with `out of range` even though the user clicked a visible message.
+    # Read disk FIRST (full history). Stable message IDs are resolved against this
+    # complete corpus; the legacy index fallback also has to use the same chained
+    # view the fully-loaded frontend renders. Without the chained read, an archived
+    # target is reported missing (ID path) or indices past the current file boundary
+    # fail out of range (legacy path).
     async with slot._fork_lock:
         all_messages: list[dict] = []
         new_msgs: list[dict] = []
@@ -229,10 +257,11 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             # without marking dirty. There is deliberately no ``_dirty`` gate on
             # the merge below: the boundary alone is authoritative and the slice is
             # empty when everything is persisted, so a flush clearing ``_dirty``
-            # mid-read can no longer skip the reconciliation and drop the tail.
+            # mid-read cannot skip the reconciliation and drop the tail.
             # ``pending_retry`` carries a SUSPICION across the ``continue`` below.
-            # The save at :209 clears ``_pending_rewrite`` unconditionally once the
-            # archive-safe rewrite succeeds (``chat_persistence``: ``if rewrite:
+            # The pending-rewrite save below clears ``_pending_rewrite``
+            # unconditionally once the archive-safe rewrite succeeds
+            # (``chat_persistence``: ``if rewrite:
             # slot._pending_rewrite = False``) with NO check that the flag it clears
             # is the one its own snapshot was taken for. So a rewind landing while
             # that save is suspended has its flag erased, and without this carry the
@@ -355,8 +384,8 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                 if disk_len_before <= count_before:
                     # The boundary is a usable index and authoritative: the slice
                     # is empty exactly when everything is persisted. Deliberately
-                    # NO ``_dirty`` gate here -- that is what let a flush clearing
-                    # ``_dirty`` mid-read skip the merge and drop the tail.
+                    # NO ``_dirty`` gate here -- a gate is what lets a flush
+                    # clearing ``_dirty`` mid-read skip the merge and drop the tail.
                     tail = list(slot.messages[disk_len_before:])
                 elif slot._dirty:
                     # The boundary can run AHEAD of the resident window, and is
@@ -499,6 +528,7 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                     },
                     status=503,
                 )
+        _fork_tail_len = len(new_msgs) if (all_messages and new_msgs) else 0
         if all_messages and new_msgs:
             # REBIND, never ``extend``. ``read_messages_chained`` hands back the
             # SHARED ``_msg_cache`` list BY IDENTITY whenever it falls through to
@@ -508,12 +538,15 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             # callers MUST treat the result as immutable and slice or ``list(...)``
             # it before mutating.
             #
-            # Base mutated it here too, but base always took the durable save when
-            # dirty, and that save invalidates the entry -- so the mutation was
-            # transient and self-healing. The skip-the-save branch below is
-            # deliberate and correct, and it is also what removes the eviction that
-            # used to hide this: nothing corrects the entry, so every later reader
-            # of this key sees the UNPERSISTED tail as though it were history.
+            # An in-place mutation is unsafe here because this handler can finish
+            # with no durable save at all, and only a save invalidates the cache
+            # entry: the skip-the-save branch below is deliberate, and both save
+            # arms are gated on ``slot._dirty``, so neither runs when it is
+            # already False -- while the tail snapshot above is ungated and can
+            # still be non-empty. Nothing in this handler then corrects the entry,
+            # so readers of this key see the UNPERSISTED tail as though it were
+            # history until the next write to this transcript invalidates it, or
+            # the LRU evicts it.
             #
             # A rebind rather than ``list(all_messages)`` + ``extend``: one
             # expression, the surrounding control flow untouched, and it leaves no
@@ -597,7 +630,10 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
             slot._resumed_count = len(slot.messages)
             slot._dirty = False
         if not all_messages:
+            # The whole corpus is the in-memory window: disk contributed
+            # nothing, so for the mid-rotation rebuild below it is ALL tail.
             all_messages = list(slot.messages)
+            _fork_tail_len = len(all_messages)
         # Direct delete check, independent of the flush arms above: if the
         # periodic 5s flush hit the delete-won guard first, it cleared
         # ``_dirty`` and this handler's own flush arms never ran — the disk
@@ -619,13 +655,130 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
                 },
                 status=409,
             )
+    # Fork indices arrive in the PAGINATED corpus's visible-row space, which
+    # prepends each chain key's size-rotated archive head
+    # (read_messages_chained_full). Mirror that corpus here, or every index
+    # sent after the reader paged past a rotation boundary resolves short by
+    # the archived visible-row count, silently forking the WRONG message —
+    # and archived rows could not be forked at all. Rotated rows are BY
+    # DEFINITION no longer in the live files, so this cannot duplicate
+    # anything the flush arms above already placed in ``all_messages``.
+    #
+    # Two shapes, matching the slot-detail handler exactly:
+    # - Archive only on the FIRST chain member: the archived rows are a
+    #   contiguous prefix of the chained corpus, so a flat prepend is exact.
+    # - A LATER member also rotated (``chain_mid_rotation``): the paginated
+    #   corpus interleaves rot/live per key, so a flat prepend would shift
+    #   ``at_message_index`` by the sandwiched rows. Rebuild the disk part
+    #   from the true chained corpus and re-append the unflushed tail the
+    #   arms above collected (``_fork_tail_len`` rows).
+    if state.conversation_log:
+        try:
+            _rotated_head = await asyncio.to_thread(
+                state.conversation_log.read_rotated_messages_chained,
+                slot_history_key(slot),
+            )
+        except Exception:
+            # NOT `_rotated_head = []`. Empty means "no archive" here, so folding
+            # the failure into it drops the archived head and shifts every index
+            # below it -- and this path forks BY INDEX, so it would copy a
+            # different cutoff than the one the reader pointed at, silently. Same
+            # retryable shape the snapshot loop below already returns.
+            logger.warning("rotated-archive read failed for fork", exc_info=True)
+            return history_corpus_unreadable("fork_corpus_unreadable")
+        if _rotated_head:
+            _mid_rotation = False
+            try:
+                _mid_rotation = await asyncio.to_thread(
+                    state.conversation_log.chain_mid_rotation,
+                    slot_history_key(slot),
+                )
+            except Exception:
+                # Same reasoning as the slot-detail probe: a False fallback picks
+                # the flat-prepend path, which is only correct when the rotation is
+                # on the first chain member. Getting that wrong here forks BY INDEX
+                # off a misindexed corpus, so it copies different messages than the
+                # ones the reader pointed at.
+                logger.warning("mid-rotation probe failed for fork", exc_info=True)
+                return history_corpus_unreadable("fork_corpus_unreadable")
+            _rebuilt = False
+            if _mid_rotation:
+                try:
+                    _full_disk = await asyncio.to_thread(
+                        state.conversation_log.read_messages_chained_full,
+                        slot_history_key(slot),
+                    )
+                    _tail = (
+                        all_messages[len(all_messages) - _fork_tail_len :] if _fork_tail_len else []
+                    )
+                    # `_tail` was derived as "unflushed" against the corpus the
+                    # snapshot loop read. THIS is a later read, and two
+                    # `to_thread` suspensions separate them, so a save landing in
+                    # that window puts those same rows on disk — appending the
+                    # tail blind then duplicates them, surfacing as an ambiguous
+                    # fork id or a doubled fork tail. The loop's stability
+                    # guarantee does not reach across this read, so re-derive
+                    # against what this read actually returned.
+                    all_messages = _full_disk + drop_persisted_tail_prefix(_full_disk, _tail)
+                    _rebuilt = True
+                except Exception:
+                    # FAIL CLOSED. The flat prepend below puts only THIS key's
+                    # rotated head in front, so when the rotation is on a later
+                    # chain member the earlier members' rotated rows are still
+                    # missing and every index shifts. An index-addressed fork
+                    # then copies DIFFERENT messages than the ones the reader
+                    # pointed at, silently — worse than not forking at all,
+                    # which the reader can see and retry. Same retryable shape
+                    # the snapshot loop above already returns.
+                    logger.warning("chained-full fork corpus read failed", exc_info=True)
+                    return history_corpus_unreadable("fork_corpus_unreadable")
+            if not _rebuilt:
+                # Same crash window as `read_messages_chained_full`'s concatenation,
+                # reached by a different branch: rotation archives the dropped lines
+                # first and rewrites the live file's head second, so a kill between
+                # those two steps leaves the archived rows in BOTH files. Prepending
+                # blind then serves them twice, and in this corpus a duplicated row
+                # is what makes a legacy fork index select the wrong cutoff.
+                #
+                # This branch is not covered by that function's own guard because it
+                # runs when the chained-full read was not used at all.
+                all_messages = _rotated_head + drop_persisted_tail_prefix(
+                    _rotated_head, all_messages
+                )
     visible = [m for m in all_messages if m.get("role") in ("user", "assistant")]
     if not visible:
         return web.json_response(
             {"error": "no messages to fork", "code": "no_messages_to_fork"},
             status=400,
         )
-    if at_index is not None:
+    if at_message_id is not None:
+        matches = []
+        for index, message in enumerate(visible):
+            meta = message.get("meta")
+            mid = meta.get("mid") if isinstance(meta, dict) else None
+            if mid == at_message_id:
+                matches.append(index)
+        if not matches:
+            return web.json_response(
+                {
+                    "error": "the selected message is no longer present in this session",
+                    "code": "fork_message_not_found",
+                },
+                status=409,
+            )
+        if len(matches) > 1:
+            # ``meta`` can originate with a caller. Never guess when a malformed
+            # transcript reuses an id: choosing either occurrence silently forks
+            # from a different point than the user selected.
+            return web.json_response(
+                {
+                    "error": "the selected message id is ambiguous in this session",
+                    "code": "fork_message_ambiguous",
+                },
+                status=409,
+            )
+        at_index = matches[0]
+    elif at_index is not None:
         if isinstance(at_index, bool) or not isinstance(at_index, int) or at_index < 0:
             return web.json_response(
                 {
@@ -666,21 +819,24 @@ async def api_chat_slot_fork(request: web.Request) -> web.Response:
     elif at_index is not None:
         visible = visible[: at_index + 1]
 
+    # A fork of a member DM thread is an ordinary chat, never a second "member"
+    # slot: the fork mints a chat-* key, so member mode would make it invisible
+    # everywhere (excluded from Sessions by surface mode, and absent from the
+    # roster, whose threads live only on member-<slug> keys). The override
+    # allowlist deliberately cannot name "member".
+    if mode_override is not None:
+        fork_mode = mode_override
+    elif slot.mode == "member":
+        fork_mode = ""
+    else:
+        fork_mode = slot.mode
+
     new_slot = state.get_or_create_slot(
         name=None,
         agent=slot.agent,
         workspace=slot.workspace,
         model=slot.model,
-        # A fork of a member DM thread is an ordinary chat, never a second
-        # "member" slot: the fork mints a chat-* key, so member mode would make
-        # it invisible everywhere (excluded from Sessions by surface mode, and
-        # absent from the roster, whose threads live only on member-<slug>
-        # keys). The override allowlist deliberately cannot name "member".
-        mode=(
-            mode_override
-            if mode_override is not None
-            else ("" if slot.mode == "member" else slot.mode)
-        ),
+        mode=fork_mode,
         app=request_app,
         origin=request_slot_origin(request_app),
         # Human request-layer path: a person forking a conversation. The

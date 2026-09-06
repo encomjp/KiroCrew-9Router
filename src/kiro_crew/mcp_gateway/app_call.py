@@ -45,7 +45,7 @@ import uuid
 from typing import Any, Optional
 
 from kiro_crew.mcp_apps_render import load_spool
-from kiro_crew.mcp_caller import CallerContext
+from kiro_crew.mcp_caller import CallerContext, new_tenant_nonce
 from kiro_crew.mcp_gateway.apps import AUDIENCE_APP, visibility_allows
 from kiro_crew.sel import SecurityEventLog
 from kiro_crew.validation import ValidationError, validate_mcp_tool_arguments
@@ -95,7 +95,12 @@ async def _roundtrip(
     stub_uuid = f"__app_call__{uuid.uuid4().hex[:12]}"
     inbox = await backend.attach_stub(stub_uuid)
     try:
-        await backend.forward_from_stub(stub_uuid, frame, caller=caller)
+        # Own nonce per round-trip: this ephemeral stub is a distinct connection
+        # from every real one, so an unnamed app-call must not land in a chat
+        # session's per-tenant namespace on a pooled backend (#5322).
+        await backend.forward_from_stub(
+            stub_uuid, frame, caller=caller, tenant_nonce=new_tenant_nonce()
+        )
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()

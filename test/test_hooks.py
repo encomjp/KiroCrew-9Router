@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -809,13 +810,26 @@ class TestSafeReadFile:
 class TestShouldAutoApproveSpawn:
     """Test _should_auto_approve_spawn helper from handler.py."""
 
+    @staticmethod
+    def _spawn_event(**overrides):
+        base = {
+            "tool_name": "spawn_run",
+            "mcp_server_name": "kirocrew-core",
+            "mcp_identity_trusted": True,
+            "title": "spawn_run",
+            "is_shell": False,
+            "shell_classified": True,
+        }
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
     def test_approves_spawn_run_when_flag_true(self):
         from kiro_crew.hooks import HookManager
         from kiro_crew.slack.handler import _should_auto_approve_spawn
 
         ctx = MagicMock()
         ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": True}))
-        assert _should_auto_approve_spawn(ctx, "spawn_run") is True
+        assert _should_auto_approve_spawn(ctx, self._spawn_event()) is True
 
     def test_rejects_when_flag_false(self):
         from kiro_crew.hooks import HookManager
@@ -823,7 +837,7 @@ class TestShouldAutoApproveSpawn:
 
         ctx = MagicMock()
         ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": False}))
-        assert _should_auto_approve_spawn(ctx, "spawn_run") is False
+        assert _should_auto_approve_spawn(ctx, self._spawn_event()) is False
 
     def test_rejects_non_spawn_tool(self):
         from kiro_crew.hooks import HookManager
@@ -831,7 +845,121 @@ class TestShouldAutoApproveSpawn:
 
         ctx = MagicMock()
         ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": True}))
-        assert _should_auto_approve_spawn(ctx, "spawn_run_privileged") is False
+        event = self._spawn_event(tool_name="spawn_run_privileged", title="spawn_run_privileged")
+        assert _should_auto_approve_spawn(ctx, event) is False
+
+    def test_rejects_shell_event_with_forged_spawn_title(self):
+        """The issue's attack: a SHELL event titled spawn_run must not ride
+        the spawn rung — the title is model-authored."""
+        from kiro_crew.hooks import HookManager
+        from kiro_crew.slack.handler import _should_auto_approve_spawn
+
+        ctx = MagicMock()
+        ctx.hooks = HookManager(HooksConfig.from_dict({"auto_approve_subagent_spawn": True}))
+        event = self._spawn_event(
+            tool_name="", mcp_server_name="", title="spawn_run", is_shell=True
+        )
+        assert _should_auto_approve_spawn(ctx, event) is False
+
+
+class TestEventIsSpawnRun:
+    """The canonical spawn identity predicate the rung keys on.
+
+    Mutation pin: reverting any consumer to a title-only check must fail the
+    forged-shell and canonical-mismatch directions below.
+    """
+
+    @staticmethod
+    def _event(**fields):
+        return SimpleNamespace(
+            tool_name=fields.get("tool_name", ""),
+            mcp_server_name=fields.get("mcp_server_name", ""),
+            mcp_identity_trusted=fields.get("mcp_identity_trusted", False),
+            title=fields.get("title", ""),
+            is_shell=fields.get("is_shell", False),
+            shell_classified=fields.get("shell_classified", False),
+        )
+
+    def _genuine(self, **overrides):
+        fields = dict(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+        )
+        fields.update(overrides)
+        return self._event(**fields)
+
+    def test_canonical_trusted_core_spawn_is_genuine(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine()) is True
+
+    def test_rephrased_title_falls_to_the_ladder_despite_canonical_identity(self):
+        # A genuine spawn whose display title was rephrased does NOT ride the
+        # rung: the channel deny plane keys on the title, so approving here
+        # would bypass a title-keyed deny rule. Falling to the ladder is a
+        # downgrade (prompt/trust), never a hard block.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(title="Spawn agents")) is False
+
+    def test_canonical_mismatch_refuses_regardless_of_a_forged_title(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._genuine(tool_name="execute_bash")
+        assert event_is_spawn_run(event) is False
+
+    def test_untrusted_identity_provenance_fails_closed(self):
+        # tool_name non-emptiness alone is not proof of provenance: a future
+        # inline population path leaves the flag False and must fail closed.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(mcp_identity_trusted=False)) is False
+
+    def test_foreign_server_spawn_run_tool_is_refused(self):
+        # A third-party MCP server exposing a tool literally named spawn_run
+        # must not ride the crew's spawn rung.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(mcp_server_name="evil-server")) is False
+
+    def test_builtin_named_spawn_run_without_a_server_is_refused(self):
+        # kiro-cli sets tool_name for built-ins too, with an empty server
+        # name — a built-in cannot satisfy the MCP-server pin.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._genuine(mcp_server_name="")) is False
+
+    def test_shell_event_with_forged_title_refuses_without_canonical_identity(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._event(tool_name="", title="spawn_run", is_shell=True, shell_classified=True)
+        assert event_is_spawn_run(event) is False
+
+    def test_unclassified_event_with_forged_title_fails_closed(self):
+        # The correlated cache miss: tool_name empty AND shell_classified
+        # False AND is_shell miss-default False. Canonical-only means no
+        # evidence -> refuse.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._event(tool_name="", title="spawn_run", shell_classified=False)
+        assert event_is_spawn_run(event) is False
+
+    def test_non_shell_event_with_forged_title_fails_closed(self):
+        # CI GPT-lane finding: a no-_meta.kiro NON-shell tool (e.g. send_file
+        # re-titled "spawn_run") must not ride the rung either — there is no
+        # title fallback. The rung not firing is a downgrade to the channel's
+        # normal ladder, never a hard block.
+        from kiro_crew.hooks import event_is_spawn_run
+
+        event = self._event(tool_name="", title="spawn_run", is_shell=False, shell_classified=True)
+        assert event_is_spawn_run(event) is False
+
+    def test_plain_non_spawn_title_refuses(self):
+        from kiro_crew.hooks import event_is_spawn_run
+
+        assert event_is_spawn_run(self._event(tool_name="", title="grep")) is False
 
 
 class TestMutatingKindBeatsTheTitle:
@@ -967,14 +1095,30 @@ class TestMutatingKindBeatsTheTitle:
     def test_rejects_none_context(self):
         from kiro_crew.slack.handler import _should_auto_approve_spawn
 
-        assert _should_auto_approve_spawn(None, "spawn_run") is False
+        event = SimpleNamespace(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+            is_shell=False,
+            shell_classified=True,
+        )
+        assert _should_auto_approve_spawn(None, event) is False
 
     def test_rejects_none_hooks(self):
         from kiro_crew.slack.handler import _should_auto_approve_spawn
 
         ctx = MagicMock()
         ctx.hooks = None
-        assert _should_auto_approve_spawn(ctx, "spawn_run") is False
+        event = SimpleNamespace(
+            tool_name="spawn_run",
+            mcp_server_name="kirocrew-core",
+            mcp_identity_trusted=True,
+            title="spawn_run",
+            is_shell=False,
+            shell_classified=True,
+        )
+        assert _should_auto_approve_spawn(ctx, event) is False
 
 
 class TestCanonicalMcpIdentityGoverned:
@@ -1941,3 +2085,54 @@ class TestTargetPathNestedExtraction:
         result = target_paths(params)
         assert len(result) == 40
         assert result.truncated is False
+
+
+class TestUnrecoverableShellIsRefusedUnconditionally:
+    """The deny-by-default refusal on a shell call with no recoverable command has
+    no operator override, and must not acquire one.
+
+    An override was implemented and removed on the PR that added the
+    ``DeniedRuleProvider`` seam. ``ToolHookResult`` carries only
+    ``allow`` / ``auto_approve`` / ``deny``, so a suppressed call can at best
+    return ``allow`` — and ``allow`` falls through to
+    patterns / trust-reads / trust / YOLO / interactive in the dashboard runner.
+    Under YOLO the unverified command would then execute with no human ever
+    seeing it, so barring the hook-level auto-approve branches is not sufficient:
+    the decision is re-made downstream. Reinstating a switch here needs a fourth
+    action meaning "force the interactive prompt, and let no downstream tier
+    auto-grant it".
+    """
+
+    _REASON = "could not be verified for security policy"
+
+    def test_the_refusal_fires(self):
+        res = HookManager(HooksConfig()).on_tool_call(
+            "Running a command", is_shell=True, command=None
+        )
+        assert res.action == TOOL_DENY
+        assert self._REASON in (res.reason or "")
+
+    def test_a_stale_override_key_cannot_resurrect_the_suppression(self):
+        """A build that briefly shipped the switch may have left
+        ``allow_unverified_shell: true`` in the keystone state. It is now an
+        unknown key and must be inert, not honoured."""
+        cfg = HooksConfig.from_dict(
+            {"denied_commands": {"allow_unverified_shell": True}},
+        )
+        assert not hasattr(cfg, "denied_commands_allow_unverified_shell")
+        res = HookManager(cfg).on_tool_call("Running a command", is_shell=True, command=None)
+        assert res.action == TOOL_DENY
+        assert self._REASON in (res.reason or "")
+
+    def test_an_auto_approve_pattern_cannot_admit_it(self):
+        """The ``auto_approve_tools`` loop matches only the agent-authored TITLE.
+        It is safe ONLY because this refusal returns before the loop is reached —
+        so a pattern as broad as ``*`` must still not admit an unverified call."""
+        cfg = HooksConfig(auto_approve_tools=["*", "Running: *"])
+        res = HookManager(cfg).on_tool_call("Running: something", is_shell=True, command=None)
+        assert res.action == TOOL_DENY
+
+        # Control: the same config DOES auto-approve once the command is present,
+        # so the assertion above pins the refusal and not a broken fixture.
+        ok = HookManager(cfg).on_tool_call("Running: ls", is_shell=True, command="ls")
+        assert ok.action == TOOL_AUTO_APPROVE

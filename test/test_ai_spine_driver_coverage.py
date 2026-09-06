@@ -86,7 +86,16 @@ class _Git:
         return seq.pop(0) if len(seq) > 1 else seq[0]
 
     def git(self, args, cwd):
-        joined = " ".join(str(a) for a in args)
+        toks = [str(a) for a in args]
+        clean: list[str] = []
+        index = 0
+        while index < len(toks):
+            if toks[index] == "-c":
+                index += 2
+                continue
+            clean.append(toks[index])
+            index += 1
+        joined = " ".join(clean)
         self.calls.append(joined)
         rc, out, err = self._take(joined)
         return subprocess.CompletedProcess(args=list(args), returncode=rc, stdout=out, stderr=err)
@@ -369,6 +378,10 @@ DIFF = "--- a/m.py\n+++ b/m.py\n@@ -1 +1 @@\n-old\n+new\n"
 @pytest.fixture(autouse=True)
 def _isolate_env(tmp_path, monkeypatch):
     """No real home, no inherited fan-out overrides, no leaked log handlers."""
+    from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+
+    monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+    monkeypatch.setattr(clone_setup, "_push_disabled", lambda _clone: True)
     monkeypatch.setenv("KIROCREW_HOME", str(tmp_path / "home"))
     for var in ("AUTO_IMPROVEMENT_WIDE", "AUTO_IMPROVEMENT_DEEP"):
         monkeypatch.delenv(var, raising=False)
@@ -474,6 +487,19 @@ def test_live_push_is_tolerated_under_an_authorized_direct_commit(tmp_path):
     d.assert_push_disabled()  # scoped push exception
 
 
+def test_direct_commit_never_bypasses_unsafe_repository(tmp_path, monkeypatch):
+    from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+
+    monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: False)
+    d = _make(
+        tmp_path,
+        profile=_Profile(isolation=_Isolation(disabled=False)),
+        direct_commit=True,
+    )
+    with pytest.raises(drv.PushEnabledError, match="repository metadata"):
+        d.assert_push_disabled()
+
+
 def test_live_push_on_a_protected_branch_still_refuses(tmp_path):
     d = _make(tmp_path, profile=_Profile(isolation=_Isolation(disabled=False)), direct_commit=True)
     d.branch = "main"
@@ -574,6 +600,37 @@ def test_preflight_uses_an_explicitly_injected_boot_verbatim(tmp_path, monkeypat
     d = _make(tmp_path, profile=_Profile(isolation=_Isolation(boot=lambda: None)), boot_callable=boot)
     d.preflight()
     assert seen["boot"] is boot
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_preflight_retires_before_interpreting_success_or_failure(tmp_path, monkeypatch, raises):
+    d = _make(tmp_path)
+    result = PreflightResult(ok=True, noise_band=1.0)
+
+    def _preflight():
+        if raises:
+            raise RuntimeError("preflight failed")
+        return result
+
+    retired: list[str] = []
+    d.preflight = _preflight
+    d._retire_if_unsafe = lambda stage: retired.append(stage) or True
+
+    assert d._preflight_checked() is None
+    assert retired == ["perf preflight"]
+
+
+def test_post_execution_live_urls_retire_the_clone(tmp_path, monkeypatch):
+    from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+
+    d = _make(tmp_path)
+    monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+    monkeypatch.setattr(clone_setup, "_push_disabled", lambda _clone: False)
+    retained = tmp_path / ".clone.unsafe" / "clone"
+    monkeypatch.setattr(clone_setup, "_retire_unsafe_clone", lambda _clone: retained)
+
+    assert d._retire_if_unsafe("agent") is True
+    assert d._repository_retired is True and d._stop is True
 
 
 def test_measurement_boot_comes_from_the_isolation_recipe_when_not_injected(tmp_path):
@@ -906,7 +963,7 @@ def test_direct_push_refuses_a_disabled_remote_url(tmp_path, git):
 
 def test_direct_push_refuses_an_unreadable_pushable_diff(tmp_path, git):
     git.script("rev-parse --verify", 0)
-    git.script("diff HEAD~1..HEAD", (128, "", "fatal"))
+    git.script("diff --no-ext-diff HEAD~1..HEAD", (128, "", "fatal"))
     d = _direct_push_driver(tmp_path)
     assert d._direct_push(fp="fp", kind="perf", target="t", sha="abc") is False
     assert d.ledger._seen["fp"].note == (
@@ -916,18 +973,18 @@ def test_direct_push_refuses_an_unreadable_pushable_diff(tmp_path, git):
 
 def test_direct_push_scans_a_root_commit_with_show(tmp_path, git, monkeypatch):
     git.script("rev-parse --verify", 1)  # no parent → root commit
-    git.script("show --format=", (0, DIFF, ""))
+    git.script("show --no-ext-diff --format=", (0, DIFF, ""))
     git.script("rev-parse HEAD", (0, "landedsha\n", ""))
     git.script("push", 0)
     d = _direct_push_driver(tmp_path)
     assert d._direct_push(fp="fp", kind="perf", target="t", sha="abc") is True
-    assert git.seen("show --format=")
+    assert git.seen("show --no-ext-diff --format=")
 
 
 def test_direct_push_refuses_content_the_scanner_flags(tmp_path, git, monkeypatch):
     monkeypatch.setattr(PP, "scan_content_for_secrets", lambda text: (False, PP.SCAN_HIT))
     git.script("rev-parse --verify", 0)
-    git.script("diff HEAD~1..HEAD", (0, DIFF, ""))
+    git.script("diff --no-ext-diff HEAD~1..HEAD", (0, DIFF, ""))
     d = _direct_push_driver(tmp_path)
     assert d._direct_push(fp="fp", kind="perf", target="t", sha="abc") is False
     assert d.ledger._seen["fp"].note == (
@@ -938,7 +995,7 @@ def test_direct_push_refuses_content_the_scanner_flags(tmp_path, git, monkeypatc
 
 def test_direct_push_records_a_failed_push(tmp_path, git):
     git.script("rev-parse --verify", 0)
-    git.script("diff HEAD~1..HEAD", (0, DIFF, ""))
+    git.script("diff --no-ext-diff HEAD~1..HEAD", (0, DIFF, ""))
     git.script("rev-parse HEAD", (0, "headsha\n", ""))
     git.script("push", (1, "", "remote rejected"))
     d = _direct_push_driver(tmp_path)
@@ -949,7 +1006,7 @@ def test_direct_push_records_a_failed_push(tmp_path, git):
 
 def test_direct_push_reports_the_sha_that_actually_landed(tmp_path, git):
     git.script("rev-parse --verify", 0)
-    git.script("diff HEAD~1..HEAD", (0, DIFF, ""))
+    git.script("diff --no-ext-diff HEAD~1..HEAD", (0, DIFF, ""))
     git.script("rev-parse HEAD", (0, "rebasedsha\n", ""))
     git.script("push", 0)
     d = _direct_push_driver(tmp_path)
@@ -959,7 +1016,7 @@ def test_direct_push_reports_the_sha_that_actually_landed(tmp_path, git):
 
 def test_direct_push_falls_back_to_the_snapshot_sha_when_rev_parse_blanks(tmp_path, git):
     git.script("rev-parse --verify", 0)
-    git.script("diff HEAD~1..HEAD", (0, DIFF, ""))
+    git.script("diff --no-ext-diff HEAD~1..HEAD", (0, DIFF, ""))
     git.script("rev-parse HEAD", (0, "   \n", ""))
     git.script("push", 0)
     d = _direct_push_driver(tmp_path)
@@ -970,7 +1027,7 @@ def test_direct_push_falls_back_to_the_snapshot_sha_when_rev_parse_blanks(tmp_pa
 def test_direct_push_reads_the_fetch_url_off_the_clone_when_the_profile_has_none(tmp_path, git):
     git.script("remote get-url", (0, "https://example.invalid/from-clone.git\n", ""))
     git.script("rev-parse --verify", 0)
-    git.script("diff HEAD~1..HEAD", (0, DIFF, ""))
+    git.script("diff --no-ext-diff HEAD~1..HEAD", (0, DIFF, ""))
     git.script("rev-parse HEAD", (0, "sha\n", ""))
     git.script("push", 0)
     d = _direct_push_driver(tmp_path, profile=_Profile(fetch_url=""))

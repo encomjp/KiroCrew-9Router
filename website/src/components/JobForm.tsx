@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '../api/client'
 import { Input, SendBtn } from './ui'
@@ -22,6 +22,26 @@ const CRON_DOW_TO_GRID: Record<number, number> = { 1: 1, 2: 2, 3: 3, 4: 4, 5: 5,
 
 
 
+/** The pinned crew, rendered as a fact rather than a disabled selector — a
+ * greyed-out control asks to be re-enabled; a value does not. Shrink-wrapped
+ * so it cannot read as an editable input among the real ones, and the hint
+ * says WHY it is fixed, replacing the picker's own hint line. */
+function LockedAgentValue({ name }: { name: string }) {
+  const hint = i18nT('components.jobForm.agent_pinned_hint')
+  return (
+    <span className="flex flex-col items-start gap-1">
+      <span className="text-[11px] text-muted/70">{hint}</span>
+      <span
+        className="inline-flex max-w-full break-all items-center rounded-full border border-border bg-bg-hover px-2.5 py-0.5 font-mono text-[12px] text-text-strong"
+        title={hint}
+        data-testid="jobform-locked-agent"
+      >
+        {name}
+      </span>
+    </span>
+  )
+}
+
 /** Job execution kind. 'message' runs the agent; 'script'/'command' are
  * LLM-less (Python callable / shell) and have no message, agent, or approval. */
 export type JobKind = 'message' | 'script' | 'command'
@@ -38,11 +58,41 @@ function parseJobDefaults(job?: CronJob) {
   if (!job) return { name: '', message: '', agent: '', model: '', channel: '', approvalMode: '', silent: false, strictSchedule: false, hideInChat: false, jobKind: 'message' as JobKind, schedMode: 'interval' as const, intVal: 1, intUnit: 'hours' as const, weekDays: [] as number[], weekTime: '09:00', cronExpr: '' }
   const isInterval = !!(job.every_secs || (job.schedule || '').match(/^every\s+\d+/))
   const secs = job.every_secs || (() => { const m = (job.schedule || '').match(/^every\s+(\d+)\s*([sh])/); if (!m) return 3600; return m[2] === 'h' ? parseInt(m[1]) * 3600 : parseInt(m[1]) })()
-  const intUnit = secs >= 86400 ? 'days' as const : secs >= 3600 ? 'hours' as const : 'minutes' as const
+  // Largest unit that divides `secs` EVENLY, not the largest unit that is merely
+  // <= `secs`. The magnitude test sent 5400s to 'hours', where Math.round(1.5) is
+  // 2, and buildBody re-serialises `intVal * 3600` — so opening a 90-minute job
+  // and saving an unrelated field silently rewrote its schedule to 2 hours. That
+  // is the #8469 class on the interval side: 90 minutes IS representable here, and
+  // the magnitude choice discarded that representation before rounding ever ran.
+  const evenUnit = secs % 86400 === 0 ? 'days' as const
+    : secs % 3600 === 0 ? 'hours' as const
+    : secs % 60 === 0 ? 'minutes' as const
+    : null
+  // Nothing divides evenly (e.g. 90s): no unit offered here can represent that
+  // schedule, so keep the pre-existing nearest-magnitude choice rather than widen
+  // the unit set. Sub-minute precision is a separate question from this defect.
+  const intUnit = evenUnit ?? (secs >= 86400 ? 'days' as const : secs >= 3600 ? 'hours' as const : 'minutes' as const)
   const intVal = Math.max(1, Math.round(intUnit === 'days' ? secs / 86400 : intUnit === 'hours' ? secs / 3600 : secs / 60))
   const cronRaw = job.cron_expr || ''
   const cronParts = cronRaw.split(/\s+/)
+  // Weekly mode can only represent a single plain minute/hour pair plus a day
+  // set expandDow understands. A list, range, or step in the minute or hour
+  // field (e.g. `0 9,12,15 * * 1-5`) must fall through to cron mode, where the
+  // raw expression round-trips verbatim — parseInt would silently truncate
+  // '9,12,15' to 9 and a save would drop the other run times (#8469).
+  // /^\d{1,2}$/ matches cronClock's plain-field grammar in cronUtils so the
+  // list view and the editor classify the same job the same way.
+  const isPlainField = (s: string, max: number) => /^\d{1,2}$/.test(s) && parseInt(s, 10) <= max
+  // The day-of-week field must be FULLY representable: expandDow drops
+  // segments it cannot parse (`1,3-5/2` expands to just [1]), so a whole-field
+  // non-empty check would still collapse the unsupported part on save. Each
+  // comma segment must expand on its own, and numeric tokens must stay in
+  // cron's 0-7 range — parseDowToken wraps 8 to Monday via % 7, which would
+  // silently rewrite the expression.
+  const isRepresentableDow = (field: string) => field.split(',').every(seg =>
+    !seg.split('-').some(tok => /^\d+$/.test(tok) && parseInt(tok, 10) > 7) && expandDow(seg).length > 0)
   const isWeekly = !isInterval && cronParts.length === 5 && cronParts[4] !== '*' && cronParts[2] === '*' && cronParts[3] === '*'
+    && isPlainField(cronParts[0], 59) && isPlainField(cronParts[1], 23) && isRepresentableDow(cronParts[4])
   const schedMode = isInterval ? 'interval' as const : isWeekly ? 'weekly' as const : 'cron' as const
   // Read cron time and days directly (stored in job timezone, not UTC)
   let weekDays: number[] = []
@@ -99,12 +149,25 @@ function buildBody(
   return body
 }
 
+/** One row of `GET /api/models`. The payload is kiro-cli's own `--list-models`
+ *  output after the backend's filtering, so nothing here is guaranteed: the
+ *  current spelling is `model_name`, `name` is the legacy one, and a row that
+ *  carries neither is unusable. */
+type ModelRow = { model_name?: string; name?: string; display_name?: string }
+
 interface Props {
   job?: CronJob // if provided, edit mode
   /** Seed values for a NEW job (create mode). Ignored when `job` is set. */
   prefill?: CronPrefill
   agents: KiroCrewAgent[]
   defaultAgent: string
+  /** The roster fetch failed — see AgentSelector's prop of the same name. */
+  rosterFailure?: { reloading: boolean; onReload: () => void }
+  /** Pin the job to ONE crew: the agent field renders as a fixed value instead
+   *  of a selector, and the submit body always carries this name. For hosts
+   *  that embed the form inside a single crew's own surface, where offering a
+   *  crew picker would just be a way to file the job in the wrong place. */
+  lockedAgent?: string
   onSaved: () => void
   /** Vertical layout for side panel, horizontal for inline create */
   layout?: 'vertical' | 'horizontal'
@@ -114,9 +177,18 @@ interface Props {
   submitRef?: React.MutableRefObject<(() => void) | null>
   /** Called when saving state changes */
   onSavingChange?: (saving: boolean) => void
+  /** Called when the form's TOUCHED state changes: true once any field has
+   *  diverged from its initial value, false when they all match again (or
+   *  after a successful create resets them). Hosts that guard destruction
+   *  paths key on this rather than on mere open-ness, so looking at an empty
+   *  form and backing out never triggers a "your typed work will be lost"
+   *  confirm about work that does not exist. */
+  onDirtyChange?: (dirty: boolean) => void
 }
 
-export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange }: Props) {
+export default function JobForm({ job, prefill, agents, defaultAgent, rosterFailure, lockedAgent, onSaved, layout = 'horizontal', externalSubmit, submitRef, onSavingChange, onDirtyChange }: Props) {
+  // "" and undefined both mean unlocked, so render and submit share one truth.
+  const locked = lockedAgent || undefined
   const defaults = parseJobDefaults(job)
   // In create mode (no job), a preset can seed the prompt + schedule fields.
   // Edit mode always reflects the job as-stored and ignores any prefill.
@@ -142,7 +214,15 @@ export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, l
     queryKey: ['models'],
     queryFn: async () => {
       const m = await api.models()
-      return Array.isArray(m) ? m.map((x: any) => ({ name: x.model_name || x.name, description: x.display_name || '' })) : []
+      // A row carrying neither spelling is dropped, not mapped to '': '' is
+      // this form's own value for "inherit" (the `clearLabel` row, see
+      // `modelOptions` below), so aliasing an unusable row onto it would render
+      // a second, duplicate inherit option that silently clears the override.
+      if (!Array.isArray(m)) return []
+      return m.flatMap((x: ModelRow) => {
+        const name = x.model_name || x.name
+        return name ? [{ name, description: x.display_name || '' }] : []
+      })
     },
   })
   const [channel, setChannel] = useState(defaults.channel)
@@ -157,7 +237,42 @@ export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, l
   const [weekTime, setWeekTime] = useState(init.weekTime)
   const [tz, setTz] = useState(() => job ? (job.timezone || 'UTC') : Intl.DateTimeFormat().resolvedOptions().timeZone)
   const [cronExpr, setCronExpr] = useState(init.cronExpr)
-  const [error, setError] = useState('')
+  // Touched = any field diverged from what the form OPENED with. Compared
+  // against `init`/`defaults` (the same sources the state seeded from), so a
+  // value typed and then typed back reads as untouched again — the same rule
+  // the crew editor's own dirtyPanes uses. tz is excluded: its initial value
+  // is the machine's zone, an environment fact rather than user work worth a
+  // discard confirm. Reported through an effect keyed on the recomputed
+  // boolean, so hosts only hear about EDGES, not every keystroke.
+  const dirty =
+    name !== init.name || msg !== init.message ||
+    agent !== defaults.agent || model !== defaults.model ||
+    channel !== defaults.channel || approvalMode !== defaults.approvalMode ||
+    silent !== init.silent || strictSchedule !== defaults.strictSchedule ||
+    hideInChat !== defaults.hideInChat || schedMode !== init.schedMode ||
+    intVal !== init.intVal || intUnit !== init.intUnit ||
+    weekTime !== init.weekTime || cronExpr !== init.cronExpr ||
+    weekDays.length !== init.weekDays.length || weekDays.some((d, i) => d !== init.weekDays[i])
+  const dirtyChangeRef = useRef(onDirtyChange)
+  dirtyChangeRef.current = onDirtyChange
+  useEffect(() => { dirtyChangeRef.current?.(dirty) }, [dirty])
+  // Unmount clears the flag for the same reason CrewWakeSection's own
+  // cleanup does: the work no longer exists, so no host may keep gating on it.
+  useEffect(() => () => { dirtyChangeRef.current?.(false) }, [])
+  const [error, setErrorState] = useState('')
+  // When the submit control lives in a host's header (`externalSubmit`) the
+  // form can be taller than its pane, so a failed submit's notice — rendered
+  // at the form's bottom — lands below the fold and the click looks like a
+  // dead button. Bring the notice to the failed click, whichever layout. The
+  // tick makes a REPEATED identical failure scroll again (batching collapses
+  // `setError('')` + same message into no state change); the optional call
+  // guards jsdom, which has no scrollIntoView.
+  const errorRef = useRef<HTMLDivElement | null>(null)
+  const [errorTick, setErrorTick] = useState(0)
+  const setError = (e: string) => { setErrorState(e); if (e) setErrorTick(t => t + 1) }
+  useEffect(() => {
+    if (error) errorRef.current?.scrollIntoView?.({ block: 'nearest' })
+  }, [error, errorTick])
   const [saving, setSavingState] = useState(false)
   const setSaving = (v: boolean) => { setSavingState(v); onSavingChange?.(v) }
 
@@ -182,7 +297,7 @@ export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, l
 
   const submit = async () => {
     setError(''); setSaving(true)
-    const f = { name, message: msg, agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
+    const f = { name, message: msg, agent: locked ?? agent, model, channel, approvalMode, silent, strictSchedule, hideInChat, jobKind, schedMode, intVal, intUnit, weekDays, weekTime, cronExpr }
     const body = buildBody(f, tz, setError, !!job)
     if (!body) { setSaving(false); return }
     try {
@@ -252,7 +367,9 @@ export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, l
         <div className="flex gap-2 items-center flex-wrap">
           <Input placeholder={i18nT('components.jobForm.job_name')} value={name} onChange={e => setName(e.target.value)} />
           <Input placeholder={i18nT('components.jobForm.message_task')} style={{ flex: 2 }} value={msg} onChange={e => setMsg(e.target.value)} />
-          <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} modal />
+          {locked
+            ? <LockedAgentValue name={locked} />
+            : <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} rosterFailure={rosterFailure} modal />}
           <SimpleSelect
             options={modelOptions.values}
             optionLabels={modelOptions.labels}
@@ -316,8 +433,12 @@ export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, l
         {!isLlmless && (<>
         <div className="flex flex-col gap-1">
           <span className="text-[12px] text-muted font-medium">{i18nT('components.jobForm.agent')}</span>
-          <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.which_agent_handles_this_job_leave_default_for_t')}</span>
-          <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} modal />
+          {locked
+            ? <LockedAgentValue name={locked} />
+            : (<>
+              <span className="text-[11px] text-muted/70">{i18nT('components.jobForm.which_agent_handles_this_job_leave_default_for_t')}</span>
+              <AgentSelector agents={agents} defaultAgent={defaultAgent} value={agent} onChange={(name) => setAgent(name)} rosterFailure={rosterFailure} modal />
+            </>)}
         </div>
         </>)}
         {!isLlmless && (
@@ -383,7 +504,9 @@ export default function JobForm({ job, prefill, agents, defaultAgent, onSaved, l
 
       {/* No hand-off: the notice sits beside unsaved form input, and the button
           navigates away — which would discard what the user typed. */}
-      <ErrorNotice message={error} />
+      <div ref={errorRef}>
+        <ErrorNotice message={error} />
+      </div>
     </div>
   )
 }

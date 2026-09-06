@@ -1135,7 +1135,7 @@ def test_allowlist_reports_every_offending_path_not_just_the_first():
     ("push_url", "fetch_url", "expected"),
     [
         ("DISABLED_NO_PUSH", "DISABLED_NO_PUSH", True),
-        ("", "", True),
+        ("", "", False),
         ("DISABLED_NO_PUSH", "https://github.com/o/r.git", False),
         ("https://github.com/o/r.git", "DISABLED_NO_PUSH", False),
     ],
@@ -1143,26 +1143,50 @@ def test_allowlist_reports_every_offending_path_not_just_the_first():
 def test_isolation_push_disabled_requires_both_urls_neutral(
     tmp_path, monkeypatch, push_url, fetch_url, expected
 ):
-    """A live FETCH url is a live push target -- checking only the push url was the bug."""
+    """Only exact singleton sentinels satisfy the shared runtime isolation gate."""
+    from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+
     clone = tmp_path / "clone"
     clone.mkdir()
     fake = _FakeRun(_Proc(0, push_url), _Proc(0, fetch_url))
     monkeypatch.setattr(gh, "_run", fake)
+    monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+    monkeypatch.setattr(
+        clone_setup,
+        "_push_disabled",
+        lambda _clone: push_url == "DISABLED_NO_PUSH" and fetch_url == "DISABLED_NO_PUSH",
+    )
     iso = gh.RepoIsolation(clone_path=clone)
     assert iso.push_disabled() is expected
     assert iso.base_ref == "origin/main"
 
 
 def test_isolation_push_disabled_fails_closed_on_a_git_error(tmp_path, monkeypatch):
+    from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+
     clone = tmp_path / "clone2"
     clone.mkdir()
-    monkeypatch.setattr(gh, "_run", _FakeRun(_Proc(128, "", "not a git repository")))
+    monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+    monkeypatch.setattr(
+        clone_setup.subprocess,
+        "run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 128, "", "not a repo"),
+    )
     assert gh.RepoIsolation(clone_path=clone, base_ref="").push_disabled() is False
 
 
 def test_isolation_push_disabled_fails_closed_on_a_spawn_failure(tmp_path, monkeypatch):
-    monkeypatch.setattr(gh, "_run", _FakeRun(OSError("git missing")))
-    iso = gh.RepoIsolation(clone_path=tmp_path / "absent", base_ref="origin/dev")
+    from kiro_crew.apps.builtins.auto_improvement.backend import clone_setup
+
+    clone = tmp_path / "absent"
+    clone.mkdir()
+    monkeypatch.setattr(clone_setup, "_repository_is_safe", lambda _clone: True)
+    monkeypatch.setattr(
+        clone_setup.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("git missing")),
+    )
+    iso = gh.RepoIsolation(clone_path=clone, base_ref="origin/dev")
     assert iso.push_disabled() is False
     assert iso.base_ref == "origin/dev"
 

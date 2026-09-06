@@ -43,6 +43,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from kiro_crew.platform.context import redact_log_via_context
 from kiro_crew.subprocess_utf8 import UTF8_TEXT
 
 from ...spine.git_safety import GIT_SAFE_CONFIG, require_pinned
@@ -347,10 +348,25 @@ class GitHubPRRecipe:
         try:
             if base:
                 # The full range this push would publish, against the base the PR targets.
-                proc = self._git("diff", f"{base}...HEAD", timeout=_PUSH_TIMEOUT_S)
+                proc = self._git(
+                    "-c",
+                    "diff.external=",
+                    "diff",
+                    "--no-ext-diff",
+                    f"{base}...HEAD",
+                    timeout=_PUSH_TIMEOUT_S,
+                )
             else:
                 # `--format=` prints the commit's PATCH and nothing else.
-                proc = self._git("show", "--format=", "HEAD", timeout=_PUSH_TIMEOUT_S)
+                proc = self._git(
+                    "-c",
+                    "diff.external=",
+                    "show",
+                    "--no-ext-diff",
+                    "--format=",
+                    "HEAD",
+                    timeout=_PUSH_TIMEOUT_S,
+                )
         except (OSError, subprocess.SubprocessError):
             logger.warning("could not read the pushable diff — refusing the push", exc_info=True)
             return False, "could not read the pushable diff"
@@ -370,6 +386,16 @@ class GitHubPRRecipe:
 
     def _push_fix_branch(self, *, branch: str) -> tuple[bool, str]:
         """Push HEAD to ``branch`` on the fetch url. Returns (ok, note)."""
+        from ...backend.clone_setup import IsolationProbeError, _repository_is_isolated
+
+        try:
+            isolated = _repository_is_isolated(self.clone_path)
+        except IsolationProbeError as exc:
+            # Sandbox failure, not an isolation verdict — the note must not
+            # read as if the repository changed under review (#8151).
+            return False, str(exc)
+        if not isolated:
+            return False, "repository isolation changed after review"
         url = self._resolve_fetch_url()
         if not url:
             return False, "no pushable origin fetch url (clone fully push-disabled)"
@@ -398,7 +424,7 @@ class GitHubPRRecipe:
                 "push failed for %s (git exit %s): %s",
                 branch,
                 proc.returncode,
-                (proc.stderr or "").strip()[:200],
+                redact_log_via_context((proc.stderr or "").strip())[:200],
             )
             return False, "push failed"
         return True, branch
@@ -485,7 +511,9 @@ class GitHubPRRecipe:
             return f"QUEUED:{fingerprint}"
         if proc.returncode != 0:
             logger.warning(
-                "gh pr create failed for %s: %s", fingerprint, (proc.stderr or "").strip()[:200]
+                "gh pr create failed for %s: %s",
+                fingerprint,
+                redact_log_via_context((proc.stderr or "").strip())[:200],
             )
             return f"QUEUED:{fingerprint}"
         return extract_pr_url(proc.stdout or "") or f"QUEUED:{fingerprint}"

@@ -30,6 +30,23 @@ export interface ImeLatch {
    * the `ImeEnterClaimRatchet` exists to prevent.
    */
   claimKey: (e: globalThis.KeyboardEvent) => boolean
+  /**
+   * SYNTHETIC-event twin of `claimKey`, for a React `onKeyDown` that claims
+   * through a latch of this flavour. The latch consumes the NATIVE event;
+   * React walks its OWN propagation flag when dispatching to component
+   * ancestors, and the native `stopPropagation()` does not set it — so a
+   * declined key needs both halves or it still reaches an ancestor's
+   * keyboard handling.
+   *
+   * It exists so no call site has to spell that pair itself. Reaching for
+   * `claimKey(e.nativeEvent)` and remembering a caller-side
+   * `e.stopPropagation()` is the same split-the-halves drift the
+   * `ImeEnterClaimRatchet` pins everywhere else: four sites carried it, each
+   * one a place one half could be dropped. An ACCEPTED key's default is left
+   * to the caller, exactly as `claimKey` leaves it — a Tab site consumes only
+   * the wrap it owns.
+   */
+  claimSyntheticKey: (e: KeyboardEvent) => boolean
 }
 
 /**
@@ -49,6 +66,13 @@ export function createImeLatch(): ImeLatch {
   let latched = false
   let timer: ReturnType<typeof setTimeout> | undefined
   const isLatched = () => latched
+  const claimKey = (e: globalThis.KeyboardEvent) => {
+    const composing = latched || e.isComposing || e.keyCode === 229
+    if (!composing) return true
+    if (!e.isComposing && e.keyCode !== 229) e.preventDefault()
+    e.stopPropagation()
+    return false
+  }
   return {
     onCompositionStart() {
       clearTimeout(timer)
@@ -63,10 +87,9 @@ export function createImeLatch(): ImeLatch {
       clearTimeout(timer)
       latched = false
     },
-    claimKey(e: globalThis.KeyboardEvent) {
-      const composing = latched || e.isComposing || e.keyCode === 229
-      if (!composing) return true
-      if (!e.isComposing && e.keyCode !== 229) e.preventDefault()
+    claimKey,
+    claimSyntheticKey(e: KeyboardEvent) {
+      if (claimKey(e.nativeEvent)) return true
       e.stopPropagation()
       return false
     },
@@ -74,12 +97,18 @@ export function createImeLatch(): ImeLatch {
 }
 
 /**
- * Document-tracked IME latch for NATIVE keydown handlers that trap Tab at a
- * dialog's focus boundary (`useDialogFocusTrap` and the hand-rolled traps that
- * share its shape). Those listeners receive native KeyboardEvents, which the
- * synthetic-only `useImeGuard().claimEnter` cannot consume — so they share the
- * tracked latch through this hook instead of each re-implementing the
- * flag-and-timer semantics (the drift the `ImeEnterClaimRatchet` pins).
+ * Document-tracked IME latch for keydown handlers that trap Tab at a dialog's
+ * focus boundary (`useDialogFocusTrap` and the hand-rolled traps that share
+ * its shape), rather than each re-implementing the flag-and-timer semantics
+ * (the drift the `ImeEnterClaimRatchet` pins).
+ *
+ * Both event worlds consume it, and each has its own claim: a NATIVE
+ * document/window listener (which never sees a synthetic event, so
+ * `useImeGuard().claimEnter` cannot consume for it) claims with `claimKey(e)`;
+ * a React `onKeyDown` on the dialog panel claims with `claimSyntheticKey(e)`,
+ * which adds the synthetic propagation half React needs. What makes the latch
+ * document-tracked is the composing input's position, not the handler's
+ * flavour — see the tracking note below.
  *
  * Composition tracking listens at DOCUMENT capture: the composing input is
  * anywhere inside the dialog, so element-scoped listeners have nothing
@@ -226,20 +255,17 @@ export function useImeGuard() {
    * owns both halves exactly as the native contract specifies — always
    * `stopPropagation`, `preventDefault` only in the post-composition window
    * where the browser would otherwise act. The latch consumes the NATIVE
-   * event; the SYNTHETIC propagation flag is stopped here too, because React
-   * walks its own flag when dispatching to component ancestors and the
-   * native call does not set it — leaving that to the caller would re-open
-   * the split-the-halves drift this file's ratchet exists to prevent. Enter
-   * branches keep using `claimEnter`, whose ACCEPTED path also consumes the
-   * key (a submitted Enter must never insert a newline); `claimKey` leaves an
-   * accepted key's default to the caller, which is what a Tab site needs —
-   * it consumes only the wrap it owns.
+   * event; the SYNTHETIC propagation flag is stopped too, because React walks
+   * its own flag when dispatching to component ancestors and the native call
+   * does not set it. Both halves live in ONE place — `claimSyntheticKey` on
+   * the latch, which this delegates to — so the synthetic-flavour contract
+   * has a single owner rather than one spelling here and another at every
+   * document-latch call site. Enter branches keep using `claimEnter`, whose
+   * ACCEPTED path also consumes the key (a submitted Enter must never insert
+   * a newline); `claimKey` leaves an accepted key's default to the caller,
+   * which is what a Tab site needs — it consumes only the wrap it owns.
    */
-  const claimKey = (e: KeyboardEvent) => {
-    if (latch.claimKey(e.nativeEvent)) return true
-    e.stopPropagation()
-    return false
-  }
+  const claimKey = (e: KeyboardEvent) => latch.claimSyntheticKey(e)
 
   /**
    * Spread onto any input or textarea that needs IME-safe composition tracking.

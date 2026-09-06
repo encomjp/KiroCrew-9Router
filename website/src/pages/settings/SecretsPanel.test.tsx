@@ -12,7 +12,7 @@ import { SecretsPanel } from './SecretsPanel'
  * add and delete paths must be asserted on the REQUEST they send, not just on
  * the re-render they cause.
  */
-type FetchCall = { url: string; method: string; body?: unknown }
+type FetchCall = { url: string; method: string; body?: unknown; headers?: Record<string, string> }
 
 let calls: FetchCall[] = []
 
@@ -26,10 +26,22 @@ function installFetch() {
   const impl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
     const method = init?.method ?? 'GET'
+    // Normalise Headers object / plain object / undefined to a plain record so
+    // tests can do a simple property lookup regardless of how fetch was called.
+    let headers: Record<string, string> | undefined
+    if (init?.headers) {
+      if (init.headers instanceof Headers) {
+        headers = {}
+        init.headers.forEach((v, k) => { headers![k] = v })
+      } else {
+        headers = { ...(init.headers as Record<string, string>) }
+      }
+    }
     calls.push({
       url,
       method,
       body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      headers,
     })
 
     if (method === 'GET' && url === '/api/secrets') {
@@ -237,9 +249,11 @@ describe('SecretsPanel', () => {
     listShouldFail = true
     mount()
 
-    // `names` falls back to [] on error, so the panel degrades to the empty state
-    // instead of throwing — the Add path stays reachable.
-    expect(await screen.findByText('No secrets stored yet.')).toBeInTheDocument()
+    // A failed read must NOT read as "no secrets": the panel names the failure
+    // (with the backend prose) instead of degrading to the empty state — and the
+    // Add path stays reachable.
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load secrets: boom')
+    expect(screen.queryByText('No secrets stored yet.')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Add secret' })).toBeInTheDocument()
   })
 })
@@ -334,9 +348,10 @@ describe('SecretsPanel error handling', () => {
     )
     mount()
 
-    // The list query rejects, so the panel shows the empty state. The assertion
-    // that matters is that a non-OK status did NOT resolve as data.
-    expect(await screen.findByText('No secrets stored yet.')).toBeInTheDocument()
+    // The list query rejects and the panel names the failure. The assertion that
+    // matters is that a non-OK status did NOT resolve as data — and that the
+    // backend's prose survived into the thrown error.
+    expect(await screen.findByRole('alert')).toHaveTextContent('HTTP 400: Secret name must be a string')
   })
 
   it('rejects a non-OK response whose body is not JSON', async () => {
@@ -353,7 +368,389 @@ describe('SecretsPanel error handling', () => {
     mount()
 
     // The detail-extraction `catch` must swallow the parse failure and still
-    // throw on the status, not leak a SyntaxError.
-    expect(await screen.findByText('No secrets stored yet.')).toBeInTheDocument()
+    // throw on the status, not leak a SyntaxError — so the notice carries the
+    // bare status and nothing else.
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load secrets: HTTP 502')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('not json')
+  })
+})
+
+describe('SecretsPanel error feedback and in-flight guards', () => {
+  /**
+   * A rejected POST must show the failure to the user, not just leave the form
+   * populated. Before this change the mutation error was never rendered, so a
+   * 403 looked like nothing happened.
+   */
+  it('shows the save error message after a failed POST', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method ?? 'GET'
+        if (method === 'POST') {
+          return Promise.resolve({
+            ok: false,
+            status: 403,
+            json: () => Promise.resolve({ error: 'forbidden' }),
+          } as Response)
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ names: [] }),
+        } as Response)
+      }),
+    )
+    mount()
+    await screen.findByText('No secrets stored yet.')
+
+    await user.click(screen.getByRole('button', { name: 'Add secret' }))
+    await user.type(screen.getByLabelText('Secret name'), 'MY_KEY')
+    await user.type(screen.getByLabelText('Secret value'), 'sk-abc123')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    // The alert carries the backend prose surfaced by `j()` (HTTP 403: forbidden).
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Could not save secret')
+    expect(alert).toHaveTextContent('403')
+    expect(alert).toHaveTextContent('forbidden')
+  })
+
+  /**
+   * react-query keeps a mutation's error until the next mutate(); without an
+   * explicit reset(), a failed save's alert would greet the user again on a
+   * freshly reopened (empty) add form — a stale failure attributed to input
+   * they have not typed yet.
+   */
+  it('clears the stale save error when the form is cancelled and reopened', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method ?? 'GET'
+        if (method === 'POST') {
+          return Promise.resolve({
+            ok: false,
+            status: 403,
+            json: () => Promise.resolve({ error: 'forbidden' }),
+          } as Response)
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ names: [] }),
+        } as Response)
+      }),
+    )
+    mount()
+    await screen.findByText('No secrets stored yet.')
+
+    await user.click(screen.getByRole('button', { name: 'Add secret' }))
+    await user.type(screen.getByLabelText('Secret name'), 'MY_KEY')
+    await user.type(screen.getByLabelText('Secret value'), 'sk-abc123')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    await screen.findByRole('alert')
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }))
+    await user.click(screen.getByRole('button', { name: 'Add secret' }))
+
+    // The reopened, empty form must not carry the previous attempt's failure.
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  /**
+   * Cancel during an in-flight save would reset the mutation and let a
+   * resubmit of the same name race the still-pending original request — the
+   * slower original could then overwrite the newer value. Cancel is therefore
+   * disabled while the save is pending.
+   */
+  it('disables Cancel while the POST is in flight', async () => {
+    const user = userEvent.setup()
+    let resolvePost: (r: Response) => void = () => {}
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method ?? 'GET'
+        if (method === 'POST') {
+          return new Promise<Response>((resolve) => {
+            resolvePost = resolve
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ names: [] }),
+        } as Response)
+      }),
+    )
+    mount()
+    await screen.findByText('No secrets stored yet.')
+
+    await user.click(screen.getByRole('button', { name: 'Add secret' }))
+    await user.type(screen.getByLabelText('Secret name'), 'MY_KEY')
+    await user.type(screen.getByLabelText('Secret value'), 'sk-abc123')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled()
+
+    resolvePost({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true }),
+    } as Response)
+  })
+
+  /**
+   * Switching confirm rows during an in-flight DELETE must not reset the
+   * mutation: the reset would clear the pending gate and allow a duplicate
+   * DELETE of the same name, whose delayed original could erase a value the
+   * user re-saved in between.
+   */
+  it('ignores row switches while a DELETE is in flight', async () => {
+    const user = userEvent.setup()
+    let resolveDelete: (r: Response) => void = () => {}
+    const deletes: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method ?? 'GET'
+        if (method === 'DELETE') {
+          deletes.push(String(input))
+          return new Promise<Response>((resolve) => {
+            resolveDelete = resolve
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ names: ['ALPHA', 'BETA'] }),
+        } as Response)
+      }),
+    )
+    mount()
+    await screen.findByText('ALPHA')
+
+    // Open ALPHA's confirm row and fire its DELETE (stays pending).
+    await user.click(screen.getByRole('button', { name: 'Delete secret ALPHA' }))
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+    expect(deletes).toHaveLength(1)
+
+    // Attempting to open BETA's confirm row mid-flight is a no-op: ALPHA's
+    // pending confirm row stays (its Delete disabled), and no second DELETE
+    // is ever sent.
+    await user.click(screen.getByRole('button', { name: 'Delete secret BETA' }))
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeDisabled()
+    expect(deletes).toHaveLength(1)
+
+    resolveDelete({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true }),
+    } as Response)
+  })
+
+  /**
+   * Save must be disabled while a DELETE is in flight (and vice versa): a
+   * save of name X racing a pending DELETE of X lets the delayed DELETE
+   * erase the newly saved value.
+   */
+  it('disables Save while a DELETE is in flight', async () => {
+    const user = userEvent.setup()
+    let resolveDelete: (r: Response) => void = () => {}
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method ?? 'GET'
+        if (method === 'DELETE') {
+          return new Promise<Response>((resolve) => {
+            resolveDelete = resolve
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ names: ['ALPHA'] }),
+        } as Response)
+      }),
+    )
+    mount()
+    await screen.findByText('ALPHA')
+
+    // Open the add form first so Save is on screen, then fire the DELETE.
+    await user.click(screen.getByRole('button', { name: 'Add secret' }))
+    await user.type(screen.getByLabelText('Secret name'), 'ALPHA')
+    await user.type(screen.getByLabelText('Secret value'), 'sk-new')
+    await user.click(screen.getByRole('button', { name: 'Delete secret ALPHA' }))
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+
+    resolveDelete({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true }),
+    } as Response)
+  })
+
+  /**
+   * A rejected DELETE must surface under the still-open confirm row, so the user
+   * knows the secret was NOT removed.
+   */
+  it('shows the delete error message after a failed DELETE', async () => {
+    const user = userEvent.setup()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method ?? 'GET'
+        if (method === 'DELETE') {
+          return Promise.resolve({
+            ok: false,
+            status: 500,
+            json: () => Promise.resolve({ error: 'boom' }),
+          } as Response)
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ names: ['MY_API_KEY'] }),
+        } as Response)
+      }),
+    )
+    mount()
+    await screen.findByText('MY_API_KEY')
+
+    await user.click(screen.getByRole('button', { name: 'Delete secret MY_API_KEY' }))
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Could not delete secret')
+    expect(alert).toHaveTextContent('500')
+    expect(alert).toHaveTextContent('boom')
+  })
+
+  /**
+   * While the POST is in flight the Save button must be disabled, both to signal
+   * progress and to stop a second submit.
+   */
+  it('disables Save while the POST is in flight', async () => {
+    const user = userEvent.setup()
+    let resolvePost: (r: Response) => void = () => {}
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method ?? 'GET'
+        if (method === 'POST') {
+          // Never settles until we release it, holding the mutation pending.
+          return new Promise<Response>(res => {
+            resolvePost = res
+          })
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ names: [] }),
+        } as Response)
+      }),
+    )
+    mount()
+    await screen.findByText('No secrets stored yet.')
+
+    await user.click(screen.getByRole('button', { name: 'Add secret' }))
+    await user.type(screen.getByLabelText('Secret name'), 'MY_KEY')
+    await user.type(screen.getByLabelText('Secret value'), 'sk-abc123')
+
+    const save = screen.getByRole('button', { name: 'Save' })
+    expect(save).toBeEnabled()
+    await user.click(save)
+
+    await waitFor(() => expect(save).toBeDisabled())
+
+    // Release the in-flight request so the test does not leak a pending promise.
+    resolvePost({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ ok: true }),
+    } as Response)
+  })
+
+  /**
+   * A rapid double-click must not send two POSTs for a single secret. The
+   * mechanism is the native `disabled` attribute on Save (set while the
+   * mutation is pending): React flushes discrete-event renders synchronously,
+   * so by the time the second click is dispatched the button no longer
+   * accepts it. (There is deliberately NO handler-side pending guard — it
+   * would read the previous render's snapshot and cannot close any window
+   * the disabled attribute leaves open.)
+   */
+  it('does not send a second POST on a double-click', async () => {
+    const user = userEvent.setup()
+    const seen: string[] = []
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        const method = init?.method ?? 'GET'
+        if (method === 'POST') {
+          seen.push('POST')
+          // Stay pending so the first click holds `isPending` true across the
+          // second click.
+          return new Promise<Response>(() => {})
+        }
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ names: [] }),
+        } as Response)
+      }),
+    )
+    mount()
+    await screen.findByText('No secrets stored yet.')
+
+    await user.click(screen.getByRole('button', { name: 'Add secret' }))
+    await user.type(screen.getByLabelText('Secret name'), 'MY_KEY')
+    await user.type(screen.getByLabelText('Secret value'), 'sk-abc123')
+
+    const save = screen.getByRole('button', { name: 'Save' })
+    // Two clicks back to back; only the first may reach the network.
+    await user.click(save)
+    await user.click(save)
+
+    await waitFor(() => expect(seen.length).toBeGreaterThan(0))
+    expect(seen).toHaveLength(1)
+  })
+})
+
+describe('SecretsPanel session key', () => {
+  /**
+   * The panel sends the fixed `dashboard:ui` session key that the shared
+   * transport (`src/api/client.ts`) uses, on every request.  It previously read
+   * `localStorage['kiro_crew_token']` — a key nothing in the app ever writes —
+   * so that read always resolved to '' and was vestigial dead code.  This pins
+   * the panel to the same `dashboard:ui` identity every other panel sends, and
+   * guards against a regression back to a stored-token read.
+   */
+  it('sends the dashboard:ui session key on both the list GET and a mutating POST', async () => {
+    const user = userEvent.setup()
+
+    // Even with a stray token in localStorage, the panel must NOT read it —
+    // the header is the fixed dashboard:ui literal.
+    localStorage.setItem('kiro_crew_token', 'SHOULD-BE-IGNORED')
+    installFetch()
+
+    mount()
+    await screen.findByText('No secrets stored yet.')
+
+    const listGet = calls.find(c => c.method === 'GET' && c.url === '/api/secrets')
+    expect(listGet?.headers?.['X-Session-Key']).toBe('dashboard:ui')
+
+    await user.click(screen.getByRole('button', { name: 'Add secret' }))
+    await user.type(screen.getByLabelText('Secret name'), 'MY_KEY')
+    await user.type(screen.getByLabelText('Secret value'), 'sk-new')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+
+    await waitFor(() => {
+      const post = calls.find(c => c.method === 'POST')
+      expect(post).toBeTruthy()
+      expect(post?.headers?.['X-Session-Key']).toBe('dashboard:ui')
+    })
   })
 })

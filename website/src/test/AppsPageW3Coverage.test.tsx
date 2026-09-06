@@ -52,6 +52,11 @@ vi.mock('../api/client', () => ({
 
 vi.mock('../hooks/useTheme', () => ({ useTheme: () => ({ theme: 'dark' }) }))
 
+// The Library tiles' overflow menu is a Radix DropdownMenu, which happy-dom
+// cannot drive — swap in the repo's stateful mock (FileExplorerPageCoverage
+// pattern): Trigger click toggles, items render inline as role="menuitem".
+vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
+
 vi.mock('../components/AppIcon', () => ({
   default: ({ icon }: { icon?: string }) => <div data-testid="app-icon" data-icon={icon || ''} />,
 }))
@@ -223,6 +228,13 @@ async function browseRow(name: string) {
 /** Mount the Library route directly — the split removed the in-page tab. */
 const renderLibrary = () => renderPage('/apps/library')
 
+/** Open a Library tile's overflow menu (the MoreHorizontal trigger). The
+ *  mocked portal renders inline, so items land inside the tile scope. */
+async function openTileMenu(display: string) {
+  fireEvent.click(await screen.findByRole('button', { name: `More actions for ${display}` }))
+  return screen
+}
+
 /** Mount Discover's Updates sub-tab, where Update All lives since PR2 demoted
  *  the Library banner to a hint row. */
 const renderUpdates = () => renderPage('/apps/-/updates')
@@ -363,7 +375,7 @@ describe('AppsPage — query failures and empty states', () => {
 
   it('shows the no-match Library state when the search excludes every installed app', async () => {
     renderLibrary()
-    await screen.findByText('Slack inbox manager.')
+    await screen.findByTestId('launchpad-tile-secretary')
     fireEvent.change(screen.getByLabelText('Search library'), { target: { value: 'nothing-matches-this' } })
     expect(await screen.findByText('No matching apps')).toBeInTheDocument()
     expect(screen.getByText('Try a different search term')).toBeInTheDocument()
@@ -371,11 +383,11 @@ describe('AppsPage — query failures and empty states', () => {
 
   it('matches an installed app by its manifest tags', async () => {
     renderLibrary()
-    await screen.findByText('Slack inbox manager.')
+    await screen.findByTestId('launchpad-tile-secretary')
     fireEvent.change(screen.getByLabelText('Search library'), { target: { value: 'inbox' } })
-    // The tag match keeps the row; nothing falls through to the empty state.
+    // The tag match keeps the tile; nothing falls through to the empty state.
     await waitFor(() => expect(screen.queryByText('No matching apps')).toBeNull())
-    expect(screen.getByText('Slack inbox manager.')).toBeInTheDocument()
+    expect(screen.getByTestId('launchpad-tile-secretary')).toBeInTheDocument()
   })
 })
 
@@ -391,7 +403,14 @@ describe('AppsPage — Library actions', () => {
     expect(probe).toHaveAttribute('data-path', '/apps/secretary')
   })
 
-  it('routes to the detail page when the card name is clicked', async () => {
+  it('routes to the detail page when the tile face of a non-openable app is clicked', async () => {
+    // The tile face opens the app when it can open (previous test); an
+    // enabled app with no UI and no openCommand has nowhere to open, so its
+    // face falls back to the detail page — plain navigation, no autoAction.
+    listApps.mockResolvedValue([{
+      ...SECRETARY,
+      manifest: { ...SECRETARY.manifest, ui: undefined },
+    }])
     renderLibrary()
     fireEvent.click(await screen.findByRole('button', { name: 'Secretary' }))
     const probe = await screen.findByTestId('detail-route')
@@ -406,16 +425,20 @@ describe('AppsPage — Library actions', () => {
     // old copy pointed at a dead end for a builtin with no catalog row.
     listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: true }])
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Disable' }))
+    await openTileMenu('Pets')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Disable' }))
     await waitFor(() => expect(disableApp).toHaveBeenCalledWith('pets'))
     expect(screen.queryByText(/re-enable it from the Discover/)).toBeNull()
   })
 
-  it('lists a builtin that is already disabled, with an Enable button', async () => {
-    // The reachability property itself: a disabled builtin is in Library at all.
+  it('lists a builtin that is already disabled, with Enable in its overflow menu', async () => {
+    // The reachability property itself: a disabled builtin is in Library at
+    // all. Its Enable verb lives in the tile's overflow menu (the launchpad
+    // grid caps direct actions at two peers).
     listApps.mockResolvedValue([{ ...BUILTIN_OFF, enabled: false }])
     renderLibrary()
-    expect(await screen.findByRole('button', { name: 'Enable' })).toBeInTheDocument()
+    await openTileMenu('Pets')
+    expect(await screen.findByRole('menuitem', { name: 'Enable' })).toBeInTheDocument()
   })
 
   it('orders enabled rows above disabled ones', async () => {
@@ -435,7 +458,8 @@ describe('AppsPage — Library actions', () => {
   it('reports a failed disable with the action-failed message', async () => {
     disableApp.mockRejectedValue({})
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Disable' }))
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Disable' }))
     expect(await screen.findByText('Failed to disable secretary')).toBeInTheDocument()
   })
 
@@ -463,15 +487,18 @@ describe('AppsPage — Library actions', () => {
     expect(screen.getByRole('link', { name: 'View updates' }))
       .toHaveAttribute('href', '/apps/-/updates')
     expect(screen.queryByRole('button', { name: 'Update All' })).toBeNull()
-    // The affected card still wears its version chip (current → pending).
-    expect(screen.getByText('v1.0.0 (v1.1.0 available)')).toBeInTheDocument()
+    // The affected tile still offers per-app Update — in its overflow menu
+    // (the redesigned bar caps at Open + menu).
+    await openTileMenu('Secretary')
+    expect(screen.getByRole('menuitem', { name: 'Update' })).toBeInTheDocument()
   })
 })
 
 describe('AppsPage — uninstall dialog', () => {
   const openDialog = async () => {
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Uninstall' }))
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Uninstall' }))
     return screen.findByRole('dialog', { name: 'Confirm uninstall' })
   }
 
@@ -576,7 +603,8 @@ describe('AppsPage — uninstall dialog', () => {
     fireEvent.keyDown(first, { key: 'Escape' })
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Confirm uninstall' })).toBeNull())
 
-    fireEvent.click(screen.getByRole('button', { name: 'Uninstall' }))
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Uninstall' }))
     const second = await screen.findByRole('dialog', { name: 'Confirm uninstall' })
     fireEvent.click(second)
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Confirm uninstall' })).toBeNull())
@@ -651,7 +679,8 @@ describe('AppsPage — editorial layer wiring', () => {
 describe('AppsPage — Library enable and update', () => {
   it('Update on a Library card routes to the streaming detail page', async () => {
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Update' }))
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Update' }))
     const probe = await screen.findByTestId('detail-route')
     expect(probe).toHaveAttribute('data-path', '/apps/detail/secretary')
     expect(probe).toHaveAttribute('data-auto', 'update')
@@ -660,32 +689,40 @@ describe('AppsPage — Library enable and update', () => {
   })
 
   it('syncs a PATH-installed app in place instead of routing at the registry', async () => {
-    // A directory install has no registry row, so the streaming registry install
-    // the detail page runs can only answer "not found in registry". Its refresh
-    // is POST /api/apps/{name}/update, which re-copies the recorded directory.
+    // The grid only offers Update while one is pending (a registry row later
+    // published for this name), but ROUTING stays keyed on the RECORDED
+    // source: a directory install refreshes via POST /api/apps/{name}/update
+    // (re-copying the recorded directory), never the streaming registry
+    // install the detail page runs.
     listApps.mockResolvedValue([{
       ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
       source: '/home/u/apps/orchestrator-switch', origin: 'local',
     }])
-    listRegistry.mockResolvedValue({ apps: [] })
+    listRegistry.mockResolvedValue({
+      apps: [{ ...REGISTRY_APPS[1], name: 'orchestrator-switch', displayName: 'Orchestrator Switch' }],
+    })
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    await openTileMenu('Orchestrator Switch')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Update' }))
     await waitFor(() => expect(updateApp).toHaveBeenCalledWith('orchestrator-switch'))
     expect(screen.queryByTestId('detail-route')).toBeNull()
   })
 
   it('reflects a completed in-place sync, which is otherwise invisible', async () => {
     // Re-copying a source directory usually carries the SAME version, so the
-    // card re-renders identically and silence is indistinguishable from a
+    // tile re-renders identically and silence is indistinguishable from a
     // no-op. Without this the primary action the fix creates has no success
     // signal at all.
     listApps.mockResolvedValue([{
       ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
       source: '/home/u/apps/orchestrator-switch', origin: 'local',
     }])
-    listRegistry.mockResolvedValue({ apps: [] })
+    listRegistry.mockResolvedValue({
+      apps: [{ ...REGISTRY_APPS[1], name: 'orchestrator-switch', displayName: 'Orchestrator Switch' }],
+    })
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    await openTileMenu('Orchestrator Switch')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Update' }))
     expect(await screen.findByText(/Synced Orchestrator Switch from its source directory/)).toBeInTheDocument()
   })
 
@@ -694,27 +731,35 @@ describe('AppsPage — Library enable and update', () => {
       ...SECRETARY, name: 'orchestrator-switch', displayName: 'Orchestrator Switch',
       source: '/home/u/apps/orchestrator-switch', origin: 'local',
     }])
-    listRegistry.mockResolvedValue({ apps: [] })
+    listRegistry.mockResolvedValue({
+      apps: [{ ...REGISTRY_APPS[1], name: 'orchestrator-switch', displayName: 'Orchestrator Switch' }],
+    })
     updateApp.mockRejectedValue(new Error('source path no longer exists'))
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
+    await openTileMenu('Orchestrator Switch')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Update' }))
     expect(await screen.findByText('source path no longer exists')).toBeInTheDocument()
   })
 
-  it('still routes a registry-sourced app at the registry when it has no update', async () => {
+  it('offers no update affordance on a tile when nothing is pending', async () => {
+    // Grid contract: Update appears in the overflow menu only WHEN an update
+    // is pending. With no registry row flagging one, the menu carries no
+    // Update item at all — the recorded-source routing for that case is the
+    // shared hook's contract (useAppUpdates.test.tsx).
     listApps.mockResolvedValue([{ ...SECRETARY, source: 'registry:secretary' }])
     listRegistry.mockResolvedValue({ apps: [] })
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Sync' }))
-    const probe = await screen.findByTestId('detail-route')
-    expect(probe).toHaveAttribute('data-auto', 'update')
+    await screen.findByTestId('launchpad-tile-secretary')
+    await openTileMenu('Secretary')
+    expect(screen.queryByRole('menuitem', { name: 'Update' })).toBeNull()
     expect(updateApp).not.toHaveBeenCalled()
   })
 
   it('enables a switched-off installed app from the Library', async () => {
     listApps.mockResolvedValue([{ ...SECRETARY, enabled: false }])
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Enable' }))
+    await openTileMenu('Secretary')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Enable' }))
     await waitFor(() => expect(enableApp).toHaveBeenCalledWith('secretary'))
   })
 
@@ -727,7 +772,8 @@ describe('AppsPage — Library enable and update', () => {
     listRegistry.mockResolvedValue({ apps: [] })
     enableApp.mockRejectedValue({ code: 'app_execution_denied' })
     renderLibrary()
-    fireEvent.click(await screen.findByRole('button', { name: 'Enable' }))
+    await openTileMenu('Local App')
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Enable' }))
     expect(await screen.findByText('Trust “Local App” to run its own code?')).toBeInTheDocument()
     expect(screen.queryByText('https://github.com/z/secretary')).toBeNull()
   })

@@ -1,12 +1,14 @@
 import React, { createContext, useContext, memo, useEffect, useMemo, useRef, useId, useCallback, useState } from 'react'
 import Clickable from './Clickable'
-import { HOVER_NONE_ACTION_BTN_CLS } from '../utils/touchActions'
+import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { getImageDims, rememberImageDims } from '../utils/imageDims'
-import { Paperclip, X, Download, Plus, Minus, Search, Folder, Maximize2, Check, Image as ImageIcon } from 'lucide-react'
-import { copyToClipboard } from '../utils/clipboard'
+import { X, Download, Plus, Minus, Search, Folder, Maximize2, Check, FileCode, Copy, Image as ImageIcon, ImageOff, GitPullRequest, MessageSquare } from 'lucide-react'
+import { copyCode, copyToClipboard } from '../utils/clipboard'
+import { canonicalChatHref, sessionKeyFrom, sessionKeyFromChatHref } from '../utils/sessionKeys'
 import ReactMarkdown from 'react-markdown'
 import type { Components, ExtraProps } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkAutolinkRules from '../utils/remarkAutolinkRules'
 import remarkCjkFriendly from 'remark-cjk-friendly'
 import remarkCjkFriendlyGfmStrikethrough from 'remark-cjk-friendly-gfm-strikethrough'
 import remarkMath from 'remark-math'
@@ -31,23 +33,27 @@ function spliceChildren(parent: HastParent, index: number, nodes: Array<HastElem
   else parent.children.splice(index, 1, ...nodes)
 }
 import '../utils/hljs'
-import { api } from '../api/client'
 import { useBlockAssembler, maskInlineCode } from '../hooks/useBlockAssembler'
 import { usePathKind, type PathKind } from '../hooks/usePathKind'
 import { useGatewayPlatform, type GatewayPlatform } from '../hooks/useGatewayPlatform'
 import { DOUBLE_TAP_MS, DOUBLE_TAP_SLOP, DOUBLE_TAP_ZOOM } from '../hooks/usePinchZoom'
+import { useBranding } from '../hooks/useBranding'
 import { fileIcon } from '../utils/fileIcons'
 import { urlTransform, ALLOWED_PROTOCOLS, WINDOWS_ABS_PATH_RE, decodeLocalPath } from '../utils/urlTransform'
 import { safeHttpUrl } from '../lib/safeUrl'
 import { useLinkMeta, type LinkMeta } from '../lib/linkMeta'
 import { LinkChip, LinkCard } from './LinkPreview'
 import { parseSourceLinkUrl, forgeChipLabel, type PullRequestLink } from '../utils/pullRequestLinks'
+import { sourceProviderMeta } from '../utils/sourceProviderMeta'
 import { JiraHostsCtx } from '../lib/jiraHosts'
 import JiraLogo from './icons/JiraLogo'
 import GithubLogo from './icons/GithubLogo'
 import GitlabLogo from './icons/GitlabLogo'
 import DiffBlock from './DiffBlock'
+import ErrorNotice from './ErrorNotice'
+import FoldableDiffBlock from './FoldableDiffBlock'
 import EditableCodeBlock from './EditableCodeBlock'
+import FilePathMenu, { revealOrOpen, useRevealFailure } from './FilePathMenu'
 import { SmoothResize } from './SmoothResize'
 import type { ContentBlock } from '../types'
 import { useLanguageGeneration } from '../i18n/useLanguageGeneration'
@@ -71,14 +77,99 @@ export function artifactSlugFromHref(href: string | null | undefined): string | 
  * Character-level shape of a local filesystem path: letters and digits in any
  * script (`\p{L}\p{N}` — filenames are not ASCII-only), combining marks
  * (`\p{M}` — macOS stores NFD-decomposed forms, and Indic/Thai/Arabic scripts
- * need marks even under NFC), underscore, dot, dash, @, ~, colon and space,
- * separated by slashes. Anchored at both ends, so anything carrying a URL
+ * need marks even under NFC), underscore, dot, dash, @, ~, colon, space and
+ * PARENTHESES, separated by slashes — EITHER kind, because a Windows gateway
+ * names its files with `\`. Anchored at both ends, so anything carrying a URL
  * scheme (`https://…`) or shell punctuation fails outright.
+ *
+ * The punctuation set is a DECIDED boundary, not an accumulation. Two review
+ * rounds each found one more character that is legal in a real filename —
+ * parentheses (`C:\Program Files (x86)`, the most-trodden directory on Windows)
+ * and then an apostrophe (`C:\Users\O'Neil`) — which is the signature of an
+ * allowlist being discovered one bug report at a time. So the rule is stated once
+ * instead: admit every character that is legal in a filename on BOTH platforms
+ * and is not a shell control operator, on both shapes, since the two describe one
+ * filesystem convention and an asymmetry is only a later bug report.
+ *
+ * IN: letters, marks, digits, `_ . @ ~ - space` and `' ! # % = + , ( ) [ ] { }`.
+ * A closing bracket may also END a path, so `App (old)` and `data [2026]`
+ * classify as directories.
+ *
+ * OUT, deliberately — these are what keep the anchored shape from matching a
+ * command or a URL: `$` and a backtick (expansion), `&` `;` `|` (chaining),
+ * `<` `>` (redirection), `"` (quoting), `?` `*` (globbing), and `:` anywhere but
+ * the last segment, where it serves `file:447`. Windows forbids `< > : " / \ | ?
+ * *` in a filename outright, so excluding them costs nothing there and buys the
+ * prose rejection everywhere.
+ *
+ * Widening the repertoire never widens the positive-signal rule, so punctuated
+ * prose (`foo/bar (baz)`, `a&&b/c.sh`) still carries neither a root nor an
+ * extension and is still refused below.
+ *
+ * Admitting `\` as a separator here is what lets a relative Windows path
+ * (`src\main.py`, `.\src\main.py`) reach the probe. It cannot express a
+ * DRIVE-rooted path, whose colon sits before the first separator while this
+ * shape allows a colon only in the last segment (where it serves `file:447`),
+ * so that form has its own shape below.
  *
  * Shape alone is NOT sufficient to linkify — see `isPathCandidate`.
  */
 const PATH_SHAPE_RE =
-  /^~?(?:\.{0,2}\/)?[\p{L}\p{M}\p{N}_.@~/ -]*\/[\p{L}\p{M}\p{N}_.@~: -]*[\p{L}\p{M}\p{N}_.]$/u
+  /^~?(?:\.{0,2}[/\\])?[\p{L}\p{M}\p{N}_.@~'!#%=+,()[\]{}/\\ -]*[/\\][\p{L}\p{M}\p{N}_.@~'!#%=+,()[\]{}: -]*[\p{L}\p{M}\p{N}_.)\]}]$/u
+
+/**
+ * Character-level shape of a DRIVE-rooted Windows path (`C:\x`, `c:/x`), whose
+ * root `PATH_SHAPE_RE` cannot carry: the colon precedes the first separator.
+ *
+ * The trailing segment may be empty so a bare drive root (`C:\`) — a real
+ * directory the file manager can reveal — still classifies, and segments carry
+ * the same repertoire `PATH_SHAPE_RE` allows, so both
+ * `C:\Program Files (x86)\app.txt` and `C:\Users\O'Neil\notes.md` resolve.
+ */
+const WIN_DRIVE_PATH_SHAPE_RE =
+  /^[A-Za-z]:[/\\](?:[\p{L}\p{M}\p{N}_.@~'!#%=+,()[\]{} -]+[/\\])*[\p{L}\p{M}\p{N}_.@~'!#%=+,()[\]{} -]*$/u
+
+/**
+ * A UNC prefix in EITHER spelling — `\\host\share\…` or `//host/share/…` —
+ * refused outright below.
+ *
+ * NOT an oversight that the Windows support here stops at drive letters. A UNC
+ * path names a HOST, and this pre-filter classifies markdown that may be
+ * attacker-authored (a rendered web page, a quoted file, any untrusted text a
+ * message carries), so admitting one would let that text make the dashboard ask
+ * the gateway to stat `\\attacker.example\share\x`. On Windows that stat is an
+ * outbound SMB connection, which offers the host's NTLM credentials — a
+ * credential-leak vector, from nothing but rendering a message.
+ *
+ * Windows reads ANY two leading separators as a UNC root, of either kind and in
+ * either order, so the character class is the whole point: matching two of the
+ * SAME kind (`\\\\` or `//`) leaves `\\/attacker.example\\share\\x` and its `/\\`
+ * mirror admitted, and those resolve to the same share. A mixed pair is the same
+ * vector under a different coat of paint, and unlike the `//` spelling it is a
+ * shape no pre-diff predicate here could even form.
+ *
+ * Three places in this codebase already hold exactly this line, and this is the
+ * fourth: `WINDOWS_ABS_PATH_RE` (utils/urlTransform.ts) excludes UNC for image
+ * `src` values, `MdAnchor` refuses a decoded `//`-prefixed link destination, and
+ * `WIN_PRODUCER_PATH_RE` (utils/fileTokens.ts) documents the producer/consumer
+ * asymmetry that makes all of them deliberate — our own upload endpoint may emit
+ * a UNC path because we trust it, while every consumer-side predicate over
+ * authorable text must refuse the host-naming shape.
+ *
+ * Cost on POSIX is nil: `//tmp/x` names the same file as `/tmp/x`, which is
+ * still a candidate. Cost on Windows is that a network-share path renders as a
+ * copy chip rather than an open chip — the same trade `MdAnchor` already makes.
+ */
+const UNC_PREFIX_RE = /^[/\\]{2}/
+
+/** The last path segment, split on EITHER separator so a Windows path yields its
+ *  real basename. `lastIndexOf('/')` alone returns -1 for `C:\a\notes` and hands
+ *  the whole string to `EXT_RE`, which then reads a dotted DIRECTORY name
+ *  (`project\v1.2\notes`) as an extension on the file. */
+function basenameOf(s: string): string {
+  const cut = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'))
+  return s.slice(cut + 1)
+}
 
 /** A trailing `.ext` on the last segment, 1-8 chars — the only positive path
  *  signal available to a path that is neither rooted nor explicitly relative.
@@ -87,6 +178,9 @@ const PATH_SHAPE_RE =
  *  Unicode basename with an ASCII extension (`产品文档-v1.0.md`) still passes,
  *  because only the trailing `.ext` is matched. */
 const EXT_RE = /\.[A-Za-z0-9]{1,8}$/
+
+/** Explicitly relative, either separator: `./x`, `../x`, `.\x`, `..\x`. */
+const REL_PREFIX_RE = /^\.{1,2}[/\\]/
 
 /**
  * Could this inline-code text denote a local filesystem path?
@@ -102,18 +196,35 @@ const EXT_RE = /\.[A-Za-z0-9]{1,8}$/
  * of which then rendered as a clickable "file" that could only ever 404. So a
  * candidate must carry a positive signal that it names a location:
  *
- *   - rooted (`/x`, `~/x`), or
- *   - explicitly relative (`./x`, `../x`), or
- *   - a file extension on the last segment (`src/main.py`).
+ *   - rooted — POSIX (`/x`, `~/x`) or a Windows drive (`C:\x`, `C:/x`), or
+ *   - explicitly relative (`./x`, `../x`, `.\x`, `..\x`), or
+ *   - a file extension on the last segment (`src/main.py`, `src\main.py`).
  *
- * A bare two-segment identifier with no extension is rejected. Note the third
- * rule still admits `origin/feature/x.ts`; that is intentional — syntax cannot
- * settle it, and the stat probe will.
+ * A bare two-segment identifier with no extension is rejected. That rejection is
+ * what keeps the backslash separator safe on every platform: a `\`-joined
+ * non-path carries no extension, so an escape sequence (`\n`), a registry key
+ * (`HKEY_LOCAL_MACHINE\Software\Foo`) and a domain-qualified login
+ * (`CORP\alice`) all still fail here rather than becoming a chip that could only
+ * 404. Note the third rule still admits `origin/feature/x.ts`; that is
+ * intentional — syntax cannot settle it, and the stat probe will.
+ *
+ * UNC is refused FIRST, ahead of every shape and signal test, because the other
+ * rules would otherwise readmit it: the extension rule matches
+ * `\\host\share\x.txt`, and the leading-`/` rule matches `//host/share/x`.
+ * See `UNC_PREFIX_RE` for why that shape must never reach the probe.
  */
 export function isPathCandidate(s: string): boolean {
-  if (!PATH_SHAPE_RE.test(s)) return false
-  if (s.startsWith('/') || s.startsWith('~') || s.startsWith('./') || s.startsWith('../')) return true
-  return EXT_RE.test(s.slice(s.lastIndexOf('/') + 1))
+  if (UNC_PREFIX_RE.test(s)) return false
+  if (!PATH_SHAPE_RE.test(s) && !WIN_DRIVE_PATH_SHAPE_RE.test(s)) return false
+  if (s.startsWith('/') || s.startsWith('~') || REL_PREFIX_RE.test(s)) return true
+  // Rootedness is the positive signal, exactly as a leading `/` is on POSIX, so
+  // a drive-rooted path needs no extension: `C:\Windows` is a real directory.
+  // Reuses the consumer-side predicate `urlTransform` already applies to image
+  // `src` values rather than restating it, so the chip and the request it issues
+  // cannot drift on what "absolute" means — and this pre-filter inherits that
+  // predicate's deliberate exclusion of host-naming shapes.
+  if (WINDOWS_ABS_PATH_RE.test(s)) return true
+  return EXT_RE.test(basenameOf(s))
 }
 
 /**
@@ -405,6 +516,15 @@ const LIST_STYLE_TYPE: Record<string, string> = {
   I: 'upper-roman',
 }
 
+/** Chrome shared by the diagram action row's buttons. The padding is kept an
+ *  UNVARIATED base utility on purpose: `HOVER_NONE_ACTIONS_ROW_CLS` grows the
+ *  touch target with `[&_button]:p-3`, which wins by Tailwind's
+ *  variant-after-base ordering rather than by specificity, so a padding that
+ *  itself carried a variant could sort after the override and silently keep the
+ *  target below the touch floor. Positioning and the reveal live on the row. */
+const MERMAID_ACTION_BTN_CLS =
+  'p-1.5 rounded-md bg-bg-elevated/90 border border-border text-muted hover:text-text cursor-pointer'
+
 const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const ref = useRef<HTMLDivElement>(null)
@@ -415,10 +535,57 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
   // for (and targets) the diagram currently on screen.
   const [svg, setSvg] = useState('')
   const [enlarged, setEnlarged] = useState(false)
+  // Which of the two views is on screen. The diagram host below stays MOUNTED
+  // either way and is hidden with the `hidden` ATTRIBUTE rather than unmounted:
+  // the render effect is guarded on `renderedRef.current === code`, so a
+  // remounted host would be a fresh empty node the effect then declines to fill,
+  // and toggling back would show a blank frame. Hiding keeps the already-rendered
+  // SVG in the same node, so the switch back is instant and cannot strand an
+  // empty host. The attribute rather than a `hidden` utility class because it
+  // also takes the diagram out of the accessibility tree, which a class cannot.
+  const [showSource, setShowSource] = useState(false)
+  // Outcome of the last copy press. `failed` is a refused clipboard write --
+  // `copyCode` RESOLVES false when the textarea fallback reports failure and
+  // REJECTS if that fallback throws, so both arms are handled; confirming
+  // unconditionally would announce "Copied" for a write that never landed.
+  //
+  // The two outcomes are NOT symmetric, and that asymmetry is the design:
+  //   - `ok` is a transient confirmation. It clears itself, because a
+  //     confirmation the user has already read is noise.
+  //   - `failed` is an ERROR and persists until it is dismissed or until a later
+  //     press succeeds. A failure that erased itself after a second and a half
+  //     could not be read, let alone acted on -- and it is the outcome the user
+  //     most needs, since the text they asked for is NOT on their clipboard.
+  //
+  // It surfaces through `ErrorNotice` rather than through the button's own icon
+  // and label: the value originates in an operation that failed, which is what
+  // `errors-use-error-notice` covers -- the rule decides by where the value
+  // comes from, not by how it is rendered, so a refusal reported only as a red
+  // glyph is the same finding in a smaller font. The notice is the SINGLE error
+  // surface for it; the button deliberately keeps its neutral icon while it
+  // shows, rather than restating the failure a second time beside it.
+  type CopyOutcome = 'idle' | 'ok' | 'failed'
+  const [copyState, setCopyState] = useState<CopyOutcome>('idle')
+  const copySource = () => {
+    copyCode(code).then(
+      ok => {
+        setCopyState(ok ? 'ok' : 'failed')
+        // Only the confirmation is on a timer. See above.
+        if (ok) setTimeout(() => setCopyState('idle'), 1500)
+      },
+      () => setCopyState('failed'),
+    )
+  }
+  const copyLabel = copyState === 'ok' ? i18nT('components.markdownRenderer.copied')
+    : i18nT('components.markdownRenderer.copy_diagram_source')
+  // A render that threw: the raw source stays visible below (it is the only
+  // evidence of what failed), and this drives the notice above it.
+  const [failed, setFailed] = useState(false)
 
   useEffect(() => {
     if (!ref.current || renderedRef.current === code) return
     renderedRef.current = code
+    setFailed(false)
     loadMermaid().then(mermaid => {
       // Re-initialized per render so a theme switch between two diagrams is
       // picked up; initialize() is cheap and idempotent.
@@ -433,38 +600,142 @@ const MermaidBlock = memo(function MermaidBlock({ code }: { code: string }) {
       setSvg(svg)
     }).catch(() => {
       if (!ref.current) return
-      const pre = document.createElement('pre')
-      pre.className = 'text-danger text-[13px]'
-      pre.textContent = code
+      // The host is EMPTIED rather than filled with a hand-built <pre>. The
+      // source is rendered declaratively below for both states that show it
+      // (`failed || showSource`), so there is exactly one element -- and one set
+      // of styles -- meaning "this diagram's source as text". Building a second
+      // one here left two spellings of the same thing, kept in sync by hand,
+      // which diverges the first time either is retouched.
       ref.current.textContent = ''
-      ref.current.appendChild(pre)
       setSvg('')
       setEnlarged(false)
+      // Reset so the failed state has ONE shape. Not to prevent stranding: the
+      // source below now lives OUTSIDE the hidden host, so neither value of
+      // `showSource` can strand the reader. It is that a later successful render
+      // should show the diagram it just produced rather than silently staying on
+      // text, and while no diagram exists neither does the toggle that would
+      // bring the reader back.
+      setShowSource(false)
+      setFailed(true)
     })
   }, [code, id])
 
   return (
     <div className="relative group my-3">
+      {/* No hand-off: this renderer is embedded in hosts that hold unsaved
+          drafts and cannot tell which — the file panel's editor buffer and the
+          composer's markdown preview among them — so the navigation could
+          discard what the user typed. */}
+      {failed && (
+        <ErrorNotice
+          variant="inline"
+          className="mb-2"
+          message={i18nT('components.markdownRenderer.mermaid_render_failed')}
+          testId="mermaid-render-error"
+        />
+      )}
       {/* Pointer convenience: clicking the rendered diagram opens the viewer.
           Keyboard and AT users reach the same viewer through the real button
           below — the same pairing the image lightbox uses (clickable <img>,
           focusable controls elsewhere). */}
       {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions, jsx-a11y/click-events-have-key-events */}
       <figure
+        hidden={showSource || failed}
         className={`m-0 ${svg ? 'cursor-zoom-in' : ''}`}
         onClick={svg ? () => setEnlarged(true) : undefined}
       >
         <div ref={ref} className="flex justify-center overflow-x-auto min-h-[60px]" />
       </figure>
-      {svg && (
-        <button
-          aria-label={i18nT('components.diagramLightbox.enlarge_diagram')}
-          title={i18nT('components.diagramLightbox.enlarge_diagram')}
-          className={`absolute top-1.5 right-1.5 p-1.5 rounded-md bg-bg-elevated/90 border border-border text-muted hover:text-text opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 transition-opacity cursor-pointer ${HOVER_NONE_ACTION_BTN_CLS}`}
-          onClick={() => setEnlarged(true)}
-        >
-          <Maximize2 className="lucide-inline" aria-hidden="true" />
-        </button>
+      {(showSource || failed) && (
+        // THE one place this component paints a diagram's source as text, for
+        // both states that show it: the toggle, and a render that threw (where
+        // the source is the only evidence of what failed, sitting under the
+        // notice that reports it). One element rather than two hand-synced ones,
+        // so toggling to the source after a failure cannot restyle it and the
+        // two cannot drift. Styles are explicit rather than leaning on
+        // `.msg-content pre`: this renderer is also mounted in hosts that are
+        // not a message body.
+        <pre data-testid="mermaid-source" className="text-[13px] font-mono overflow-x-auto text-muted">{code}</pre>
+      )}
+      {/* One action row rather than three absolutely-positioned buttons:
+          `touchActions` documents that the ROW shape is what carries the touch
+          overrides for a cluster (it grows the descendants and wraps), while the
+          single-button shape this replaces can only override the element it sits
+          on. The row stays visible while the source view is on, so the control
+          that left the default state is still reachable without hovering.
+
+          AT MOST TWO BUTTONS IN EVERY REACHABLE STATE, by construction rather
+          than by counting: the diagram view is toggle + enlarge, the source view
+          is toggle + copy (enlarge would open a viewer for the view just left),
+          and a failed render is copy alone, there being no rendered diagram to
+          toggle to. Copy rides with the SOURCE for a second reason: on the
+          rendered diagram the object of "copy" is ambiguous -- the picture or the
+          text behind it -- and beside the source text it is not. */}
+      <div className={`absolute top-1.5 right-1.5 flex items-center gap-1 transition-opacity ${showSource ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'} ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
+        {svg && (
+          <button
+            data-testid="mermaid-source-toggle"
+            aria-pressed={showSource}
+            aria-label={i18nT('components.markdownRenderer.diagram_source')}
+            title={i18nT('components.markdownRenderer.diagram_source')}
+            className={MERMAID_ACTION_BTN_CLS}
+            onClick={() => setShowSource(v => !v)}
+          >
+            {/* `FileCode`, not `Code`: the message footer's own raw-markdown
+                toggle sits a row below and already uses `Code`, and a first-time
+                reader could not tell the two glyphs apart. */}
+            <FileCode className="lucide-inline" aria-hidden="true" />
+          </button>
+        )}
+        {/* Copies the SOURCE, never the rendered image, and only where the source
+            is on screen: the source view, and a failed render, where it is what a
+            reader most wants to take away. Copying the image is not offered at
+            all -- this surface leaves mermaid's `htmlLabels` at its default, so
+            labels live in `<foreignObject>`, which browsers refuse to paint in an
+            image context; see `DiagramLightbox`'s note on the same constraint. */}
+        {(showSource || failed) && (
+          <button
+            data-testid="mermaid-copy-source"
+            aria-label={copyLabel}
+            title={copyLabel}
+            className={MERMAID_ACTION_BTN_CLS}
+            onClick={copySource}
+          >
+            {copyState === 'ok' ? <Check className="lucide-inline text-ok" aria-hidden="true" />
+              : <Copy className="lucide-inline" aria-hidden="true" />}
+          </button>
+        )}
+        {svg && !showSource && (
+          <button
+            data-testid="mermaid-enlarge"
+            aria-label={i18nT('components.diagramLightbox.enlarge_diagram')}
+            title={i18nT('components.diagramLightbox.enlarge_diagram')}
+            className={MERMAID_ACTION_BTN_CLS}
+            onClick={() => setEnlarged(true)}
+          >
+            <Maximize2 className="lucide-inline" aria-hidden="true" />
+          </button>
+        )}
+      </div>
+      {/* A SEPARATED REGION below the action row, deliberately NOT a third
+          control inside it. `max-two-buttons-per-row` counts action controls
+          that are siblings in one horizontal group and exempts "controls in a
+          genuinely different row or a separated region", so this notice -- and
+          the dismiss affordance it brings with it -- cannot push the row past
+          two. The row's cap therefore still holds in this state as well: toggle
+          + copy, with the failure reported beneath them rather than among them.
+
+          No hand-off, for exactly the reason given at the render notice above --
+          this renderer is embedded in hosts holding unsaved drafts it cannot
+          identify, so navigating away could discard what the user typed. */}
+      {copyState === 'failed' && (
+        <ErrorNotice
+          variant="inline"
+          className="mt-2"
+          message={i18nT('components.markdownRenderer.copy_failed')}
+          onDismiss={() => setCopyState('idle')}
+          testId="mermaid-copy-error"
+        />
       )}
       {enlarged && svg && <DiagramLightbox svg={svg} onClose={() => setEnlarged(false)} />}
     </div>
@@ -538,6 +809,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   // canonical url drops), so a credential-smuggling `user:pass@github.com`
   // href must never be dressed up as a trusted-looking chip.
   const jiraHosts = useContext(JiraHostsCtx)
+  const sessionActions = useContext(SessionActionCtx)
   const source = useMemo(() => {
     if (!href || claimed) return null
     const link = parseSourceLinkUrl(href, [], jiraHosts)
@@ -556,6 +828,28 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       if (!decodedHref.startsWith('//')) localHref = decodedHref
     } catch { /* keep it a normal link */ }
   }
+  // Decoded but NOT narrowed to root-relative: the app mints its own share links
+  // absolute, and the recognizer's origin check is what refuses a foreign one.
+  let sessionCandidate: string | null = null
+  if (href) {
+    try {
+      sessionCandidate = decodeURIComponent(href)
+    } catch { /* keep it a normal link */ }
+  }
+  // Same gate as the inline chip, so a link and a bare key naming one session
+  // cannot disagree about whether it is reachable.
+  const sessionLink = sessionCandidate ? resolveSessionChip(sessionKeyFromChatHref(sessionCandidate) ?? '', sessionActions) : null
+  // The attribute carries the canonical key: a modified click goes to the browser,
+  // and an authored `dashboard_…` sid would open a session `?sid=` cannot resolve.
+  const sessionHref = sessionLink && sessionCandidate ? canonicalChatHref(sessionCandidate, sessionLink.key) : null
+  const onSessionClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
+    // Only the PLAIN click is reinterpreted; the href stays real so Cmd+click
+    // still opens the session in its own tab.
+    const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey
+    if (!sessionLink || !plainPrimaryClick) return
+    e.preventDefault()
+    sessionActions.onSessionOpen!(sessionLink.key)
+  }
   const pathResolution = usePathResolution(
     localHref ?? '',
     probeEnabled
@@ -564,6 +858,9 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       && !artifactSlugFromHref(localHref)
       && !!(actions.onFileOpen || actions.onFolderOpen),
   )
+  // askAgent on: a transcript link holds no draft (the host composer's draft is
+  // persisted per slot), and a blocked or failed reveal is gateway-side.
+  const reveal = useRevealFailure(localHref ?? undefined)
   const onPathClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
     const plainPrimaryClick = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.altKey
     if (pathResolution.probePending && plainPrimaryClick) {
@@ -579,6 +876,7 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
       pathResolution.kind,
       e.shiftKey,
       actions,
+      reveal.onError,
       pathResolution.line,
       pathResolution.endLine,
     )
@@ -603,6 +901,8 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   }
   const forgeLabel = source ? forgeChipLabel(source) : null
   if (source && forgeLabel) {
+    const forgeMeta = sourceProviderMeta(source.provider)
+    const ForgeIcon = forgeMeta.icon
     return (
       <span className="group inline-flex max-w-full items-center gap-1 rounded-md border border-border/60 bg-accent/10 px-1.5 py-px align-baseline text-[13px] transition-colors hover:border-border hover:bg-accent/20 focus-within:border-border">
         <a
@@ -612,9 +912,16 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
           title={href}
           className="inline-flex min-w-0 items-center gap-1.5 text-text no-underline focus-ring"
         >
-          {source.provider === 'github'
+          {forgeMeta.logo === 'github'
             ? <GithubLogo size={12} className="shrink-0" />
-            : <GitlabLogo size={12} className="shrink-0" />}
+            : forgeMeta.logo === 'gitlab'
+              ? <GitlabLogo size={12} className="shrink-0" />
+              : ForgeIcon
+                // A registered provider's own mark, when its descriptor ships one.
+                ? <ForgeIcon size={12} className="shrink-0" />
+                // A registered provider with no bundled logo uses the neutral
+                // glyph rather than borrowing GitLab's mark.
+                : <GitPullRequest className="lucide-inline shrink-0" />}
           <span className="truncate max-w-[32ch]">{forgeLabel}</span>
         </a>
       </span>
@@ -629,16 +936,27 @@ function MdAnchor({ node, href, children }: React.AnchorHTMLAttributes<HTMLAncho
   }
   let ext = false
   try { ext = !!href && ALLOWED_PROTOCOLS.has(new URL(href, 'http://x').protocol) } catch { /* not a URL */ }
+  // A confirmed session link is in-app navigation, so it keeps in-place semantics.
+  if (sessionLink) ext = true
   return (
+    <>
     <a
       {...sp(node)}
-      href={href}
-      onClick={pathResolution.candidate ? onPathClick : undefined}
+      href={sessionHref ?? href}
+      // A `/chat?sid=` href is never a path, so the session branch wins outright.
+      onClick={sessionLink ? onSessionClick : (pathResolution.candidate ? onPathClick : undefined)}
+      title={sessionLink
+        ? `${sessionLink.title}\n${i18nT('components.markdownRenderer.click_to_switch_to_this_session')}`
+        : undefined}
       {...(ext ? {} : { target: '_blank', rel: 'noopener noreferrer' })}
       className="text-accent underline underline-offset-2 decoration-accent/40 hover:decoration-accent"
     >
       <InsideLinkCtx.Provider value={true}>{children}</InsideLinkCtx.Provider>
     </a>
+    {reveal.error && (
+      <ErrorNotice variant="inline" className="ml-1.5 align-baseline" message={reveal.error} askAgent onDismiss={reveal.clear} testId="md-link-reveal-error" />
+    )}
+    </>
   )
 }
 
@@ -664,8 +982,60 @@ const PathProbeCtx = createContext<boolean>(true)
 type PathActions = { onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void }
 const PathActionCtx = createContext<PathActions>({})
 
+/**
+ * Where a session chip sends its activation, plus the roster that decides whether
+ * a chip is offered at all.
+ *
+ * `sessions` ABSENT is deliberately not the same as an empty map: a caller that
+ * never wired it (most of the ~30 call sites) does not KNOW which sessions exist,
+ * so no chip is offered. An empty map is the opposite claim — a caller that does
+ * know, and has nothing open.
+ *
+ * The value is the display title, for the tooltip only. It is never substituted
+ * for the chip's text, which would make the visible span disagree with what
+ * Ctrl+click copies.
+ */
+type SessionActions = {
+  onSessionOpen?: (key: string) => void
+  sessions?: ReadonlyMap<string, string>
+  activeSession?: string
+}
+const SessionActionCtx = createContext<SessionActions>({})
+
+/**
+ * Whether a recognised slot key may render as a chip, and what to title it with.
+ *
+ * Mirrors the path chip's rule — an affordance only once the target is CONFIRMED —
+ * with the slot roster standing in for the stat probe. Three refusals, each of
+ * which must stay plain text rather than become a chip that cannot act:
+ *
+ *   - the caller wired no handler or no roster (see `SessionActions`);
+ *   - the key names a session that is not open, so there is nothing to switch to.
+ *     A closed session's transcript may still exist on disk, but reopening it is
+ *     a History-page resume rather than a slot switch, so `onSessionOpen` could
+ *     not honour a chip here;
+ *   - the key names the session the reader is ALREADY in, where a click would be
+ *     a visible no-op.
+ */
+function resolveSessionChip(raw: string, actions: SessionActions): { key: string; title: string } | null {
+  if (!actions.onSessionOpen || !actions.sessions) return null
+  const key = sessionKeyFrom(raw)
+  if (!key || key === actions.activeSession) return null
+  const title = actions.sessions.get(key)
+  if (title === undefined) return null
+  return { key, title }
+}
+
 type PathResolution = {
   candidate: boolean
+  /** Path SHAPE alone, independent of whether probing is enabled.
+   *
+   * `candidate` also requires the probe to be on, so it flips the moment a
+   * message stops streaming — and anything keyed to it would appear then,
+   * re-wrapping a paragraph whose text has just become final. The glyph reserve
+   * is keyed to this instead, so it is already in place before the probe's
+   * answer (or the probe itself) can arrive. */
+  shaped: boolean
   kind: PathKind | undefined
   path: string
   splitPath: string
@@ -681,7 +1051,8 @@ type PathResolution = {
  */
 function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
   const { path: splitPath, line, endLine } = splitLineRef(raw)
-  const candidate = probeEnabled && isPathCandidate(splitPath)
+  const shaped = isPathCandidate(splitPath)
+  const candidate = probeEnabled && shaped
   const literalCandidate = candidate && line != null
   const splitKind = usePathKind(candidate ? splitPath : null)
   const literalKind = usePathKind(literalCandidate ? raw : null)
@@ -689,6 +1060,7 @@ function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
 
   return {
     candidate,
+    shaped,
     kind: literalWins ? literalKind : splitKind,
     path: literalWins ? raw : splitPath,
     splitPath,
@@ -710,16 +1082,31 @@ function usePathResolution(raw: string, probeEnabled: boolean): PathResolution {
  * `revealPath` selects a file in Finder/Explorer, which has no notion of a line,
  * and a directory does not have one either.
  */
-function activatePath(path: string, kind: PathKind, reveal: boolean, actions: PathActions, line?: number, endLine?: number): void {
-  if (reveal) { api.revealPath(path); return }
+function activatePath(
+  path: string,
+  kind: PathKind,
+  reveal: boolean,
+  actions: PathActions,
+  onRevealError: (message: string) => void,
+  line?: number,
+  endLine?: number,
+): void {
+  // Route through the shared helper, not bare `api.revealPath`: the helper owns
+  // the clipboard write and the failure message. `api.revealPath` is side-effect-
+  // free, so a bare call on a remote/headless session would answer {ok, copy} and
+  // nobody would write the clipboard — the chip's "Shift+click to copy path"
+  // promise would silently do nothing. A failed reveal is reported to the chip
+  // that was clicked (see useRevealFailure), never to a blocking dialog.
+  const opts = { onError: onRevealError }
+  if (reveal) { void revealOrOpen(path, 'reveal', opts); return }
   if (kind === 'dir') {
     // No folder handler wired: fall back to the OS file manager rather than
     // silently doing nothing.
     if (actions.onFolderOpen) actions.onFolderOpen(path)
-    else api.revealPath(path)
+    else void revealOrOpen(path, 'reveal', opts)
     return
   }
-  if (!actions.onFileOpen) { api.revealPath(path); return }
+  if (!actions.onFileOpen) { void revealOrOpen(path, 'reveal', opts); return }
   // Called with ONE argument when there is no line, not with an explicit
   // `undefined`: the handler is also the app's general-purpose file opener, and
   // an omitted argument keeps a chip click indistinguishable from every other
@@ -729,6 +1116,41 @@ function activatePath(path: string, kind: PathKind, reveal: boolean, actions: Pa
 }
 
 const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-accent text-sm font-mono'
+
+/** Geometry of a path chip's leading glyph, shared by the confirmed chip and by
+ *  the reserve that stands in for it while the path is unconfirmed.
+ *
+ *  Both sites MUST read these two values, because equal width in every state is
+ *  the whole mechanism: the glyph is an inline atom, so 16px (12px box + 4px
+ *  margin) appearing mid-paragraph can push a line over and change the row's
+ *  height. Measured in a browser at phone widths, that re-wrap costs 24px — one
+ *  line — and it lands under a reader who is scrolling history, because a path
+ *  is probed the first time its row mounts. Same rule the image reserve follows
+ *  (`reservedImageStyle`): reserve the box before the async answer arrives, so
+ *  the answer restyles instead of reflowing. */
+const CHIP_GLYPH_SIZE = 12
+const CHIP_GLYPH_GEOMETRY = 'inline align-middle mr-1'
+
+/**
+ * Invisible stand-in for the chip glyph, for a path-shaped span that is not (or
+ * not yet) a confirmed path.
+ *
+ * It renders the same icon element at the same size and margin, so it occupies
+ * the confirmed chip's width exactly rather than an approximation of it — the
+ * geometry cannot drift because a different icon or a different margin would
+ * have to be written at both sites. `opacity-0` rather than a blank span keeps
+ * the line box identical too: an empty inline-block contributes a different
+ * baseline than an svg does.
+ *
+ * Blank, deliberately NOT a dimmed glyph: `InlineCode`'s glyph is what tells a
+ * reader at rest which paths the backend actually confirmed, and a placeholder
+ * glyph would erase that distinction to buy nothing — the reserve only needs the
+ * space, not a mark.
+ */
+function ChipGlyphReserve({ path }: { path: string }) {
+  const Glyph = fileIcon(path)
+  return <Glyph size={CHIP_GLYPH_SIZE} aria-hidden="true" className={`${CHIP_GLYPH_GEOMETRY} opacity-0`} />
+}
 
 /**
  * The chip's hover instruction, naming the application shift+click will actually
@@ -744,7 +1166,18 @@ const CHIP_BASE = 'bg-bg-elevated px-1.5 py-0.5 rounded text-accent text-sm font
  * Dateimanager", "dans le gestionnaire de fichiers", "ファイルマネージャーに表示"),
  * which a placeholder cannot carry.
  */
-function revealHintFor(isDir: boolean, platform: GatewayPlatform): string {
+function revealHintFor(isDir: boolean, platform: GatewayPlatform, directLocal: boolean): string {
+  // On a remote or tunneled session /api/reveal cannot drive the gateway host's
+  // file manager, so shift+click degrades to a clipboard copy (files.py answers
+  // the copy-degrade branch). Naming Finder/Explorer here would promise an action
+  // the backend no longer performs, so the hint tells the truth: shift+click
+  // copies the path. The click (open/browse) arm is unchanged — it drives the
+  // in-app viewer, which works remotely — so only the shift+click clause differs.
+  if (!directLocal) {
+    return isDir
+      ? i18nT('components.markdownRenderer.click_to_browse_shift_click_to_copy_path')
+      : i18nT('components.markdownRenderer.click_to_open_shift_click_to_copy_path')
+  }
   if (isDir) {
     if (platform === 'darwin') return i18nT('components.markdownRenderer.click_to_browse_shift_click_to_reveal_in_finder')
     if (platform === 'windows') return i18nT('components.markdownRenderer.click_to_browse_shift_click_to_open_in_file_explorer')
@@ -760,22 +1193,37 @@ function revealHintFor(isDir: boolean, platform: GatewayPlatform): string {
  *  preserve line-wrapping. The copied state shows a small check icon inline;
  *  the icon is `pointer-events-none` and purely decorative so it cannot steal
  *  the click or affect layout reflow. */
+/**
+ * The 1.5s "Copied!" acknowledgment, shared by every chip that copies.
+ *
+ * One definition so the two chips cannot drift on how long it lasts or whether it
+ * appears at all — the session chip advertises Ctrl+click in its tooltip, so the
+ * gesture owes the same confirmation the click-to-copy chip gives.
+ */
+function useCopiedFlash(): { copied: boolean; flash: () => void } {
+  const [copied, setCopied] = useState(false)
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
+  const flash = () => {
+    setCopied(true)
+    if (timerRef.current) clearTimeout(timerRef.current)
+    timerRef.current = setTimeout(() => setCopied(false), 1500)
+  }
+  return { copied, flash }
+}
+
 function CopyableCode({ className, safeProps, text, children }: {
   className: string
   safeProps: Record<string, unknown>
   text: string
   children: React.ReactNode
 }) {
-  const [copied, setCopied] = useState(false)
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current) }, [])
+  const { copied, flash } = useCopiedFlash()
   const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
     e.preventDefault()
     e.stopPropagation()
     copyToClipboard(text.trim())
-    setCopied(true)
-    if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = setTimeout(() => setCopied(false), 1500)
+    flash()
   }
   return (
     <code
@@ -790,6 +1238,56 @@ function CopyableCode({ className, safeProps, text, children }: {
         : i18nT('components.markdownRenderer.click_to_copy')}
       {...safeProps}
     >
+      {children}
+      {copied && <Check size={12} aria-hidden="true" className="inline align-middle ml-0.5 opacity-70 pointer-events-none text-ok" />}
+    </code>
+  )
+}
+
+/**
+ * Click-to-switch inline chip for a confirmed dashboard session key.
+ *
+ * Deliberately shaped like the confirmed PATH chip rather than like the
+ * click-to-copy fallback it replaces: same `<code>` element and `CHIP_BASE`, a
+ * leading glyph so "this is actionable" is legible at rest rather than only on
+ * hover, and Ctrl/Cmd+click reserved for copying. A reader who has learned what a
+ * file chip does therefore already knows what this does.
+ *
+ * `stopPropagation` keeps the container's artifact-link delegation from also
+ * firing for a click this chip has handled.
+ */
+function SessionChip({ sessionKey, sessionTitle, safeProps, onOpen, children }: {
+  sessionKey: string
+  sessionTitle: string
+  safeProps: Record<string, unknown>
+  onOpen: (key: string) => void
+  children: React.ReactNode
+}) {
+  const { copied, flash } = useCopiedFlash()
+  const act = (e: { ctrlKey: boolean; metaKey: boolean; preventDefault: () => void; stopPropagation: () => void }) => {
+    e.preventDefault()
+    e.stopPropagation()
+    // The NORMALISED key, not the author's spelling: `?sid=` rejects a
+    // `dashboard_`-prefixed transcript filename.
+    if (e.ctrlKey || e.metaKey) { copyToClipboard(sessionKey); flash(); return }
+    onOpen(sessionKey)
+  }
+  return (
+    <code
+      className={`${CHIP_BASE} cursor-pointer hover:underline`}
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-switch)
+      role="button"
+      tabIndex={0}
+      onClick={act}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') act(e) }}
+      {...safeProps}
+      data-session-key={sessionKey}
+      // Title leads: the key alone does not say which conversation this is.
+      title={copied
+        ? i18nT('components.markdownRenderer.copied')
+        : `${sessionTitle}\n${i18nT('components.markdownRenderer.click_to_switch_to_this_session')}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
+    >
+      <MessageSquare size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
       {children}
       {copied && <Check size={12} aria-hidden="true" className="inline align-middle ml-0.5 opacity-70 pointer-events-none text-ok" />}
     </code>
@@ -816,31 +1314,58 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
   const codeStr = String(children).replace(/\n$/, '')
   const probeEnabled = useContext(PathProbeCtx)
   const actions = useContext(PathActionCtx)
+  const sessionActions = useContext(SessionActionCtx)
   const insideLink = useContext(InsideLinkCtx)
   const gatewayPlatform = useGatewayPlatform()
+  const { directLocal } = useBranding()
   const raw = codeStr.trim()
   const pathResolution = usePathResolution(raw, probeEnabled)
+  // Failure state for the chip's reveal (Shift+click / no handler wired); rendered
+  // beside the chip. Declared before the early returns below (rules of hooks).
+  const reveal = useRevealFailure(raw)
 
-  // `data-path` / `data-path-kind` describe a chip THIS component rendered, so
+  // `data-path*` / `data-session-key` describe a chip THIS component rendered, so
   // only it may set them. rehypeSanitize allowlists every `data-*` attribute
   // (isAllowedAttr: `k.startsWith('data')`), so raw HTML arrives here with a
   // forged pair intact; spreading it would publish attributes claiming a
   // backend-confirmed path that was never probed. Drop any inbound copy.
   const safeProps = Object.fromEntries(
-    Object.entries(props).filter(([k]) => !k.toLowerCase().startsWith('data-path')),
+    Object.entries(props).filter(([k]) => {
+      const name = k.toLowerCase()
+      return !name.startsWith('data-path') && !name.startsWith('data-session')
+    }),
   )
 
   if (pathResolution.probePending
     || (pathResolution.kind !== 'file' && pathResolution.kind !== 'dir')) {
+    // Keyed to `shaped`, not to `candidate` or `probePending`, so the reserve is
+    // present in EVERY state this span can be in — streaming, probe in flight,
+    // and probe answered "not a path". A reserve that appeared only while a probe
+    // was pending would simply move the re-wrap to the moment it went away.
+    // A session chip needs none: `isPathCandidate` demands a separator, a drive
+    // or an extension, and a session key carries none of the three, so the two
+    // chips cannot claim the same span.
+    const reserve = pathResolution.shaped ? <ChipGlyphReserve path={pathResolution.splitPath} /> : null
     // Inside an anchor the link owns the click, so stay the inert span this was
     // before #4433 rather than cancelling the navigation to copy. Nothing is
     // lost: the browser's own "Copy link address" still reaches the URL.
-    if (insideLink) return <code className={CHIP_BASE} {...safeProps}>{children}</code>
-    return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{children}</CopyableCode>
+    if (insideLink) return <code className={CHIP_BASE} {...safeProps}>{reserve}{children}</code>
+    const session = resolveSessionChip(raw, sessionActions)
+    if (session) {
+      return (
+        <SessionChip
+          sessionKey={session.key}
+          sessionTitle={session.title}
+          safeProps={safeProps}
+          onOpen={sessionActions.onSessionOpen!}
+        >{children}</SessionChip>
+      )
+    }
+    return <CopyableCode className={CHIP_BASE} safeProps={safeProps} text={codeStr}>{reserve}{children}</CopyableCode>
   }
   const isDir = pathResolution.kind === 'dir'
   const { path, splitPath, kind, line: targetLine, endLine: targetEndLine } = pathResolution
-  const revealHint = revealHintFor(isDir, gatewayPlatform)
+  const revealHint = revealHintFor(isDir, gatewayPlatform, directLocal)
   // A leading glyph is what makes "this is actionable" legible at rest. Without
   // one, a confirmed chip and an inert one differ only on hover, so a reader
   // cannot tell which paths the backend actually resolved. Files use the same
@@ -861,41 +1386,57 @@ function InlineCode({ children, ...props }: { children?: React.ReactNode } & Rec
     e.stopPropagation()
     // Ctrl/Cmd+Click copies the path text rather than opening/revealing.
     if (e.ctrlKey || e.metaKey) { copyToClipboard(raw); return }
-    activatePath(path, kind, e.shiftKey, actions, targetLine, targetEndLine)
+    activatePath(path, kind, e.shiftKey, actions, reveal.onError, targetLine, targetEndLine)
   }
+  // Right-click opens the shared file-path menu (Open in default app / reveal /
+  // copy path), additive to the existing click/shift-click activation. The menu
+  // items self-gate on directLocal, so a remote session sees only Copy path.
+  // `kind` is threaded through so a directory chip hides "Open with default
+  // app" — the reveal endpoint 400s an `open` on a directory, which would land
+  // the user on an error for a click they cannot fix.
   return (
-    <code
-      className={`${CHIP_BASE} cursor-pointer hover:underline`}
-      role="button"
-      tabIndex={0}
-      onClick={act}
-      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') act(e) }}
-      {...safeProps}
-      data-path={path}
-      data-path-kind={kind}
-      data-path-line={targetLine}
-      data-path-end-line={targetEndLine}
-      // The resolved path leads the tooltip, not just the instruction. A native
-      // tooltip paints in the browser's own layer, above page content, and any
-      // element overlaying the chip must be pointer-events-none to let the click
-      // reach it — so hovering always discloses the real target even when
-      // surrounding markup visually covers the chip's text. It also shows a long
-      // path in full when layout truncates it.
-      //
-      // `raw`, not `path`, so a `file:447` chip discloses the line it will jump
-      // to. That keeps the disclosure honest without a second catalog string:
-      // the location is already in the text the user is hovering.
-      title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
-    >
-      <Glyph size={12} aria-hidden="true" className="inline align-middle mr-1 opacity-70" />
-      {targetLine != null && raw.length > splitPath.length
-        // Keep the location suffix atomic. A range is the case that actually
-        // misleads: broken across lines, `…2026.md:10-` / `16` reads as a citation
-        // ending at line 10 until the eye reaches the next line. The path itself
-        // stays breakable, since that is what lets a long citation wrap at all.
-        ? <>{splitPath}<span className="whitespace-nowrap">{raw.slice(splitPath.length)}</span></>
-        : children}
-    </code>
+    <>
+    <FilePathMenu filePath={path} kind={kind}>
+      <code
+        className={`${CHIP_BASE} cursor-pointer hover:underline`}
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-element-to-interactive-role -- <code> is intentionally interactive (click-to-open path chip), same pattern as CopyableCode
+        role="button"
+        tabIndex={0}
+        onClick={act}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') act(e) }}
+        {...safeProps}
+        data-path={path}
+        data-path-kind={kind}
+        data-path-line={targetLine}
+        data-path-end-line={targetEndLine}
+        // The resolved path leads the tooltip, not just the instruction. A native
+        // tooltip paints in the browser's own layer, above page content, and any
+        // element overlaying the chip must be pointer-events-none to let the click
+        // reach it — so hovering always discloses the real target even when
+        // surrounding markup visually covers the chip's text. It also shows a long
+        // path in full when layout truncates it.
+        //
+        // `raw`, not `path`, so a `file:447` chip discloses the line it will jump
+        // to. That keeps the disclosure honest without a second catalog string:
+        // the location is already in the text the user is hovering.
+        title={`${raw}\n${revealHint}\n${i18nT('components.markdownRenderer.ctrl_click_to_copy')}`}
+      >
+        <Glyph size={CHIP_GLYPH_SIZE} aria-hidden="true" className={`${CHIP_GLYPH_GEOMETRY} opacity-70`} />
+        {targetLine != null && raw.length > splitPath.length
+          // Keep the location suffix atomic. A range is the case that actually
+          // misleads: broken across lines, `…2026.md:10-` / `16` reads as a citation
+          // ending at line 10 until the eye reaches the next line. The path itself
+          // stays breakable, since that is what lets a long citation wrap at all.
+          ? <>{splitPath}<span className="whitespace-nowrap">{raw.slice(splitPath.length)}</span></>
+          : children}
+      </code>
+    </FilePathMenu>
+    {/* askAgent on: a transcript chip holds no draft; the host composer's
+        draft is persisted per slot. */}
+    {reveal.error && (
+      <ErrorNotice variant="inline" className="ml-1.5 align-baseline" message={reveal.error} askAgent onDismiss={reveal.clear} testId="md-chip-reveal-error" />
+    )}
+    </>
   )
 }
 
@@ -1094,10 +1635,76 @@ const MD_COMPONENTS: Components = {
   img: ImgWithFallback,
 }
 
-/** Markdown image with a React-rendered Paperclip fallback when the URL is
- *  broken. The fallback is React-rendered rather than a hand-built SVG swapped
- *  in via .replaceWith(), so it never mutates DOM React owns — which could
- *  otherwise trigger "removeChild on Node" reconciliation crashes. */
+/** Markdown image with a React-rendered fallback chip when the URL is broken
+ *  (see `BrokenImage`). The fallback is React-rendered rather than a hand-built
+ *  SVG swapped in via .replaceWith(), so it never mutates DOM React owns —
+ *  which could otherwise trigger "removeChild on Node" reconciliation crashes. */
+/** Fallback chip for an image whose bytes failed to load.
+ *
+ * Chat images are read from disk at VIEW time (`/api/file-raw`), not stored in
+ * the message — so the dominant failure is a local file that no longer exists
+ * (a screenshot written to a temp directory that has since been cleaned), long
+ * after the message rendered fine for its author. The chip names that
+ * condition, and the whole chip is click-to-copy for the on-disk path:
+ * recovery starts from knowing WHICH file is gone, and the path is the one
+ * thing the transcript still holds.
+ *
+ * The `<img>` error event carries no status, so "file no longer exists" is
+ * NOT asserted from the error alone — a backend hiccup, a sensitive-path
+ * denial (403), or a file still being written all fire the same event. A
+ * cheap HEAD probe re-asks the endpoint, and only a confirmed 404 (the
+ * backend's not-found refusal) earns the missing-file wording; every other
+ * outcome — including a failed probe — keeps the generic load-failure line,
+ * so the chip never states a cause it did not verify. Remote URLs are never
+ * probed: a cross-origin HEAD says nothing reliable and the generic wording
+ * is already honest there.
+ */
+function BrokenImage({ path, alt, probeUrl }: { path: string; alt?: string; probeUrl?: string }) {
+  const { copied, flash } = useCopiedFlash()
+  const [confirmedGone, setConfirmedGone] = useState(false)
+  useEffect(() => {
+    if (!probeUrl) return
+    let cancelled = false
+    fetch(probeUrl, { method: 'HEAD' })
+      .then(r => { if (!cancelled && r.status === 404) setConfirmedGone(true) })
+      .catch(() => { /* unknown stays unknown — generic wording */ })
+    return () => { cancelled = true }
+  }, [probeUrl])
+  const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    copyToClipboard(path)
+    flash()
+  }
+  // The path leads the tooltip (same rule as the file-path chip) so a
+  // truncated chip still discloses the real target — except when alt is
+  // empty: the visible label already IS the path, and repeating it in the
+  // tooltip adds nothing.
+  const idle = alt
+    ? `${path}\n${i18nT('components.markdownRenderer.click_to_copy')}`
+    : i18nT('components.markdownRenderer.click_to_copy')
+  return (
+    <span
+      className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border bg-bg-elevated px-2 py-1 text-sm text-muted cursor-pointer hover:text-text"
+      role="button"
+      tabIndex={0}
+      onClick={handleCopy}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') handleCopy(e) }}
+      title={copied ? i18nT('components.markdownRenderer.copied') : idle}
+    >
+      <ImageOff size={14} aria-hidden="true" className="shrink-0" />
+      <span className="truncate">{alt || path}</span>
+      <span className="shrink-0 opacity-75">
+        {confirmedGone
+          ? i18nT('components.markdownRenderer.image_file_no_longer_exists')
+          : i18nT('components.markdownRenderer.image_failed_to_load')}
+      </span>
+      {copied
+        ? <Check size={12} aria-hidden="true" className="shrink-0 text-ok" />
+        : <Copy size={12} aria-hidden="true" className="shrink-0 opacity-70" />}
+    </span>
+  )
+}
 /** Style reserving a not-yet-loaded transcript image's EXACT display box.
  *
  * The loaded layout follows the replaced-element min/max rules, which
@@ -1157,6 +1764,9 @@ function ImgWithFallback({
   const isLocal = src.startsWith('/') || src.startsWith('~') || src.startsWith('.') || isWinAbs
     || (basePath && !src.startsWith('http'))
   let url: string
+  // The on-disk path the backend is asked to read — what the broken-image
+  // fallback discloses and copies. Stays `src` verbatim for remote URLs.
+  let diskPath = src
   if (isLocal) {
     // micromark percent-encodes destinations in BOTH forms, so wrap-ness is
     // recovered from the source text at this node's position: only a
@@ -1173,8 +1783,10 @@ function ImgWithFallback({
     const localPath = wrapped ? decodeLocalPath(src) : src
     if (basePath && !src.startsWith('/') && !src.startsWith('~') && !isWinAbs) {
       const resolved = basePath.replace(/\/[^/]*$/, '') + '/' + localPath
+      diskPath = resolved
       url = `/api/file-raw?path=${encodeURIComponent(resolved)}`
     } else {
+      diskPath = localPath
       url = `/api/file-raw?path=${encodeURIComponent(localPath)}`
     }
     // See ImageVersionCtx: without this every impression of a rewritten file
@@ -1185,12 +1797,7 @@ function ImgWithFallback({
     url = src
   }
   if (errored) {
-    return (
-      <span className="text-sm text-muted inline-flex items-center gap-1">
-        <Paperclip size={14} aria-hidden="true" />
-        {' ' + (alt || src)}
-      </span>
-    )
+    return <BrokenImage path={diskPath} alt={alt} probeUrl={isLocal ? url : undefined} />
   }
   // SVGs authored with only a `viewBox` (no width/height) carry no intrinsic
   // size. Under the max-w/max-h-only CSS below they collapse to ~0px and look
@@ -1654,6 +2261,9 @@ const REMARK_PLUGINS: PluggableList = [
   remarkGfm,
   remarkCjkFriendlyGfmStrikethrough,
   [remarkMath, { singleDollarTextMath: false }],
+  // After gfm so an autolink literal is already a `link` node, but BEFORE the
+  // verbatim pass, which retypes an unknown tag to text and hides it.
+  remarkAutolinkRules,
   remarkVerbatimUnknownTags,
 ]
 
@@ -1834,16 +2444,16 @@ const SOFT_BREAK_RE = /[\t ]*(?:\r?\n|\r)/g
  * (mdast `break` → <br>). This is an inlined equivalent of the `remark-breaks`
  * package, kept local to avoid adding a runtime dependency.
  *
- * Opt-in via MarkdownRenderer's `softBreaks` prop and used ONLY for user
- * messages: the chat input lets people press Shift+Enter for a newline, so
- * those breaks must survive rendering. Assistant/LLM markdown keeps standard
- * CommonMark soft-break-collapse.
+ * Opt-in via MarkdownRenderer's `softBreaks` prop, for surfaces where a lone
+ * source newline is meaningful: user messages (Shift+Enter in the composer)
+ * and injected notes. Assistant/LLM markdown keeps standard CommonMark
+ * soft-break-collapse.
  *
  * Operates on `text` nodes only, so fenced code, inline code, math, and raw
  * HTML (whose content lives in `.value`, not `.children`) are untouched, and
  * blank-line block separators — already parsed as distinct blocks — are not
  * affected, so lists and paragraphs keep their normal block spacing. That is
- * what lets user messages drop container-level `white-space: pre-wrap`, which
+ * what lets those surfaces drop container-level `white-space: pre-wrap`, which
  * had made react-markdown's inter-block newline text nodes render as literal
  * blank lines and inflated list/paragraph gaps.
  */
@@ -3156,13 +3766,34 @@ function extractPathHintFromText(text: string | undefined): string | undefined {
   return undefined
 }
 
-function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, widgetIndex, slotKey, glow, smooth, softBreaks, live, unfurl }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; widgetIndex?: number; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean }) {
+function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, widgetIndex, slotKey, glow, smooth, softBreaks, live, unfurl, collapseDiffs }: { block: ContentBlock; prevBlock?: ContentBlock; onFileOpen?: (path: string) => void; sourcePos?: boolean; messageTs?: string; widgetIndex?: number; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; live?: boolean; unfurl?: boolean; collapseDiffs?: boolean }) {
   switch (block.type) {
     case 'diff': {
       const pathHint = prevBlock?.type === 'markdown'
         ? extractPathHintFromText(prevBlock.content)
         : undefined
-      const node = <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} />
+      // `collapseDiffs` is the CHAT TRANSCRIPT's opt-in, and only its opt-in.
+      // A fence in an assistant message is the model's own retelling of a
+      // change, and several of them bury the prose. Everywhere else this
+      // renderer is used — artifacts, specs, knowledge documents, the
+      // changelog, review reports — the patch IS the content, and collapsing
+      // it would take the text out of the DOM for find-in-page, whole-surface
+      // selection and printing.
+      //
+      // `foldKey` is slot + message + the fence's line, which is the identity
+      // the block list already keys on: stable across streaming, so an opened
+      // patch survives a re-mount. All THREE parts are required. Keyed on the
+      // line alone, two messages whose fences start on the same line would
+      // share one entry and open together; without the slot, a fork — which
+      // preserves the parent's message timestamps — would collide with the
+      // session it was forked from. Without a key the state is local, which
+      // only costs the re-mount memory.
+      const foldKey = slotKey != null && messageTs != null && block.startLine != null
+        ? `${slotKey}:${messageTs}:${block.startLine}`
+        : undefined
+      const node = collapseDiffs
+        ? <FoldableDiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} foldKey={foldKey} />
+        : <DiffBlock code={block.content} complete={block.complete} onFileOpen={onFileOpen} pathHint={pathHint} streaming={!!smooth && !block.complete} />
       // Smooth mode: wrap so the block height eases as lines arrive. The wrapper
       // is mounted for the whole message lifecycle (smooth is constant) so the
       // child never remounts when streaming flips to complete.
@@ -3196,7 +3827,7 @@ function BlockRenderer({ block, prevBlock, onFileOpen, sourcePos, messageTs, wid
   }
 }
 
-export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean }) {
+export default memo(function MarkdownRenderer({ content, streaming = false, onFileOpen, onFolderOpen, onArtifactOpen, onSessionOpen, sessions, activeSession, rawMode = false, sourcePos = false, messageTs, slotKey, glow = false, smooth, softBreaks = false, compactImages = false, linkPreviews = false, collapseDiffs = false }: { content: string; streaming?: boolean; onFileOpen?: (path: string, opts?: { line?: number; endLine?: number }) => void; onFolderOpen?: (path: string) => void; onArtifactOpen?: (slug: string) => void; onSessionOpen?: (key: string) => void; sessions?: ReadonlyMap<string, string>; activeSession?: string; rawMode?: boolean; sourcePos?: boolean; messageTs?: string; slotKey?: string; glow?: boolean; smooth?: boolean; softBreaks?: boolean; compactImages?: boolean; linkPreviews?: boolean; /** Chat transcript only: render a ```diff fence collapsed to a chip. Off everywhere else, where the patch IS the content rather than a retelling of it. */ collapseDiffs?: boolean }) {
   useLanguageGeneration() // memo() bails out of the provider-level repaint; subscribe directly
   const blocks = useBlockAssembler(content, streaming)
 
@@ -3223,6 +3854,10 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
   /** Stable identity so every chip in a long transcript doesn't re-render when
    *  this component does. */
   const pathActions = useMemo<PathActions>(() => ({ onFileOpen, onFolderOpen }), [onFileOpen, onFolderOpen])
+  const sessionActions = useMemo<SessionActions>(
+    () => ({ onSessionOpen, sessions, activeSession }),
+    [onSessionOpen, sessions, activeSession],
+  )
 
   // Pre-compute the widget index for each widget block (0-based ordinal of
   // widgets within this message). WidgetFrame uses (messageTs, widgetIndex)
@@ -3310,6 +3945,7 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
           module-level, so the renderer cannot pass these down as props. */}
       <PathProbeCtx.Provider value={!streaming}>
       <PathActionCtx.Provider value={pathActions}>
+      <SessionActionCtx.Provider value={sessionActions}>
       {/* CompactImagesCtx: user-message ("sent prompt") callers pass compactImages
           so their attached images render as small previews. The provider wraps the
           blocks here (a context Provider renders no DOM node, so data-image-scope /
@@ -3342,10 +3978,12 @@ export default memo(function MarkdownRenderer({ content, streaming = false, onFi
             unfurl={linkPreviews}
             smooth={smooth}
             softBreaks={softBreaks}
+            collapseDiffs={collapseDiffs}
           />
         ))}
       </ImageVersionCtx.Provider>
       </CompactImagesCtx.Provider>
+      </SessionActionCtx.Provider>
       </PathActionCtx.Provider>
       </PathProbeCtx.Provider>
     </div>
@@ -3697,7 +4335,7 @@ export function Lightbox() {
   // On any zoom change, recentre at fit and otherwise re-clamp the existing pan
   // to the new (smaller/larger) bounds — zooming out must not strand the image
   // off-screen. Runs post-layout, so offsetWidth already reflects the new box.
-  useEffect(() => { setPan(p => (zoom <= LIGHTBOX_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan])
+  useEffect(() => { setPan(p => (zoom <= LIGHTBOX_ZOOM_MIN ? { x: 0, y: 0 } : clampPan(p.x, p.y))) }, [zoom, clampPan, setPan])
   useEffect(() => {
     if (!isOpen) return
     const onKey = (e: KeyboardEvent) => {
@@ -3737,7 +4375,7 @@ export function Lightbox() {
     // modal open and Escape closes only the viewer.
     window.addEventListener('keydown', onKey, true)
     return () => window.removeEventListener('keydown', onKey, true)
-  }, [isOpen, zoomIn, zoomOut])
+  }, [isOpen, zoomIn, zoomOut, setZoom])
   if (!state) return null
   const img = state.images[state.index]
   const zoomed = zoom > LIGHTBOX_ZOOM_MIN

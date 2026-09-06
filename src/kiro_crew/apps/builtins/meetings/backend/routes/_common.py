@@ -291,13 +291,20 @@ class BadRequest(Exception):
         self.code = code
 
 
-async def json_body(request: web.Request, *, required: bool = True) -> dict[str, Any]:
+async def json_body(
+    request: web.Request, *, required: bool = True, max_bytes: int = MAX_BODY_BYTES
+) -> dict[str, Any]:
     """Parse and size-cap a JSON object body.
 
     A non-object body (list, string, number) is rejected rather than coerced —
     every handler indexes the result by key, so a list would surface as a 500.
+
+    *max_bytes* exists for the ONE route whose body is a whole document rather than
+    a short field (the minutes edit; see
+    :data:`constants.MAX_MINUTES_BODY_BYTES` for the arithmetic). Raising it per
+    route rather than raising the default keeps every other body small.
     """
-    if request.content_length is not None and request.content_length > MAX_BODY_BYTES:
+    if request.content_length is not None and request.content_length > max_bytes:
         raise BadRequest("request body is too large", status=413)
     try:
         raw = await request.json()

@@ -3,6 +3,7 @@ import { Upload, Plus, X, ChevronLeft, ChevronRight, PencilRuler } from 'lucide-
 import { KIND_LABEL, kindLabel } from './constants'
 import { detectKind, recognise } from './utils'
 import { S } from './styles'
+import ErrorNotice from '../../components/ErrorNotice'
 import type { Blocked, StagedItem } from './types'
 
 import { i18nT } from '../../i18n/t'
@@ -15,6 +16,8 @@ interface Props {
   showAuth: boolean
   busy: boolean
   err: string
+  /** A client-side check or a not-failed status — plain text, never an error surface. */
+  hint: string
   inputRef: RefObject<HTMLInputElement>
   onPick: (e: React.ChangeEvent<HTMLInputElement>) => void
   onDrop: (e: React.DragEvent) => void
@@ -33,7 +36,7 @@ interface Props {
 
 export default function Composer(p: Props) {
   const ime = useImeGuard()
-  const { staged, refText, dragging, blocked, showAuth, busy, err, inputRef } = p
+  const { staged, refText, dragging, blocked, showAuth, busy, err, hint, inputRef } = p
 
   const canStart = !busy && (staged.length > 0 || !!refText.trim())
   const det = detectKind(refText)
@@ -82,7 +85,12 @@ export default function Composer(p: Props) {
     )
 
   return (
-    <div style={S.composerMid} onDragOver={p.onDragOver} onDragLeave={p.onDragLeave} onDrop={p.onDrop}>
+    // Drag-and-drop is a pointer-only shortcut layered over this card; the
+    // keyboard path is the role="button" drop tile above, which opens the same
+    // file picker on Enter/Space. `presentation` marks the drop surface as
+    // layout rather than a control — the card's real inputs and buttons below
+    // keep their own semantics.
+    <div style={S.composerMid} role="presentation" onDragOver={p.onDragOver} onDragLeave={p.onDragLeave} onDrop={p.onDrop}>
       <div style={S.card}>
         <input
           ref={inputRef}
@@ -120,7 +128,10 @@ export default function Composer(p: Props) {
           {subLine}
           {staged.length ? <button style={S.clearLink} onClick={p.clearStaged}>{i18nT('apps.designCritique.composer.clear_all')}</button> : null}
         </p>
-        {err ? <div style={{ fontSize: '12.5px', color: 'var(--error, #e5484d)', textAlign: 'center' }}>{err}</div> : null}
+        {hint ? <div style={{ fontSize: '12.5px', color: 'var(--warn)', textAlign: 'center' }}>{hint}</div> : null}
+        {/* No hand-off: the staged screens, the pasted link and the brief in this
+            composer are unsaved until a critique starts. */}
+        <ErrorNotice message={err} />
         {middle}
         {/* Decorative separator between the drop zone and the link field. A lone
             connector word ("OR") cannot be translated in isolation

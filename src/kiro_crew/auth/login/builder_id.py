@@ -45,6 +45,29 @@ class BuilderIdAuthError(Exception):
     """Builder ID / IdC SSO-OIDC login failed."""
 
 
+async def _parse_json(resp: aiohttp.ClientResponse, step: str) -> dict:
+    """Decode a 200 body into a dict, or raise BuilderIdAuthError.
+
+    Every parsing failure — undecodable body, non-object JSON — must surface as
+    the flow's own error type: anything else escapes the API handler as an
+    uncoded HTTP 500.
+    """
+    try:
+        data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, ValueError) as err:
+        raise BuilderIdAuthError(f"{step} returned an undecodable body") from err
+    if not isinstance(data, dict):
+        raise BuilderIdAuthError(f"{step} returned a non-object body")
+    return data
+
+
+def _require_str(data: dict, key: str, step: str) -> str:
+    value = data.get(key)
+    if not isinstance(value, str) or not value:
+        raise BuilderIdAuthError(f"{step} response is missing {key!r}")
+    return value
+
+
 @dataclass
 class RegisteredClient:
     client_id: str
@@ -73,8 +96,11 @@ async def register_client(region: str, *, session: aiohttp.ClientSession) -> Reg
         if resp.status not in (200, 201):
             body = await resp.text()
             raise BuilderIdAuthError(f"RegisterClient failed: HTTP {resp.status} {body}")
-        data = await resp.json()
-    return RegisteredClient(client_id=data["clientId"], client_secret=data["clientSecret"])
+        data = await _parse_json(resp, "RegisterClient")
+    return RegisteredClient(
+        client_id=_require_str(data, "clientId", "RegisterClient"),
+        client_secret=_require_str(data, "clientSecret", "RegisterClient"),
+    )
 
 
 async def start_device_authorization(
@@ -94,15 +120,65 @@ async def start_device_authorization(
         if resp.status != 200:
             body = await resp.text()
             raise BuilderIdAuthError(f"StartDeviceAuthorization failed: HTTP {resp.status} {body}")
-        data = await resp.json()
+        data = await _parse_json(resp, "StartDeviceAuthorization")
+    try:
+        expires_in = int(data.get("expiresIn", 600))
+        interval = float(data.get("interval", 5))
+    except (TypeError, ValueError) as err:
+        raise BuilderIdAuthError("StartDeviceAuthorization returned non-numeric timing") from err
     return DeviceAuthorization(
-        device_code=data["deviceCode"],
-        user_code=data["userCode"],
-        verification_uri=data["verificationUri"],
-        verification_uri_complete=data["verificationUriComplete"],
-        expires_at=datetime.now(timezone.utc) + timedelta(seconds=int(data.get("expiresIn", 600))),
-        interval_secs=float(data.get("interval", 5)),
+        device_code=_require_str(data, "deviceCode", "StartDeviceAuthorization"),
+        user_code=_require_str(data, "userCode", "StartDeviceAuthorization"),
+        verification_uri=_require_str(data, "verificationUri", "StartDeviceAuthorization"),
+        verification_uri_complete=_require_str(
+            data, "verificationUriComplete", "StartDeviceAuthorization"
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=expires_in),
+        interval_secs=interval,
     )
+
+
+async def poll_token_once(
+    client: RegisteredClient,
+    auth: DeviceAuthorization,
+    *,
+    region: str,
+    identity: str = "builder_id",
+    provider: str = "BuilderId",
+    session: aiohttp.ClientSession,
+) -> KasToken | None:
+    """One non-blocking poll of the token endpoint.
+
+    Returns the token when the user has approved, ``None`` while approval is still
+    pending (``authorization_pending`` / ``slow_down`` — the caller owns the cadence,
+    so slow_down is just "not yet" here), and raises BuilderIdAuthError for
+    ``expired_token`` or any other terminal rejection.
+    """
+    url = f"{oidc_url(region)}/token"
+    payload = {
+        "clientId": client.client_id,
+        "clientSecret": client.client_secret,
+        "grantType": _DEVICE_GRANT,
+        "deviceCode": auth.device_code,
+    }
+    async with session.post(url, json=payload, headers=_HEADERS) as resp:
+        try:
+            data = await resp.json(content_type=None)
+        except (aiohttp.ClientError, ValueError):
+            # Malformed/empty body (e.g. a proxy or LB error page during an
+            # outage): "not yet", mirroring the social poll's guard — the
+            # flow's own expiry bounds how long a caller retries.
+            return None
+        if resp.status == 200:
+            if not isinstance(data, dict):
+                raise BuilderIdAuthError("CreateToken returned a non-object body")
+            return _token_from_create(data, client, region, identity, provider)
+        err = data.get("error", "") if isinstance(data, dict) else ""
+    if err in ("authorization_pending", "slow_down"):
+        return None
+    if err == "expired_token":
+        raise BuilderIdAuthError("device code expired before approval")
+    raise BuilderIdAuthError(f"token poll failed: {err or 'unknown error'}")
 
 
 async def poll_token(
@@ -145,7 +221,10 @@ def _token_from_create(
     access_token = data.get("accessToken")
     if not access_token:
         raise BuilderIdAuthError("CreateToken returned no access token")
-    expires_in = int(data.get("expiresIn") or 3600)
+    try:
+        expires_in = int(data.get("expiresIn") or 3600)
+    except (TypeError, ValueError) as err:
+        raise BuilderIdAuthError("CreateToken returned a non-numeric expiry") from err
     return KasToken(
         access_token=access_token,
         expires_at=datetime.now(timezone.utc) + timedelta(seconds=expires_in),

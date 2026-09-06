@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import random
 from pathlib import Path
@@ -24,6 +25,7 @@ from kiro_crew.acp.prompt_blocks import (
     MAX_IMAGE_BYTES,
     MAX_IMAGE_EDGE_PX,
     build_prompt_blocks,
+    summarize_prompt_structure,
 )
 
 # Smallest valid 1x1 PNG.
@@ -816,4 +818,236 @@ class TestImageEncodedBudget:
         gives up and hands back a path instead."""
         p = _noise_image(tmp_path, 1000, 1000)
         blocks = build_prompt_blocks(f"see {p}", max_image_b64_bytes=64)
+        assert [b["type"] for b in blocks] == ["text"]
+
+
+class TestSummarizePromptStructure:
+    """Content-free outbound-request STRUCTURE diagnostics (issue #6022).
+
+    The summary lets an operator tell a stale/invalid model id apart from a
+    structurally malformed payload the next time a turn is rejected as
+    "Improperly formed request" -- WITHOUT ever recording message content, so
+    it is safe to log even though the kiro-cli data dir holds SSO tokens.
+    """
+
+    def test_counts_text_and_image_blocks(self):
+        blocks = [
+            {"type": "text", "text": "hello"},
+            {"type": "image", "data": "x", "mimeType": "image/png"},
+            {"type": "image", "data": "y", "mimeType": "image/png"},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["block_count"] == 3
+        assert out["type_counts"]["text"] == 1
+        assert out["type_counts"]["image"] == 2
+
+    def test_counts_empty_text_blocks(self):
+        blocks = [
+            {"type": "text", "text": "real content"},
+            {"type": "text", "text": "   "},
+            {"type": "text", "text": ""},
+            {"type": "text", "text": "\n\t"},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["block_count"] == 4
+        # Three of the four text blocks are blank/whitespace-only.
+        assert out["empty_text_blocks"] == 3
+
+    def test_text_block_missing_text_key_counts_as_empty(self):
+        """A ``{"type": "text"}`` with no ``text`` key at all is as
+        structurally suspect as one whose ``text`` is a blank string, so it
+        folds into the empty count alongside present-but-blank text. This is
+        exactly the malformed-payload signal the diagnostic exists to surface.
+        """
+        blocks = [
+            {"type": "text", "text": "real content"},
+            {"type": "text"},  # no text key at all
+            {"type": "text", "text": None},  # present but not a string
+            {"type": "text", "text": "   "},  # present but blank
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["block_count"] == 4
+        assert out["type_counts"]["text"] == 4
+        # The missing key, the non-string, and the blank string all count.
+        assert out["empty_text_blocks"] == 3
+
+    def test_reports_tool_use_and_tool_result_imbalance(self):
+        """A tool_result with no matching tool_use is the classic malformed
+        transcript; the two top-level counts expose the imbalance directly."""
+        blocks = [
+            {"type": "tool_use", "id": "1"},
+            {"type": "tool_use", "id": "2"},
+            {"type": "tool_result", "tool_use_id": "1"},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["tool_use"] == 2
+        assert out["tool_result"] == 1
+        assert out["tool_use"] != out["tool_result"]
+        assert out["type_counts"]["tool_use"] == 2
+        assert out["type_counts"]["tool_result"] == 1
+
+    def test_reports_total_byte_size(self):
+        blocks = [{"type": "text", "text": "hello world"}]
+        out = summarize_prompt_structure(blocks)
+        assert out["total_bytes"] == len(json.dumps(blocks))
+        assert out["total_bytes"] > 0
+
+    def test_summary_contains_no_message_content(self):
+        """The #6022 hard requirement: a content sentinel placed in a block's
+        text must not appear anywhere in repr() of the summary."""
+        sentinel = "SENTINEL_SECRET_TOKEN_ghp_deadbeef"
+        blocks = [
+            {"type": "text", "text": f"please look at {sentinel} now"},
+            {"type": "image", "data": sentinel, "mimeType": "image/png"},
+            {"type": "tool_use", "id": sentinel, "input": {"arg": sentinel}},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert sentinel not in repr(out)
+        # And the redaction did not cost the shape: still three blocks.
+        assert out["block_count"] == 3
+
+    def test_unknown_block_types_fold_into_other(self):
+        blocks = [
+            {"type": "text", "text": "x"},
+            {"type": "audio", "data": "z"},
+            {"type": "resource_link", "uri": "file:///x"},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["type_counts"]["text"] == 1
+        assert out["type_counts"]["other"] == 2
+
+    def test_malformed_block_list_does_not_raise(self):
+        """A diagnostics helper must never break a live turn: odd inputs yield
+        a partial/minimal summary instead of propagating an exception."""
+        for bad in (
+            [{"nonsense": 1}, None],
+            "not a list at all",
+            None,
+            42,
+            [None, None, None],
+            [{"type": "text"}],  # text key missing
+        ):
+            out = summarize_prompt_structure(bad)
+            assert isinstance(out, dict)
+            assert "block_count" in out
+            assert "type_counts" in out
+            assert "total_bytes" in out
+
+    def test_unserializable_content_still_yields_counts(self):
+        """Content that json.dumps cannot serialize must not sink the summary:
+        structural counts survive and total_bytes reports -1 (unknown)."""
+
+        class _Unserializable:
+            pass
+
+        blocks = [
+            {"type": "text", "text": "ok"},
+            {"type": "image", "data": _Unserializable()},
+        ]
+        out = summarize_prompt_structure(blocks)
+        assert out["block_count"] == 2
+        assert out["type_counts"]["text"] == 1
+        assert out["type_counts"]["image"] == 1
+        # default=str is applied, so this actually serializes; but if a type
+        # ever defeats even that, total_bytes falls back to -1 rather than
+        # raising. Assert the summary is coherent either way.
+        assert isinstance(out["total_bytes"], int)
+
+    def test_empty_block_list(self):
+        out = summarize_prompt_structure([])
+        assert out["block_count"] == 0
+        assert out["type_counts"] == {}
+        assert out["empty_text_blocks"] == 0
+        assert out["tool_use"] == 0
+        assert out["tool_result"] == 0
+        assert out["total_bytes"] == len(json.dumps([]))
+
+    def test_non_list_argument_reports_coherent_size(self):
+        """A non-list/tuple argument normalises to an empty block list, and
+        ``total_bytes`` measures THAT normalised list -- not the raw argument.
+        So the size stays coherent with the counts (``block_count: 0`` reads as
+        an empty ``[]``) instead of "0 blocks, N bytes" describing a payload the
+        counts claim is empty. This is exactly the malformed-argument path the
+        diagnostic exists to serve."""
+        empty_bytes = len(json.dumps([]))
+        for bad in ("not a list at all", {"type": "text", "text": "x"}, 42, None):
+            out = summarize_prompt_structure(bad)
+            assert out["block_count"] == 0
+            assert out["total_bytes"] == empty_bytes
+
+
+class TestLinkedAncestorGate:
+    """On Windows, a candidate beneath a linked ANCESTOR must be refused
+    BEFORE the first filesystem probe -- ``is_file()`` resolves every
+    ancestor, so the probe itself would traverse the link and open the SMB
+    connection the lexical UNC screen exists to prevent (#5962).
+
+    NOTE: under the module-local os patch, ``_PATH_RE`` keeps the grammar
+    chosen at import time, so candidates here stay host-native; the Windows
+    CI shard exercises real backslash shapes via ``tmp_path`` (see
+    ``test_natively_produced_path_is_inlined_on_this_host``)."""
+
+    def _windows(self, monkeypatch):
+        import types
+
+        # Patch ONLY prompt_blocks' view of os (its sole runtime use is the
+        # two gates' os.name checks; _PATH_RE was chosen at import time) --
+        # patching the global os.name would make pathlib dispatch WindowsPath
+        # everywhere on a POSIX test host.
+        monkeypatch.setattr(prompt_blocks, "os", types.SimpleNamespace(name="nt"))
+
+    def test_linked_ancestor_candidate_is_refused_before_any_probe(self, tmp_path, monkeypatch):
+        """Ordering IS the property: the leaf probe is wired to explode, so a
+        regression that probes first fails loudly instead of silently."""
+        p = _png(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", lambda _p: str(tmp_path))
+
+        def _boom(self):  # type: ignore[no-untyped-def]  # pragma: no cover
+            raise AssertionError("is_file ran before the ancestor walk")
+
+        monkeypatch.setattr(Path, "is_file", _boom)
+        blocks = build_prompt_blocks(f"see {p}")
+        # The candidate is skipped, not inlined; the text keeps the path so
+        # the turn still carries a usable reference.
+        assert [b["type"] for b in blocks] == ["text"]
+        assert str(p) in blocks[0]["text"]
+
+    def test_bypassing_the_guard_restores_the_probe(self, tmp_path, monkeypatch):
+        """Mutation check: with the walk reporting no link, the same candidate
+        is probed and inlined again -- so the refusal above is attributable to
+        the guard, not to some other screen."""
+        p = _png(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", lambda _p: None)
+        blocks = build_prompt_blocks(f"see {p}")
+        assert [b["type"] for b in blocks] == ["text", "image"]
+
+    def test_the_walk_is_not_consulted_on_posix(self, tmp_path, monkeypatch):
+        """macOS /tmp and /var are symlinks to /private/*; an unconditional
+        walk would refuse every image staged in a temp dir there."""
+        if os.name == "nt":
+            pytest.skip("gate is active on Windows by design")
+
+        def _boom(_p):  # pragma: no cover
+            raise AssertionError("ancestor walk ran on POSIX")
+
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", _boom)
+        p = _png(tmp_path)
+        blocks = build_prompt_blocks(f"see {p}")
+        assert [b["type"] for b in blocks] == ["text", "image"]
+
+    def test_a_leaf_link_is_refused_before_the_probe(self, tmp_path, monkeypatch):
+        """The walk deliberately excludes the leaf, so the leaf gets its own
+        junction-aware check -- is_file() FOLLOWS a final-component link."""
+        p = _png(tmp_path)
+        self._windows(monkeypatch)
+        monkeypatch.setattr(prompt_blocks, "first_linked_ancestor", lambda _p: None)
+        monkeypatch.setattr(prompt_blocks, "is_link_or_junction", lambda _p: True)
+
+        def _boom(self):  # type: ignore[no-untyped-def]  # pragma: no cover
+            raise AssertionError("is_file ran before the leaf link check")
+
+        monkeypatch.setattr(Path, "is_file", _boom)
+        blocks = build_prompt_blocks(f"see {p}")
         assert [b["type"] for b in blocks] == ["text"]

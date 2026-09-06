@@ -43,7 +43,7 @@ The bulk stub action consults whichever of the two the global sharing switch mak
 
 ## Session-bound by construction, which is not the same as "ours"
 
-The `disqualified` reason `first_party_session_scoped` names a server that resolves the calling session from its own PROCESS — an env var, a pid walk — so one backend can only ever serve one session correctly. It is decided by which servers actually consume the injected caller block, not by matching a name against Kiro Crew's managed set: keying it on authorship once disqualified `kirocrew-core` — which advertised the extension and consumed the block from the start — for a property only its unadopted siblings had. All four managed servers now advertise and consume the block (`kirocrew-core` from the start, `kirocrew-cron` since #4622's fix, `kirocrew-computer` and `kirocrew-dashboard` since #4659). Advertising is necessary but not sufficient for the shareable classification: `kirocrew-computer` stays session-bound deliberately, because a caller the gateway cannot name proceeds under `unresolved:<pid>` and unnamed co-tenants on a pooled backend would share that one snapshot namespace (#5322) — see `_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD` in `mcp_discovery.py`. The classification stays per-server because the next managed server starts unadopted, exactly as these did.
+The `disqualified` reason `first_party_session_scoped` names a server that resolves the calling session from its own PROCESS — an env var, a pid walk — so one backend can only ever serve one session correctly. It is decided by which servers actually consume the injected caller block, not by matching a name against Kiro Crew's managed set: keying it on authorship once disqualified `kirocrew-core` — which advertised the extension and consumed the block from the start — for a property only its unadopted siblings had. All four managed servers now advertise and consume the block (`kirocrew-core` from the start, `kirocrew-cron` since #4622's fix, `kirocrew-computer` and `kirocrew-dashboard` since #4659). Advertising is necessary but not sufficient for the shareable classification: `kirocrew-computer` stays session-bound deliberately, because a caller the gateway cannot name proceeds under `unresolved:<pid>` — #5322 gave each CONNECTION its own namespace there, but this classification is what `seed.py` turns into a config write and an ADOPTED pre-nonce daemon injects no nonce, so promotion waits on a negotiated guarantee rather than on the nonce alone. See `_MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD` in `mcp_discovery.py`. The classification stays per-server because the next managed server starts unadopted, exactly as these did.
 
 `mcp_discovery.managed_server_is_session_bound` answers from a module-level set, `_MANAGED_SERVERS_CALLER_AWARE`, and deliberately imports nothing: the assessment must answer WITHOUT a handshake (the probe cannot spawn on every host — Windows, macOS >= 26 — and has not run at all before the first probe cycle), and it is consulted on every render, so importing a server module to read its `ADVERTISE_CALLER_IDENTITY` would execute package code from an editable checkout on a path the sandbox never confines. `test/test_mcp_managed_caller_identity.py::test_the_classification_reads_no_module_at_import_time` pins that refusal.
 
@@ -166,7 +166,7 @@ not behaviour a reader can observe now.
 Three properties, each chosen so the operator is not surprised:
 
 - **At start, never mid-run.** Nothing changes under a live session, so the failure this feature exists to prevent — a chat losing a server's tools because its backend was recycled — cannot happen as a side effect of seeding. No live re-apply path is needed either: `SessionManager.refresh_defaults` deliberately does not retrofit running sessions.
-- **Written into `mcp_gateway.stub_servers`, not acted on implicitly.** The MCP Management page renders that key, so materialising the verdict there is what makes the row's toggle show the true state. The operator sees the decision in a file they own. A gateway that routed differently from what the page claimed would be the dishonest alternative.
+- **Written into the config, not acted on implicitly.** The MCP Management page renders the resolved stub set, so materialising the verdict there is what makes the row's toggle show the true state. The operator sees the decision in a file they own. A gateway that routed differently from what the page claimed would be the dishonest alternative. The decision lands in `mcp_gateway.stub_overrides` — the roster in `mcp_gateway.stub_servers` belongs to whoever ships it, and the page resolves the two together.
 - **Once per server.** After the first seed the config is the operator's; a later start that finds the same recommendation must not undo their choice.
 
 Seeding never turns the global `mcp_gateway.enabled` sharing switch on by itself. A recommendation to share is reported in `SeedPlan.wants_share` and left for a separate decision, because flipping that switch changes topology for every stubbed server, including ones stubbed for unrelated reasons.
@@ -184,7 +184,7 @@ That split is also the export contract. The telemetry layer requires low-cardina
 | `observed_hazard` | refuted | Ledger entry; detail is the hazard code. **One of only two durable grounds for refusing to share, because it happened rather than being inferred.** |
 | `not_stdio` | disqualified | No stdio pipe — out of scope, not unsafe. **The other durable ground, and the only remaining `disqualified` code.** |
 | `handshake_not_reproducible` | note | Pre-flight saw a divergent replayed surface (capabilities, protocol version, `serverInfo` shape, or the tool list). Reported and gates nothing: see below. |
-| `session_bound_by_construction` | disqualified | A managed server that resolves its caller from its own process rather than the injected caller block -- or that consumes the block yet is deliberately withheld from the shareable classification. Kept gating because `mcp_cron._check_cron_job_ownership` treats a falsy session key as *allow*, so a pooled backend reading EMPTY skips the ownership check rather than merely losing a feature -- and no routing-shaped hazard code would ever record it. Current producer: `kirocrew-computer` (advertises, but unnamed co-tenants share one `unresolved:<pid>` snapshot namespace, #5322). |
+| `session_bound_by_construction` | disqualified | A managed server that resolves its caller from its own process rather than the injected caller block -- or that consumes the block yet is deliberately withheld from the shareable classification. Kept gating because `mcp_cron._check_cron_job_ownership` treats a falsy session key as *allow*, so a pooled backend reading EMPTY skips the ownership check rather than merely losing a feature -- and no routing-shaped hazard code would ever record it. Current producer: `kirocrew-computer` (advertises; #5322 gave its unnamed co-tenants per-connection namespaces on a current gateway, but an adopted pre-nonce daemon injects none). |
 | `rotating_secret_env` | note | Declares an env name excluded from the pool key. Detail is the name. Not emitted for a name in `mcp_gateway.pool_identity_env`, which IS in the pool key. |
 | `degrades_when_shared` | note | `logging`; detail is `logging_level`. |
 | `not_probed` | unknown | No handshake was observed. |
@@ -242,10 +242,11 @@ failure, and it is the one case the retreat cannot backstop: both hazard codes
 describe frames that could not be routed, so serving the wrong session's data
 produces no record. The producers have narrowed as managed servers adopted the
 caller block (#4622, #4659); today the code has one deliberate producer --
-`kirocrew-computer`, which advertises and consumes the block but whose UNNAMED
-co-tenants would share one `unresolved:<pid>` snapshot namespace on a pooled
-backend (#5322) -- and it remains the conservative default for the next managed
-server, which starts unadopted exactly as the others did.
+`kirocrew-computer`, which advertises and consumes the block, and whose UNNAMED
+co-tenants #5322 separated per CONNECTION on a current gateway but not on a
+pre-nonce daemon `manager.py` adopted across an upgrade -- and it remains the
+conservative default for the next managed server, which starts unadopted exactly
+as the others did.
 
 `*.listChanged` is deliberately absent from all of the above: those notifications
 are global broadcasts (`backend._GLOBAL_BROADCAST_NOTIFICATIONS`) and are safe to

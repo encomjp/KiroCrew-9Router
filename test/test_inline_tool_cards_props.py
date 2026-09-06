@@ -10,18 +10,17 @@ unittest.mock.patch instead.
 
 from __future__ import annotations
 
-import platform
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from kiro_crew.dashboard.chat import _flush_segment, _prepare_messages
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import ConversationLog
+from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 # ── Helpers ──
 
@@ -47,6 +46,47 @@ def _make_state_no_fixture(**kwargs):
         **kwargs,
     )
     return state, tmp_dir
+
+
+class _SegmentSlotStub:
+    """Small in-memory seam for properties that exercise only ``_flush_segment``.
+
+    Building ``DashboardState`` and two temporary directories inside every
+    Hypothesis example made the property measure filesystem/antivirus startup,
+    not segment ordering.  The production helper's contract at this seam is
+    only the message window, pending-chunk release, append, variants, and key.
+    Keeping those concrete (rather than a ``MagicMock``) means a missing call or
+    a wrong mutation still fails the property.
+    """
+
+    def __init__(self) -> None:
+        self.key = "prop1"
+        self.messages: list[dict] = []
+        self._pending_variants: list[dict] = []
+        self.pending_chunks_released = False
+
+    def append(
+        self,
+        role: str,
+        content: str,
+        cls: str = "",
+        *,
+        broadcast: bool = True,
+    ) -> dict:
+        message = {"role": role, "content": content, "cls": cls, "ts": ""}
+        self.messages.append(message)
+        return message
+
+    def release_pending_chunks(self) -> None:
+        self.pending_chunks_released = True
+
+
+class _BroadcastStateStub:
+    def __init__(self) -> None:
+        self.broadcasts: list[tuple[str, dict]] = []
+
+    def broadcast_ws(self, event_type: str, data: dict) -> None:
+        self.broadcasts.append((event_type, data))
 
 
 # Strategy: non-empty printable text (no control chars that break redaction)
@@ -77,66 +117,57 @@ class TestProperty1SegmentFlushOnInterrupt:
     Validates: Requirements 1.1, 1.2, 1.4
     """
 
-    @pytest.mark.skipif(platform.system() == "Darwin", reason="Hypothesis flaky on macOS CI (timing-sensitive)")
     @given(
         text_chunks=st.lists(_text_st, min_size=1, max_size=5),
         tool_name=_tool_name_st,
     )
     @settings(deadline=2000)
-    @pytest.mark.asyncio
-    async def test_flush_segment_broadcasts_before_tool(self, text_chunks, tool_name):
+    def test_flush_segment_broadcasts_before_tool(self, text_chunks, tool_name):
         """**Validates: Requirements 1.1, 1.2**
 
         Generate random text chunks followed by a tool call.  Verify
         _flush_segment broadcasts chat_segment and clears chunks from
         the slot.
         """
-        with tempfile.TemporaryDirectory() as config_tmp:
-            with patch("kiro_crew.dashboard.state.config_dir", return_value=Path(config_tmp)):
-                state, tmp_dir = _make_state_no_fixture()
-                try:
-                    slot = state.get_or_create_slot("prop1")
+        state = _BroadcastStateStub()
+        slot = _SegmentSlotStub()
 
-                    # Accumulate text chunks in the slot
-                    assistant_text = ""
-                    for chunk in text_chunks:
-                        slot.append("chunk", chunk, "chunk")
-                        assistant_text += chunk
+        # Accumulate text chunks in the slot.
+        assistant_text = ""
+        for chunk in text_chunks:
+            slot.append("chunk", chunk, "chunk")
+            assistant_text += chunk
 
-                    # Record broadcasts
-                    broadcasts: list[tuple[str, dict]] = []
-                    state.broadcast_ws = lambda t, d: broadcasts.append((t, d))
+        # Flush segment (simulates what _run_chat does on EVENT_TOOL_CALL).
+        assert assistant_text != ""
+        expected_text, _ = redact_exfiltration_urls(assistant_text)
+        expected_text, _ = redact_credentials(expected_text)
+        _flush_segment(state, slot, assistant_text)  # type: ignore[arg-type]
+        assistant_text = ""
 
-                    # Flush segment (simulates what _run_chat does on EVENT_TOOL_CALL)
-                    assert assistant_text != ""
-                    _flush_segment(state, slot, assistant_text)
-                    assistant_text = ""
+        # Broadcast the tool_call after flush.
+        state.broadcast_ws("tool_call", {"slot": slot.key, "tool": tool_name, "kind": "read"})
 
-                    # Broadcast the tool_call after flush
-                    state.broadcast_ws(
-                        "tool_call", {"slot": slot.key, "tool": tool_name, "kind": "read"}
-                    )
+        # Verify: chat_segment comes before tool_call.
+        types = [event_type for event_type, _data in state.broadcasts]
+        assert "chat_segment" in types, "chat_segment must be broadcast"
+        assert "tool_call" in types, "tool_call must be broadcast"
+        seg_idx = types.index("chat_segment")
+        tool_idx = types.index("tool_call")
+        assert seg_idx < tool_idx, "chat_segment must precede tool_call"
 
-                    # Verify: chat_segment comes before tool_call
-                    types = [b[0] for b in broadcasts]
-                    assert "chat_segment" in types, "chat_segment must be broadcast"
-                    assert "tool_call" in types, "tool_call must be broadcast"
-                    seg_idx = types.index("chat_segment")
-                    tool_idx = types.index("tool_call")
-                    assert seg_idx < tool_idx, "chat_segment must precede tool_call"
+        # Verify: assistant_text is reset.
+        assert assistant_text == ""
 
-                    # Verify: assistant_text is reset
-                    assert assistant_text == ""
+        # Verify: both representations of pending chunks were released.
+        chunk_count = sum(1 for m in slot.messages if m.get("role") == "chunk")
+        assert chunk_count == 0, "chunks must be removed after flush"
+        assert slot.pending_chunks_released
 
-                    # Verify: no chunk messages remain in slot
-                    chunk_count = sum(1 for m in slot.messages if m.get("role") == "chunk")
-                    assert chunk_count == 0, "chunks must be removed after flush"
-
-                    # Verify: an assistant message was persisted
-                    assistant_msgs = [m for m in slot.messages if m.get("role") == "assistant"]
-                    assert len(assistant_msgs) >= 1, "flushed text must be persisted as assistant"
-                finally:
-                    tmp_dir.cleanup()
+        # Verify: an assistant message was persisted with the complete segment.
+        assistant_msgs = [m for m in slot.messages if m.get("role") == "assistant"]
+        assert len(assistant_msgs) == 1, "flushed text must be persisted once"
+        assert assistant_msgs[0]["content"] == expected_text
 
     @given(text_chunks=st.lists(_text_st, min_size=1, max_size=5))
     @settings(deadline=None)
@@ -342,7 +373,7 @@ class TestProperty7PrepareMessagesChunkCollapse:
         for chunk in trailing_chunks:
             messages.append({"role": "chunk", "content": chunk, "cls": "chunk"})
 
-        result = _prepare_messages(messages, running=True)
+        result = _prepare_messages(messages, running=True, live_child="")
 
         # Count roles in output
         result_roles = [m.get("role") for m in result]

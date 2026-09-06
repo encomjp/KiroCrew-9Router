@@ -15,12 +15,14 @@
  * LibraryPage, so the two pages cannot drift. Only view-local state (search
  * query, category pick, sort, action loading) lives here.
  */
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Link, Navigate, useLocation, useNavigate } from 'react-router-dom'
-import { AlertTriangle, CheckCircle2, ShoppingBag, X } from 'lucide-react'
-import { EmptyState, PageHeader, SearchInput } from '../../components/ui'
+import { AlertTriangle, CheckCircle2, RefreshCw, ShoppingBag, X } from 'lucide-react'
+import { EmptyState, IconButton, PageHeader, SearchInput } from '../../components/ui'
 import SimpleSelect from '../../components/SimpleSelect'
-import UnderlineTabs, { type UnderlineTab } from '../../components/UnderlineTabs'
+import { Tabs, TabsContent, TabsCount, TabsList, TabsTrigger } from '../../components/ui/tabs'
+import { TABS_RAIL_ROW_CLASS } from '../../components/ui/tabsPill'
 import FeaturedSpotlight from '../../components/appstore/FeaturedSpotlight'
 import CategoryRail from '../../components/appstore/CategoryRail'
 import AppListRow from '../../components/appstore/AppListRow'
@@ -28,6 +30,7 @@ import TrustAppModal, { isTrustDeniedError } from '../../components/appstore/Tru
 import SourcesPopover from '../../components/appstore/SourcesPopover'
 import { categoryFor, type Category } from '../../components/appstore/categories'
 import type { RegistryApp } from '../../components/appstore/types'
+import { api } from '../../api/client'
 import { i18nT } from '../../i18n/t'
 import { compareText } from '../../i18n/format'
 import ErrorNotice from '../../components/ErrorNotice'
@@ -184,6 +187,83 @@ function DiscoverPageBody() {
     rowUpdatesInPlace: true,
   })
 
+  // Manual store refresh. This exists because the two cache layers degrade
+  // silently -- a failed catalog fetch leaves the store on the seed listing
+  // for up to an hour with nothing the user can do about it from the UI.
+  // Order matters: the POSTs drop the server's document caches (official
+  // documents AND the user's external registries -- both sources the store
+  // renders), then the invalidations rebuild both lists past their staleTime
+  // (same mechanism as TrustAppModal / RegistryManager; awaiting them holds
+  // the spinner until the refetches settle). allSettled, because one source
+  // being unreachable must not stop the refetch from repairing the other.
+  //
+  // The settled results are READ, not discarded: a failed refresh keeps
+  // serving the prior (stale or seed) listing, which looks identical to a
+  // successful one, so the outcome must reach the error banner or the user
+  // cannot tell them apart. TWO outcomes are observable here and the code
+  // claims only those: a REJECTED POST reports its own message, and a
+  // fulfilled registries response reporting per-source failures names them
+  // (the same branch RegistryManager runs on this response shape).
+  //
+  // A degraded OFFICIAL catalog is deliberately NOT claimed: the store POST
+  // only drops caches and never fetches (see handle_registry_refresh), so it
+  // resolves ok whatever the catalog's health, and the fetch it defers to
+  // serves the seed listing with a 200. Reporting that needs a signal on the
+  // follow-up GET, which is a server change and not this one.
+  //
+  // Reporting never skips the invalidations below -- the healthy source still
+  // gets its refetch.
+  const queryClient = useQueryClient()
+  const [refreshing, setRefreshing] = useState(false)
+  // The last banner text THIS handler wrote, so a later success clears its own
+  // stale error without erasing an unrelated one. `setError` is shared page
+  // state (useAppActions): SourcesPopover, runEnable and useAppUpdates all
+  // write it, and Update All's failure notice has no auto-dismiss -- so an
+  // unconditional clear here would silently drop the only report of a failed
+  // update the moment the user clicked the adjacent refresh.
+  const refreshErrorRef = useRef('')
+  const reportRefreshOutcome = (message: string) => {
+    const previous = refreshErrorRef.current
+    refreshErrorRef.current = message
+    if (message) setError(message)
+    // Clear only while the banner still shows what this handler put there.
+    else setError(prev => (prev === previous ? '' : prev))
+  }
+  const handleRefresh = async () => {
+    if (refreshing) return
+    setRefreshing(true)
+    try {
+      const [storeResult, registriesResult] = await Promise.allSettled([
+        api.refreshAppStore(),
+        api.refreshRegistries(),
+      ])
+      const rejection = [storeResult, registriesResult].find(
+        (r): r is PromiseRejectedResult => r.status === 'rejected',
+      )
+      if (rejection) {
+        reportRefreshOutcome(rejection.reason instanceof Error && rejection.reason.message
+          ? rejection.reason.message
+          : i18nT('components.registryManager.failed_to_refresh_registries'))
+      } else if (
+        registriesResult.status === 'fulfilled'
+        && registriesResult.value.ok === false
+        && registriesResult.value.failed && registriesResult.value.failed.length > 0
+      ) {
+        reportRefreshOutcome(
+          i18nT('components.registryManager.could_not_refresh_still_showing_last_synced',
+            { names: registriesResult.value.failed.join(', ') }))
+      } else {
+        reportRefreshOutcome('')
+      }
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['registry'] }),
+        queryClient.invalidateQueries({ queryKey: ['apps'] }),
+      ])
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   const filteredBrowse = useMemo(() => {
     const q = query.trim().toLowerCase()
     const list = browseApps.filter(a => {
@@ -250,6 +330,17 @@ function DiscoverPageBody() {
               aria-label={i18nT('pages.appsPage.search_apps')}
             />
           )}
+          {/* Manual store refresh — always visible (unlike search): the
+              degraded-catalog state it repairs also starves the Updates
+              worklist, whose update map derives from the same registry rows. */}
+          <IconButton
+            aria-label={i18nT('pages.appsPage.refresh_store')}
+            title={i18nT('pages.appsPage.refresh_store')}
+            onClick={handleRefresh}
+            disabled={refreshing}
+          >
+            <RefreshCw size={15} className={refreshing ? 'animate-spin' : undefined} />
+          </IconButton>
           <SourcesPopover
             open={sourcesOpen}
             onOpenChange={setSourcesOpen}
@@ -275,29 +366,34 @@ function DiscoverPageBody() {
             copy's line length past comfortable reading. Utility pages stay
             full-width; a content shelf follows store convention instead. */}
         <div className="max-w-[1200px] mx-auto">
-        {/* Sub-tabs (V1 mockup): Featured is the storefront, Updates the
-            pending-updates worklist. The repo's shared UnderlineTabs carries
-            the WAI-ARIA tabs contract (roving tabindex, arrow keys,
-            aria-selected) and hides the count at zero, so no badge noise when
+        {/* The Tabs root spans the rail and both panels, so they are one
+            tablist. The notices and the trust modal sitting between them are
+            ordinary children, not panel content. */}
+        <Tabs
+          value={tab}
+          onValueChange={v => switchTab(v as DiscoverTab)}
+          layoutId="discover-subtab"
+        >
+        {/* Sub-tabs: Featured is the storefront, Updates the pending-updates
+            worklist. Radix carries the WAI-ARIA tabs contract (roving tabindex,
+            arrow keys, aria-selected, and the trigger ⇄ panel linkage);
+            TabsCount hides the count at zero, so no badge noise when
             everything is current. */}
-        <div className="mb-4">
-          <UnderlineTabs<DiscoverTab>
-            tabs={[
-              { key: 'featured', label: i18nT('pages.discoverPage.tab_featured') },
-              {
-                key: 'updates',
-                label: i18nT('pages.discoverPage.tab_updates'),
-                count: updatables.length,
-                tooltip: updatables.length > 0
-                  ? i18nT('pages.discoverPage.updates_badge_label', { count: updatables.length })
-                  : undefined,
-              },
-            ] satisfies Array<UnderlineTab<DiscoverTab>>}
-            value={tab}
-            onChange={switchTab}
-            ariaLabel={i18nT('pages.discoverPage.title')}
-            layoutId="discover-subtab"
-          />
+        <div className={TABS_RAIL_ROW_CLASS}>
+          <TabsList aria-label={i18nT('pages.discoverPage.title')}>
+            <TabsTrigger value="featured">
+              <span>{i18nT('pages.discoverPage.tab_featured')}</span>
+            </TabsTrigger>
+            <TabsTrigger
+              value="updates"
+              title={updatables.length > 0
+                ? i18nT('pages.discoverPage.updates_badge_label', { count: updatables.length })
+                : undefined}
+            >
+              <span>{i18nT('pages.discoverPage.tab_updates')}</span>
+              <TabsCount value={updatables.length} />
+            </TabsTrigger>
+          </TabsList>
         </div>
         {/* Notifications. No hand-off on the error notice: the SourcesPopover's
             install-path input shares this page — navigating away would discard
@@ -337,8 +433,8 @@ function DiscoverPageBody() {
           onConfirm={trust.confirm}
         />
 
-        {tab === 'updates' ? (
-          /* Updates sub-page: the pending-updates worklist. This branch owns
+        <TabsContent value="updates">{
+          /* Updates sub-page: the pending-updates worklist. This panel owns
              the tab's frame (loading, the all-current empty state); the row
              list and its Update All header render through UpdatesList, driven
              by the shared useAppUpdates instance above. */
@@ -388,7 +484,9 @@ function DiscoverPageBody() {
               onUpdateAll={updateAll}
             />
           )
-        ) : loading ? (
+        }</TabsContent>
+        <TabsContent value="featured">{
+          loading ? (
           <div className="text-center py-12 text-muted text-sm">{i18nT('pages.appsPage.loading_apps')}</div>
         ) : browseApps.length === 0 ? (
           <EmptyState
@@ -552,7 +650,8 @@ function DiscoverPageBody() {
               </div>
             </div>
           </>
-        )}
+        )}</TabsContent>
+        </Tabs>
         </div>
       </div>
     </>

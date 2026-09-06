@@ -6,7 +6,7 @@
  * still activates) against a rendered ChatSidebar.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, fireEvent } from '@testing-library/react'
+import { render, fireEvent, waitFor, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { Provider } from 'react-redux'
 import { MemoryRouter } from 'react-router-dom'
@@ -23,21 +23,21 @@ vi.mock('framer-motion', async () => {
     'drag', 'dragConstraints', 'dragElastic', 'onAnimationComplete',
   ])
   const make = (tag: string) =>
-    React.forwardRef((props: any, ref: any) => {
-      const clean: any = {}
+    React.forwardRef((props: Record<string, unknown>, ref: React.Ref<unknown>) => {
+      const clean: Record<string, unknown> = {}
       for (const k of Object.keys(props)) {
         if (k === 'children') continue
         if (k === 'layoutId') { clean['data-layout-id'] = props[k]; continue }
         if (FRAMER_PROPS.has(k)) continue
         clean[k] = props[k]
       }
-      return React.createElement(tag, { ...clean, ref }, props.children)
+      return React.createElement(tag, { ...clean, ref }, props.children as React.ReactNode)
     })
   const motion = new Proxy({}, { get: (_t, tag: string) => make(tag) })
   return {
     motion,
-    AnimatePresence: ({ children }: any) => React.createElement(React.Fragment, null, children),
-    LayoutGroup: ({ children }: any) => React.createElement(React.Fragment, null, children),
+    AnimatePresence: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    LayoutGroup: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
   }
 })
 
@@ -78,8 +78,10 @@ Object.defineProperty(window, 'matchMedia', {
 })
 
 import ChatSidebar from '../pages/ChatSidebar'
+import type { RootState } from '../store'
+import type { ChatSlot } from '../types'
 
-function renderSidebar(slots: any[]) {
+function renderSidebar(slots: ChatSlot[]) {
   const store = createTestStore({
     dashboard: {
       status: {}, connected: true, slots, approvalMode: 'normal',
@@ -87,26 +89,27 @@ function renderSidebar(slots: any[]) {
       slotsLoaded: true,
       subagentRunning: {}, subagentDetails: {}, subagentText: {},
       sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-    } as any,
-    chat: { activeSlot: null, slotStatusDetail: {} } as any,
+    } as unknown as RootState['dashboard'],
+    chat: { activeSlot: null, slotStatusDetail: {} } as unknown as RootState['chat'],
   })
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
   qc.setQueryData(['chat-folders'], [])
-  const utils = render(
+  const view = (nextSlots: ChatSlot[]) => (
     <QueryClientProvider client={qc}>
       <Provider store={store}>
         <ThemeProvider>
           <MemoryRouter>
             <ChatSidebar
-              slots={slots} activeSlot={null} unreadSlots={[]}
+              slots={nextSlots} activeSlot={null} unreadSlots={[]}
               history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
             />
           </MemoryRouter>
         </ThemeProvider>
       </Provider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   )
-  return { ...utils, store }
+  const utils = render(view(slots))
+  return { ...utils, store, rerenderSlots: (nextSlots: ChatSlot[]) => utils.rerender(view(nextSlots)) }
 }
 
 const THREE = [
@@ -122,7 +125,10 @@ function row(key: string): HTMLElement {
   return el
 }
 
-beforeEach(() => localStorage.clear())
+beforeEach(() => {
+  localStorage.clear()
+  chatConfig.tagColumnsEnabled = false
+})
 afterEach(() => vi.clearAllMocks())
 
 describe('sessionRowNav', () => {
@@ -229,6 +235,80 @@ describe('chat sidebar — session list arrow navigation', () => {
     fireEvent.keyDown(row('k1'), { key: 'ArrowDown', altKey: true })
     expect(document.activeElement).toBe(row('k1'))
   })
+
+  it('persists the initial complete pinned order after authoritative slots load', async () => {
+    const pins = [
+      { key: 'k1', title: 'older', running: false, messages: 1, pinned: true, last_ts: '2026-01-01T00:00:00Z' },
+      { key: 'k2', title: 'newer', running: false, messages: 1, pinned: true, last_ts: '2026-02-01T00:00:00Z' },
+    ]
+    renderSidebar(pins)
+
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['k2', 'k1']))
+  })
+
+  it('seeds the baseline when pins arrive after an initially empty roster', async () => {
+    const { rerenderSlots } = renderSidebar([])
+    await waitFor(() => expect(localStorage.getItem('mc-pinned-session-order')).toBeNull())
+
+    rerenderSlots([
+      { key: 'k1', title: 'older', running: false, messages: 1, pinned: true, last_ts: '2026-01-01T00:00:00Z' },
+      { key: 'k2', title: 'newer', running: false, messages: 1, pinned: true, last_ts: '2026-02-01T00:00:00Z' },
+    ])
+
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['k2', 'k1']))
+  })
+
+  it('prunes remote unpins and appends later remote re-pins', async () => {
+    const a = { key: 'a', title: 'A', running: false, messages: 1, pinned: true, last_ts: '2026-03-01T00:00:00Z' }
+    const b = { key: 'b', title: 'B', running: false, messages: 1, pinned: true, last_ts: '2026-02-01T00:00:00Z' }
+    const c = { key: 'c', title: 'C', running: false, messages: 1, pinned: true, last_ts: '2026-01-01T00:00:00Z' }
+    localStorage.setItem('mc-pinned-session-order', JSON.stringify(['a', 'b', 'c']))
+    const { rerenderSlots } = renderSidebar([a, b, c])
+
+    rerenderSlots([a, c])
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['a', 'c']))
+
+    rerenderSlots([a, b, c])
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['a', 'c', 'b']))
+  })
+
+  it('does not write back a storage-originated membership reconciliation', async () => {
+    const a = { key: 'a', title: 'A', running: false, messages: 1, pinned: true, last_ts: '2026-03-01T00:00:00Z' }
+    const c = { key: 'c', title: 'C', running: false, messages: 1, pinned: true, last_ts: '2026-01-01T00:00:00Z' }
+    localStorage.setItem('mc-pinned-session-order', JSON.stringify(['a', 'c']))
+    renderSidebar([a, c])
+
+    await act(async () => {
+      localStorage.setItem('mc-pinned-session-order', JSON.stringify(['a', 'b', 'c']))
+      window.dispatchEvent(new StorageEvent('storage', { key: 'mc-pinned-session-order' }))
+      await Promise.resolve()
+    })
+
+    expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['a', 'b', 'c'])
+  })
+
+  it('reorders against the next rendered pin instead of a filtered-out peer', async () => {
+    const pins = [
+      { key: 'k1', title: 'keep first', running: false, messages: 1, pinned: true },
+      { key: 'k2', title: 'drop second', running: false, messages: 1, pinned: true },
+      { key: 'k3', title: 'keep third', running: false, messages: 1, pinned: true },
+    ]
+    localStorage.setItem('mc-pinned-session-order', JSON.stringify(['k1', 'k2', 'k3']))
+    const { findByText, getByPlaceholderText, queryByText } = renderSidebar(pins)
+    await findByText('drop second')
+
+    fireEvent.change(getByPlaceholderText(/search/i), { target: { value: 'keep' } })
+    await waitFor(() => expect(queryByText('drop second')).toBeNull())
+    fireEvent.keyDown(row('k1'), { key: 'ArrowDown', altKey: true })
+
+    expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['k2', 'k3', 'k1'])
+  })
 })
 
 /**
@@ -244,8 +324,8 @@ describe('chat sidebar — board column arrow navigation', () => {
   const boardColumns = [{ id: COL, name: 'Blocked', tag_ids: [TAG], mode: 'any', order: 0 }]
   const boardFolders = [{ id: FOLDER, name: 'CDF', order: 0, collapsed: false }]
   const boardSlots = [
-    { key: 'b1', title: 'in folder', running: false, messages: 1, tags: [TAG], folder_id: FOLDER },
-    { key: 'b2', title: 'at column root', running: false, messages: 1, tags: [TAG] },
+    { key: 'b1', title: 'in folder', running: false, messages: 1, tags: [TAG], folder_id: FOLDER, pinned: true },
+    { key: 'b2', title: 'at column root', running: false, messages: 1, tags: [TAG], pinned: true },
   ]
 
   function renderBoard() {
@@ -256,27 +336,29 @@ describe('chat sidebar — board column arrow navigation', () => {
         slotsLoaded: true,
         subagentRunning: {}, subagentDetails: {}, subagentText: {},
         sessionDefaultColor: null, sessionColorsMode: 'tint', sessionColorsPalette: 'horizon', sessionColorsIntensity: 'clear',
-      } as any,
-      chat: { activeSlot: null, slotStatusDetail: {} } as any,
+      } as unknown as RootState['dashboard'],
+      chat: { activeSlot: null, slotStatusDetail: {} } as unknown as RootState['chat'],
     })
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
     qc.setQueryData(['chat-tags'], boardTags)
     qc.setQueryData(['tag-columns'], boardColumns)
     qc.setQueryData(['chat-folders'], boardFolders)
-    return render(
+    const view = (slots: typeof boardSlots) => (
       <QueryClientProvider client={qc}>
         <Provider store={store}>
           <ThemeProvider>
             <MemoryRouter>
               <ChatSidebar
-                slots={boardSlots} activeSlot={null} unreadSlots={[]}
+                slots={slots} activeSlot={null} unreadSlots={[]}
                 history={[]} historyHasMore={false} defaultAgent="" installedAgents={[]}
               />
             </MemoryRouter>
           </ThemeProvider>
         </Provider>
-      </QueryClientProvider>,
+      </QueryClientProvider>
     )
+    const utils = render(view(boardSlots))
+    return { ...utils, rerenderSlots: (slots: typeof boardSlots) => utils.rerender(view(slots)) }
   }
 
   beforeEach(() => {
@@ -301,5 +383,29 @@ describe('chat sidebar — board column arrow navigation', () => {
     expect(rooted.dataset.sessionScope).toBe(COL)
     // …and the rove therefore reaches across the boundary in one step.
     expect(siblingSessionRow(foldered, 1)).toBe(rooted)
+  })
+
+  it('reconciles remote board membership after rank authority exists', async () => {
+    localStorage.setItem('mc-pinned-session-order', JSON.stringify(['b1', 'b2']))
+    const { rerenderSlots } = renderBoard()
+
+    rerenderSlots([boardSlots[0]])
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['b1']))
+
+    rerenderSlots(boardSlots)
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('mc-pinned-session-order')!))
+      .toEqual(['b1', 'b2']))
+  })
+
+  it('does not advertise or execute pinned ordering in a board projection', async () => {
+    const { findByText } = renderBoard()
+    await findByText('in folder')
+    const foldered = document.querySelector<HTMLElement>('[data-session-row="b1"]')!
+    expect(foldered.getAttribute('aria-keyshortcuts')).toBeNull()
+
+    fireEvent.keyDown(foldered, { key: 'ArrowDown', altKey: true })
+
+    expect(localStorage.getItem('mc-pinned-session-order')).toBeNull()
   })
 })

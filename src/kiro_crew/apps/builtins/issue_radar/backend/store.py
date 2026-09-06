@@ -8,8 +8,8 @@ used — auth is entirely delegated to the user's own ``gh`` CLI session.
 Layout::
 
     <data_dir>/config.json                          # connected repos, no secrets
-    <data_dir>/repos/{owner}__{repo}/issues-cache.json  # last-fetched open issues
-    <data_dir>/repos/{owner}__{repo}/members-cache.json # repo members (derived)
+    <data_dir>/repos/{owner}/{repo}/issues-cache.json   # last-fetched open issues
+    <data_dir>/repos/{owner}/{repo}/members-cache.json  # repo members (derived)
 
 ``root`` is accepted on every function (mirroring code_review_sage's
 ``store.py``) so tests can point at a tmp dir instead of the real app data dir.
@@ -71,13 +71,6 @@ def _config_lock(root: Path | None = None):
     with open(lock_path, "w") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             yield
-
-
-def repo_slug_dir_name(owner: str, repo: str) -> str:
-    # Use nested directories (owner/repo) so repos whose names contain "__"
-    # don't collide.  This helper remains for migration/test use; repo_data_dir
-    # is the canonical path builder.
-    return f"{owner}/{repo}"
 
 
 # ── provider-scoped storage ─────────────────────────────────────────────────
@@ -1048,8 +1041,28 @@ def read_ref_summary_cache(
 # what counts as "already on the issue", so suggestions must be recomputed).
 
 
-def issue_ai_cache_path(owner: str, repo: str, number: int, root: Path | None = None) -> Path:
-    return repo_data_dir(owner, repo, root) / f"issue-{int(number)}-ai.json"
+def issue_ai_cache_path(
+    owner: str, repo: str, number: int, root: Path | None = None, *, ui_language: str = ""
+) -> Path:
+    """Where one issue's AI triage result lives, PARTITIONED by output language.
+
+    The summary and each suggested label's `reason` are prose written in one
+    language, and the language can differ per-browser. One slot per issue would
+    therefore thrash: two browsers resolving different languages would each read
+    the other's entry as unusable, regenerate over it, and pay a model call on
+    every single open, so the cache would stop working for the install entirely.
+    A partition per language makes each browser's summary durable.
+
+    ``""`` -- no language known, which is every install that never configured one
+    -- keeps the ORIGINAL filename, so caches written before partitioning are
+    still found and no migration is needed.
+
+    The tag is safe in a filename by construction: it only ever arrives via
+    :func:`kiro_crew.context.normalize_ui_language_tag`, which admits nothing
+    outside a fixed set of shipped catalog names.
+    """
+    suffix = f"-{ui_language}" if ui_language else ""
+    return repo_data_dir(owner, repo, root) / f"issue-{int(number)}-ai{suffix}.json"
 
 
 def _cache_generated_at(data: dict, path: Path) -> str | None:
@@ -1073,7 +1086,8 @@ def _cache_generated_at(data: dict, path: Path) -> str | None:
 
 
 def write_issue_ai_cache(
-    owner: str, repo: str, number: int, payload: dict, *, root: Path | None = None
+    owner: str, repo: str, number: int, payload: dict, *,
+    root: Path | None = None, ui_language: str = "",
 ) -> None:
     """Cache one issue's AI triage result (``{summary, suggested_labels}``).
 
@@ -1081,19 +1095,17 @@ def write_issue_ai_cache(
     without it a cached card gives no hint whether it was written minutes or
     months ago.
 
-    ``ui_language`` (the BCP-47 tag the prose was generated under, ``""`` for
-    English-default installs) rides along because a cached result is only
-    servable for the language it was written in — the route compares it on
-    read and treats a mismatch as a miss, so a dashboard-language switch
-    regenerates instead of serving the old language."""
+    ``ui_language`` selects the partition to write (see
+    :func:`issue_ai_cache_path`); it is deliberately NOT also stored inside the
+    document, because the path already carries it and a second copy could only
+    ever disagree with it."""
     atomic_write(
-        issue_ai_cache_path(owner, repo, number, root),
+        issue_ai_cache_path(owner, repo, number, root, ui_language=ui_language),
         json.dumps(
             {
                 "owner": owner, "repo": repo, "number": int(number),
                 "summary": payload.get("summary", ""),
                 "suggested_labels": payload.get("suggested_labels", []),
-                "ui_language": str(payload.get("ui_language") or ""),
                 "generated_at": _now_iso(),
             },
             indent=2,
@@ -1101,13 +1113,17 @@ def write_issue_ai_cache(
     )
 
 
-def read_issue_ai_cache(owner: str, repo: str, number: int, root: Path | None = None) -> dict | None:
-    """Return ``{"summary", "suggested_labels", "ui_language", "generated_at"}``
-    for a cached issue, or None. Caches written before the stamp existed fall
-    back to the file's mtime (see _cache_generated_at); ones written before
-    ``ui_language`` existed read as ``""``, which matches the English-default
-    sentinel so legacy entries stay servable on unconfigured installs."""
-    path = issue_ai_cache_path(owner, repo, number, root)
+def read_issue_ai_cache(
+    owner: str, repo: str, number: int, root: Path | None = None, *, ui_language: str = ""
+) -> dict | None:
+    """Return ``{"summary", "suggested_labels", "generated_at"}``, or None.
+
+    Reads only the partition for ``ui_language``, so a summary written in another
+    language is a miss rather than something served with foreign prose -- and,
+    unlike a shared slot, is left intact for the browser that generated it.
+    Caches written before the ``generated_at`` stamp existed fall back to the
+    file's mtime (see _cache_generated_at)."""
+    path = issue_ai_cache_path(owner, repo, number, root, ui_language=ui_language)
     if not path.is_file():
         return None
     try:
@@ -1117,14 +1133,37 @@ def read_issue_ai_cache(owner: str, repo: str, number: int, root: Path | None = 
     return {
         "summary": data.get("summary", ""),
         "suggested_labels": data.get("suggested_labels", []),
-        "ui_language": str(data.get("ui_language") or ""),
         "generated_at": _cache_generated_at(data, path),
     }
 
 
 def delete_issue_ai_cache(owner: str, repo: str, number: int, root: Path | None = None) -> None:
-    """Drop a cached AI result (called after a label edit so it recomputes)."""
-    issue_ai_cache_path(owner, repo, number, root).unlink(missing_ok=True)
+    """Drop a cached AI result (called after a label edit so it recomputes).
+
+    Clears EVERY language partition, not just one. The applied label changes what
+    counts as "already on the issue", so the suggestions are stale in whatever
+    language they were written in -- dropping only the caller's language would
+    leave another browser reading advice that predates the edit."""
+    for path in issue_ai_cache_paths(owner, repo, number, root):
+        path.unlink(missing_ok=True)
+
+
+def issue_ai_cache_paths(
+    owner: str, repo: str, number: int, root: Path | None = None
+) -> list[Path]:
+    """Every existing language partition of one issue's AI cache.
+
+    Globs rather than iterating the shipped catalog set so a partition left behind
+    by a language that has since been removed from the registry is still cleaned
+    up instead of lingering forever.
+    """
+    unsuffixed = issue_ai_cache_path(owner, repo, number, root)
+    found = [unsuffixed] if unsuffixed.is_file() else []
+    # `issue-7-ai-*.json` cannot collide with another issue: the number is
+    # followed by the literal `-ai`, so `issue-7-ai-de.json` matches and
+    # `issue-70-ai.json` does not.
+    found.extend(sorted(unsuffixed.parent.glob(f"issue-{int(number)}-ai-*.json")))
+    return found
 
 
 # ── PR AI summary cache ──────────────────────────────────────────────────────
@@ -1137,16 +1176,29 @@ def delete_issue_ai_cache(owner: str, repo: str, number: int, root: Path | None 
 # repeated model call while nothing has changed.
 
 
-def pr_ai_cache_path(owner: str, repo: str, number: int, root: Path | None = None) -> Path:
-    return repo_data_dir(owner, repo, root) / f"pull-{int(number)}-ai.json"
+def pr_ai_cache_path(
+    owner: str, repo: str, number: int, root: Path | None = None, *, ui_language: str = ""
+) -> Path:
+    """Where one PR's AI summary lives, PARTITIONED by output language.
+
+    Same reasoning as :func:`issue_ai_cache_path`: the summary is prose in one
+    language, the language can differ per-browser, and a single slot per PR would
+    make two browsers overwrite each other's summary on every open. The
+    fingerprint alone cannot solve this -- it decides whether the PR has MOVED,
+    and one file holds one fingerprint, so the second browser's write evicts the
+    first. ``""`` keeps the ORIGINAL filename so existing caches survive.
+    """
+    suffix = f"-{ui_language}" if ui_language else ""
+    return repo_data_dir(owner, repo, root) / f"pull-{int(number)}-ai{suffix}.json"
 
 
 def write_pr_ai_cache(
-    owner: str, repo: str, number: int, payload: dict, *, root: Path | None = None
+    owner: str, repo: str, number: int, payload: dict, *,
+    root: Path | None = None, ui_language: str = "",
 ) -> None:
     """Cache one PR's AI summary together with the fingerprint it was built from."""
     atomic_write(
-        pr_ai_cache_path(owner, repo, number, root),
+        pr_ai_cache_path(owner, repo, number, root, ui_language=ui_language),
         json.dumps(
             {
                 "owner": owner, "repo": repo, "number": int(number),
@@ -1160,14 +1212,17 @@ def write_pr_ai_cache(
 
 
 def read_pr_ai_cache(
-    owner: str, repo: str, number: int, root: Path | None = None, *, fingerprint: str | None = None
+    owner: str, repo: str, number: int, root: Path | None = None, *,
+    fingerprint: str | None = None, ui_language: str = "",
 ) -> dict | None:
     """Return ``{"summary", "generated_at"}`` for a cached PR summary, or None.
 
     A stored fingerprint that does not match ``fingerprint`` is a MISS: the PR has
     moved (new comment, new push, check flipped) since the summary was written.
+    ``ui_language`` selects the partition, so another language's summary is absent
+    here rather than evicted.
     """
-    path = pr_ai_cache_path(owner, repo, number, root)
+    path = pr_ai_cache_path(owner, repo, number, root, ui_language=ui_language)
     if not path.is_file():
         return None
     try:
@@ -1191,16 +1246,45 @@ def read_pr_ai_cache(
 # Generated on explicit user action (the settings "Recommend labels" button),
 # so it is cached until the user regenerates.
 
-def recommendations_cache_path(owner: str, repo: str, root: Path | None = None) -> Path:
-    return repo_data_dir(owner, repo, root) / "recommendations-cache.json"
+def recommendations_cache_path(
+    owner: str, repo: str, root: Path | None = None, *, ui_language: str = ""
+) -> Path:
+    """Where a repo's label recommendations live, PARTITIONED by output language.
+
+    Each recommendation carries `rationale` prose written in one language, so a set
+    is only meaningful for the language it was generated in. Partitioning rather
+    than gating one shared document matters because the language can differ
+    per-browser: with a single slot, two browsers resolving different languages
+    would each read the other's set as absent and each regenerate would overwrite
+    it, silently discarding paid model output back and forth. Separate files remove
+    the eviction outright, and switching a language back finds the earlier set
+    still there instead of destroyed.
+
+    ``""`` -- no language known, which is every install that never configured one
+    -- keeps the ORIGINAL unsuffixed filename, so existing caches are still found
+    after the upgrade and no migration is needed.
+
+    The tag is safe in a filename by construction: it only ever arrives via
+    :func:`kiro_crew.context.normalize_ui_language_tag`, which admits nothing
+    outside a fixed set of shipped catalog names.
+    """
+    name = "recommendations-cache.json" if not ui_language else (
+        f"recommendations-cache-{ui_language}.json"
+    )
+    return repo_data_dir(owner, repo, root) / name
 
 
 def write_recommendations_cache(
-    owner: str, repo: str, payload: dict, *, root: Path | None = None
+    owner: str, repo: str, payload: dict, *, root: Path | None = None, ui_language: str = ""
 ) -> None:
-    """Cache a repo's AI label recommendations (``{recommendations, generated_at}``)."""
+    """Cache a repo's AI label recommendations (``{recommendations, generated_at}``).
+
+    ``ui_language`` selects the partition to write (see
+    :func:`recommendations_cache_path`); it is deliberately NOT also stored inside
+    the document, because the path already carries it and a second copy could only
+    ever disagree with it."""
     atomic_write(
-        recommendations_cache_path(owner, repo, root),
+        recommendations_cache_path(owner, repo, root, ui_language=ui_language),
         json.dumps(
             {
                 "owner": owner, "repo": repo,
@@ -1212,9 +1296,15 @@ def write_recommendations_cache(
     )
 
 
-def read_recommendations_cache(owner: str, repo: str, root: Path | None = None) -> dict | None:
-    """Return ``{"recommendations", "generated_at"}`` for a repo, or None."""
-    path = recommendations_cache_path(owner, repo, root)
+def read_recommendations_cache(
+    owner: str, repo: str, root: Path | None = None, *, ui_language: str = ""
+) -> dict | None:
+    """Return ``{"recommendations", "generated_at"}`` for a repo, or None.
+
+    Reads only the partition for ``ui_language``, so a set generated in another
+    language reads as absent rather than being served with foreign prose -- and,
+    unlike a shared slot, is left intact for whoever generated it."""
+    path = recommendations_cache_path(owner, repo, root, ui_language=ui_language)
     if not path.is_file():
         return None
     try:
@@ -1290,9 +1380,17 @@ def _normalize_tagging(raw: Any) -> dict[str, list[dict]]:
 
 
 def read_tagging_cache(owner: str, repo: str, root: Path | None = None) -> dict | None:
-    """Return ``{"suggestions", "generated_at"}`` for a repo, or None when
-    nothing has been generated yet (an unreadable / stale-schema file is a miss,
-    same guard as the other caches)."""
+    """Return ``{"suggestions", "generated_at", "ui_language"}`` for a repo, or None
+    when nothing has been generated yet (an unreadable / stale-schema file is a
+    miss, same guard as the other caches).
+
+    ``ui_language`` is the BCP-47 tag the cached ``reason`` text was WRITTEN in, so
+    a caller can tell a servable entry from one that predates a language switch.
+    Absent reads as ``""`` — identical to the unconfigured sentinel — which is why
+    adding it did not need a schema bump: a document written before this field is
+    still valid, and an install that never set a language keeps every cached
+    suggestion across the upgrade. Bumping the schema would have discarded them
+    all, which is a worse trade for a field whose absence is meaningful."""
     path = tagging_cache_path(owner, repo, root)
     if not path.is_file():
         return None
@@ -1305,12 +1403,13 @@ def read_tagging_cache(owner: str, repo: str, root: Path | None = None) -> dict 
     return {
         "suggestions": _normalize_tagging(data.get("suggestions")),
         "generated_at": str(data.get("generated_at") or ""),
+        "ui_language": str(data.get("ui_language") or ""),
     }
 
 
 def _write_tagging_cache_unlocked(
     owner: str, repo: str, suggestions: dict[str, list[dict]], generated_at: str,
-    root: Path | None = None,
+    root: Path | None = None, ui_language: str = "",
 ) -> None:
     atomic_write(
         tagging_cache_path(owner, repo, root),
@@ -1318,6 +1417,7 @@ def _write_tagging_cache_unlocked(
             {
                 "schema": TAGGING_CACHE_SCHEMA, "owner": owner, "repo": repo,
                 "suggestions": suggestions, "generated_at": generated_at,
+                "ui_language": ui_language,
             },
             indent=2,
         ),
@@ -1325,21 +1425,65 @@ def _write_tagging_cache_unlocked(
 
 
 def merge_tagging_suggestions(
-    owner: str, repo: str, batch: dict[str, list[dict]], *, root: Path | None = None
+    owner: str, repo: str, batch: dict[str, list[dict]], *,
+    verify_language: Callable[[], str],
+    root: Path | None = None, ui_language: str = "",
 ) -> dict:
     """Merge one generated batch into the repo's cached suggestions; return the
-    merged document.
+    merged document, or the untouched one when the batch is refused.
 
     The batch WINS for the issues it covers — a regenerate must replace a stale
     proposal — while every issue outside the batch keeps its existing entry, so
-    analysing the queue in slices accumulates instead of overwriting."""
+    analysing the queue in slices accumulates instead of overwriting.
+
+    EXCEPT across a language change. Each cached entry carries `reason` prose, so
+    accumulating a batch generated in one language on top of entries generated in
+    another would leave the queue showing two languages at once, with nothing to
+    say which rows are which. When the stored tag differs from ``ui_language`` the
+    surviving entries are dropped and the batch starts a fresh document: a
+    regenerate the user can trigger is a better state than a permanently mixed
+    one. Same reasoning as the issue-ai cache, which refuses a hit whose tag no
+    longer matches.
+
+    ``verify_language`` is what makes that safe under concurrency, and it has to
+    be checked HERE rather than by the caller. The caller's own pre-write check
+    and this write would not be atomic, so a switch landing between them lets a
+    stale generation replace a newer-language one that already landed — the replace
+    semantics above turn a lost race into lost data. Re-reading the configured
+    language inside the lock closes that: the check and the write it authorises
+    cannot be separated. REQUIRED, not optional: there is one caller and it always
+    has a language to verify against, so a default would only offer a way to write
+    without the guard that makes writing safe. Refusing returns the CURRENT
+    document with ``stale_language`` set, so the caller can report that nothing was
+    written rather than claiming a batch it did not persist. The stored language is
+    deliberately NOT echoed back: no caller reads it, and the one place that needs
+    it -- the two tagging routes' servable-cache gate -- reads it from
+    :func:`read_tagging_cache`, which is where it lives.
+
+    Deliberately a callable rather than a compare-and-set on the stored tag: a CAS
+    would also refuse the ordinary case of two same-language batches accumulating
+    slice by slice, where the second read the document before the first wrote. What
+    makes a write valid is that the CONFIGURED language is still the one the batch
+    was generated under, not what other writers did in the meantime."""
     with _tagging_cache_lock(owner, repo, root):
+        if verify_language() != ui_language:
+            current = read_tagging_cache(owner, repo, root)
+            return {
+                "suggestions": (current or {}).get("suggestions") or {},
+                "generated_at": (current or {}).get("generated_at") or "",
+                "stale_language": True,
+            }
         current = read_tagging_cache(owner, repo, root)
-        merged = dict(current["suggestions"]) if current else {}
+        if current is not None and str(current.get("ui_language") or "") == ui_language:
+            merged = dict(current["suggestions"])
+        else:
+            merged = {}
         merged.update(_normalize_tagging(batch))
         generated_at = _now_iso()
-        _write_tagging_cache_unlocked(owner, repo, merged, generated_at, root)
-    return {"suggestions": merged, "generated_at": generated_at}
+        _write_tagging_cache_unlocked(
+            owner, repo, merged, generated_at, root, ui_language=ui_language
+        )
+    return {"suggestions": merged, "generated_at": generated_at, "stale_language": False}
 
 
 def drop_tagging_suggestions(
@@ -1353,7 +1497,13 @@ def drop_tagging_suggestions(
             return {"suggestions": {}, "generated_at": ""}
         drop = {int(n) for n in numbers}
         remaining = {k: v for k, v in current["suggestions"].items() if int(k) not in drop}
-        _write_tagging_cache_unlocked(owner, repo, remaining, current["generated_at"], root)
+        # Carries the stored tag through: this rewrites the document, and dropping
+        # the tag here would make every surviving entry read as "generated with no
+        # language configured" and become servable again after a switch.
+        _write_tagging_cache_unlocked(
+            owner, repo, remaining, current["generated_at"], root,
+            ui_language=str(current.get("ui_language") or ""),
+        )
         return {"suggestions": remaining, "generated_at": current["generated_at"]}
 
 
@@ -1816,6 +1966,11 @@ def _merge_findings(existing: Any, raw: Any) -> dict[str, Any] | None:
     There is deliberately NO per-field clear: an empty string means "leave this
     alone", which is what makes a partial patch safe for an LLM writer. Clear
     everything with an explicit null and re-write what should remain.
+
+    All of the above is the contract for writes WITHIN one investigation run.
+    Across a run boundary it is the wrong contract, and
+    :func:`write_investigation` decides that question before calling here — see
+    :func:`_findings_run_key`.
     """
     if raw is None:
         return None
@@ -1835,6 +1990,26 @@ def _merge_findings(existing: Any, raw: Any) -> dict[str, Any] | None:
     return _normalize_findings(combined)
 
 
+def _findings_run_key(existing: dict[str, Any]) -> str | None:
+    """Which run's session the STORED findings were written under, or None when
+    that is not known.
+
+    ``findings_slot_key`` is stamped by :func:`write_investigation` on every
+    write, so a record written by this build always answers for itself. A record
+    written BEFORE the field existed carries findings but no stamp, and the
+    honest backfill is the record's own ``slot_key``: those findings were
+    written by whatever session the record pointed at at the time. That reading
+    keeps a mid-run partial update on an upgraded record merging exactly as it
+    did before, and still moves the boundary when the slot later changes,
+    because this is read from the PRE-patch record — before a new ``slot_key``
+    overwrites the old one.
+    """
+    raw = existing.get("findings_slot_key") if "findings_slot_key" in existing else existing.get("slot_key")
+    if not isinstance(raw, str):
+        return None
+    return raw.strip() or None
+
+
 def write_investigation(
     owner: str, repo: str, number: int, patch: dict[str, Any], *,
     root: Path | None = None, kind: str = "issue",
@@ -1847,7 +2022,30 @@ def write_investigation(
     ``findings`` (merged per key by :func:`_merge_findings`, so a patch carrying
     only ``verdict`` keeps the stored ``root_cause``/``summary``/labels; an
     explicit ``None`` clears them). A partial patch (even ``{}``, which just bumps
-    the open stamp) is valid. Returns the stored record."""
+    the open stamp) is valid. Returns the stored record.
+
+    Per-key merging is right WITHIN one investigation run and wrong ACROSS runs:
+    a re-run (Issue Radar's "Start over", or any path that opens a replacement
+    session) that records a ``verdict`` and ``summary`` but no ``root_cause``
+    would inherit the PREVIOUS run's ``root_cause``, leaving the record — the
+    only copy — holding a verdict assembled from two investigations with nothing
+    marking which parts came from which.
+
+    So the run boundary is owned HERE rather than by callers, because only here
+    is it atomic with the write. The record remembers the session its findings
+    were written under (``findings_slot_key``), and the FIRST findings write
+    under a different session REPLACES rather than merges; later writes from that
+    same session merge as before. The previous verdict therefore survives right
+    up until a new one exists and never blends with it — which is why the clear
+    is not done when the replacement session opens (the record is the only copy,
+    so an abandoned re-run would lose the prior verdict permanently).
+
+    A boundary is only crossed when BOTH sessions are known and differ. An
+    unknown owner (findings recorded through the MCP tool for an item with no
+    session linked) falls back to merging: the store cannot tell those findings
+    from ones the about-to-be-linked session just wrote, and merging is the
+    non-destructive reading. Clearing the link (``slot_key: ""``) is not a new
+    run either."""
     number = int(number)
     now = _now_iso()
     lock_path = investigation_path(owner, repo, number, root, kind=kind).with_suffix(".lock")
@@ -1855,6 +2053,10 @@ def write_investigation(
     with open(lock_path, "w") as fd:
         with platform_compat.file_lock(fd.fileno(), exclusive=True):
             existing = read_investigation(owner, repo, number, root, kind=kind) or {}
+            # Read the findings' owning session from the PRE-patch record: the
+            # patch below may replace slot_key, and the comparison needs the old
+            # one.
+            findings_run_key = _findings_run_key(existing)
 
             record: dict[str, Any] = {
                 "owner": owner,
@@ -1866,6 +2068,9 @@ def write_investigation(
                 "started_at": existing.get("started_at") or now,
                 "last_opened_at": now,
                 "findings": existing.get("findings"),
+                # Only meaningful while findings are stored; re-stamped below
+                # whenever they change.
+                "findings_slot_key": findings_run_key if existing.get("findings") else None,
             }
 
             if "slot_key" in patch and isinstance(patch["slot_key"], str):
@@ -1877,9 +2082,41 @@ def write_investigation(
                 if st in _INVESTIGATION_STATUSES:
                     record["status"] = st
             if "findings" in patch:
-                record["findings"] = _merge_findings(
-                    existing.get("findings"), patch.get("findings")
+                # Runs AFTER slot_key is applied: a patch may carry both, and the
+                # session it names is the run this write belongs to.
+                raw = patch.get("findings")
+                # None (the explicit clear), a non-dict, and a dict with nothing
+                # in it all normalize to None — so this is "the patch carries a
+                # real verdict", which is the only thing that may cross a run
+                # boundary.
+                fresh = _normalize_findings(raw)
+                crossed_runs = bool(
+                    findings_run_key
+                    and record["slot_key"]
+                    and findings_run_key != record["slot_key"]
                 )
+                if fresh is not None:
+                    if crossed_runs:
+                        # First findings of a new run: REPLACE. Nothing from the
+                        # previous run survives into the new verdict.
+                        record["findings"] = fresh
+                    else:
+                        record["findings"] = _merge_findings(existing.get("findings"), raw)
+                    # A real verdict was written, so the current session owns it.
+                    # The merge above always keeps `fresh`, so this is never a
+                    # stamp on an empty findings object.
+                    record["findings_slot_key"] = record["slot_key"]
+                elif raw is None:
+                    # The explicit clear. No findings, so no owning run.
+                    record["findings"] = None
+                    record["findings_slot_key"] = None
+                # else: nothing to write — an empty dict, a whitespace-only value,
+                # or a malformed one. Findings AND their owning run are both left
+                # exactly as the pre-patch record had them. Advancing the stamp
+                # here would silently re-home the PREVIOUS run's findings onto the
+                # new session, so the next real write would merge into them
+                # instead of replacing them — the very blend this boundary
+                # exists to stop, reachable through a no-op.
 
             atomic_write(
                 investigation_path(owner, repo, number, root, kind=kind),

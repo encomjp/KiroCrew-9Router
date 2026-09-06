@@ -23,6 +23,8 @@
     "test:integration": "vitest run integration/",
     "test:playwright": "playwright test --headed --workers=1",
     "test:playwright:headless": "playwright test",
+    "storybook": "storybook dev -p 6006 --host 127.0.0.1 --no-open",
+    "build-storybook": "storybook build -o storybook-static",
     "lint": "eslint src --ext .ts,.tsx",
     "typecheck": "tsc -b",
     "check": "npm run typecheck && npm run lint && npm run test",
@@ -45,10 +47,15 @@
     "verify:path-chips": "node scripts/capture-path-chips.mjs",
     "verify:registry-pinned-row": "node scripts/capture-registry-pinned-row.mjs",
     "verify:reveal-fade": "node scripts/probe-reveal-fade.mjs",
+    "verify:steering-inclusion": "node scripts/capture-steering-inclusion.mjs",
     "verify:tool-row-narrow-stack": "node scripts/capture-tool-row-narrow-stack.mjs",
+    "verify:tool-blocked-cause": "node scripts/capture-tool-blocked-cause.mjs",
+    "verify:theme-overlay-topbar": "node scripts/capture-theme-overlay-topbar.mjs",
     "verify:topbar-badge-overhang": "node scripts/capture-topbar-badge-overhang.mjs",
     "verify:user-bubble-mobile-overflow": "node scripts/capture-user-bubble-mobile-overflow.mjs",
-    "pretest": "npm run jscpd"
+    "pretest": "npm run jscpd",
+    "mutation:scroll-shell": "node scripts/mutation-check-scroll-shell.mjs",
+    "golden:scroll-shell": "node scripts/capture-chatpage-scroll-shell.mjs"
   },
   "files": [
     "dist/"
@@ -58,6 +65,7 @@
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
+    "@excalidraw/excalidraw": "0.18.1",
     "@pierre/diffs": "1.3.5",
     "@pierre/trees": "1.0.0-beta.6",
     "@radix-ui/react-context-menu": "^2.2.6",
@@ -69,6 +77,7 @@
     "@radix-ui/react-popover": "^1.1.23",
     "@radix-ui/react-progress": "^1.1.16",
     "@radix-ui/react-select": "^2.3.7",
+    "@radix-ui/react-tabs": "^1.1.21",
     "@reduxjs/toolkit": "^2.5.0",
     "@tailwindcss/browser": "4.1.13",
     "@tanstack/react-query": "5.96.0",
@@ -85,6 +94,7 @@
     "graphology-communities-louvain": "2.0.2",
     "graphology-layout-forceatlas2": "0.10.1",
     "highlight.js": "^11.11.1",
+    "html-to-image": "1.11.13",
     "i18next": "^26.3.6",
     "katex": "0.16.44",
     "lottie-web": "5.13.0",
@@ -110,11 +120,15 @@
     "unified": "^11.0.5",
     "vis-data": "^8.0.3",
     "vis-network": "^10.0.2",
-    "vscode-jsonrpc": "8.2.0"
+    "vscode-jsonrpc": "8.2.0",
+    "yaml": "2.9.0"
   },
   "devDependencies": {
     "@axe-core/react": "^4.10.1",
     "@playwright/test": "1.58.2",
+    "@storybook/addon-a11y": "10.5.10",
+    "@storybook/addon-themes": "10.5.10",
+    "@storybook/react-vite": "10.5.10",
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
@@ -138,6 +152,7 @@
     "jsdom": "26.1.0",
     "msw": "2.12.14",
     "postcss": "8.5.25",
+    "storybook": "10.5.10",
     "tailwindcss": "^3.4.19",
     "tailwindcss-animate": "^1.0.7",
     "typescript": "^5.6.3",
@@ -156,6 +171,15 @@
     "@mermaid-js/parser": "1.2.0",
     "@mswjs/interceptors": "0.41.3",
     "@pierre/theming": "1.0.1",
+    "@excalidraw/excalidraw": {
+      "@radix-ui/react-dismissable-layer": "1.1.19",
+      "@radix-ui/react-focus-guards": "1.1.6",
+      "@radix-ui/react-focus-scope": "1.1.16",
+      "nanoid": "3.3.18",
+      "@excalidraw/mermaid-to-excalidraw": {
+        "nanoid": "5.1.16"
+      }
+    },
     "@smithy/types": "4.13.1",
     "@tanstack/query-core": "5.96.0",
     "@types/node": "24.13.3",

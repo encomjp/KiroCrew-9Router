@@ -294,6 +294,52 @@ class TestSlackReactions:
         slack.add_reaction.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_ts", ["1" * 40 + ".123456", "١٢٣٤٥٦٧٨٩٠.١٢٣٤٥٦"])
+    async def test_reaction_ts_is_bounded_and_ascii_only(self, bad_ts):
+        """`ts` is forwarded to Slack and written into the SEL audit line.
+
+        That audit line is written BEFORE the untracked-channel rejection, so an
+        unbounded value lands in the log either way. The old inline `^\\d+\\.\\d+$`
+        carried no length cap, and `\\d` is Unicode-aware, so a string of
+        Arabic-Indic numerals satisfied it and was forwarded verbatim.
+        """
+        slack = MagicMock()
+        slack.add_reaction = AsyncMock()
+        app = _make_app(slack)
+        with _patch_tracked(True):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/slack/reactions",
+                    json={
+                        "channel": TRACKED,
+                        "ts": bad_ts,
+                        "emoji": "eyes",
+                        "action": "add",
+                    },
+                )
+        assert resp.status == 400
+        slack.add_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_reaction_channel_is_length_bounded(self):
+        """`CHANNEL_ID_RE` is `[A-Z0-9]+` -- unbounded without `CHANNEL_MAX_LEN`."""
+        slack = MagicMock()
+        slack.add_reaction = AsyncMock()
+        app = _make_app(slack)
+        async with TestClient(TestServer(app)) as client:
+            resp = await client.post(
+                "/api/slack/reactions",
+                json={
+                    "channel": "C" + "A" * 64,
+                    "ts": TS,
+                    "emoji": "eyes",
+                    "action": "add",
+                },
+            )
+        assert resp.status == 400
+        slack.add_reaction.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_reaction_invalid_action(self):
         slack = MagicMock()
         app = _make_app(slack)

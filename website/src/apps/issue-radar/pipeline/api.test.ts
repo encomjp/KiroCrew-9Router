@@ -18,6 +18,9 @@ import {
   autoTriagePipelineFoldApi,
   CREW_PHASES,
   CREW_FABRIC_SCHEMA,
+  isQueueMigrationPending,
+  isUnsupportedForge,
+  type ApiError,
   type CrewFabricResponse,
   type RepoRef,
 } from './api'
@@ -779,3 +782,59 @@ describe('the refusal code crossing from the HTTP body onto the error', () => {
     ).rejects.toThrow(/502/)
   })
 })
+
+
+describe('isQueueMigrationPending', () => {
+  // RECOGNITION of the backend's `queue_migration_pending` refusal (raised by
+  // `_read_queue`, answered 503 by `_handle_step` / `_handle_item_sessions`). The
+  // view keys its migration-specific copy on this, so the code must be recognised
+  // by its exact value and nothing else.
+  it('is true only for an error carrying code queue_migration_pending', () => {
+    const err = new Error('migrate') as ApiError
+    err.code = 'queue_migration_pending'
+    expect(isQueueMigrationPending(err)).toBe(true)
+  })
+
+  it('is false for a different code, a codeless error, and non-errors', () => {
+    const other = new Error('x') as ApiError
+    other.code = 'repo_provider_unsupported'
+    expect(isQueueMigrationPending(other)).toBe(false)
+    expect(isQueueMigrationPending(new Error('plain'))).toBe(false)
+    expect(isQueueMigrationPending(null)).toBe(false)
+    expect(isQueueMigrationPending(undefined)).toBe(false)
+    // The two recognizers must not answer to each other's code, or the view would
+    // show the wrong band for the wrong refusal.
+    expect(isUnsupportedForge(err_qmp())).toBe(false)
+  })
+
+  it('lifts the code off a real 503 refusal so the recognizer fires end-to-end', async () => {
+    // The whole path: the fold client lifts the body `code` onto the error (the only
+    // place it crosses), and the recognizer reads it. A view test builds its error
+    // object directly, so without this the plumbing could be removed and the view
+    // test would stay green while the migration band went unreachable in the product.
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    fetchSpy.mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({
+        error: 'The dispatch queue has not been sharded per repository yet; run the pipeline installer to migrate it',
+        code: 'queue_migration_pending',
+      }),
+    } as unknown as Response)
+    try {
+      await autoTriagePipelineFoldApi.step({ step: 'implement', owner: 'acme', repo: 'alpha' })
+      throw new Error('expected the refusal to throw')
+    } catch (err) {
+      expect(isQueueMigrationPending(err)).toBe(true)
+    } finally {
+      fetchSpy.mockRestore()
+    }
+  })
+})
+
+/** A queue-migration-pending error, built the way a view test builds one. */
+function err_qmp(): ApiError {
+  const e = new Error('migrate') as ApiError
+  e.code = 'queue_migration_pending'
+  return e
+}

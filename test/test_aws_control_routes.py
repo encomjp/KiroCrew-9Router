@@ -22,11 +22,17 @@ module-private there and the two files must not edit each other.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
+import inspect
 import json
+import logging
+import re
+import threading
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import AsyncMock
 
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import make_mocked_request
 
@@ -143,7 +149,60 @@ class TestHelpers:
         # The audit is best-effort: a broken SEL sink must never propagate into
         # the response path, so a raising backend is logged and swallowed.
         with mock.patch.object(routes_mod, "sel", side_effect=RuntimeError("no sel")):
-            routes_mod._audit("op", "res", "denied")  # must not raise
+            routes_mod._audit_sync("op", "res", "denied")  # must not raise
+
+    def test_audit_routes_the_sel_write_off_the_event_loop(self):
+        # The SEL write's first touch pays log construction, so the async
+        # _audit wrapper must hand the sync writer to a worker thread instead
+        # of running it inline on the loop — the regression issue #8139 locks
+        # out. Observed from inside the writer itself (which thread ran it)
+        # rather than by patching the stdlib asyncio module object, which
+        # would leak the mock to unrelated code on other threads.
+        assert asyncio.iscoroutinefunction(routes_mod._audit)
+        seen: dict[str, object] = {}
+
+        def _record(*args: object, **kwargs: object) -> None:
+            seen["thread"] = threading.current_thread()
+            seen["args"] = args
+            seen["kwargs"] = kwargs
+
+        with mock.patch.object(routes_mod, "_audit_sync", side_effect=_record):
+            asyncio.run(routes_mod._audit("op", "res", "denied", error="why"))
+        assert seen["args"] == ("op", "res", "denied")
+        assert seen["kwargs"] == {"error": "why"}
+        # asyncio.run drives the loop on the calling thread, so a writer that
+        # ran on the loop would report this thread.
+        assert seen["thread"] is not threading.current_thread()
+
+    def test_audit_swallows_a_failing_thread_dispatch(self):
+        # The wrapper keeps the sync body's never-raises contract even when
+        # the dispatched call raises out of the worker (the real _audit_sync
+        # swallows its own errors; this pins the wrapper's guard for anything
+        # that escapes thread dispatch itself).
+        with mock.patch.object(
+            routes_mod, "_audit_sync", side_effect=RuntimeError("executor down")
+        ):
+            asyncio.run(routes_mod._audit("op", "res", "denied"))  # must not raise
+
+    def test_every_audit_call_site_awaits_the_wrapper(self):
+        # Wiring pin: with _audit patched as an AsyncMock, an UNAWAITED
+        # `_audit(...)` still lands in call_args_list, so the behavioural
+        # tests cannot detect a dropped `await` — the audit would silently
+        # stop being recorded (only a RuntimeWarning). Pin the source instead:
+        # every call site must `await` the wrapper, directly or through
+        # `asyncio.shield` (the post-side-effect sites). Same style as
+        # test_api_health.py::test_every_middleware_denial_is_audited_off_the_loop.
+        src = inspect.getsource(routes_mod)
+        sites = [m for m in re.finditer(r"_audit\(", src) if not src[: m.start()].endswith("def ")]
+        assert len(sites) >= 13, "expected the module's audit call sites to be present"
+        for m in sites:
+            before = src[: m.start()]
+            line = src[src.rfind("\n", 0, m.start()) + 1 : src.find("\n", m.end())]
+            # `await _audit(` or `await asyncio.shield(  _audit(` — black may
+            # break the shield form across lines, so allow whitespace between.
+            assert re.search(
+                r"await\s+(asyncio\.shield\(\s*)?$", before
+            ), f"_audit call site is not awaited: {line.strip()!r}"
 
     def test_body_returns_empty_dict_for_a_non_dict_json(self):
         # A JSON list is valid JSON but not a body shape the handlers accept;
@@ -448,8 +507,22 @@ class TestDriveDownload:
         presign.assert_not_called()
 
     def test_download_surfaces_an_aws_error_during_presign(self):
+        resp = self._download(meta={}, presign=AWSError("sign failed"))
+        assert resp.status == 502
+
+    def _download(self, *, meta: object, presign: object = "https://signed/x"):
         handlers = _registered()
         p1, p2, p3 = _enabled_owner_env()
+        meta_patch = (
+            mock.patch.object(routes_mod.storage_mod, "head_object_meta", side_effect=meta)
+            if isinstance(meta, Exception)
+            else mock.patch.object(routes_mod.storage_mod, "head_object_meta", return_value=meta)
+        )
+        presign_patch = (
+            mock.patch.object(routes_mod.storage_mod, "presign", side_effect=presign)
+            if isinstance(presign, Exception)
+            else mock.patch.object(routes_mod.storage_mod, "presign", return_value=presign)
+        )
         with (
             p1,
             p2,
@@ -458,12 +531,10 @@ class TestDriveDownload:
             _drive_found(),
             mock.patch.object(routes_mod, "publish_denied_reason", return_value=""),
             mock.patch.object(routes_mod.storage_mod, "validate_key", return_value=None),
-            mock.patch.object(routes_mod.storage_mod, "object_exists", return_value=True),
-            mock.patch.object(
-                routes_mod.storage_mod, "presign", side_effect=AWSError("sign failed")
-            ),
+            meta_patch,
+            presign_patch,
         ):
-            resp = asyncio.run(
+            return asyncio.run(
                 handlers[("GET", "/drive/{account}/download")](  # type: ignore[operator]
                     _request(
                         "GET",
@@ -472,6 +543,289 @@ class TestDriveDownload:
                     )
                 )
             )
+
+    def test_download_carries_the_stored_content_type(self):
+        # The preview tells a real PDF from a `.pdf`-named object served as
+        # octet-stream by this field; the same HEAD the presign precondition
+        # already makes is where it comes from, so no extra round trip.
+        resp = self._download(meta={"ContentType": "application/pdf", "ContentLength": 5})
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body["url"] == "https://signed/x"
+        assert body["contentType"] == "application/pdf"
+
+    def test_download_reports_no_content_type_as_null_not_a_guess(self):
+        resp = self._download(meta={})
+        assert _payload(resp)["contentType"] is None
+
+    def test_download_404s_a_missing_object_before_presigning(self):
+        resp = self._download(meta=None)
+        assert resp.status == 404
+        assert _payload(resp)["code"] == "object_missing"
+
+
+# ---------------------------------------------------------------------------
+# Drive preview — the gateway-proxied text read (missing object, decode,
+# truncation, invalid key)
+# ---------------------------------------------------------------------------
+
+
+class TestDrivePreview:
+    def _call(self, *, exists: object = True, head: object = (b"hello", 5), key: str = "a.txt"):
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        exists_patch = (
+            mock.patch.object(routes_mod.storage_mod, "object_exists", side_effect=exists)
+            if isinstance(exists, Exception)
+            else mock.patch.object(routes_mod.storage_mod, "object_exists", return_value=exists)
+        )
+        head_patch = (
+            mock.patch.object(routes_mod.storage_mod, "get_object_head_bytes", side_effect=head)
+            if isinstance(head, Exception)
+            else mock.patch.object(
+                routes_mod.storage_mod, "get_object_head_bytes", return_value=head
+            )
+        )
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            exists_patch,
+            head_patch as headed,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/drive/{account}/preview")](  # type: ignore[operator]
+                    _request(
+                        "GET",
+                        f"/drive/{ACCOUNT}/preview?section=drive&key={key}",
+                        match_info={"account": ACCOUNT},
+                    )
+                )
+            )
+        return resp, headed
+
+    def test_preview_404s_a_missing_object(self):
+        # The presign lesson applies to the proxy read too: a typo'd key must
+        # answer 404, not surface as an opaque transfer failure.
+        resp, headed = self._call(exists=False)
+        assert resp.status == 404
+        assert _payload(resp)["code"] == "object_missing"
+        headed.assert_not_called()
+
+    def test_preview_returns_the_decoded_head(self):
+        resp, headed = self._call(head=(b"hello", 5))
+        assert resp.status == 200
+        assert _payload(resp) == {"content": "hello", "truncated": False, "redacted": False}
+        # The window is the module constant, not a caller-tunable.
+        # The window plus the redaction look-ahead, both module constants, not
+        # caller-tunables.
+        assert headed.call_args.kwargs["max_bytes"] == (
+            routes_mod._PREVIEW_MAX_BYTES + routes_mod._PREVIEW_REDACT_LOOKAHEAD
+        )
+
+    def test_preview_reports_truncation_from_the_full_size(self):
+        # truncated must come from the OBJECT's size against the WINDOW, not
+        # from how many bytes came back (the look-ahead makes those differ) —
+        # the frontend's "showing only the head" hint hangs off this bit.
+        resp, _ = self._call(head=(b"head", routes_mod._PREVIEW_MAX_BYTES + 1))
+        assert resp.status == 200
+        assert _payload(resp) == {"content": "head", "truncated": True, "redacted": False}
+
+    def test_preview_reports_no_truncation_for_an_object_inside_the_window(self):
+        resp, _ = self._call(head=(b"head", 100))
+        assert _payload(resp)["truncated"] is False
+
+    def test_a_secret_straddling_the_window_never_reaches_the_browser(self):
+        # The boundary case the look-ahead exists for: an access key that
+        # begins inside the window and ends past it. Without the look-ahead
+        # the redactor sees only a prefix it cannot recognise, and 19 of the
+        # key's 20 characters ship. With it the key is masked whole, and the
+        # trim then backs off to whitespace so no split run is shown either.
+        window = 32
+        head = b"line one\nkey = "  # 15 bytes
+        secret = b"AKIAIOSFODNN7EXAMPLE"  # 20 bytes: straddles byte 32
+        tail = b"\nline three\n"
+        data = head + secret + tail
+        with (
+            mock.patch.object(routes_mod, "_PREVIEW_MAX_BYTES", window),
+            mock.patch.object(routes_mod, "_PREVIEW_REDACT_LOOKAHEAD", 64),
+            mock.patch.object(routes_mod, "_PREVIEW_TRIM_SEARCH", 64),
+        ):
+            resp, headed = self._call(head=(data, len(data) + 1000))
+        body = _payload(resp)
+        assert headed.call_args.kwargs["max_bytes"] == window + 64
+        assert "AKIAIOSFODNN7EXAMPLE" not in body["content"]
+        assert "AKIAIOSFODNN" not in body["content"]
+        assert body["truncated"] is True
+        assert body["redacted"] is True
+        assert body["content"].startswith("line one\n")
+
+    def test_a_whitespace_free_blob_still_previews(self):
+        # The whitespace back-off is bounded: a minified blob has no boundary
+        # to back off to, and trimming it to nothing would hide the file.
+        window = 32
+        data = b"x" * 200
+        with (
+            mock.patch.object(routes_mod, "_PREVIEW_MAX_BYTES", window),
+            mock.patch.object(routes_mod, "_PREVIEW_REDACT_LOOKAHEAD", 16),
+            mock.patch.object(routes_mod, "_PREVIEW_TRIM_SEARCH", 8),
+        ):
+            resp, _ = self._call(head=(data[: window + 16], len(data)))
+        body = _payload(resp)
+        assert body["content"] == "x" * window
+        assert body["truncated"] is True
+
+    def test_the_window_is_a_byte_budget_for_multibyte_text_too(self):
+        # 3-byte code points: a CHARACTER count of `window` would ship three
+        # times the budget, carrying the whole look-ahead past the window. The
+        # cut lands on a code-point boundary (32 is not a multiple of 3), and
+        # the split code point is dropped rather than shown as a glyph.
+        window = 32
+        data = ("中" * 200).encode("utf-8")
+        with (
+            mock.patch.object(routes_mod, "_PREVIEW_MAX_BYTES", window),
+            mock.patch.object(routes_mod, "_PREVIEW_REDACT_LOOKAHEAD", 16),
+            mock.patch.object(routes_mod, "_PREVIEW_TRIM_SEARCH", 8),
+        ):
+            resp, _ = self._call(head=(data[: window + 16], len(data)))
+        body = _payload(resp)
+        assert body["content"] == "中" * (window // 3)
+        assert len(body["content"].encode("utf-8")) <= window
+        assert body["truncated"] is True
+
+    def test_preview_survives_bytes_that_are_not_utf8(self):
+        # The frontend gates by extension, but nothing stops a .txt holding a
+        # stray byte; one bad byte must degrade, not fail the whole preview.
+        resp, _ = self._call(head=(b"\xff\xfegood", 6))
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body["content"].endswith("good")
+        assert "\ufffd" in body["content"]
+
+    def test_preview_redacts_credentials_like_every_other_egress(self):
+        # A notes file that happens to hold an access key must render masked,
+        # the same way listing and search names do -- the preview is a new
+        # egress path and inherits the same floor.
+        secret = b"notes\naws_access_key_id = AKIAIOSFODNN7EXAMPLE\nmore notes\n"
+        resp, _ = self._call(head=(secret, len(secret)))
+        assert resp.status == 200
+        body = _payload(resp)
+        content = body["content"]
+        assert "AKIAIOSFODNN7EXAMPLE" not in content
+        assert "REDACTED" in content
+        assert content.startswith("notes\n")
+        assert content.endswith("more notes\n")
+        # The reader is TOLD the mask fired: without the bit, a masked value
+        # reads as the file's actual bytes.
+        assert body["redacted"] is True
+
+    def test_preview_reports_a_staging_refusal_as_a_coded_500(self):
+        # A link squatting the staging root (ValueError) or a local filesystem
+        # failure (OSError) is neither an AWS failure nor the caller's doing;
+        # it must come back as a coded body, never an uncoded crash -- and the
+        # exception text (which carries the staging path) stays out of it.
+        for exc in (ValueError("staging root is not a real directory"), OSError(13, "denied")):
+            resp, _ = self._call(head=exc)
+            assert resp.status == 500
+            body = _payload(resp)
+            assert body["code"] == "preview_staging_failed"
+            assert "staging root" not in body["error"]
+            assert "denied" not in body["error"]
+
+    def test_preview_rejects_an_invalid_key(self):
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod.storage_mod, "validate_key", return_value="bad key"),
+            mock.patch.object(routes_mod.storage_mod, "get_object_head_bytes") as headed,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/drive/{account}/preview")](  # type: ignore[operator]
+                    _request(
+                        "GET",
+                        f"/drive/{ACCOUNT}/preview?section=drive&key=bad",
+                        match_info={"account": ACCOUNT},
+                    )
+                )
+            )
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_key"
+        headed.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Drive search — the filename search body (empty query, success shape, error)
+# ---------------------------------------------------------------------------
+
+
+class TestDriveSearch:
+    def _call(self, query_string: str, search: object = ([], False)):
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        search_patch = (
+            mock.patch.object(routes_mod.storage_mod, "search_keys", side_effect=search)
+            if isinstance(search, Exception)
+            else mock.patch.object(routes_mod.storage_mod, "search_keys", return_value=search)
+        )
+        with p1, p2, p3, _consent_ok(), _drive_found(), search_patch as searched:
+            resp = asyncio.run(
+                handlers[("GET", "/drive/{account}/search")](  # type: ignore[operator]
+                    _request(
+                        "GET",
+                        f"/drive/{ACCOUNT}/search?{query_string}",
+                        match_info={"account": ACCOUNT},
+                    )
+                )
+            )
+        return resp, searched
+
+    def test_search_requires_a_non_empty_query(self):
+        # Whitespace-only is empty: an unfiltered walk of the whole section is
+        # never what a blank search box meant.
+        resp, searched = self._call("section=drive&q=%20%20")
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "empty_query"
+        searched.assert_not_called()
+
+    def test_search_returns_results_and_the_capped_flag(self):
+        hit = {"key": "notes/a.txt", "size": 7, "modified": "2026-01-01T00:00:00+00:00"}
+        resp, searched = self._call("section=drive&q=notes", search=([hit], True))
+        assert resp.status == 200
+        assert _payload(resp) == {
+            "results": [hit],
+            "capped": True,
+            "limit": routes_mod.storage_mod.SEARCH_MAX_RESULTS,
+        }
+        # The trimmed query is what reaches storage.
+        assert searched.call_args.args[4] == "notes"
+
+    def test_search_rejects_an_unknown_section(self):
+        resp, searched = self._call("section=nope&q=x")
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_section"
+        searched.assert_not_called()
+
+    @pytest.mark.parametrize("section", ["library", "backup"])
+    def test_search_is_scoped_to_the_file_drive(self, section):
+        # A VALID section that is not the drive is still refused: the library
+        # and backups have their own listing surfaces, and a search reaching
+        # into backup archive keys would surface names the dashboard never
+        # otherwise renders. Distinct code from invalid_section so the client
+        # can tell "no such section" from "not searchable".
+        resp, searched = self._call(f"section={section}&q=x")
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "section_not_searchable"
+        searched.assert_not_called()
+
+    def test_search_surfaces_an_aws_error(self):
+        resp, _ = self._call("section=drive&q=x", search=AWSError("nope"))
         assert resp.status == 502
 
 
@@ -612,6 +966,112 @@ class TestDriveUpload:
         assert resp.status == 200
         put.assert_called_once()
 
+    def test_a_drive_retag_during_the_spool_refuses_the_write(self):
+        # The drive bucket is tag-discovered, and a 512 MB spool is long enough
+        # for the tags to move to a DIFFERENT bucket while the identity triple
+        # stays the same. A name resolved before the spool is exactly the
+        # staleness the module's no-cache rule forbids, so the post-spool
+        # re-authorization re-resolves the drive and refuses on a mismatch --
+        # otherwise put_file would land the object in the previously-discovered
+        # bucket.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request(
+            "POST",
+            f"/drive/{ACCOUNT}/upload?section=drive&key=f.bin",
+            match_info={"account": ACCOUNT},
+        )
+        req._fake_content = _FakeContent([b"hello"])  # type: ignore[attr-defined]
+        with (
+            mock.patch.object(type(req), "content", new=property(lambda s: s._fake_content)),
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            mock.patch.object(
+                routes_mod.storage_mod,
+                "find_drive",
+                side_effect=["drive-before", "drive-after"],
+            ),
+            mock.patch.object(routes_mod, "_audit") as audit,
+            mock.patch.object(routes_mod.storage_mod, "put_file") as put,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/upload")](req)  # type: ignore[operator]
+            )
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "drive_changed"
+        # The decisive assertions: nothing was written, and the denial is a
+        # permission DECISION so it must reach the audit trail.
+        put.assert_not_called()
+        audit.assert_any_call("drive_upload", mock.ANY, "denied", error="drive_changed")
+
+    def test_the_put_targets_the_bucket_the_post_spool_discovery_returned(self):
+        # A pass through the re-authorization means the pre-spool name and the
+        # post-spool resolution AGREE, so the put's target is the post-wait
+        # answer, never a name only the pre-spool lookup vouched for. The second
+        # find_drive call is that re-resolve; without it the equality was never
+        # checked and the write trusts a stale name.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request(
+            "POST",
+            f"/drive/{ACCOUNT}/upload?section=drive&key=f.bin",
+            match_info={"account": ACCOUNT},
+        )
+        req._fake_content = _FakeContent([b"hello"])  # type: ignore[attr-defined]
+        with (
+            mock.patch.object(type(req), "content", new=property(lambda s: s._fake_content)),
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            mock.patch.object(
+                routes_mod.storage_mod, "find_drive", return_value="drive-stable"
+            ) as find,
+            mock.patch.object(routes_mod.storage_mod, "put_file") as put,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/upload")](req)  # type: ignore[operator]
+            )
+        assert resp.status == 200
+        assert find.call_count == 2
+        put.assert_called_once()
+        assert put.call_args.args[2] == "drive-stable"
+
+    def test_consent_withdrawn_during_the_spool_refuses_the_write(self):
+        # Way-in consent PASSES and the withdrawal lands during the spool, so
+        # the refusal can only come from the post-spool re-check. The blanket
+        # always-deny variant cannot tell the two gates apart: it refuses on
+        # the way in and never reaches the spool.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request(
+            "POST",
+            f"/drive/{ACCOUNT}/upload?section=drive&key=f.bin",
+            match_info={"account": ACCOUNT},
+        )
+        req._fake_content = _FakeContent([b"hello"])  # type: ignore[attr-defined]
+        with (
+            mock.patch.object(type(req), "content", new=property(lambda s: s._fake_content)),
+            p1,
+            p2,
+            p3,
+            mock.patch.object(
+                routes_mod.aws_consent,
+                "refuse_and_log",
+                AsyncMock(side_effect=[True, False]),
+            ),
+            _drive_found(),
+            mock.patch.object(routes_mod.storage_mod, "put_file") as put,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/upload")](req)  # type: ignore[operator]
+            )
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "aws_consent_required"
+        put.assert_not_called()
+
     def test_empty_upload_is_refused_and_never_put(self):
         resp, put = self._run([])
         assert resp.status == 400
@@ -751,6 +1211,379 @@ class TestDriveDelete:
                 handlers[("POST", "/drive/{account}/delete")](req)  # type: ignore[operator]
             )
         assert resp.status == 502
+
+
+# ---------------------------------------------------------------------------
+# Drive move — copy-then-delete, no silent overwrite, drive section only
+# ---------------------------------------------------------------------------
+
+
+class TestDriveMove:
+    def _move(self, body: dict, *, exists=(True, False), copy_err=None):
+        """Run the move handler with src/dest existence and copy outcome faked.
+
+        ``exists`` feeds the two ``object_exists`` probes in call order
+        (source first, then destination). Both storage mocks are attached to
+        one parent so a test can assert the copy-before-delete ORDER, not just
+        that both were called.
+        """
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/drive/{ACCOUNT}/move", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(return_value=body)  # type: ignore[method-assign]
+        parent = mock.Mock()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(
+                routes_mod.storage_mod, "object_exists", side_effect=list(exists)
+            ) as head,
+            mock.patch.object(routes_mod.storage_mod, "copy_object", side_effect=copy_err) as copy,
+            mock.patch.object(routes_mod.storage_mod, "delete_key") as delete,
+        ):
+            parent.attach_mock(copy, "copy_object")
+            parent.attach_mock(delete, "delete_key")
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/move")](req)  # type: ignore[operator]
+            )
+        return resp, parent, head
+
+    def test_move_copies_before_deleting(self):
+        # The order is the safety property: a delete issued before the copy
+        # succeeded turns a failed move into data loss.
+        resp, parent, _head = self._move(
+            {"section": "drive", "fromKey": "a.txt", "toKey": "b/a.txt"}
+        )
+        assert resp.status == 200
+        assert _payload(resp) == {"moved": True}
+        names = [name for name, _args, _kwargs in parent.mock_calls]
+        assert names == ["copy_object", "delete_key"]
+
+    def test_move_rejects_an_invalid_key(self):
+        # validate_key runs on BOTH keys BEFORE any AWS call reaches storage.
+        resp, parent, head = self._move(
+            {"section": "drive", "fromKey": "../etc/passwd", "toKey": "b.txt"}
+        )
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_key"
+        assert parent.mock_calls == []
+        head.assert_not_called()
+
+    def test_move_rejects_an_empty_destination(self):
+        resp, parent, head = self._move({"section": "drive", "fromKey": "a.txt", "toKey": ""})
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_key"
+        assert parent.mock_calls == []
+        head.assert_not_called()
+
+    def test_move_rejects_equal_keys(self):
+        # A same-key move would head the destination (which exists — it is the
+        # source) and answer a confusing 409; refuse it as the no-op it is.
+        resp, parent, head = self._move({"section": "drive", "fromKey": "a.txt", "toKey": "a.txt"})
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "same_key"
+        assert parent.mock_calls == []
+        head.assert_not_called()
+
+    def test_move_rejects_a_non_drive_section(self):
+        # library/backup are managed surfaces whose objects carry ledger state;
+        # a move from here would orphan it. Known-but-refused answers the same
+        # 400 an unknown section does.
+        for section in ("library", "backup", "nope"):
+            resp, parent, head = self._move(
+                {"section": section, "fromKey": "a.txt", "toKey": "b.txt"}
+            )
+            assert resp.status == 400
+            assert _payload(resp)["code"] == "invalid_section"
+            assert parent.mock_calls == []
+            head.assert_not_called()
+
+    def test_move_missing_source_answers_404(self):
+        resp, parent, _head = self._move(
+            {"section": "drive", "fromKey": "gone.txt", "toKey": "b.txt"},
+            exists=(False,),
+        )
+        assert resp.status == 404
+        assert _payload(resp)["code"] == "object_missing"
+        assert parent.mock_calls == []
+
+    def test_move_existing_destination_answers_409_and_deletes_nothing(self):
+        # NEVER silently overwrite: an occupied destination refuses before the
+        # copy, and no delete is issued against either key.
+        resp, parent, _head = self._move(
+            {"section": "drive", "fromKey": "a.txt", "toKey": "b.txt"},
+            exists=(True, True),
+        )
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "destination_exists"
+        assert parent.mock_calls == []
+
+    def test_move_copy_failure_issues_no_delete(self):
+        # A failed copy must leave the source untouched — the delete is what
+        # turns "copy failed" into "file lost".
+        resp, parent, _head = self._move(
+            {"section": "drive", "fromKey": "a.txt", "toKey": "b.txt"},
+            copy_err=AWSError("denied"),
+        )
+        assert resp.status == 502
+        names = [name for name, _args, _kwargs in parent.mock_calls]
+        assert names == ["copy_object"]
+
+    def test_move_of_a_shared_source_is_refused(self):
+        # A presigned share URL is bound to the SOURCE key: copy+delete would
+        # leave it 404ing while the Access ledger reports it live until
+        # expiry. The move must refuse (409 share_active) with zero storage
+        # calls — the URL cannot be re-pointed, so refusal is the only honest
+        # answer.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/drive/{ACCOUNT}/move", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"section": "drive", "fromKey": "a.txt", "toKey": "b.txt"}
+        )
+        live = [{"account": ACCOUNT, "section": "drive", "key": "a.txt"}]
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod.shares_mod, "list_shares", return_value=live),
+            mock.patch.object(routes_mod.storage_mod, "object_exists") as head,
+            mock.patch.object(routes_mod.storage_mod, "copy_object") as copy,
+            mock.patch.object(routes_mod.storage_mod, "delete_key") as delete,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/move")](req)  # type: ignore[operator]
+            )
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "share_active"
+        assert not head.called and not copy.called and not delete.called
+
+    def test_move_destination_probe_failure_fails_closed(self):
+        # object_exists raises on anything S3 did not answer 404 to. If the
+        # DESTINATION probe fails transiently, the move must answer 502 and
+        # touch nothing — reading the failure as "absent" would copy over the
+        # destination and delete the source.
+        resp, parent, _head = self._move(
+            {"section": "drive", "fromKey": "a.txt", "toKey": "b.txt"},
+            exists=(True, AWSError("head-object failed")),
+        )
+        assert resp.status == 502
+        assert parent.mock_calls == []
+
+    def test_move_reauthorizes_inside_the_lock_before_any_storage_call(self):
+        # The lock wait can queue a move for minutes behind an upload; consent
+        # withdrawn during that wait must refuse the queued mutation. The
+        # re-authorization runs AFTER lock acquisition and BEFORE any probe.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/drive/{ACCOUNT}/move", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"section": "drive", "fromKey": "a.txt", "toKey": "b.txt"}
+        )
+        deny = web.json_response({"error": "consent withdrawn"}, status=403)
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(
+                routes_mod, "_reauthorize_in_lock", AsyncMock(return_value=deny)
+            ) as reauth,
+            mock.patch.object(routes_mod.storage_mod, "object_exists") as head,
+            mock.patch.object(routes_mod.storage_mod, "copy_object") as copy,
+            mock.patch.object(routes_mod.storage_mod, "delete_key") as delete,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/move")](req)  # type: ignore[operator]
+            )
+        assert resp.status == 403
+        assert reauth.await_count == 1
+        assert not head.called and not copy.called and not delete.called
+
+
+# ---------------------------------------------------------------------------
+# Drive per-key write locks — the guard that makes "never overwrites" true
+# against this gateway's own concurrent writers (S3 CopyObject has no
+# destination precondition, so ordering is the only enforcement available).
+# ---------------------------------------------------------------------------
+
+
+class TestDriveKeyLocks:
+    def test_same_key_serializes_and_registry_empties(self):
+        # Two holders of one key run strictly one-after-the-other, and the
+        # registry holds no entries once both released — boundedness comes
+        # from refcounting, so a leak here would grow with drive history.
+        async def run() -> list[str]:
+            order: list[str] = []
+
+            async def hold(tag: str, gate: asyncio.Event | None) -> None:
+                async with routes_mod._locked_drive_keys("bkt", "drive", "a.txt"):
+                    order.append(f"{tag}-in")
+                    if gate:
+                        await gate.wait()
+                    order.append(f"{tag}-out")
+
+            gate = asyncio.Event()
+            first = asyncio.create_task(hold("first", gate))
+            await asyncio.sleep(0)  # first acquires
+            second = asyncio.create_task(hold("second", None))
+            await asyncio.sleep(0)  # second must be parked, not interleaved
+            assert order == ["first-in"]
+            gate.set()
+            await asyncio.gather(first, second)
+            return order
+
+        order = asyncio.run(run())
+        assert order == ["first-in", "first-out", "second-in", "second-out"]
+        assert routes_mod._drive_key_locks == {}
+        assert routes_mod._drive_key_lock_refs == {}
+
+    def test_distinct_keys_do_not_contend(self):
+        # The lock is per key by design: a 512 MB upload may hold its key for
+        # minutes, and an unrelated move must not queue behind it.
+        async def run() -> bool:
+            async with routes_mod._locked_drive_keys("bkt", "drive", "a.txt"):
+                entered = False
+                async with routes_mod._locked_drive_keys("bkt", "drive", "b.txt"):
+                    entered = True
+                return entered
+
+        assert asyncio.run(run()) is True
+        assert routes_mod._drive_key_locks == {}
+
+    def test_move_probe_waits_for_a_held_destination_key(self):
+        # The defect this guards: an upload landing between the move's
+        # destination probe and its copy was overwritten and the source then
+        # deleted. With the upload's put holding the destination key, the
+        # move's FIRST storage call must not happen until the hold releases —
+        # probe-after-release then reads the uploaded object and answers 409.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/drive/{ACCOUNT}/move", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"section": "drive", "fromKey": "a.txt", "toKey": "b.txt"}
+        )
+
+        async def run() -> tuple[int, list[str]]:
+            calls: list[str] = []
+
+            def probe(*_a, **kwargs) -> bool:
+                calls.append("probe")
+                return True  # source exists; destination exists -> 409
+
+            with (
+                p1,
+                p2,
+                p3,
+                _consent_ok(),
+                _drive_found(),
+                mock.patch.object(routes_mod.storage_mod, "object_exists", side_effect=probe),
+                mock.patch.object(routes_mod.storage_mod, "copy_object") as copy,
+            ):
+                bucket = "kirocrew-drive-abc"  # the name _drive_found answers
+                async with routes_mod._locked_drive_keys(bucket, "drive", "b.txt"):
+                    task = asyncio.create_task(
+                        handlers[("POST", "/drive/{account}/move")](req)  # type: ignore[operator]
+                    )
+                    # Give the handler every chance to (wrongly) probe while
+                    # the destination key is held by the "upload". Real sleeps,
+                    # not sleep(0): the probe crosses to_thread, so a zero-tick
+                    # yield could leave the handler short of the lock and make
+                    # the empty-calls assertion vacuous.
+                    for _ in range(10):
+                        await asyncio.sleep(0.01)
+                    assert calls == []
+                resp = await task
+                assert not copy.called
+            return resp.status, calls
+
+        status, calls = asyncio.run(run())
+        assert status == 409
+        assert calls == ["probe", "probe"]
+
+
+class TestDriveSectionSweepLock:
+    def test_shared_holders_run_concurrently_and_sweep_excludes_them(self):
+        # Two key-scoped mutations on DIFFERENT keys overlap (shared holds);
+        # a sweep waits for both, then runs alone; a key op arriving while
+        # the sweep waits queues BEHIND it (writer preference — a stream of
+        # uploads cannot starve a folder delete).
+        async def run() -> list[str]:
+            order: list[str] = []
+            gate = asyncio.Event()
+
+            async def key_op(tag: str, wait: bool) -> None:
+                async with routes_mod._locked_drive_write("bkt", "drive", tag):
+                    order.append(f"{tag}-in")
+                    if wait:
+                        await gate.wait()
+                    order.append(f"{tag}-out")
+
+            async def sweep() -> None:
+                async with routes_mod._locked_drive_sweep("bkt", "drive"):
+                    order.append("sweep")
+
+            first = asyncio.create_task(key_op("a", True))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(key_op("b", True))
+            await asyncio.sleep(0)
+            assert order == ["a-in", "b-in"]  # shared: both inside at once
+            sweeper = asyncio.create_task(sweep())
+            await asyncio.sleep(0)
+            third = asyncio.create_task(key_op("c", False))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            # Sweep is parked behind a+b; c is parked behind the WAITING sweep.
+            assert "sweep" not in order and "c-in" not in order
+            gate.set()
+            await asyncio.gather(first, second, sweeper, third)
+            return order
+
+        order = asyncio.run(run())
+        assert order.index("sweep") > order.index("a-out")
+        assert order.index("sweep") > order.index("b-out")
+        assert order.index("c-in") > order.index("sweep")
+
+    def test_folder_sweep_makes_no_storage_call_while_a_key_op_is_in_flight(self):
+        # The round-5 defect: a sweep landing between a move's copy and its
+        # source delete removes the fresh destination and the move then
+        # deletes the source — the file is lost at both ends. The sweep must
+        # not touch storage until in-flight key-scoped mutations drain.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/drive/{ACCOUNT}/folder/delete", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"section": "drive", "path": "docs"}
+        )
+
+        async def run() -> int:
+            with (
+                p1,
+                p2,
+                p3,
+                _consent_ok(),
+                _drive_found(),
+                mock.patch.object(routes_mod.storage_mod, "delete_prefix", return_value=3) as sweep,
+            ):
+                bucket = "kirocrew-drive-abc"
+                async with routes_mod._locked_drive_write(bucket, "drive", "docs/x.txt"):
+                    task = asyncio.create_task(
+                        handlers[("POST", "/drive/{account}/folder/delete")](req)  # type: ignore[operator]
+                    )
+                    for _ in range(10):
+                        await asyncio.sleep(0.01)
+                    assert not sweep.called
+                resp = await task
+                assert sweep.called
+            return resp.status
+
+        assert asyncio.run(run()) == 200
 
 
 # ---------------------------------------------------------------------------
@@ -905,6 +1738,37 @@ class TestDriveShare:
             )
         return resp, presign, recorder
 
+    def test_share_in_lock_reauthorization_rechecks_the_publish_gate(self):
+        # The entry gate runs _publish_gate (a share is bytes-leave-the-box);
+        # the in-lock re-check must re-run the SAME set — publish=True — or a
+        # policy revoked during the lock wait would still mint a bearer URL.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/drive/{ACCOUNT}/share", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(  # type: ignore[method-assign]
+            return_value={"section": "drive", "key": "a.txt", "expiresSecs": 3600}
+        )
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod, "publish_denied_reason", return_value=""),
+            mock.patch.object(
+                routes_mod, "_reauthorize_in_lock", AsyncMock(return_value=None)
+            ) as reauth,
+            mock.patch.object(routes_mod.storage_mod, "object_exists", return_value=True),
+            mock.patch.object(routes_mod.storage_mod, "presign", return_value="https://signed"),
+            mock.patch.object(routes_mod.shares_mod, "record_share", return_value={"id": "sh-1"}),
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/share")](req)  # type: ignore[operator]
+            )
+        assert resp.status == 200
+        assert reauth.await_count == 1
+        assert reauth.await_args.kwargs["publish"] is True
+
     def test_share_mints_a_url_and_records_the_ledger_entry(self):
         resp, presign, recorder = self._share(
             {"section": "drive", "key": "a.txt", "note": "hi", "expiresSecs": 3600}
@@ -978,6 +1842,39 @@ class TestDriveShare:
             )
         assert resp.status == 502
 
+    def test_share_withholds_the_url_when_the_ledger_refuses_as_corrupt(self):
+        # #7805: the ledger reader refuses a corrupt document rather than
+        # replacing it. A mint that could not be RECORDED must not be handed
+        # out — the URL would be a live unrevokable bearer grant with no local
+        # record, the exact under-reporting the strict reader exists to prevent.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/drive/{ACCOUNT}/share", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(return_value={"section": "drive", "key": "a.txt"})  # type: ignore[method-assign]
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod, "publish_denied_reason", return_value=""),
+            mock.patch.object(routes_mod.storage_mod, "object_exists", return_value=True),
+            mock.patch.object(routes_mod.storage_mod, "presign", return_value="https://signed"),
+            mock.patch.object(
+                routes_mod.shares_mod,
+                "record_share",
+                side_effect=json.JSONDecodeError("Expecting value", "[ not json", 2),
+            ),
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/drive/{account}/share")](req)  # type: ignore[operator]
+            )
+        assert resp.status == 500
+        body = _payload(resp)
+        assert body["code"] == "share_ledger_corrupt"
+        assert "https://signed" not in json.dumps(body)
+        assert "[ not json" not in json.dumps(body)
+
 
 # ---------------------------------------------------------------------------
 # Shares list + forget
@@ -987,18 +1884,244 @@ class TestDriveShare:
 class TestSharesListForget:
     def test_shares_list_filters_by_account(self):
         handlers = _registered()
-        entries = [{"id": "sh-1", "key": "a.txt"}]
+        entries = [{"id": "sh-1", "section": "drive", "key": "a.txt"}]
+        p1, p2, p3 = _enabled_owner_env()
         with (
-            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
             mock.patch.object(routes_mod.shares_mod, "list_shares", return_value=entries) as listed,
+            mock.patch.object(
+                routes_mod.storage_mod, "list_object_keys", return_value={"drive/a.txt"}
+            ),
         ):
             resp = asyncio.run(
                 handlers[("GET", "/shares")](  # type: ignore[operator]
                     _request("GET", f"/shares?account={ACCOUNT}")
                 )
             )
-        assert _payload(resp) == {"shares": entries}
+        assert _payload(resp) == {"shares": entries, "checked": True}
         listed.assert_called_once_with(ACCOUNT)
+
+    def test_a_row_whose_object_is_gone_is_marked_in_the_payload(self):
+        # The reported defect, at the route: a deleted object left the row
+        # asserting a link that resolves to nothing, with no signal at all.
+        handlers = _registered()
+        entries = [
+            {"id": "sh-1", "section": "drive", "key": "gone.txt"},
+            {"id": "sh-2", "section": "drive", "key": "here.txt"},
+        ]
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod.shares_mod, "list_shares", return_value=entries),
+            mock.patch.object(
+                routes_mod.storage_mod, "list_object_keys", return_value={"drive/here.txt"}
+            ),
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/shares")](  # type: ignore[operator]
+                    _request("GET", f"/shares?account={ACCOUNT}")
+                )
+            )
+        body = _payload(resp)
+        assert body["checked"] is True
+        # Marked, NOT dropped: both rows are still there. The ledger records an
+        # unexpired URL, and deleting the object does not un-mint it.
+        assert [row["id"] for row in body["shares"]] == ["sh-1", "sh-2"]
+        assert body["shares"][0]["objectMissing"] is True
+        assert "objectMissing" not in body["shares"][1]
+
+    def test_the_ledger_is_read_before_the_drive_is_listed(self):
+        # ORDER, pinned. A row read after the listing could be a share minted
+        # while it was in flight -- absent from it for being newer, and marked
+        # as pointing at a deleted object. Reading first makes that unreachable,
+        # which is why this route needs no observed-at cutoff.
+        handlers = _registered()
+        order: list[str] = []
+        p1, p2, p3 = _enabled_owner_env()
+
+        def _list_shares(_account):
+            order.append("ledger")
+            return [{"id": "sh-1", "section": "drive", "key": "a.txt"}]
+
+        def _list_keys(*_args, **_kwargs):
+            order.append("drive")
+            return {"drive/a.txt"}
+
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod.shares_mod, "list_shares", _list_shares),
+            mock.patch.object(routes_mod.storage_mod, "list_object_keys", _list_keys),
+        ):
+            asyncio.run(
+                handlers[("GET", "/shares")](  # type: ignore[operator]
+                    _request("GET", f"/shares?account={ACCOUNT}")
+                )
+            )
+        assert order == ["ledger", "drive"]
+
+    def test_an_empty_ledger_takes_no_listing(self):
+        # Nothing to check, so no paid call is made -- and `checked` is
+        # vacuously true because no claim went unverified.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            mock.patch.object(routes_mod.shares_mod, "list_shares", return_value=[]),
+            mock.patch.object(routes_mod.storage_mod, "list_object_keys") as keys,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/shares")](  # type: ignore[operator]
+                    _request("GET", f"/shares?account={ACCOUNT}")
+                )
+            )
+        assert _payload(resp) == {"shares": [], "checked": True}
+        keys.assert_not_called()
+
+    def test_an_unscoped_list_reports_that_it_checked_nothing(self):
+        # The ledger spans accounts, so there is no single drive to read. The
+        # rows still render; the payload says they are unverified rather than
+        # letting an absent flag read as "the object is there".
+        handlers = _registered()
+        entries = [{"id": "sh-1", "section": "drive", "key": "a.txt"}]
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(routes_mod.shares_mod, "list_shares", return_value=entries),
+            mock.patch.object(routes_mod.storage_mod, "list_object_keys") as keys,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/shares")](_request("GET", "/shares"))  # type: ignore[operator]
+            )
+        body = _payload(resp)
+        assert body == {"shares": entries, "checked": False}
+        keys.assert_not_called()
+
+    def test_an_unreadable_drive_leaves_every_row_unmarked(self, caplog):
+        # THE degradation that matters. A throttle, a timeout or a garbled
+        # listing must never be rendered as "these objects are gone" -- the rows
+        # come back untouched, and the AWS reason reaches the operator's LOG
+        # rather than the payload, which carries no reason field at all.
+        handlers = _registered()
+        entries = [{"id": "sh-1", "section": "drive", "key": "a.txt"}]
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            caplog.at_level(logging.INFO, logger=routes_mod.logger.name),
+            mock.patch.object(routes_mod.shares_mod, "list_shares", return_value=entries),
+            mock.patch.object(
+                routes_mod.storage_mod,
+                "list_object_keys",
+                side_effect=AWSError("ThrottlingException: slow down"),
+            ),
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/shares")](  # type: ignore[operator]
+                    _request("GET", f"/shares?account={ACCOUNT}")
+                )
+            )
+        assert resp.status == 200
+        assert _payload(resp) == {"shares": entries, "checked": False}
+        # Swallowing the reason entirely would leave an operator with a section
+        # that silently stopped checking, so it is asserted where it now lives.
+        assert "Throttling" in caplog.text
+
+    def test_an_account_with_no_drive_still_renders_its_rows(self, caplog):
+        handlers = _registered()
+        entries = [{"id": "sh-1", "section": "drive", "key": "a.txt"}]
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(name=""),
+            caplog.at_level(logging.INFO, logger=routes_mod.logger.name),
+            mock.patch.object(routes_mod.shares_mod, "list_shares", return_value=entries),
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/shares")](  # type: ignore[operator]
+                    _request("GET", f"/shares?account={ACCOUNT}")
+                )
+            )
+        assert _payload(resp) == {"shares": entries, "checked": False}
+        assert "this account has no drive yet" in caplog.text
+
+    def test_a_withheld_s3_consent_degrades_instead_of_409ing(self):
+        # This GET now reaches S3, so it runs the consent gate -- but the Access
+        # section is the ledger's only surface and must not disappear behind a
+        # 409 for a grant that only governs the remote half.
+        #
+        # Everything PAST the gate is stubbed to succeed, so the gate is the only
+        # reason the listing does not happen: without it this render would reach
+        # a paid call on a withdrawn grant and report `checked: true`.
+        handlers = _registered()
+        entries = [{"id": "sh-1", "section": "drive", "key": "a.txt"}]
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            mock.patch.object(
+                routes_mod.aws_consent, "refuse_and_log", AsyncMock(return_value=False)
+            ),
+            _drive_found(),
+            mock.patch.object(routes_mod.shares_mod, "list_shares", return_value=entries),
+            mock.patch.object(
+                routes_mod.storage_mod, "list_object_keys", return_value={"drive/a.txt"}
+            ) as keys,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/shares")](  # type: ignore[operator]
+                    _request("GET", f"/shares?account={ACCOUNT}")
+                )
+            )
+        assert resp.status == 200
+        assert _payload(resp)["checked"] is False
+        keys.assert_not_called()
+
+    def test_an_unavailable_account_is_audited_as_a_denial(self):
+        # A permission decision reaches SEL even though the route degrades: the
+        # profile no longer resolves to the requested account, and that is the
+        # one event an incident review asks about.
+        handlers = _registered()
+        entries = [{"id": "sh-1", "section": "drive", "key": "a.txt"}]
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(
+                routes_mod.accounts_mod, "resolve_account_profile", AsyncMock(return_value=None)
+            ),
+            mock.patch.object(routes_mod.shares_mod, "list_shares", return_value=entries),
+            mock.patch.object(routes_mod, "_audit") as audited,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/shares")](  # type: ignore[operator]
+                    _request("GET", f"/shares?account={ACCOUNT}")
+                )
+            )
+        assert _payload(resp)["checked"] is False
+        # Asserted BEFORE the fields are read: a regression that stops auditing
+        # leaves `call_args` as None, and dereferencing it reports an
+        # AttributeError instead of the event that went missing.
+        assert audited.called
+        assert audited.call_args.args[0] == "shares_list"
+        assert audited.call_args.kwargs["error"] == "account_unavailable"
 
     def test_forget_removes_a_known_share(self):
         handlers = _registered()
@@ -1026,6 +2149,27 @@ class TestSharesListForget:
             )
         assert resp.status == 404
         assert _payload(resp)["code"] == "unknown_share"
+
+    def test_forget_reports_a_corrupt_ledger_instead_of_claiming_unknown(self):
+        # #7805: on the old lenient read a corrupt ledger made every share read
+        # as absent, so forget answered 404 "unknown share" while the record sat
+        # readable in the corrupt bytes — and the rewrite then destroyed it.
+        handlers = _registered()
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(
+                routes_mod.shares_mod,
+                "forget_share",
+                side_effect=json.JSONDecodeError("Expecting value", "[ not json", 2),
+            ),
+        ):
+            req = _request("POST", "/shares/sh-1/forget", match_info={"id": "sh-1"})
+            req.json = AsyncMock(return_value={})  # type: ignore[method-assign]
+            resp = asyncio.run(
+                handlers[("POST", "/shares/{id}/forget")](req)  # type: ignore[operator]
+            )
+        assert resp.status == 500
+        assert _payload(resp)["code"] == "share_ledger_corrupt"
 
 
 # ---------------------------------------------------------------------------
@@ -1158,19 +2302,450 @@ class TestCostsEndpoint:
 
 
 class TestLibrary:
-    def test_library_list_returns_pushable_rows(self):
+    def test_library_list_renders_rows_when_the_bucket_cannot_be_read(self):
+        # The load-bearing degradation: no working connection means the ledger's
+        # claim is UNVERIFIED, so the rows still render but `reconciled` is false
+        # and the reason is stated. A caller that could not tell this apart from
+        # "nothing in the cloud" is how a delete control gets offered for an item
+        # nothing is known about.
         handlers = _registered()
         rows = [{"slug": "x", "name": "X"}]
         with (
             mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(
+                routes_mod.accounts_mod,
+                "resolve_account_profile",
+                AsyncMock(return_value=None),
+            ),
             mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=rows),
+            mock.patch.object(routes_mod.library_mod, "reconcile") as reconcile,
         ):
             resp = asyncio.run(
                 handlers[("GET", "/library/{account}")](  # type: ignore[operator]
                     _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
                 )
             )
-        assert _payload(resp) == {"artifacts": rows}
+        body = _payload(resp)
+        assert body["artifacts"] == rows
+        assert body["reconciled"] is False
+        assert body["remoteError"]
+        # Nothing was concluded about absence, so nothing was pruned.
+        reconcile.assert_not_called()
+        # And no remoteOnly key: an empty list would read as "no untracked
+        # copies", which was never established.
+        assert "remoteOnly" not in body
+
+    def test_library_list_reconciles_the_ledger_and_reports_untracked_copies(self):
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        rows = [{"slug": "local-one", "name": "L"}]
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(
+                routes_mod.storage_mod,
+                "list_library_folders",
+                return_value=["local-one", "pushed-elsewhere"],
+            ),
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=rows),
+            mock.patch.object(routes_mod.library_mod, "reconcile", return_value=["stale"]) as rec,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        body = _payload(resp)
+        assert body["reconciled"] is True
+        assert "remoteError" not in body
+        # The bucket listing is what corrects the ledger, and it is the SERVER's
+        # own read -- never a set handed in by the caller.
+        assert rec.call_args.args[0] == ACCOUNT
+        assert rec.call_args.args[1] == {"local-one", "pushed-elsewhere"}
+        # The snapshot's own time travels with it: reconcile refuses to prune a
+        # record written after the listing, and cannot do that without knowing
+        # when the listing was taken.
+        assert isinstance(rec.call_args.kwargs["observed_at"], dt.datetime)
+        # A cloud copy with no local artifact row has nothing to carry it in
+        # `artifacts`; without this it would be unreachable from the console.
+        assert body["remoteOnly"] == ["pushed-elsewhere"]
+
+    def test_library_list_ignores_a_folder_that_is_not_a_slug(self):
+        # A prefix written by another tool ("my uploads/") is not a slug the
+        # store could have produced, so it cannot answer for a ledger key. It is
+        # dropped before reconcile rather than counted as a cloud copy.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(
+                routes_mod.storage_mod,
+                "list_library_folders",
+                return_value=["good-slug", "my uploads", "Not_A_Slug"],
+            ),
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=[]),
+            mock.patch.object(routes_mod.library_mod, "reconcile", return_value=[]) as rec,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        assert rec.call_args.args[1] == {"good-slug"}
+        assert _payload(resp)["remoteOnly"] == ["good-slug"]
+
+    def test_library_list_skips_reconcile_when_the_listing_fails(self):
+        # An AWS failure is not evidence of an empty bucket. The reason is
+        # reported and the ledger is left exactly as it was.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(
+                routes_mod.storage_mod,
+                "list_library_folders",
+                side_effect=AWSError("list denied"),
+            ),
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=[]),
+            mock.patch.object(routes_mod.library_mod, "reconcile") as rec,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        body = _payload(resp)
+        assert body["reconciled"] is False and "list denied" in body["remoteError"]
+        rec.assert_not_called()
+
+    def test_library_list_skips_reconcile_when_the_account_has_no_drive(self):
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            mock.patch.object(routes_mod.storage_mod, "find_drive", return_value=""),
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=[]),
+            mock.patch.object(routes_mod.library_mod, "reconcile") as rec,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        # Still 200 with rows: the Library list is a LOCAL view first, and an
+        # account with no drive yet must not blank the page.
+        assert resp.status == 200
+        assert _payload(resp)["reconciled"] is False
+        rec.assert_not_called()
+
+    def test_the_listing_and_the_prune_run_under_one_lock(self):
+        # The window GPT and Design both flagged: a push completing between the
+        # reconcile's listing and its prune has its fresh record deleted on a
+        # snapshot taken before it existed. The lock is what makes the two a
+        # single step, so the listing must observe it HELD -- asserting on the
+        # lock rather than on a sleep, which would only prove timing.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        seen: dict[str, bool] = {}
+
+        def _list_folders(*_a, **_kw):
+            seen["locked_during_listing"] = routes_mod._library_lock.locked()
+            return ["a"]
+
+        def _reconcile(*_a, **_kw):
+            seen["locked_during_prune"] = routes_mod._library_lock.locked()
+            return []
+
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(
+                routes_mod.storage_mod, "list_library_folders", side_effect=_list_folders
+            ),
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=[]),
+            mock.patch.object(routes_mod.library_mod, "reconcile", side_effect=_reconcile),
+        ):
+            asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        assert seen == {"locked_during_listing": True, "locked_during_prune": True}
+        # And released afterwards, or the next render would deadlock behind it.
+        assert not routes_mod._library_lock.locked()
+
+    def test_library_list_skips_reconcile_when_consent_is_withdrawn_while_queued(self):
+        # The lock makes the reconcile read WAIT too, and a listing is still a
+        # call into a paid service -- so it re-checks inside the lock like the two
+        # mutations. Failure degrades to "not reconciled" rather than erroring:
+        # this route's local half must keep rendering.
+        handlers = _registered()
+        calls = {"n": 0}
+
+        async def _consent_then_deny(*_a, **_kw):
+            calls["n"] += 1
+            return calls["n"] <= 1
+
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(
+                routes_mod.accounts_mod,
+                "resolve_account_profile",
+                AsyncMock(return_value=("prof", "us-west-2")),
+            ),
+            mock.patch.object(
+                routes_mod.aws_consent,
+                "probe_identity",
+                AsyncMock(return_value=aws_consent.Identity(ok=True, account=ACCOUNT)),
+            ),
+            mock.patch.object(
+                routes_mod.aws_consent, "refuse_and_log", AsyncMock(side_effect=_consent_then_deny)
+            ),
+            _drive_found(),
+            mock.patch.object(routes_mod.storage_mod, "list_library_folders") as lister,
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=[]),
+            mock.patch.object(routes_mod.library_mod, "reconcile") as rec,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        body = _payload(resp)
+        assert resp.status == 200
+        assert body["reconciled"] is False and body["remoteError"]
+        # No AWS call and no prune on a grant that no longer holds.
+        lister.assert_not_called()
+        rec.assert_not_called()
+
+    def test_library_list_skips_reconcile_when_the_drive_changes_while_queued(self):
+        # Identity unchanged is NOT enough: tag discovery can return a different
+        # bucket while the profile still names the same account, and this module
+        # keeps no bucket-name cache precisely because that identity must not be
+        # stale. A queued caller holding a pre-wait name is that staleness.
+        handlers = _registered()
+        seen = {"n": 0}
+
+        def _drive_then_move(*_a, **_kw):
+            seen["n"] += 1
+            return "kirocrew-drive-abc" if seen["n"] <= 1 else "kirocrew-drive-def"
+
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(
+                routes_mod.accounts_mod,
+                "resolve_account_profile",
+                AsyncMock(return_value=("prof", "us-west-2")),
+            ),
+            mock.patch.object(
+                routes_mod.aws_consent,
+                "probe_identity",
+                AsyncMock(return_value=aws_consent.Identity(ok=True, account=ACCOUNT)),
+            ),
+            _consent_ok(),
+            mock.patch.object(routes_mod.storage_mod, "find_drive", side_effect=_drive_then_move),
+            mock.patch.object(routes_mod.storage_mod, "list_library_folders") as lister,
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=[]),
+            mock.patch.object(routes_mod.library_mod, "reconcile") as rec,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        assert resp.status == 200
+        assert _payload(resp)["reconciled"] is False
+        lister.assert_not_called()
+        rec.assert_not_called()
+
+    def test_library_list_survives_an_unwritable_ledger(self):
+        # The reconcile WRITES, and this route is best-effort by contract. An
+        # unwritable ledger dir must not turn a page render into a 500 -- the rows
+        # are still renderable, they are just unverified.
+        handlers = _registered()
+        rows = [{"slug": "x", "name": "X"}]
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod.storage_mod, "list_library_folders", return_value=["x"]),
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=rows),
+            mock.patch.object(
+                routes_mod.library_mod,
+                "reconcile",
+                side_effect=OSError("read-only file system"),
+            ),
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        body = _payload(resp)
+        assert resp.status == 200
+        assert body["artifacts"] == rows
+        # Reported, not swallowed: the payload must not claim a reconcile happened.
+        assert body["reconciled"] is False and body["remoteError"]
+
+    def test_library_list_survives_a_corrupt_ledger(self):
+        # #7805: the strict update reader refuses a corrupt ledger with
+        # JSONDecodeError. The list route is best-effort by contract and its
+        # rows come from the LENIENT display read, so the render must survive
+        # and the degradation must be reported — with a reason that says
+        # "repair", not "retry".
+        handlers = _registered()
+        rows = [{"slug": "x", "name": "X"}]
+        p1, p2, p3 = _enabled_owner_env()
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod.storage_mod, "list_library_folders", return_value=["x"]),
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=rows),
+            mock.patch.object(
+                routes_mod.library_mod,
+                "reconcile",
+                side_effect=json.JSONDecodeError("Expecting value", "{ not json", 2),
+            ),
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        body = _payload(resp)
+        assert resp.status == 200
+        assert body["artifacts"] == rows
+        assert body["reconciled"] is False
+        assert "corrupt" in body["remoteError"]
+
+    def test_library_list_audits_an_identity_denial_it_degrades_past(self):
+        # _guarded's own rule: a permission DECISION reaches SEL. This route
+        # degrades instead of failing, so without an explicit audit the decision
+        # would go unrecorded -- the one event an incident review asks about.
+        handlers = _registered()
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(
+                routes_mod.accounts_mod,
+                "resolve_account_profile",
+                AsyncMock(return_value=None),
+            ),
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=[]),
+            mock.patch.object(routes_mod, "_audit") as audit,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        assert resp.status == 200
+        assert _payload(resp)["reconciled"] is False
+        denials = [c for c in audit.call_args_list if "denied" in c.args]
+        assert denials, "the degraded identity denial was not audited"
+
+    def test_library_list_audits_a_queued_identity_denial_it_degrades_past(self):
+        # The SECOND site of the same class: the pre-lock denial was audited last
+        # round, this one fires inside _reauthorize_in_lock. On the read path that
+        # response becomes a degraded 200, so the decision has to be recorded at
+        # the point it is made or it vanishes on this path entirely.
+        handlers = _registered()
+        calls = {"n": 0}
+
+        async def _resolve_then_lose(*_a, **_kw):
+            calls["n"] += 1
+            return ("prof", "us-west-2") if calls["n"] <= 1 else None
+
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(
+                routes_mod.accounts_mod,
+                "resolve_account_profile",
+                AsyncMock(side_effect=_resolve_then_lose),
+            ),
+            mock.patch.object(
+                routes_mod.aws_consent,
+                "probe_identity",
+                AsyncMock(return_value=aws_consent.Identity(ok=True, account=ACCOUNT)),
+            ),
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod.storage_mod, "list_library_folders") as lister,
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=[]),
+            mock.patch.object(routes_mod, "_audit") as audit,
+        ):
+            resp = asyncio.run(
+                handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            )
+        assert resp.status == 200
+        assert _payload(resp)["reconciled"] is False
+        lister.assert_not_called()
+        denials = [c for c in audit.call_args_list if "denied" in c.args]
+        assert denials, "the queued identity denial was not audited"
+
+    def test_library_list_gives_up_the_reconcile_rather_than_waiting_on_a_slow_mutation(self):
+        # The lock is also held across a push, whose upload allows up to 600s. An
+        # unbounded wait here would hang every Library page render for that long.
+        # Errors on this path already degrade to reconciled:false; slowness has to
+        # degrade the same way, or the degradation is only half real.
+        handlers = _registered()
+        rows = [{"slug": "x", "name": "X"}]
+        p1, p2, p3 = _enabled_owner_env()
+
+        async def _run():
+            # Hold the lock the way a slow push would, then render.
+            await routes_mod._library_lock.acquire()
+            try:
+                return await handlers[("GET", "/library/{account}")](  # type: ignore[operator]
+                    _request("GET", f"/library/{ACCOUNT}", match_info={"account": ACCOUNT})
+                )
+            finally:
+                routes_mod._library_lock.release()
+
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod, "_LIBRARY_RECONCILE_LOCK_WAIT_SECS", 0.05),
+            mock.patch.object(routes_mod.storage_mod, "list_library_folders") as lister,
+            mock.patch.object(routes_mod.library_mod, "list_pushable", return_value=rows),
+            mock.patch.object(routes_mod.library_mod, "reconcile") as rec,
+        ):
+            resp = asyncio.run(_run())
+        body = _payload(resp)
+        # The rows still render; only the re-read was skipped, and it says so.
+        assert resp.status == 200 and body["artifacts"] == rows
+        assert body["reconciled"] is False and body["remoteError"]
+        lister.assert_not_called()
+        rec.assert_not_called()
+        # Released, so the next render is not stuck behind this one.
+        assert not routes_mod._library_lock.locked()
 
     def _push(self, *, side_effect=None, record=None):
         handlers = _registered()
@@ -1238,9 +2813,220 @@ class TestLibrary:
         assert resp.status == 400
         assert _payload(resp)["code"] == "not_pushable"
 
+    def test_push_reports_a_corrupt_ledger_not_a_client_error(self):
+        # #7805, the trap the issue names: JSONDecodeError subclasses ValueError,
+        # so without its own arm the ledger's corruption refusal would be
+        # reported as 400 not_pushable — blaming the artifact for a store the
+        # operator has to repair, on a push whose upload may already be in the
+        # bucket.
+        resp = self._push(side_effect=json.JSONDecodeError("Expecting value", "{ not json", 2))
+        assert resp.status == 500
+        assert _payload(resp)["code"] == "library_ledger_corrupt"
+
     def test_push_surfaces_an_aws_error(self):
         resp = self._push(side_effect=AWSError("put denied"))
         assert resp.status == 502
+
+    def _remove(self, *, body=None, side_effect=None, result=None, publish_reason=""):
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/library/{ACCOUNT}/remove", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(return_value={"slug": "art-1"} if body is None else body)  # type: ignore[method-assign]
+        remove = mock.patch.object(
+            routes_mod.library_mod,
+            "library_remove",
+            side_effect=side_effect,
+            return_value=(
+                result
+                if result is not None
+                else {"slug": "art-1", "account": ACCOUNT, "objects": 2, "forgotten": True}
+            ),
+        )
+        with (
+            p1,
+            p2,
+            p3,
+            _consent_ok(),
+            _drive_found(),
+            mock.patch.object(routes_mod, "publish_denied_reason", return_value=publish_reason),
+            remove as removed,
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/library/{account}/remove")](req)  # type: ignore[operator]
+            )
+        return resp, removed
+
+    def test_remove_deletes_the_cloud_copy_and_reports_both_halves(self):
+        resp, removed = self._remove()
+        assert resp.status == 200
+        body = _payload(resp)
+        assert body["removed"] is True
+        # Objects AND record, told apart: a copy pushed from another machine has
+        # objects with no local record, and one number for both would hide which
+        # of the two was emptied.
+        assert body["objects"] == 2 and body["forgotten"] is True
+        assert removed.call_args.args == (
+            "prof",
+            "us-west-2",
+            "kirocrew-drive-abc",
+            ACCOUNT,
+            "art-1",
+        )
+
+    def test_remove_is_not_gated_by_the_publish_gate(self):
+        # Publish governance decides whether BYTES MAY LEAVE the box. A removal
+        # sends nothing out, so a profile that forbids publishing must still be
+        # able to empty a bucket it is paying for -- otherwise denying publish
+        # traps whatever was pushed before it was denied.
+        resp, removed = self._remove(publish_reason="capability denied")
+        assert resp.status == 200
+        removed.assert_called_once()
+
+    def test_remove_requires_a_slug(self):
+        resp, removed = self._remove(body={})
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_slug"
+        removed.assert_not_called()
+
+    def test_remove_refuses_a_slug_that_would_widen_the_delete_prefix(self):
+        # "a/b" is a KEY, not a slug: it would address a prefix below one
+        # artifact. The empty and '/'-shaped values are the same class of
+        # widening, and none of them reach the storage layer.
+        for bad in ("", "/", "..", "a/b", "Upper"):
+            resp, removed = self._remove(body={"slug": bad})
+            assert resp.status == 400, bad
+            assert _payload(resp)["code"] == "invalid_slug"
+            removed.assert_not_called()
+
+    def test_remove_maps_a_rejected_slug_from_the_engine_to_400(self):
+        # library_remove re-checks the shape itself, so the route reports that
+        # refusal as a bad request rather than a 500.
+        resp, _removed = self._remove(side_effect=ValueError("'x/y' is not an artifact slug"))
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_slug"
+
+    def test_remove_reports_a_corrupt_ledger_not_an_invalid_slug(self):
+        # #7805: JSONDecodeError subclasses ValueError, so without its own arm
+        # the ledger's corruption refusal reads as 400 invalid_slug — blaming
+        # the request for a store the operator has to repair.
+        resp, _removed = self._remove(
+            side_effect=json.JSONDecodeError("Expecting value", "{ not json", 2)
+        )
+        assert resp.status == 500
+        assert _payload(resp)["code"] == "library_ledger_corrupt"
+
+    def test_remove_surfaces_an_aws_error(self):
+        # A failed delete must NOT report success: the objects are still there,
+        # and the ledger still says so, which reconcile will confirm.
+        resp, _removed = self._remove(side_effect=AWSError("delete denied"))
+        assert resp.status == 502
+
+    def test_push_and_remove_both_hold_the_library_lock(self):
+        # Both are a network round trip followed by a ledger write, and the two
+        # interleaving on one slug can leave an object behind the delete sweep or
+        # forget a record the other is about to write. One lock covers push,
+        # remove, and the reconcile read.
+        held: dict[str, bool] = {}
+
+        def _record_push(*_a, **_kw):
+            held["push"] = routes_mod._library_lock.locked()
+            return {"slug": "art-1"}
+
+        def _record_remove(*_a, **_kw):
+            held["remove"] = routes_mod._library_lock.locked()
+            return {"slug": "art-1", "account": ACCOUNT, "objects": 1, "forgotten": True}
+
+        self._push(side_effect=_record_push)
+        self._remove(side_effect=_record_remove)
+        assert held == {"push": True, "remove": True}
+        assert not routes_mod._library_lock.locked()
+
+    def _queued_then_revoked(self, path: str, *, revoke: str):
+        """Run push/remove with authorization that FAILS on the second check.
+
+        The lock makes a caller wait, and the wait sits between the checks
+        _require_drive ran and the AWS call they authorized. These fakes pass the
+        first time and fail the second, standing in for the policy changing while
+        the caller was queued.
+        """
+        handlers = _registered()
+        calls = {"consent": 0, "identity": 0, "publish": 0}
+
+        async def _consent_then_deny(*_a, **_kw):
+            calls["consent"] += 1
+            return not (revoke == "consent" and calls["consent"] > 1)
+
+        async def _identity_then_move(*_a, **_kw):
+            calls["identity"] += 1
+            if revoke == "identity" and calls["identity"] > 1:
+                return aws_consent.Identity(ok=True, account="999988887777")
+            return aws_consent.Identity(ok=True, account=ACCOUNT)
+
+        def _publish_then_deny(*_a, **_kw):
+            calls["publish"] += 1
+            return "capability denied" if (revoke == "publish" and calls["publish"] > 1) else ""
+
+        req = _request("POST", f"{path}", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(return_value={"slug": "art-1"})  # type: ignore[method-assign]
+        route = "/library/{account}/push" if path.endswith("push") else "/library/{account}/remove"
+        target = "push_artifact" if path.endswith("push") else "library_remove"
+        with (
+            mock.patch.object(routes_mod, "is_app_enabled", return_value=True),
+            mock.patch.object(
+                routes_mod.accounts_mod,
+                "resolve_account_profile",
+                AsyncMock(return_value=("prof", "us-west-2")),
+            ),
+            mock.patch.object(
+                routes_mod.aws_consent, "probe_identity", AsyncMock(side_effect=_identity_then_move)
+            ),
+            mock.patch.object(
+                routes_mod.aws_consent, "refuse_and_log", AsyncMock(side_effect=_consent_then_deny)
+            ),
+            _drive_found(),
+            mock.patch.object(routes_mod, "publish_denied_reason", side_effect=_publish_then_deny),
+            mock.patch.object(routes_mod.library_mod, target) as engine,
+        ):
+            resp = asyncio.run(handlers[("POST", route)](req))  # type: ignore[operator]
+        return resp, engine
+
+    def test_push_refuses_when_consent_is_withdrawn_while_queued(self):
+        # The gap the lock introduced: a queued push must not upload on an
+        # authorization it has outlived. Same re-check drive_upload runs after its
+        # spool, for the same reason.
+        resp, engine = self._queued_then_revoked(f"/library/{ACCOUNT}/push", revoke="consent")
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "aws_consent_required"
+        engine.assert_not_called()
+
+    def test_push_refuses_when_the_profile_moves_account_while_queued(self):
+        # A profile repointed A -> B while queued: the upload would still write
+        # into the bucket resolved for A, so it is refused rather than run.
+        resp, engine = self._queued_then_revoked(f"/library/{ACCOUNT}/push", revoke="identity")
+        assert resp.status == 409
+        engine.assert_not_called()
+
+    def test_push_refuses_when_publish_governance_starts_denying_while_queued(self):
+        resp, engine = self._queued_then_revoked(f"/library/{ACCOUNT}/push", revoke="publish")
+        assert resp.status == 403
+        assert _payload(resp)["code"] == "publish_denied"
+        engine.assert_not_called()
+
+    def test_remove_refuses_when_consent_is_withdrawn_while_queued(self):
+        # A queued DELETE can outlive its authorization too, and a delete under
+        # withdrawn consent is still an unauthorized call into the account.
+        resp, engine = self._queued_then_revoked(f"/library/{ACCOUNT}/remove", revoke="consent")
+        assert resp.status == 409
+        assert _payload(resp)["code"] == "aws_consent_required"
+        engine.assert_not_called()
+
+    def test_remove_does_not_consult_the_publish_gate_even_in_the_lock(self):
+        # Removal sends nothing out, so the egress gate does not apply on the way
+        # in OR on the re-check -- a profile denied publishing must still be able
+        # to empty a bucket it pays for.
+        resp, engine = self._queued_then_revoked(f"/library/{ACCOUNT}/remove", revoke="publish")
+        assert resp.status == 200
+        engine.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -1268,7 +3054,9 @@ class TestBackupEndpoints:
         ):
             resp = asyncio.run(
                 handlers[("GET", "/backup/{account}")](  # type: ignore[operator]
-                    _request("GET", f"/backup/{ACCOUNT}", match_info={"account": ACCOUNT})
+                    # `remote=1` is required now: the remote half is opt-in so the
+                    # poll that follows a run does not spend paid AWS calls on it.
+                    _request("GET", f"/backup/{ACCOUNT}?remote=1", match_info={"account": ACCOUNT})
                 )
             )
         body = _payload(resp)
@@ -1293,7 +3081,9 @@ class TestBackupEndpoints:
         ):
             resp = asyncio.run(
                 handlers[("GET", "/backup/{account}")](  # type: ignore[operator]
-                    _request("GET", f"/backup/{ACCOUNT}", match_info={"account": ACCOUNT})
+                    # `remote=1` is required now: the remote half is opt-in so the
+                    # poll that follows a run does not spend paid AWS calls on it.
+                    _request("GET", f"/backup/{ACCOUNT}?remote=1", match_info={"account": ACCOUNT})
                 )
             )
         body = _payload(resp)
@@ -1316,71 +3106,86 @@ class TestBackupEndpoints:
         ):
             resp = asyncio.run(
                 handlers[("GET", "/backup/{account}")](  # type: ignore[operator]
-                    _request("GET", f"/backup/{ACCOUNT}", match_info={"account": ACCOUNT})
+                    # `remote=1` is required now: the remote half is opt-in so the
+                    # poll that follows a run does not spend paid AWS calls on it.
+                    _request("GET", f"/backup/{ACCOUNT}?remote=1", match_info={"account": ACCOUNT})
                 )
             )
         assert _payload(resp)["remote"] is None
         find.assert_not_called()
 
-    def _run_backup(self, kind, *, runner_side=None, run_record=None):
+    def _run_backup(self, kind, *, start=None, sdk_present=True):
+        """Drive ``POST /backup/{account}/run``.
+
+        The handler no longer performs the backup: it claims a durable Job SDK
+        run and returns its id. So this stubs the SDK rather than the backup
+        functions. The runner's own behaviour -- resolving its account, refusing
+        a key that names none, and the reconciliation of a run left behind by a
+        dead gateway -- lives in ``test_aws_control_backup_job.py``.
+        """
         handlers = _registered()
         p1, p2, p3 = _enabled_owner_env()
         req = _request("POST", f"/backup/{ACCOUNT}/run", match_info={"account": ACCOUNT})
         req.json = AsyncMock(return_value={"kind": kind})  # type: ignore[method-assign]
-        record = run_record if run_record is not None else {"key": "snapshots/x.tar.gz"}
+        fake = (
+            SimpleNamespace(start_async=start or AsyncMock(return_value="e" * 32))
+            if sdk_present
+            else None
+        )
         with (
             p1,
             p2,
             p3,
             _consent_ok(),
             _drive_found(),
-            mock.patch.object(
-                routes_mod.backup_mod,
-                "run_snapshot_backup",
-                side_effect=runner_side,
-                return_value=record,
-            ),
-            mock.patch.object(
-                routes_mod.backup_mod,
-                "run_sessions_backup",
-                side_effect=runner_side,
-                return_value=record,
-            ),
+            mock.patch.object(routes_mod, "get_job_sdk", return_value=fake),
         ):
             resp = asyncio.run(
                 handlers[("POST", "/backup/{account}/run")](req)  # type: ignore[operator]
             )
         return resp
 
-    def test_run_snapshot_backup_returns_the_run_record(self):
+    def test_run_snapshot_backup_starts_a_job_and_returns_its_id(self):
         from kiro_crew.apps.builtins.aws_control.backend import backup as backup_mod
 
         resp = self._run_backup(backup_mod.KIND_SNAPSHOT)
         assert resp.status == 200
         body = _payload(resp)
-        assert body["ran"] is True and body["kind"] == backup_mod.KIND_SNAPSHOT
+        assert body["started"] is True
+        assert body["kind"] == backup_mod.KIND_SNAPSHOT
+        assert body["runId"] == "e" * 32
 
-    def test_run_sessions_backup_uses_the_sessions_runner(self):
+    def test_run_sessions_backup_claims_the_sessions_kind(self):
         from kiro_crew.apps.builtins.aws_control.backend import backup as backup_mod
 
-        resp = self._run_backup(backup_mod.KIND_SESSIONS)
+        start = AsyncMock(return_value="f" * 32)
+        resp = self._run_backup(backup_mod.KIND_SESSIONS, start=start)
         assert resp.status == 200
         assert _payload(resp)["kind"] == backup_mod.KIND_SESSIONS
+        # The account is the dedupe key, so a double click adopts the first run
+        # instead of doing the paid upload twice.
+        start.assert_awaited_once_with(backup_mod.KIND_SESSIONS, dedupe_key=ACCOUNT)
 
-    def test_run_maps_a_runtime_error_to_a_409(self):
-        # The backup builder raising RuntimeError (e.g. a teardown signal) is a
-        # conflict, not an AWS failure — it must surface as 409 backup_failed.
+    def test_run_reports_an_absent_job_runtime_as_503(self):
+        # Enabled, but no SDK was published: the `jobs` grant is missing or the
+        # context build failed. The runtime is absent — not a bad request.
         from kiro_crew.apps.builtins.aws_control.backend import backup as backup_mod
 
-        resp = self._run_backup(backup_mod.KIND_SNAPSHOT, runner_side=RuntimeError("shutting down"))
-        assert resp.status == 409
-        assert _payload(resp)["code"] == "backup_failed"
+        resp = self._run_backup(backup_mod.KIND_SNAPSHOT, sdk_present=False)
+        assert resp.status == 503
+        assert _payload(resp)["code"] == "jobs_unavailable"
 
-    def test_run_surfaces_an_aws_error(self):
+    def test_run_reports_a_refused_claim_as_503(self):
+        # The SDK could not persist the initial record, or the host refused a
+        # thread. Nothing started, and the code says which layer refused.
         from kiro_crew.apps.builtins.aws_control.backend import backup as backup_mod
+        from kiro_crew.apps.job_sdk import JobError
 
-        resp = self._run_backup(backup_mod.KIND_SNAPSHOT, runner_side=AWSError("upload denied"))
-        assert resp.status == 502
+        resp = self._run_backup(
+            backup_mod.KIND_SNAPSHOT, start=AsyncMock(side_effect=JobError("no disk"))
+        )
+        assert resp.status == 503
+        assert _payload(resp)["code"] == "backup_start_failed"
 
     def test_nightly_toggle_persists_the_flag(self):
         handlers = _registered()
@@ -1420,6 +3225,35 @@ class TestBackupEndpoints:
             assert resp.status == 400, f"{raw!r} was accepted"
             assert _payload(resp)["code"] == "invalid_enabled"
             set_nightly.assert_not_called()
+
+    def test_a_toggle_that_could_not_persist_fails_with_a_structured_error(self):
+        # `set_nightly` now propagates rather than publishing over state it could
+        # not read, so this endpoint has a reachable failure. It must fail loudly
+        # -- reporting a setting the next read contradicts is worse than an error
+        # -- but with the machine-readable `code` every non-2xx here carries.
+        handlers = _registered()
+        p1, p2, p3 = _enabled_owner_env()
+        req = _request("POST", f"/backup/{ACCOUNT}/nightly", match_info={"account": ACCOUNT})
+        req.json = AsyncMock(return_value={"enabled": True})  # type: ignore[method-assign]
+        boom = OSError(28, "No space left on device", "/home/someone/.kirocrew/backup.json")
+        with (
+            p1,
+            p2,
+            p3,
+            mock.patch.object(routes_mod.backup_mod, "set_nightly", side_effect=boom),
+        ):
+            resp = asyncio.run(
+                handlers[("POST", "/backup/{account}/nightly")](req)  # type: ignore[operator]
+            )
+        body = _payload(resp)
+        assert resp.status == 500
+        assert body["code"] == "state_persist_failed"
+        # The response must not report the toggle as applied...
+        assert "nightly" not in body
+        # ...and must not echo the OSError's rendering, which carries the
+        # absolute path of the state file. The log has it; a response body does
+        # not need to disclose the local filesystem layout.
+        assert ".kirocrew" not in body["error"]
 
     def test_a_real_false_still_disables_nightly(self):
         # The validation must not break the ordinary off path.

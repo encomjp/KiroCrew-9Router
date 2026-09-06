@@ -37,6 +37,11 @@ _REAL_HOME = Path.home()
 # under $HOME). Provisioning resolves ``npm`` to an absolute path there.
 NODE_BIN = "/fake/node/bin"
 
+requires_posix_pod_lifecycle = pytest.mark.skipif(
+    not platform_compat.IS_POSIX,
+    reason="pod lifecycle requires POSIX descriptor traversal",
+)
+
 
 def _npm(*args: str) -> list[str]:
     """The argv provisioning is expected to spawn for an npm step."""
@@ -190,6 +195,720 @@ class TestPortDerivation:
         assert rt.derive_port(c, "pinned") == 7999
 
 
+class TestPortAllocation:
+    """Derivation maps 199 slots, so a collision is ordinary rather than exotic.
+
+    Allocation is the separate question `pod up` asks once: can this port actually
+    be had. Before this existed the answer was assumed, so the loser's gateway
+    exited "address already in use" and crash-looped while every reader kept
+    printing the shared port.
+    """
+
+    def _plane(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PodConfig:
+        monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path / "pods"))
+        return PodConfig.load()
+
+    def test_the_probe_detects_a_real_listener(self, tmp_path, monkeypatch) -> None:
+        """The load-bearing primitive, against a real socket rather than a stub.
+
+        Every other test here monkeypatches `_port_is_free` for determinism, so if
+        the probe itself were wrong they would all still pass. One real bind keeps
+        them honest.
+        """
+        import socket as _socket
+
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as held:
+            held.bind(("127.0.0.1", 0))
+            held.listen(1)
+            taken = held.getsockname()[1]
+            assert rt._port_is_free(taken) is False, "a bound, listening port must read as busy"
+        # Released with the socket. A port can be re-taken by anything on a shared
+        # host, so this direction is asserted only as "the probe answers", not as a
+        # guarantee about this specific number.
+        assert isinstance(rt._port_is_free(taken), bool)
+
+    def test_a_free_derived_port_is_used_unchanged(self, tmp_path, monkeypatch) -> None:
+        c = self._plane(tmp_path, monkeypatch)
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        port, displaced = rt.allocate_port(c, "solo")
+        assert port == rt.derive_port(c, "solo")
+        assert displaced is None, "nothing was displaced, so nothing should be reported"
+
+    def test_a_busy_derived_port_falls_back_and_names_what_it_displaced(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        c = self._plane(tmp_path, monkeypatch)
+        derived = rt.derive_port(c, "collider")
+        monkeypatch.setattr(rt, "_port_is_free", lambda p: p != derived)
+        port, displaced = rt.allocate_port(c, "collider")
+        assert port != derived
+        assert displaced == derived, "the caller cannot report the move without this"
+        assert c.base_port + 1 <= port <= c.base_port + 199, "the fallback must stay in band"
+
+    def test_the_fallback_is_deterministic(self, tmp_path, monkeypatch) -> None:
+        # Same collision must resolve the same way every time: a fallback that
+        # varied per run would reintroduce the reader disagreement from the other
+        # direction.
+        c = self._plane(tmp_path, monkeypatch)
+        derived = rt.derive_port(c, "collider")
+        monkeypatch.setattr(rt, "_port_is_free", lambda p: p != derived)
+        first, _ = rt.allocate_port(c, "collider")
+        second, _ = rt.allocate_port(c, "collider")
+        assert first == second
+
+    def test_the_fallback_never_lands_on_the_live_plane(self, tmp_path, monkeypatch) -> None:
+        """The live gateway's port is refused for the derived port already; the
+        fallback must not be the way back in."""
+        import dataclasses
+
+        c = self._plane(tmp_path, monkeypatch)
+        live = c.base_port + 5  # put the live plane inside the pod band
+        c = dataclasses.replace(c, live_port=live)
+        # ONLY the live plane is "free", so a correct allocator finds nothing and
+        # says so, rather than handing the pod the live gateway's port.
+        monkeypatch.setattr(rt, "_port_is_free", lambda p: p == live)
+        with pytest.raises(rt.PodError, match="no free port"):
+            rt.allocate_port(c, "collider")
+
+    def test_a_busy_pinned_port_refuses_instead_of_moving_it(self, tmp_path, monkeypatch) -> None:
+        # A hand-pinned port is a deliberate choice. Relocating it silently would
+        # defeat the reason it was pinned, so this is the loud path.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("pinned").write_text("PORT='7999'\n")
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: False)
+        with pytest.raises(rt.PodError, match="pins PORT=7999"):
+            rt.allocate_port(c, "pinned")
+
+    def test_a_free_pinned_port_is_returned_as_is(self, tmp_path, monkeypatch) -> None:
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("pinned").write_text("PORT='7999'\n")
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        assert rt.allocate_port(c, "pinned") == (7999, None)
+
+    def test_an_exhausted_range_raises_loudly_naming_the_band(self, tmp_path, monkeypatch) -> None:
+        # A pod that cannot get a port must not appear to start.
+        c = self._plane(tmp_path, monkeypatch)
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: False)
+        with pytest.raises(rt.PodError) as exc:
+            rt.allocate_port(c, "crowded")
+        msg = str(exc.value)
+        assert "no free port" in msg
+        assert str(c.base_port + 1) in msg and str(c.base_port + 199) in msg
+        assert "PORT=" in msg, "the message must name the manual escape hatch"
+
+    def test_a_probe_that_cannot_run_refuses_instead_of_answering(self, monkeypatch) -> None:
+        """ "Could not run" is not "busy", and must not be coerced into it.
+
+        Socket creation can fail for reasons that say nothing about the port -- file
+        descriptor exhaustion being the obvious one. Returning False there would
+        relocate a pod on no evidence, and letting the OSError escape would be a
+        traceback. `instances/port_allocator.py` settles the same question for its own
+        probe: a probe that could not run propagates rather than being coerced.
+        """
+
+        def _no_fds(*_a, **_k):
+            raise OSError(24, "Too many open files")
+
+        monkeypatch.setattr(rt.socket, "socket", _no_fds)
+        with pytest.raises(rt.PodError, match="could not run"):
+            rt._port_is_free(7811)
+
+    def test_a_failed_socket_option_also_refuses(self, monkeypatch) -> None:
+        # The option is what makes the probe mirror the real binder, so a probe that
+        # could not set it is not a probe whose answer means anything.
+        real = rt.socket.socket
+
+        class _OptionFails(real):  # type: ignore[misc, valid-type]
+            def setsockopt(self, *_a, **_k):  # noqa: D102
+                raise OSError(1, "Operation not permitted")
+
+        monkeypatch.setattr(rt.socket, "socket", _OptionFails)
+        with pytest.raises(rt.PodError, match="could not run"):
+            rt._port_is_free(7811)
+
+    def test_a_busy_port_is_still_answered_not_raised(self) -> None:
+        # The other half: bind() failing IS a real answer and must stay a bool, or
+        # every ordinary collision would become a refusal.
+        import socket as _socket
+
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as held:
+            held.bind(("127.0.0.1", 0))
+            held.listen(1)
+            assert rt._port_is_free(held.getsockname()[1]) is False
+
+    def test_up_refuses_cleanly_when_the_probe_cannot_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # End to end: the refusal must reach the operator as a message, not a
+        # traceback, through the PodError path `_up` already handles.
+        c = self._plane(tmp_path, monkeypatch)
+
+        def _no_fds(*_a, **_k):
+            raise OSError(24, "Too many open files")
+
+        monkeypatch.setattr(rt.socket, "socket", _no_fds)
+        with pytest.raises(rt.PodError, match="could not run"):
+            rt.allocate_port(c, "demo")
+
+    def test_the_probe_mirrors_the_binders_reuseaddr(self, monkeypatch) -> None:
+        """The probe must be no stricter than the process it probes FOR.
+
+        A pod's gateway binds through aiohttp's TCPSite, which leaves
+        `reuse_address` at the asyncio default (set on POSIX), so it can bind a port
+        whose only occupant is a TIME_WAIT remnant. Without the option here, every
+        `pod down` + `pod up` would read the previous gateway's TIME_WAIT as a
+        collision and relocate the pod for nothing -- the transient occupant that
+        turns into a permanent move.
+
+        The TIME_WAIT state itself is not reliably reproducible in a unit test
+        (which side retains it depends on who closes first), so the mirror is pinned
+        at the option instead of at the symptom.
+        """
+        seen: list[tuple[int, int, int]] = []
+        real_socket = rt.socket.socket
+
+        class _Recording(real_socket):  # type: ignore[misc, valid-type]
+            def setsockopt(self, level, optname, value):  # noqa: D102
+                seen.append((level, optname, value))
+                return super().setsockopt(level, optname, value)
+
+        monkeypatch.setattr(rt.socket, "socket", _Recording)
+        rt._port_is_free(0)  # port 0 always binds; we only care about the options
+        assert (
+            rt.socket.SOL_SOCKET,
+            rt.socket.SO_REUSEADDR,
+            1,
+        ) in seen, "the probe must set SO_REUSEADDR to match what the gateway binds with"
+
+    def test_an_automatic_pin_is_relocated_when_it_goes_busy(self, tmp_path, monkeypatch) -> None:
+        """The auto-pin must not become a permanent trap.
+
+        A pin this allocator wrote records itself via PORT_AUTO. Without that, one
+        transient occupant of the derived port would move the pod permanently, and
+        every later collision on the fallback would hit the "a pin you set is never
+        moved" refusal -- a rationale written for DELIBERATE pins governing a
+        machine-written one.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("moved").write_text(f"PORT='7850'\n{rt.AUTO_PORT_KEY}='7850'\n")
+        monkeypatch.setattr(rt, "_port_is_free", lambda p: p != 7850)
+        port, displaced = rt.allocate_port(c, "moved")
+        assert port != 7850, "our own busy pin must be relocated, not refused"
+        assert displaced == 7850, "the move must still be reported"
+
+    def test_a_stale_auto_marker_does_not_capture_an_operator_pin(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # The marker stores the VALUE, so an operator who hand-edits PORT= to
+        # something else stops matching it and gets operator treatment. A bare flag
+        # would have let a stale marker reclassify their deliberate choice as ours.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("mine").write_text(f"PORT='7999'\n{rt.AUTO_PORT_KEY}='7850'\n")
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: False)
+        with pytest.raises(rt.PodError, match="pins PORT=7999"):
+            rt.allocate_port(c, "mine")
+
+    @pytest.mark.parametrize("bad", ["70000", "0", "99999999"])
+    def test_an_unusable_pin_is_refused_not_crashed(self, tmp_path, monkeypatch, bad) -> None:
+        """`_pinned_port` only checks for digits, so nonsense reaches the probe.
+
+        `bind()` answers a port above 65535 with OverflowError -- NOT an OSError, so
+        it would escape the probe as a traceback rather than a refusal. Port 0 is the
+        opposite failure: it binds happily to an EPHEMERAL port, so it would read as
+        free and the pod would be told to come up somewhere nobody can predict,
+        which is the opposite of what pinning is for. Both are operator typos and
+        both must be named, not guessed at.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("typo").write_text(f"PORT='{bad}'\n")
+        with pytest.raises(rt.PodError, match="not a usable port"):
+            rt.allocate_port(c, "typo")
+
+    def test_the_probe_never_raises_on_an_impossible_port(self) -> None:
+        # Defence in depth behind the range check above: the probe is the last place
+        # a bad port could turn into a traceback, so it answers rather than raising.
+        assert rt._port_is_free(70000) is False
+        assert rt._port_is_free(-1) is False
+
+    def test_the_walk_skips_a_port_another_pod_has_recorded(self, tmp_path, monkeypatch) -> None:
+        """A probe answers "is anyone listening", not "is that port somebody's".
+
+        A STOPPED pod listens on nothing, so its operator-pinned port probes free.
+        Landing a displaced pod there boots fine and then hard-fails the pinned pod's
+        next `up` with the "a pin you set is never moved" refusal -- for a squat this
+        code would have created, in a message that blames the operator.
+
+        The same read closes most of the concurrent-start race: a pod's port is
+        written to disk BEFORE its unit is started, so a claim is visible here even
+        while its gateway (units are Type=simple) has not bound yet.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        derived = rt.derive_port(c, "mover")
+        neighbour = derived + 1  # exactly where the walk would land first
+        c.env_file("neighbour").write_text(f"PORT='{neighbour}'\n")
+        # Nothing is LISTENING anywhere: only the recorded claim can steer the walk.
+        monkeypatch.setattr(rt, "_port_is_free", lambda p: p != derived)
+
+        port, displaced = rt.allocate_port(c, "mover")
+
+        assert displaced == derived
+        assert port != neighbour, (
+            f"the walk landed on :{neighbour}, which pod 'neighbour' has recorded -- "
+            "a stopped pod's pin probes free, so the probe alone cannot see it"
+        )
+
+    def test_a_recorded_claim_beats_a_probe_that_cannot_see_it_yet(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """THE race this fix exists for, pinned deterministically.
+
+        Two DIFFERENT names colliding mod 199 is the precondition for the whole bug
+        (same-name concurrency is already serialized by the per-name mutex, so it
+        cannot express this). A unit is `Type=simple`, so `start_pod` returns before
+        the gateway binds -- meaning the first pod's port still probes FREE while it
+        is starting. Without a recorded claim the second allocation is handed the
+        same port and one gateway crash-loops, which is the original defect
+        reappearing through the concurrent door.
+
+        Nothing is listening anywhere here on purpose: the claim is the only thing
+        that can separate them, so the probe cannot mask a regression.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        shared = c.base_port + 42
+        # Two names that both resolve to one port, as a mod-199 collision does.
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: shared)
+
+        first, _ = rt.allocate_port(c, "alpha")
+        # `_up` records the claim before starting; stand in for exactly that.
+        rt.write_env_file(c, "alpha", {"PORT": str(first), rt.AUTO_PORT_KEY: str(first)})
+        second, displaced = rt.allocate_port(c, "beta")
+
+        assert first == shared, "the first pod should get the port it derives"
+        assert second != first, (
+            "the second pod was handed the port the first has already claimed -- "
+            "nothing is listening yet, so only the recorded claim can prevent this"
+        )
+        assert displaced == shared, "the second pod should report what it moved off"
+
+    @pytest.mark.skipif(
+        rt.fcntl is None,
+        reason=(
+            "pod_name_mutex -- which pod_plane_mutex borrows -- degrades to a no-op "
+            "without fcntl, so nothing serializes these threads there. Not a gap: "
+            "require_backend refuses pods on any host without systemd/launchd, so "
+            "production never reaches the no-op. Only this test could."
+        ),
+    )
+    def test_concurrent_allocations_never_hand_out_one_port_twice(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The same property under real threads, claim-then-record under the lock.
+
+        Serialised by `pod_plane_mutex`, each thread records its claim before
+        releasing, so the next one sees it. Asserted on DISTINCTNESS rather than on
+        any particular assignment, because which name wins the lock is legitimately
+        arbitrary.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        shared = c.base_port + 17
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: shared)
+
+        names = [f"pod{i}" for i in range(6)]
+        got: dict[str, int] = {}
+        errors: list[BaseException] = []
+
+        def _claim(nm: str) -> None:
+            try:
+                with rt.pod_plane_mutex(c):
+                    port, _ = rt.allocate_port(c, nm)
+                    rt.write_env_file(c, nm, {"PORT": str(port), rt.AUTO_PORT_KEY: str(port)})
+                    got[nm] = port
+            except BaseException as exc:  # noqa: BLE001 - surfaced below
+                errors.append(exc)
+
+        workers = [threading.Thread(target=_claim, args=(n,)) for n in names]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=30)
+
+        assert not errors, f"allocation raised under contention: {errors!r}"
+        assert len(got) == len(names), f"some threads did not finish: {got}"
+        assert len(set(got.values())) == len(
+            names
+        ), f"one port was handed out twice under contention: {got}"
+
+    def test_every_allocation_records_a_claim_even_undisplaced(self, tmp_path, monkeypatch) -> None:
+        # The claim is what the concurrent case reads, so it cannot be conditional on
+        # having moved -- an undisplaced pod that records nothing is invisible to a
+        # colliding name until its gateway binds.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        port, displaced = rt.allocate_port(c, "undisplaced")
+        assert displaced is None, "nothing was busy, so nothing moved"
+        rt.write_env_file(c, "undisplaced", {"PORT": str(port), rt.AUTO_PORT_KEY: str(port)})
+        assert rt._ports_claimed_by_other_pods(c, "someone-else").get(port) == "undisplaced"
+
+    def test_the_walk_ignores_the_allocating_pods_own_record(self, tmp_path, monkeypatch) -> None:
+        # Its own pin must not exclude it from its own band walk, or relocating an
+        # auto-pin could never reuse a port the pod itself had recorded.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("solo").write_text(f"PORT='7850'\n{rt.AUTO_PORT_KEY}='7850'\n")
+        assert 7850 not in rt._ports_claimed_by_other_pods(c, "solo")
+        assert rt._ports_claimed_by_other_pods(c, "other").get(7850) == "solo"
+
+    def test_a_malformed_neighbour_env_does_not_block_allocation(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # Refusing to allocate because some unrelated pod's file is unreadable would
+        # be a worse failure than the collision the scan avoids.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("broken").write_text("PORT='not-a-number'\nGARBAGE\n")
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        port, displaced = rt.allocate_port(c, "fine")
+        assert port == rt.derive_port(c, "fine") and displaced is None
+
+    @pytest.mark.skipif(not platform_compat.IS_POSIX, reason="mkfifo is POSIX-only")
+    def test_the_claim_scan_cannot_be_hung_by_a_fifo(self, tmp_path, monkeypatch) -> None:
+        """A named pipe in the pods directory must not stall the plane.
+
+        O_NOFOLLOW does NOT cover this: a FIFO is not a symlink. A plain O_RDONLY open
+        of one BLOCKS until a writer appears, so a single FIFO named `*.env` would hang
+        every `pod up` indefinitely -- strictly worse than the symlink case, which
+        merely read the wrong bytes.
+
+        Driven on a worker thread with a join timeout because the failure mode IS a
+        hang: without O_NONBLOCK this would not fail, it would never finish.
+        """
+        import threading
+
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(c.pods_dir / "stall.env")
+
+        done: list[int | None] = []
+
+        def _scan() -> None:
+            done.append(rt._peer_effective_port(c, "stall", c.pods_dir / "stall.env"))
+
+        worker = threading.Thread(target=_scan, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        assert not worker.is_alive(), (
+            "the claim scan blocked on a FIFO -- a single named pipe in the pods "
+            "directory would hang every pod up on this plane"
+        )
+        assert done == [None], "a FIFO is not a pod env file, so it claims nothing"
+
+    @pytest.mark.skipif(not platform_compat.IS_POSIX, reason="mkfifo is POSIX-only")
+    def test_a_fifo_does_not_stop_the_rest_of_the_scan(self, tmp_path, monkeypatch) -> None:
+        # The scan must skip it and still see a real neighbour's claim: refusing the
+        # whole plane because one entry is odd is the failure this guards against.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        os.mkfifo(c.pods_dir / "stall.env")
+        c.env_file("real").write_text("PORT='7877'\n")
+        assert rt._ports_claimed_by_other_pods(c, "mine") == {7877: "real"}
+
+    def test_a_directory_named_like_an_env_file_is_refused(self, tmp_path, monkeypatch) -> None:
+        # Same non-regular check, reachable on every platform.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        (c.pods_dir / "adir.env").mkdir()
+        assert rt._peer_effective_port(c, "adir", c.pods_dir / "adir.env") is None
+
+    def test_the_scan_leaks_no_descriptors(self, tmp_path, monkeypatch) -> None:
+        """Every branch closes its fd, including the non-regular refusal.
+
+        Worth pinning rather than assuming: round 10 made an un-runnable probe RAISE
+        precisely because descriptor exhaustion is a real state, so a scan leaking one
+        per peer would be feeding the very failure it sits in front of.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        (c.pods_dir / "adir.env").mkdir()
+        c.env_file("real").write_text("PORT='7877'\n")
+
+        def _open_fds() -> int:
+            return len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else -1
+
+        before = _open_fds()
+        for _ in range(50):
+            rt._ports_claimed_by_other_pods(c, "mine")
+        after = _open_fds()
+        if before != -1:
+            assert after <= before + 1, f"descriptors grew from {before} to {after}"
+
+    @pytest.mark.skipif(
+        not platform_compat.IS_POSIX, reason="symlink creation needs elevation on Windows"
+    )
+    def test_the_claim_scan_refuses_to_follow_a_symlinked_peer_env(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The scan picks its paths from directory contents, not from an operator.
+
+        It also runs in the trusted CLI, outside the hooks gate that governs an
+        agent's own reads -- so a symlink planted in the pods directory would make a
+        privileged process read its target. The open is O_NOFOLLOW, so the link is
+        skipped rather than followed, and allocation continues.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        secret = tmp_path / "secret-elsewhere"
+        secret.write_text("PORT='7850'\n")  # a real port, so following it would SHOW
+        (c.pods_dir / "sneaky.env").symlink_to(secret)
+
+        assert (
+            rt._peer_effective_port(c, "sneaky", c.pods_dir / "sneaky.env") is None
+        ), "a symlinked peer env must not be read at all"
+        # And the claim it would have contributed must be absent, so the scan is not
+        # merely safe but also uninfluenced by the link.
+        assert 7850 not in rt._ports_claimed_by_other_pods(c, "mine")
+
+    def test_an_oversized_numeric_claim_cannot_crash_the_scan(self, tmp_path, monkeypatch) -> None:
+        """`str.isdigit` admits arbitrarily long runs; `int()` refuses over 4300
+        digits with ValueError. Unguarded, one unrelated pod's file would take down
+        every allocation on the plane."""
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("huge").write_text(f"PORT='{'1' * 4301}'\n")
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+
+        assert rt._peer_effective_port(c, "huge", c.pods_dir / "huge.env") == rt.derive_port(
+            c, "huge"
+        ), "an unusable stored value resolves to the derivation, as derive_port does"
+        # The real assertion: allocation still works rather than raising.
+        port, _ = rt.allocate_port(c, "victim")
+        assert port == rt.derive_port(c, "victim")
+
+    @pytest.mark.parametrize(
+        "stored", ["7877", "0", "70000", "99999", "", "1" * 4301, "\u00b2", "\u00bd"]
+    )
+    def test_a_peers_claim_is_exactly_what_that_peer_resolves(
+        self, tmp_path, monkeypatch, stored
+    ) -> None:
+        """The invariant, stated once instead of guessed per value.
+
+        A claim is not "some port we liked the look of" -- it is the port that peer
+        would actually come up on. So it must agree with `derive_port` for every
+        stored value, whatever shape that value is: a usable pin resolves to the pin,
+        and anything unusable (absent, out of range, oversized, non-decimal) resolves
+        to the derivation, because that is what `derive_port` itself falls back to.
+
+        Asserting the AGREEMENT rather than a hardcoded number is what makes this
+        survive a change to either side.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("peer").write_text(f"PORT='{stored}'\n")
+        assert rt._peer_effective_port(c, "peer", c.env_file("peer")) == rt.derive_port(c, "peer")
+
+    def test_a_pre_upgrade_pod_with_no_pin_is_still_claimed(self, tmp_path, monkeypatch) -> None:
+        """The upgrade window: a pod that predates claims is running, unclaimed.
+
+        Before this change nothing recorded a `PORT=`, so every already-running pod has
+        an env file with a CHECKOUT and no port. Reading that as "claims nothing" would
+        leave exactly those pods unprotected: during a restart gap the pod is listening
+        on nothing, so the probe reports its port free too, and a colliding name would
+        take it and leave the legacy pod crash-looping on EADDRINUSE.
+
+        Resolving what the peer WOULD use closes that window without requiring every
+        pod to be restarted under the new code first.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        # Exactly a pre-upgrade file: a checkout pin, no PORT.
+        c.env_file("legacy").write_text("CHECKOUT='/some/worktree'\n")
+        legacy_port = rt.derive_port(c, "legacy")
+
+        claimed = rt._ports_claimed_by_other_pods(c, "newcomer")
+        assert claimed.get(legacy_port) == "legacy", (
+            "a pod with no recorded PORT is still running on its derived port; "
+            "treating it as unclaimed is what lets a colliding name evict it"
+        )
+
+        # And the walk must honour it even with nothing listening anywhere -- which is
+        # precisely the restart-gap state.
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: legacy_port)
+        port, displaced = rt.allocate_port(c, "newcomer")
+        assert port != legacy_port, "the newcomer took a running legacy pod's port"
+        assert displaced == legacy_port
+
+    def test_an_unreadable_peer_claims_nothing(self, tmp_path, monkeypatch) -> None:
+        # The other side of the derivation fallback: it applies only to a file we could
+        # READ. A hostile entry must not be able to reserve a port by name alone.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        (c.pods_dir / "ghost.env").mkdir()  # non-regular: unreadable
+        assert rt._peer_effective_port(c, "ghost", c.pods_dir / "ghost.env") is None
+        assert rt.derive_port(c, "ghost") not in rt._ports_claimed_by_other_pods(c, "mine")
+
+    @pytest.mark.skipif(not platform_compat.IS_POSIX, reason="byte filenames are a POSIX concept")
+    def test_a_non_utf8_peer_filename_cannot_crash_the_scan(self, tmp_path, monkeypatch) -> None:
+        """Filenames are BYTES on POSIX, so a peer name need not be valid UTF-8.
+
+        Such a name arrives decoded with surrogates, and the derivation fallback has to
+        ENCODE the name to hash it -- which raises UnicodeEncodeError on a surrogate.
+        Measured: `bad-\\xff.env` is handed over as `'bad-\\udcff.env'`, and encoding
+        that stem raises. Unguarded, one such file would traceback every `pod up` on the
+        plane.
+
+        Guarded at the NAME rather than at the encode: a stem that is not a legal pod
+        name is not a pod, so it has no port to claim and nothing to read.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        target = os.path.join(os.fsencode(str(c.pods_dir)), b"bad-\xff.env")
+        try:
+            os.close(os.open(target, os.O_CREAT | os.O_WRONLY, 0o600))
+        except (OSError, ValueError) as exc:
+            # Not every POSIX filesystem allows arbitrary bytes in a name: APFS
+            # enforces UTF-8 and refuses this with EILSEQ, so macOS cannot stage the
+            # scenario at all. Skip rather than platform-guess -- what matters is
+            # whether THIS filesystem can hold such a name, not which OS we are on.
+            pytest.skip(f"this filesystem refuses a non-UTF-8 filename: {exc}")
+        c.env_file("real").write_text("PORT='7877'\n")
+
+        # Must not raise, and must still see the legitimate peer beside it.
+        assert rt._ports_claimed_by_other_pods(c, "mine") == {7877: "real"}
+
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        port, _ = rt.allocate_port(c, "mine")  # the real assertion: no traceback
+        assert port == rt.derive_port(c, "mine")
+
+    @pytest.mark.parametrize("stem", ["-leading", "has space", "a" * 70, "", "..", "a/b"])
+    def test_only_legal_pod_names_are_treated_as_peers(self, tmp_path, monkeypatch, stem) -> None:
+        # The precondition stated as a rule rather than as a list of crashes: peers are
+        # pods, so a stem that `validate_name` would reject claims nothing.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            (c.pods_dir / f"{stem}.env").write_text("PORT='7877'\n")
+        except (OSError, ValueError):
+            pytest.skip(f"the filesystem will not hold a {stem!r} entry")
+        assert 7877 not in rt._ports_claimed_by_other_pods(c, "mine")
+
+    @pytest.mark.parametrize(
+        "value,expected,why",
+        [
+            ("7999", 7999, "a plain decimal run is a port"),
+            # U+00B2 SUPERSCRIPT TWO: isdigit() True, isdecimal() False, int() raises.
+            # Written as an escape so this file stays ASCII and the codepoint is
+            # explicit rather than depending on the reader's font.
+            ("\u00b2", None, "isdigit() is True but int() raises -- the round-9 crash"),
+            # U+0662 ARABIC-INDIC DIGIT TWO: decimal, and int() parses it as 2.
+            ("\u0662", 2, "Arabic-Indic digits ARE decimal and int() parses them"),
+            # U+00BD VULGAR FRACTION ONE HALF: neither digit nor decimal.
+            ("\u00bd", None, "neither digit nor decimal"),
+            ("1" * 4301, None, "int() refuses a conversion over 4300 digits"),
+            ("70000", 70000, "out of range but PARSEABLE: allocate_port names it"),
+            ("", None, "absent"),
+            (None, None, "key not present at all"),
+        ],
+    )
+    def test_the_shared_parser_defines_what_counts_as_a_port(self, value, expected, why) -> None:
+        """One parser, one answer, every character class pinned.
+
+        Three call sites used to guard this themselves and each got it wrong
+        differently -- on length, on a sibling that was never audited, and on
+        character class. The guard is now a single function, so these cases are
+        asserted once here instead of being rediscovered per site.
+
+        `isdecimal` rather than `isdigit` is the whole point: `isdigit` is not the
+        predicate that matches `int()`. And `isascii` would have been wrong in the
+        other direction -- it rejects U+0662 ARABIC-INDIC DIGIT TWO, which `int()`
+        parses as 2.
+        """
+        assert rt._port_from_env(value) == expected, why
+
+    def test_no_env_derived_digits_can_crash_a_port_read(self, tmp_path, monkeypatch) -> None:
+        """The class, asserted through every consumer of the shared parser.
+
+        These are reached by read-only verbs (`pod url`, `pod ls`, Dev Fleet) as well
+        as by `pod up`, so a hand-edited env file must not traceback out of any of
+        them. Kept alongside the parser's own table because what matters is that each
+        CONSUMER routes through it.
+        """
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        for label, raw in (
+            ("huge", "1" * 4301),
+            ("uni", "\u00b2"),  # SUPERSCRIPT TWO -- digit but not decimal
+            ("frac", "\u00bd"),  # VULGAR FRACTION ONE HALF -- neither
+        ):
+            c.env_file(label).write_text(f"PORT='{raw}'\n{rt.AUTO_PORT_KEY}='{raw}'\n")
+            assert rt._pinned_port(c, label) is None, f"{label}: pin must not parse"
+            expected = c.base_port + (rt._posix_cksum(label.encode()) % 199) + 1
+            assert (
+                rt.derive_port(c, label) == expected
+            ), f"{label}: an unusable pin must fall back to derivation, not traceback"
+            assert (
+                rt.operator_pinned(c, label) is False
+            ), f"{label}: a value that is not a port is not a pin at all"
+            assert rt._peer_effective_port(c, label, c.pods_dir / f"{label}.env") == rt.derive_port(
+                c, label
+            ), (
+                f"{label}: an unusable stored value must resolve to the derivation, "
+                "which is what derive_port falls back to"
+            )
+
+    def test_an_oversized_auto_marker_does_not_crash_the_provenance_check(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        # The marker is attacker-shaped in exactly the same way as the pin: it is a
+        # hand-editable digit string, so it must never reach int() either.
+        c = self._plane(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("weird").write_text(f"PORT='7999'\n{rt.AUTO_PORT_KEY}='{'9' * 4301}'\n")
+        assert (
+            rt.operator_pinned(c, "weird") is True
+        ), "a marker that does not match the pin means the pin is the operator's"
+
+    def test_the_plane_lock_borrows_the_name_mutex_rather_than_copying_it(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """One lock implementation, so the two cannot drift apart.
+
+        The plane lock's key must be exactly what `pod_name_mutex` produces for the
+        reserved name, and that name must be unreachable as a real pod so the two
+        can never collide -- `_NAME_RE` forbids '@'.
+        """
+        import contextlib as _contextlib
+
+        c = self._plane(tmp_path, monkeypatch)
+        taken: list[str] = []
+        real = rt.pod_name_mutex
+
+        @_contextlib.contextmanager
+        def _recording(cfg, nm):
+            taken.append(nm)
+            with real(cfg, nm):
+                yield
+
+        monkeypatch.setattr(rt, "pod_name_mutex", _recording)
+        with rt.pod_plane_mutex(c):
+            pass
+
+        assert taken == [rt._PLANE_LOCK_NAME], "the plane lock must go through pod_name_mutex"
+        with pytest.raises(rt.PodError):
+            rt.validate_name(rt._PLANE_LOCK_NAME)  # unreachable as a real pod name
+
+
 class TestNameValidation:
     @pytest.mark.parametrize("bad", ["", "../x", "a/b", "x" * 70, "-leading", "a b"])
     def test_rejects(self, bad: str) -> None:
@@ -332,6 +1051,21 @@ class TestUnitRendering:
         monkeypatch.setenv("KIROCREW_POD_UNIT_PREFIX", "kirocrew-podtest")
         assert unit_mod.unit_path(PodConfig.load()).name == "kirocrew-podtest@.service"
 
+    @requires_posix_pod_lifecycle
+    def test_install_unit_refuses_a_symlinked_template(
+        self, cfg: PodConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        destination = tmp_path / "pod@.service"
+        victim = tmp_path / "victim.service"
+        victim.write_text("keep")
+        destination.symlink_to(victim)
+        monkeypatch.setattr(unit_mod, "unit_path", lambda _cfg: destination)
+
+        with pytest.raises(OSError, match="symbolic link"):
+            unit_mod.install_unit(cfg)
+
+        assert victim.read_text() == "keep"
+
 
 class TestBootGuardrails:
     def test_refuses_no_pinned_checkout(
@@ -383,6 +1117,27 @@ class TestSeedSanitization:
         seed = self._write(tmp_path / "s", {"dashboard": {"port": 5476}})
         out = rt.sanitized_seed_config(seed)
         assert out is not None and out["tunnel"]["enabled"] is False
+
+    def test_forces_agent_sandbox_floor_and_preserves_other_agent_keys(
+        self, tmp_path: Path
+    ) -> None:
+        seed = self._write(
+            tmp_path / "s",
+            {
+                "agent": {
+                    "sandbox": "off",
+                    "sandbox_allow_unsandboxed_exec": True,
+                    "sandbox_allow_no_isolation": True,
+                    "bot_name": "keep",
+                }
+            },
+        )
+        out = rt.sanitized_seed_config(seed)
+        assert out is not None
+        assert out["agent"]["sandbox"] == "auto"
+        assert out["agent"]["sandbox_allow_unsandboxed_exec"] is False
+        assert out["agent"]["sandbox_allow_no_isolation"] is False
+        assert out["agent"]["bot_name"] == "keep"
 
     def test_bad_json_returns_none(self, tmp_path: Path) -> None:
         seed = tmp_path / "s"
@@ -494,6 +1249,24 @@ class TestPodEnvCredentialScrub:
         survivors = set(_CREDENTIAL_KEYS) & set(env)
         assert survivors == {CRED_KIRO_API_KEY, CRED_OWNER_ID}
 
+    @pytest.mark.parametrize("inherited", ["::1", "0.0.0.0", "192.168.1.5"])
+    def test_bind_is_pinned_to_the_loopback_every_pod_client_dials(
+        self, cfg: PodConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, inherited: str
+    ) -> None:
+        """An inherited KIROCREW_BIND must never reach the pod gateway.
+
+        `health()`, `mint_token()` and `pod_api()` all dial `127.0.0.1:<port>`,
+        and the ownership attestation vouches for the recorded PROCESS, not for
+        the ADDRESS it bound. A gateway inheriting `::1` would serve the IPv6
+        loopback while a foreign local process binds `127.0.0.1:<port>` — the
+        address the mint's own HTTP request then lands on. `0.0.0.0` (the
+        official image's export) would additionally expose the pod beyond the
+        host. The pin is what keeps listener and attestation on one address.
+        """
+        monkeypatch.setenv("KIROCREW_BIND", inherited)
+        env = rt.build_pod_env(cfg, tmp_path / "home", 7999, tmp_path / "co")
+        assert env["KIROCREW_BIND"] == "127.0.0.1"
+
 
 class TestWaitHealthyFailsFast:
     def test_bails_on_failed_unit(self, cfg: PodConfig) -> None:
@@ -516,6 +1289,268 @@ class TestWaitHealthyFailsFast:
             patch.object(rt, "unit_state", return_value=("active", 0)),
         ):
             assert pod_cli._wait_healthy(cfg, "x", 7999, tries=3) == 403
+
+    def test_a_foreign_port_holder_outranks_the_generic_crash_verdict(self, cfg: PodConfig) -> None:
+        """A taken port is WHY the gateway crash-loops, so say that instead.
+
+        Both signals are present in this scenario -- the port answers from
+        somebody else AND the unit is restarting behind it -- and only one of them
+        tells the operator what to do about it.
+        """
+        with (
+            patch.object(rt, "health", return_value=rt.HEALTH_FOREIGN),
+            patch.object(rt, "unit_state", return_value=("activating", 1)),
+        ):
+            assert pod_cli._wait_healthy(cfg, "x", 7999, tries=45) == rt.HEALTH_FOREIGN
+
+    def test_a_foreign_holder_seen_mid_wait_is_remembered_at_the_deadline(
+        self, cfg: PodConfig
+    ) -> None:
+        """The verdict survives a later poll that merely fails to connect."""
+        codes = iter([rt.HEALTH_FOREIGN, 0, 0])
+
+        def _health(*a: object, **k: object) -> int:
+            return next(codes, 0)
+
+        with (
+            patch.object(rt, "health", _health),
+            patch.object(rt, "unit_state", return_value=("active", 0)),
+        ):
+            assert pod_cli._wait_healthy(cfg, "x", 7999, tries=2) == rt.HEALTH_FOREIGN
+
+    def test_a_pod_that_wins_its_port_back_still_reports_healthy(self, cfg: PodConfig) -> None:
+        """Seeing a squatter first must not condemn a pod that then comes up.
+
+        A predecessor releasing the port mid-wait is an ordinary sequence, so the
+        foreign observation is attribution for a FAILURE, never a verdict of its
+        own.
+        """
+        codes = iter([rt.HEALTH_FOREIGN, 200])
+
+        def _health(*a: object, **k: object) -> int:
+            return next(codes, 200)
+
+        with (
+            patch.object(rt, "health", _health),
+            patch.object(rt, "unit_state", return_value=("active", 0)),
+        ):
+            assert pod_cli._wait_healthy(cfg, "x", 7999, tries=5) == 200
+
+
+class TestPortOwner:
+    """Identity, not reachability: WHO holds the pod's derived port.
+
+    A derived port maps 199 slots across every pod name and can be pinned by
+    hand, so a collision with another pod or with the live gateway is ordinary.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _posix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pin the POSIX branch, for the same reason the module pins ``IS_MACOS``.
+
+        ``port_owner`` returns ``OWNER_UNPROVEN`` on a non-POSIX host before it
+        consults any of the helpers these tests patch, so on Windows the decision
+        cases FAILED (`'unproven' == 'pod'`) while the four that expect
+        ``OWNER_UNPROVEN`` passed VACUOUSLY -- they would have passed whatever the
+        logic did. Pinning it makes the branch under test explicit and asserts the
+        same contract on every platform. ``test_non_posix_is_unproven`` sets it
+        False itself, which still wins: this fixture runs first.
+        """
+        monkeypatch.setattr(rt, "IS_POSIX", True)
+        # Every positive ownership verdict requires the gateway's pid sidecar to
+        # agree with the service manager's MainPID. Patching the reader stands in
+        # for a record that PROVED fresh (it answers ``None`` otherwise), which is
+        # what lets these cases vary listener evidence independently; the
+        # freshness proof itself is covered in ``test_pod_api.py``.
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: 4242)
+
+    @staticmethod
+    def _listener(pid: int, address: str = "127.0.0.1", family: str = "4"):
+        return platform_compat.PortListener(pid=pid, address=address, family=family)
+
+    def test_the_pods_own_main_pid_holding_the_port_is_proof_it_is_ours(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(rt, "find_port_listeners", lambda port: [self._listener(4242)])
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_POD
+
+    def test_a_wildcard_bind_by_the_pod_still_counts_as_ours(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """0.0.0.0 receives a 127.0.0.1 connect, so a wildcard pod owns the probe."""
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(
+            rt, "find_port_listeners", lambda port: [self._listener(4242, "0.0.0.0")]
+        )
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_POD
+
+    def test_ownership_is_scoped_to_the_address_the_probe_reached(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pod existing elsewhere on the port must not vouch for a squatter.
+
+        A port NUMBER can carry several LISTEN sockets on different local
+        addresses. Here the pod holds one specific non-loopback address while a
+        foreign process holds 127.0.0.1 -- the address the probe dialled -- so the
+        foreign pid is the responder. Taking every pid on the port number instead
+        would find the pod's own and trust the squatter BECAUSE the real pod
+        exists.
+        """
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(
+            rt,
+            "find_port_listeners",
+            lambda port: [
+                self._listener(4242, "10.0.0.5"),  # the pod, on another address
+                self._listener(9999, "127.0.0.1"),  # the squatter, on the probed one
+            ],
+        )
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_FOREIGN
+
+    def test_a_different_pid_holding_the_port_is_foreign(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(rt, "find_port_listeners", lambda port: [self._listener(9999)])
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_FOREIGN
+
+    def test_a_pod_with_no_process_on_a_held_port_is_foreign_not_unproven(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reported bug, at its root.
+
+        A pod that lost the bind race has no process at all. If "no pid of ours"
+        read as undecidable, the squatter's 200 would still be reported as this
+        pod's health -- which is the whole defect. A held port plus a pod that
+        authoritatively has no pid IS proof the responder is someone else.
+        """
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(rt, "find_port_listeners", lambda port: [self._listener(9999)])
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: None)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_FOREIGN
+
+    def test_missing_main_pid_is_unproven_without_listener_tool(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: None)
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: False)
+        monkeypatch.setattr(
+            rt, "find_port_listeners", lambda port: pytest.fail("must not be reached")
+        )
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_UNPROVEN
+
+    def test_non_posix_is_unproven(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(rt, "IS_POSIX", False)
+        monkeypatch.setattr(
+            rt, "listening_pid_tool_available", lambda: pytest.fail("must not be reached")
+        )
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_UNPROVEN
+
+    def test_an_unaskable_service_manager_is_unproven(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ "Could not ask" must never be rendered as "not ours"."""
+
+        def _boom(c: object, n: object) -> int:
+            raise rt.PodError("systemctl unavailable")
+
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(rt, "find_port_listeners", lambda port: [self._listener(9999)])
+        monkeypatch.setattr(rt, "main_pid", _boom)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_UNPROVEN
+
+    def test_a_throwing_listener_lookup_keeps_a_fresh_pid_attestation(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broken lookup says nothing about who holds the port.
+
+        The autouse fixture supplies a record that PROVED fresh, so downgrading
+        it here would punish the pod for the tool's failure. What is refused is
+        an UNPROVABLE record -- see ``TestPodRecordFreshness`` in
+        ``test_pod_api.py`` for that leg.
+        """
+
+        def _boom(port: int) -> list:
+            raise OSError("lsof exploded")
+
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(rt, "find_port_listeners", _boom)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_POD
+
+    def test_an_unattributable_listener_keeps_a_fresh_pid_attestation(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An installed tool can still fail to attribute the reached socket.
+
+        Exactly what an unprivileged caller sees when the socket belongs to a
+        gateway its own process cannot inspect, which is how every pod runs.
+        """
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: True)
+        monkeypatch.setattr(rt, "find_port_listeners", lambda port: [])
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_POD
+
+    @pytest.mark.parametrize("tool_available, listeners", [(False, None), (True, [])])
+    def test_an_unprovable_record_withholds_the_pod_secret(
+        self,
+        cfg: PodConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        tool_available: bool,
+        listeners: list[platform_compat.PortListener] | None,
+    ) -> None:
+        """No listener evidence AND no provable record: the secret stays put.
+
+        ``_pod_recorded_pid`` answering ``None`` is what a crash leftover, a
+        pre-binding record, and a host that will not report a start time all
+        collapse to, so this covers the residual refusal on every one of them.
+        """
+        home = cfg.home_dir("demo")
+        home.mkdir(parents=True)
+        (home / ".local_secret").write_text("must-not-leave-this-process")
+        monkeypatch.setattr(rt, "_pod_recorded_pid", lambda cfg, name, port: None)
+        monkeypatch.setattr(rt, "main_pid", lambda c, n: 4242)
+        monkeypatch.setattr(rt, "derive_port", lambda c, n: 7999)
+        monkeypatch.setattr(rt, "listening_pid_tool_available", lambda: tool_available)
+        if listeners is not None:
+            monkeypatch.setattr(rt, "find_port_listeners", lambda port: listeners)
+        monkeypatch.setattr(
+            rt,
+            "loopback_urlopen",
+            lambda *a, **k: pytest.fail("the secret must not be sent"),
+        )
+
+        assert rt.port_owner(cfg, "demo", 7999) == rt.OWNER_UNPROVEN
+        with pytest.raises(rt.PodOwnershipUnproven):
+            rt.mint_token(cfg, "demo", "1h")
+
+
+class TestMainPid:
+    def test_reads_systemd_main_pid(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(stdout="MainPID=4242\n"))
+        assert rt.main_pid(cfg, "demo") == 4242
+
+    def test_main_pid_zero_means_not_running(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """systemd prints MainPID=0 for a dead or unknown unit, and exits 0."""
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(stdout="MainPID=0\n"))
+        assert rt.main_pid(cfg, "demo") is None
+
+    def test_a_missing_main_pid_line_refuses_rather_than_guessing(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No MainPID key at all means the QUERY failed, not that the pod is dead."""
+        monkeypatch.setattr(
+            rt, "systemctl", lambda *a, **k: _cp(stdout="", returncode=1, stderr="boom")
+        )
+        with pytest.raises(rt.PodError):
+            rt.main_pid(cfg, "demo")
 
 
 class TestProvision:
@@ -866,6 +1901,7 @@ class TestDrainCgroup:
         assert rt.drain_cgroup(procs, timeout=0.0) == ["7", "8"]
 
 
+@requires_posix_pod_lifecycle
 class TestLinuxTeardownOrdering:
     """Reclamation lives on the ``down`` path, not in an ``ExecStopPost`` hook that
     systemd runs BEFORE the final kill of the unit's cgroup. So ``stop_pod`` owns
@@ -1151,6 +2187,7 @@ class TestLinuxTeardownOrdering:
         assert "NOT zero-residue" in cp.stderr
 
 
+@requires_posix_pod_lifecycle
 class TestTheUnitFileNeverOutlivesAFailedLoad:
     """The invariant behind three separate defects: a unit file present on disk has
     been loaded by systemd. Every writer must uphold it — fixing only the lifecycle
@@ -1189,6 +2226,7 @@ class TestTheUnitFileNeverOutlivesAFailedLoad:
         assert "installed pod template unit" in msg
 
 
+@requires_posix_pod_lifecycle
 class TestPodNameMutexOnLinux:
     """Linux teardown moved onto the ``down`` path, so Linux now has the same
     down/up race the launchd backend needed the flock for: the mutex can no longer
@@ -1294,7 +2332,7 @@ class TestOrphanHomes:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
     ) -> None:
         c = self._plane(tmp_path, monkeypatch)
-        monkeypatch.setattr(rt, "health", lambda port, timeout=3: 200)
+        monkeypatch.setattr(rt, "health", lambda cfg, name, port, timeout=3: 200)
         pod_cli._ls(c, argparse.Namespace(json=False))
         out = capsys.readouterr().out
         assert "1 orphaned pod HOME(s)" in out
@@ -1305,7 +2343,7 @@ class TestOrphanHomes:
     ) -> None:
         """Three callers parse this array; orphans are human-output only."""
         c = self._plane(tmp_path, monkeypatch)
-        monkeypatch.setattr(rt, "health", lambda port, timeout=3: 200)
+        monkeypatch.setattr(rt, "health", lambda cfg, name, port, timeout=3: 200)
         pod_cli._ls(c, argparse.Namespace(json=True))
         assert [r["name"] for r in json.loads(capsys.readouterr().out)] == ["running"]
 
@@ -1315,7 +2353,7 @@ class TestOrphanHomes:
         """An orphan left 5 minutes ago and one left 3 weeks ago need different
         handling; the HOME's mtime is the signal the report was missing."""
         c = self._plane(tmp_path, monkeypatch)
-        monkeypatch.setattr(rt, "health", lambda port, timeout=3: 200)
+        monkeypatch.setattr(rt, "health", lambda cfg, name, port, timeout=3: 200)
         three_days = time.time() - 3 * 86400
         os.utime(c.pod_root / "orphan", (three_days, three_days))
         pod_cli._ls(c, argparse.Namespace(json=False))
@@ -1851,6 +2889,7 @@ class TestDownSamplesStateUnderTheLock:
         assert c.env_file("demo").exists(), "a live pod's checkout pin must survive"
 
 
+@requires_posix_pod_lifecycle
 class TestDownReclaimsResidue:
     """``pod down`` is the reclaim command the orphan report points at, so it has
     to work on a pod that is no longer running."""
@@ -1980,7 +3019,7 @@ class TestRuntimeHelpers:
         monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(stdout="garbage\n"))
         assert rt.unit_state(cfg, "x") == ("unknown", 0)
 
-    def test_health_codes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_health_codes(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch) -> None:
         import urllib.error
 
         class _Resp:
@@ -1992,20 +3031,96 @@ class TestRuntimeHelpers:
             def __exit__(self, *a: object) -> bool:
                 return False
 
+        # Ownership is proven separately (see TestPortOwner); here the pod owns
+        # its port so health reports the raw code.
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
         monkeypatch.setattr(rt, "loopback_urlopen", lambda *a, **k: _Resp())
-        assert rt.health(7999) == 200
+        assert rt.health(cfg, "demo", 7999) == 200
 
         def _raise_http(*a: object, **k: object) -> None:
             raise urllib.error.HTTPError("u", 403, "f", {}, None)  # type: ignore[arg-type]
 
         monkeypatch.setattr(rt, "loopback_urlopen", _raise_http)
-        assert rt.health(7999) == 403
+        assert rt.health(cfg, "demo", 7999) == 403
 
         def _raise_url(*a: object, **k: object) -> None:
             raise urllib.error.URLError("down")
 
         monkeypatch.setattr(rt, "loopback_urlopen", _raise_url)
-        assert rt.health(7999) == 0
+        assert rt.health(cfg, "demo", 7999) == 0
+
+    def test_health_treats_a_non_http_listener_as_unreachable(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A process holding the port that does not speak HTTP is not "serving".
+
+        ``BadStatusLine`` is neither ``OSError`` nor ``URLError``, so without an
+        explicit catch it escapes as a traceback out of ``pod status`` — and a
+        foreign listener on a derived port is exactly when it happens.
+        """
+        import http.client
+
+        def _raise_bad_status(*a: object, **k: object) -> None:
+            raise http.client.BadStatusLine("garbage")
+
+        monkeypatch.setattr(rt, "loopback_urlopen", _raise_bad_status)
+        assert rt.health(cfg, "demo", 7999) == 0
+
+    def test_health_reports_a_foreign_responder_as_not_up(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bug: a 200 from somebody else's gateway must not read as up."""
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self) -> "_Resp":
+                return self
+
+            def __exit__(self, *a: object) -> bool:
+                return False
+
+        monkeypatch.setattr(rt, "loopback_urlopen", lambda *a, **k: _Resp())
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_FOREIGN)
+        assert rt.health(cfg, "demo", 7999) == rt.HEALTH_FOREIGN
+
+    def test_health_keeps_the_code_when_ownership_is_unprovable(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No listener-lookup tool must not turn every pod into an unhealthy one."""
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self) -> "_Resp":
+                return self
+
+            def __exit__(self, *a: object) -> bool:
+                return False
+
+        monkeypatch.setattr(rt, "loopback_urlopen", lambda *a, **k: _Resp())
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_UNPROVEN)
+        assert rt.health(cfg, "demo", 7999) == 200
+
+    def test_health_skips_the_ownership_check_when_nothing_answers(
+        self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stopped pod costs one refused connection and no process lookup."""
+        import urllib.error
+
+        def _raise_url(*a: object, **k: object) -> None:
+            raise urllib.error.URLError("down")
+
+        calls: list[object] = []
+
+        def _owner(*a: object, **k: object) -> str:
+            calls.append(a)
+            return rt.OWNER_FOREIGN
+
+        monkeypatch.setattr(rt, "loopback_urlopen", _raise_url)
+        monkeypatch.setattr(rt, "port_owner", _owner)
+        assert rt.health(cfg, "demo", 7999) == 0
+        assert calls == []
 
     def test_mint_token_reads_secret_and_posts(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2026,8 +3141,68 @@ class TestRuntimeHelpers:
             def read(self) -> bytes:
                 return b'{"token":"tok-xyz"}'
 
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
         monkeypatch.setattr(rt, "loopback_urlopen", lambda *a, **k: _Resp())
         assert rt.mint_token(c, "demo", "1h") == "tok-xyz"
+
+    def test_mint_token_refuses_a_foreign_port_holder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Never hand this pod's secret to whatever happens to answer.
+
+        Sharper than the health misreport: mint sends the pod's own
+        ``.local_secret`` and returns a dashboard token for the responder, so
+        against a squatter it prints a URL that drives the wrong instance.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        home = c.home_dir("demo")
+        home.mkdir(parents=True)
+        (home / ".local_secret").write_text("s3cret")
+
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_FOREIGN)
+        monkeypatch.setattr(
+            rt, "loopback_urlopen", lambda *a, **k: pytest.fail("must not dial a foreign listener")
+        )
+        with pytest.raises(rt.PodError, match="another process"):
+            rt.mint_token(c, "demo", "1h")
+
+    def test_mint_token_refuses_when_ownership_is_merely_unproven(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The credential path needs POSITIVE proof, unlike the health readout.
+
+        The two ways of being wrong are not symmetrical. Refusing a live pod costs
+        an error message; proceeding on an unproven port hands a different local
+        user -- who can bind 127.0.0.1 but cannot read this 0600 secret -- a
+        credential for this pod. ``_gateway_owns_port`` fails closed on the same
+        path for the same reason, including when the listener lookup is missing.
+        """
+        monkeypatch.setenv("KIROCREW_POD_ROOT", str(tmp_path))
+        c = PodConfig.load()
+        home = c.home_dir("demo")
+        home.mkdir(parents=True)
+        (home / ".local_secret").write_text("s3cret")
+
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_UNPROVEN)
+        monkeypatch.setattr(
+            rt,
+            "loopback_urlopen",
+            lambda *a, **k: pytest.fail("must not dial an unproven listener"),
+        )
+        with pytest.raises(rt.PodOwnershipUnproven, match="could not prove"):
+            rt.mint_token(c, "demo", "1h")
+
+    def test_the_unprovable_refusal_is_a_distinguishable_type(self) -> None:
+        """`pod up` treats the two refusals differently, so they must be tellable.
+
+        FOREIGN is positive knowledge that the port is somebody else's; UNPROVEN is
+        the absence of knowledge. Both withhold the secret, but only the first
+        means there is nothing truthful left for `pod up` to print.
+        """
+        assert issubclass(rt.PodOwnershipUnproven, rt.PodError)
+        # A FOREIGN refusal must NOT be catchable as the unprovable one.
+        assert not issubclass(rt.PodError, rt.PodOwnershipUnproven)
 
     def test_mint_token_no_secret_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2038,6 +3213,7 @@ class TestRuntimeHelpers:
 
 
 class TestAuditEvents:
+    @requires_posix_pod_lifecycle
     def test_down_emits_audit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         recorded: list[tuple] = []
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: recorded.append((a, k)))
@@ -2046,6 +3222,7 @@ class TestAuditEvents:
         pod_cli._down(PodConfig.load(), argparse.Namespace(name="demo"))
         assert any("pod.down" in str(r) for r in recorded)
 
+    @requires_posix_pod_lifecycle
     def test_down_dies_when_stop_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         recorded: list[tuple] = []
         monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: recorded.append((a, k)))
@@ -2089,7 +3266,7 @@ class TestCliVerbs:
     ) -> None:
         monkeypatch.setattr(rt, "active_names", lambda c: {"alpha"})
         monkeypatch.setattr(rt, "derive_port", lambda c, n: 7811)
-        monkeypatch.setattr(rt, "health", lambda p: 403)
+        monkeypatch.setattr(rt, "health", lambda cfg, name, p: 403)
         pod_cli._ls(cfg, argparse.Namespace(json=False))
         assert "alpha" in capsys.readouterr().out
         pod_cli._ls(cfg, argparse.Namespace(json=True))
@@ -2099,7 +3276,7 @@ class TestCliVerbs:
     def test_status(self, cfg: PodConfig, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
         monkeypatch.setattr(rt, "derive_port", lambda c, n: 7811)
         monkeypatch.setattr(rt, "is_active", lambda c, n: True)
-        monkeypatch.setattr(rt, "health", lambda p: 403)
+        monkeypatch.setattr(rt, "health", lambda cfg, name, p: 403)
         pod_cli._status(cfg, argparse.Namespace(name="alpha", json=True))
         out = capsys.readouterr().out
         assert '"status": "up"' in out and '"health": 403' in out
@@ -2109,6 +3286,7 @@ class TestCliVerbs:
         pod_cli._url(cfg, argparse.Namespace(name="alpha"))
         assert "http://127.0.0.1:7811" in capsys.readouterr().out
 
+    @requires_posix_pod_lifecycle
     def test_install_writes_unit(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
     ) -> None:
@@ -2128,6 +3306,7 @@ class TestCliVerbs:
         assert "daemon-reload OK" in capsys.readouterr().out
         assert ("pod.install", "allowed") in recorded
 
+    @requires_posix_pod_lifecycle
     def test_install_dies_on_reload_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2147,6 +3326,7 @@ class TestCliVerbs:
             pod_cli.dispatch(argparse.Namespace(pod_action=None))
 
 
+@requires_posix_pod_lifecycle
 class TestUpVerb:
     """Drive the big _up body end-to-end with the host boundary mocked."""
 
@@ -2163,6 +3343,12 @@ class TestUpVerb:
         monkeypatch.setenv("KIROCREW_POD_ENV_DIR", str(tmp_path / "env"))
         # Force git resolution to miss so the root fallback resolves deterministically.
         monkeypatch.setattr(rt, "_git_worktrees", lambda ref: {})
+        # Insulate `_up` from the HOST's real port occupancy. `allocate_port`
+        # bind-probes, so without this a developer's own pod sitting on the
+        # derived port would push these tests down the fallback path and they
+        # would disagree with the port they assert -- a failure that depends on
+        # who is running them. Tests about the fallback override this.
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
         if ready:
             _ready_worktree(tmp_path / "wts", "demo", venv=True, dist=dist)
         return PodConfig.load()
@@ -2185,6 +3371,127 @@ class TestUpVerb:
         # _up must pin the resolved checkout for the systemd boot.
         assert rt.read_env_file(c, "demo").get("CHECKOUT", "").endswith("wts/demo")
 
+    def test_up_with_a_seed_runs_the_landing_verification(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        c = self._prep(tmp_path, monkeypatch)
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+        calls: list[tuple[str, str, bool]] = []
+        monkeypatch.setattr(
+            pod_cli,
+            "_verify_seed_landed",
+            lambda cfg, name, scenario, home_was_populated: calls.append(
+                (name, scenario, home_was_populated)
+            ),
+        )
+
+        pod_cli._up(
+            c,
+            argparse.Namespace(name="demo", json=True, seed="minimal", ttl="2h", provision=False),
+        )
+
+        assert calls == [("demo", "minimal", False)]
+
+    @pytest.mark.parametrize("landed", ["", "minimal"])
+    def test_populated_home_seed_request_refuses_before_start(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, landed: str
+    ) -> None:
+        """A failed start cleans up the pod home, so verification after health is
+        too late for state that existed before this command. Every seed request
+        against a populated home must refuse before `start_pod` can reach
+        `stop_pod`, including one whose marker already matches the request."""
+        c = self._prep(tmp_path, monkeypatch)
+        home = c.home_dir("demo")
+        home.mkdir(parents=True)
+        (home / "sessions").mkdir()
+        starts: list[str] = []
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(
+            rt,
+            "start_pod",
+            lambda cfg, name: (starts.append(name) or _cp(returncode=0)),
+        )
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+        # This wiring test owns the pre-start decision, not POSIX marker I/O.
+        monkeypatch.setattr(rt, "seeded_scenario_in_home", lambda cfg, name: landed)
+
+        with pytest.raises(SystemExit) as excinfo:
+            pod_cli._up(
+                c,
+                argparse.Namespace(
+                    name="demo", json=True, seed="minimal", ttl="2h", provision=False
+                ),
+            )
+
+        assert excinfo.value.code == 1
+        assert starts == []
+        assert (home / "sessions").is_dir()
+
+    def test_up_still_succeeds_when_ownership_cannot_be_proven(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """An lsof-less host must not boot the pod and then fail the command.
+
+        The credential is the last step of `up`, not its point. Dying here would
+        make `pod up` impossible on a POSIX host with no listener-lookup tool,
+        where ownership can never be proven -- a self-inflicted outage in place of
+        a hardened credential path. The secret still never reaches the wire: the
+        guard is inside mint_token, which raised before dialling.
+        """
+        c = self._prep(tmp_path, monkeypatch)
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+
+        def _unprovable(cfg: object, n: object, ttl: object) -> str:
+            raise rt.PodOwnershipUnproven("could not prove which process holds :7811")
+
+        monkeypatch.setattr(rt, "mint_token", _unprovable)
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+        )
+        cap = capsys.readouterr()
+        out = cap.out
+        # Reports what it knows, withholds only the credential.
+        assert '"status": "up"' in out and '"port": 7811' in out
+        assert '"base_url": "http://127.0.0.1:7811"' in out
+        # The empty token IS the machine signal; the JSON shape gains no field for
+        # it, so the reason travels on stderr where a caller and a human both see
+        # it. A payload key with no consumer would be schema committed forever.
+        assert '"token": ""' in out
+        assert "token_withheld" not in out
+        assert "could not prove" in cap.err
+
+    def test_up_still_dies_on_a_foreign_port_holder(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FOREIGN is positive knowledge, so there is nothing truthful left to print."""
+        c = self._prep(tmp_path, monkeypatch)
+        monkeypatch.setattr(rt, "derive_port", lambda cfg, n: 7811)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+
+        def _foreign(cfg: object, n: object, ttl: object) -> str:
+            raise rt.PodError("held by another process")
+
+        monkeypatch.setattr(rt, "mint_token", _foreign)
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+        with pytest.raises(SystemExit):
+            pod_cli._up(
+                c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+            )
+
     def test_up_refuses_live_port(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         c = self._prep(tmp_path, monkeypatch)
         monkeypatch.setattr(rt, "derive_port", lambda cfg, n: c.live_port)
@@ -2193,6 +3500,287 @@ class TestUpVerb:
             pod_cli._up(
                 c, argparse.Namespace(name="demo", json=False, seed="", ttl="2h", provision=False)
             )
+
+    def test_up_pins_the_fallback_so_every_reader_agrees(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+    ) -> None:
+        """The defect end to end: a busy derived port must not be booted onto.
+
+        The pin is the load-bearing part. `pod url`, `pod ls`, `pod exec` and Dev
+        Fleet each call `derive_port` independently, so without recording the move
+        they would keep printing the derived port while the gateway listens
+        somewhere else -- which is what presented as "a healthy pod that is not the
+        one I just built".
+        """
+        c = self._prep(tmp_path, monkeypatch)
+        derived = rt.derive_port(c, "demo")
+        monkeypatch.setattr(rt, "_port_is_free", lambda p: p != derived)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+        )
+
+        captured = capsys.readouterr()
+        pinned = rt.read_env_file(c, "demo").get("PORT")
+        assert pinned and int(pinned) != derived, "the move must be recorded as a PORT= pin"
+        # The whole point of pinning: the readers now agree with the boot.
+        assert rt.derive_port(c, "demo") == int(pinned)
+        assert f'"port": {int(pinned)}' in captured.out, "the reported port must be the real one"
+        assert "already in use" in captured.err, "a silent move is the defect, not the fix"
+
+    def test_up_does_not_move_a_running_pods_port(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An `up` against an ALREADY-ACTIVE pod must not reallocate.
+
+        That pod's port is busy precisely because it owns it, so probing would
+        "discover" a collision and move a running pod out from under every reader.
+        The active check therefore gates the allocation, not just the start.
+        """
+        c = self._prep(tmp_path, monkeypatch)
+        # Nothing is free: if allocation ran at all it would raise or relocate.
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: False)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: True)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+        monkeypatch.setattr(
+            rt, "start_pod", lambda *a, **k: pytest.fail("an active pod must not be restarted")
+        )
+
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+        )
+
+        assert "PORT" not in rt.read_env_file(
+            c, "demo"
+        ), "a running pod's port must be left exactly as its readers already resolve it"
+
+    def test_up_clears_a_stale_auto_marker_when_the_operator_takes_over(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A marker must not outlive the pin it described.
+
+        The trap is a natural user action, not a coincidence: the pod is auto-moved
+        to a port, the operator sees that and pins THAT port by hand. If the old
+        marker survives, their deliberate pin now matches it, reads as machine-made,
+        and may be relocated out from under them -- the exact guarantee this PR
+        exists to give them.
+
+        So the marker is cleared the moment an operator pin is detected, and the
+        follow-on is asserted too: pinning the previously-auto value is respected.
+        """
+        c = self._prep(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        # State after an earlier automatic allocation to 7850, then the operator
+        # editing PORT to something else.
+        c.env_file("demo").write_text(f"PORT='7999'\n{rt.AUTO_PORT_KEY}='7850'\n")
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+        )
+
+        env = rt.read_env_file(c, "demo")
+        assert env.get("PORT") == "7999", "the operator's pin must be honoured"
+        assert not env.get(rt.AUTO_PORT_KEY), (
+            f"a stale marker survived as {env.get(rt.AUTO_PORT_KEY)!r}; if the "
+            "operator later pins that same port it would read as machine-made"
+        )
+        # The follow-on: pinning the previously-auto port is now respected.
+        c.env_file("demo").write_text(f"PORT='7850'\n{rt.AUTO_PORT_KEY}=''\n")
+        assert rt.operator_pinned(c, "demo") is True, (
+            "after the marker is cleared, pinning the old auto port must read as "
+            "the operator's deliberate choice"
+        )
+
+    def test_up_never_marks_an_operator_pin_as_automatic(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Recording the claim must not launder a deliberate pin into a movable one.
+
+        `PORT_AUTO` is what licenses a later relocation. Since the claim is now
+        recorded on EVERY allocation, an operator's own `PORT=` passes through that
+        write -- and stamping the marker on it would quietly convert the one pin this
+        code promises never to move into one it may move on the next contention.
+        """
+        c = self._prep(tmp_path, monkeypatch)
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+        c.env_file("demo").write_text("PORT='7999'\n")  # a person set this, no marker
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+        )
+
+        env = rt.read_env_file(c, "demo")
+        assert env.get("PORT") == "7999", "the operator's pin must be honoured"
+        assert not env.get(rt.AUTO_PORT_KEY), (
+            "the operator's pin was marked automatic, so a later collision would "
+            "silently relocate a port they deliberately chose. (An EMPTY marker is "
+            "no marker -- the key may be present and blank, since write_env_file "
+            "merges and cannot delete.)"
+        )
+        assert rt.operator_pinned(c, "demo") is True, "it must still read as theirs"
+
+    def test_up_records_the_claim_even_when_nothing_moved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The claim must not be conditional on having been displaced.
+
+        This is the ruling's whole point. A unit is `Type=simple`, so `start_pod`
+        returns before the gateway binds; until it does, a bind probe reports this
+        pod's port FREE. If an undisplaced pod records nothing, a concurrently
+        starting colliding name is handed the same port and one gateway crash-loops
+        -- the original defect arriving through the concurrent door.
+
+        So the recording is asserted for the case where NOTHING moved, which is the
+        case a displacement-only test cannot see.
+        """
+        c = self._prep(tmp_path, monkeypatch)
+        derived = rt.derive_port(c, "demo")
+        monkeypatch.setattr(rt, "_port_is_free", lambda _p: True)  # nothing is busy
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+        )
+
+        env = rt.read_env_file(c, "demo")
+        assert env.get("PORT") == str(derived), (
+            "an undisplaced pod must still record its claim -- otherwise it is "
+            "invisible to a colliding name until its gateway binds"
+        )
+        assert env.get(rt.AUTO_PORT_KEY) == str(derived), "the claim must be marked ours"
+
+    def test_up_records_the_auto_marker_beside_the_pin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Without the marker the fallback is indistinguishable from a deliberate
+        # operator pin, and the pod can never be relocated again.
+        c = self._prep(tmp_path, monkeypatch)
+        derived = rt.derive_port(c, "demo")
+        monkeypatch.setattr(rt, "_port_is_free", lambda p: p != derived)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+        )
+        env = rt.read_env_file(c, "demo")
+        assert env["PORT"] == env[rt.AUTO_PORT_KEY], "the marker must record the port WE chose"
+
+    def test_up_refreshes_a_stale_port_when_the_pod_is_already_active(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The concurrent same-name case, which must not tear down a healthy pod.
+
+        `port` is first read BEFORE the mutex. If a concurrent `up` wins the lock,
+        allocates a fallback and pins it, this call wakes holding the OLD derived
+        port -- and the health wait stops the unit when it cannot reach `port`, so a
+        stale value would stop the pod the other `up` just started successfully.
+
+        The pin therefore has to appear DURING the lock wait, not before it: with it
+        already on disk the pre-lock read picks it up too and the staleness never
+        occurs. So the name mutex stands in for the concurrent winner and writes the
+        pin as we acquire.
+        """
+        import contextlib as _contextlib
+
+        c = self._prep(tmp_path, monkeypatch)
+        derived = rt.derive_port(c, "demo")
+        fallback = derived + 7
+        c.pods_dir.mkdir(parents=True, exist_ok=True)
+
+        @_contextlib.contextmanager
+        def _mutex_that_loses_the_race(_cfg, _name):
+            # The other `up` got here first: it pinned its fallback and started the
+            # pod while we were blocked on this lock. Written DIRECTLY and once --
+            # `write_env_file` re-acquires this very mutex, so going through it here
+            # would recurse, and `pin_checkout` below re-enters on the same thread.
+            if not raced:
+                raced.append(True)
+                c.env_file("demo").write_text(
+                    f"PORT='{fallback}'\n{rt.AUTO_PORT_KEY}='{fallback}'\n"
+                )
+            yield
+
+        raced: list[bool] = []
+        monkeypatch.setattr(rt, "pod_name_mutex", _mutex_that_loses_the_race)
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: True)
+        monkeypatch.setattr(rt, "systemctl", lambda *a, **k: _cp(returncode=0))
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+        probed: list[int] = []
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: (probed.append(p), 403)[1])
+
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+        )
+
+        assert probed == [fallback], (
+            "the health wait must use the port resolved INSIDE the lock "
+            f"({fallback}), not the pre-lock derivation ({derived})"
+        )
+
+    def test_allocation_and_start_happen_under_the_plane_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two DIFFERENT colliding names hold disjoint NAME locks, so the claim has
+        to be serialized plane-wide or both can probe one port free and both boot."""
+        import contextlib as _contextlib
+
+        c = self._prep(tmp_path, monkeypatch)
+        order: list[str] = []
+
+        @_contextlib.contextmanager
+        def _tracking_plane(_cfg):
+            order.append("plane-acquire")
+            try:
+                yield
+            finally:
+                order.append("plane-release")
+
+        monkeypatch.setattr(rt, "pod_plane_mutex", _tracking_plane)
+        monkeypatch.setattr(
+            rt, "allocate_port", lambda cfg, n: (order.append("allocate"), (7811, None))[1]
+        )
+        monkeypatch.setattr(rt, "is_active", lambda cfg, n: False)
+        monkeypatch.setattr(rt, "start_pod", lambda cfg, n: (order.append("start"), _cp())[1])
+        monkeypatch.setattr(pod_cli, "_wait_healthy", lambda cfg, n, p: 403)
+        monkeypatch.setattr(rt, "mint_token", lambda cfg, n, ttl: "tok-9")
+        monkeypatch.setattr(pod_cli, "_audit", lambda *a, **k: None)
+
+        pod_cli._up(
+            c, argparse.Namespace(name="demo", json=True, seed="", ttl="2h", provision=False)
+        )
+
+        assert order == ["plane-acquire", "allocate", "start", "plane-release"], (
+            "the claim must be held from choosing the port through starting the pod "
+            f"-- got {order}"
+        )
 
     def test_up_missing_worktree_teaches(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
@@ -2332,6 +3920,9 @@ class TestReviewRound1Fixes:
             captured["url"] = req.full_url  # type: ignore[attr-defined]
             return _Resp()
 
+        # Mint now requires positive ownership proof; this test is about the URL
+        # it builds, so grant the proof rather than exercising the guard here.
+        monkeypatch.setattr(rt, "port_owner", lambda *a, **k: rt.OWNER_POD)
         monkeypatch.setattr(rt, "loopback_urlopen", _urlopen)
         rt.mint_token(c, "demo", "1 h")
         assert "ttl=1%20h" in captured["url"]
@@ -2552,6 +4143,7 @@ class TestUnitExecSelfHeal:
         unit_path.write_text(unit_path.read_text() + f"ExecStopPost={exe} pod _cleanup %i\n")
         assert unit_mod.unit_is_current(cfg) is False
 
+    @requires_posix_pod_lifecycle
     def test_what_this_build_renders_is_current(self, cfg, monkeypatch, tmp_path):
         """Guard against the reverse failure: a check that flagged the CURRENT
         template would re-render and daemon-reload on every single `pod up`."""
@@ -2564,6 +4156,7 @@ class TestUnitExecSelfHeal:
         unit_mod.install_unit(cfg)
         assert unit_mod.unit_is_current(cfg) is True
 
+    @requires_posix_pod_lifecycle
     def test_spaced_executable_is_quoted_and_current(self, cfg, monkeypatch, tmp_path):
         from kiro_crew.pod import unit as unit_mod
 
@@ -2587,6 +4180,10 @@ class TestUnitExecSelfHeal:
         steps: list[str] = []
         monkeypatch.setattr(rt.unit_mod, "unit_is_current", lambda c: False)
         monkeypatch.setattr(rt.unit_mod, "install_unit", lambda c: steps.append("reinstall"))
+        monkeypatch.setattr(
+            rt.unit_mod, "install_dropin", lambda c, n, co: steps.append("pin-checkout")
+        )
+        monkeypatch.setattr(rt, "read_env_file", lambda c, n: {"CHECKOUT": "/checkouts/demo"})
 
         def _systemctl(*args, **kwargs):
             steps.append(args[0])
@@ -2594,7 +4191,13 @@ class TestUnitExecSelfHeal:
 
         monkeypatch.setattr(rt, "systemctl", _systemctl)
         assert rt.start_pod(cfg, "demo").returncode == 0
-        assert steps == ["reinstall", "daemon-reload", "start"]
+        assert steps == [
+            "reinstall",
+            "daemon-reload",
+            "pin-checkout",
+            "daemon-reload",
+            "start",
+        ]
 
     def test_module_invocation_form_passes(self, tmp_path, monkeypatch):
         from kiro_crew.pod import unit as unit_mod
@@ -2844,6 +4447,7 @@ class TestSessionBus:
         ), "_run no longer passes env=_systemctl_env()"
 
 
+@requires_posix_pod_lifecycle
 class TestBootTimeSettings:
     """``pod up --approval`` / ``--crons`` are persisted per pod and applied at boot.
 

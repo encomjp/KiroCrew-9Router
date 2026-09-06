@@ -13,24 +13,22 @@ import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any
 
 from aiohttp import web
 
-from kiro_crew._sqlite_compat import sqlite3
+from kiro_crew._sqlite_compat import fts5_segment_for_index, sqlite3
 from kiro_crew.artifacts import get_default_store
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, data_home
 from kiro_crew.dashboard import part_stream
+from kiro_crew.dashboard.handlers._shared import read_bounded_json
 from kiro_crew.dashboard.handlers.files import (
     _ZIP_CONTAINER_EXTS,
     _content_matches_ext,
-    _slot_project_snapshot,
 )
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.knowledge.agent_fetch import fetch_url_content
 from kiro_crew.knowledge.agent_source import add_agent_document
 from kiro_crew.knowledge.artifact_ingest import ArtifactKnowledgeSync
-from kiro_crew.knowledge.autosource import AUTO_ADDED_PROP
 from kiro_crew.knowledge.chunker import HeadingAwareChunker
 from kiro_crew.knowledge.connectors.base import BaseConnector
 from kiro_crew.knowledge.connectors.local_folder import LocalFolderConnector
@@ -56,7 +54,10 @@ from kiro_crew.knowledge.llm_pool import DEFAULT_EXTRACTION_EFFORT, LLMPool
 from kiro_crew.knowledge.readers import FileReader
 from kiro_crew.knowledge.retrieval import HybridRetriever
 from kiro_crew.knowledge.spend import source_spend
-from kiro_crew.knowledge.store import KnowledgeBundleError
+from kiro_crew.knowledge.store import (
+    AUTO_REGISTRATION_RETIRED_PROP,
+    KnowledgeBundleError,
+)
 from kiro_crew.knowledge.sync import SyncScheduler
 from kiro_crew.knowledge.watcher import KnowledgeWatcher
 from kiro_crew.security import is_sensitive_path
@@ -157,52 +158,6 @@ def _pipeline(request: web.Request):
     return request.app.get("knowledge_pipeline")
 
 
-async def _json_object_body(
-    request: web.Request, *, allow_absent: bool = False
-) -> tuple[dict[str, Any] | None, web.Response | None]:
-    """Parse the request body as a JSON **object**, or produce the 400 to return.
-
-    ``await request.json()`` happily returns a list, string, or number for a
-    body that is valid JSON but not an object, and every caller in this module
-    then calls ``.get()`` on the result -- which raises and turns a client
-    mistake into a 500. One owner for the parse-and-shape guard keeps the
-    module's ``request.json()`` call sites on a single contract instead of
-    bespoke per-handler guards.
-
-    Returns ``(body, None)`` on success, or ``(None, error_response)`` when
-    the caller should return early. *allow_absent* treats a request without a
-    readable body as an empty object, for endpoints whose fields all have
-    defaults.
-
-    Deliberately separate from ``_shared.read_bounded_json``, which shares the
-    ``invalid_json``/``body_not_object`` codes: switching these nine sites onto
-    it would mean choosing a byte cap per endpoint (its ``max_bytes`` must be
-    a number, and knowledge bundles have no principled ceiling today), would
-    change the ``"invalid JSON"`` message text existing tests and callers pin,
-    and it has no *allow_absent*. Consolidating the two helpers is deferred
-    scope, not a disagreement about the contract.
-    """
-    if allow_absent and not request.can_read_body:
-        return {}, None
-    try:
-        parsed = await request.json()
-    except (LookupError, RecursionError, ValueError):
-        # json.JSONDecodeError and UnicodeDecodeError are ValueError
-        # subclasses; LookupError is an unknown charset= codec in the
-        # client's Content-Type header; RecursionError is a deeply nested
-        # JSON document blowing the parser's stack. All are client mistakes.
-        # Transport failures (disconnect mid-body, read timeout) deliberately
-        # propagate: they are not a client JSON mistake and keep their 500
-        # status class.
-        return None, web.json_response(
-            {"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    if not isinstance(parsed, dict):
-        return None, web.json_response(
-            {"error": "body must be a JSON object", "code": "body_not_object"},
-            status=400)
-    return parsed, None
-
-
 def _create_embedder(app):
     """Create embedder from KiroCrew config. Returns None if disabled/unavailable."""
     cfg_path = config_dir() / "config.json"
@@ -234,21 +189,8 @@ async def _start_watcher_async(app: web.Application) -> None:
         await old_watcher.stop()
     pipeline = app["knowledge_pipeline"]
     store = app["state"].knowledge_store
-    state = app["state"]
 
-    def _project_dirs() -> list[str]:
-        """Directories the user is currently working in.
-
-        Live chat-slot project dirs only -- deliberately NOT the recent-projects
-        list, which includes directories the user merely picked once. Registering
-        those would spend LLM extraction on trees they are not working in.
-
-        Called by the watcher ON the event loop, because it copies a dict that
-        other coroutines on the loop mutate; it does no I/O.
-        """
-        return _slot_project_snapshot(state)
-
-    watcher = KnowledgeWatcher(store=store, pipeline=pipeline, project_dirs=_project_dirs)
+    watcher = KnowledgeWatcher(store=store, pipeline=pipeline)
     app["knowledge_watcher"] = watcher
     task = asyncio.create_task(watcher.start())
     app["_knowledge_watcher_task"] = task
@@ -540,10 +482,10 @@ async def update_item(request: web.Request) -> web.Response:
     item_id = request.match_info["id"]
     if not store.get_item(item_id):
         return web.json_response({"error": "not found"}, status=404)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     allowed = {"tags", "item_type", "status", "title", "summary", "namespace"}
     fields = {k: v for k, v in body.items() if k in allowed}
     if not fields:
@@ -560,13 +502,26 @@ async def delete_item(request: web.Request) -> web.Response:
     item = store.get_item(item_id)
     if not item:
         return web.json_response({"error": "not found"}, status=404)
-    store.delete_item(item_id)
+
+    # BEGIN IMMEDIATE takes the write lock eagerly (busy_timeout 10s, so a
+    # concurrent writer can park this call for that long) and the commit is
+    # followed by _load_graph(), a full scan of entities and entity_relations
+    # that grows linearly with the library -- never on the event loop.
+    # The SEL record rides in the same worker as the commit: a client
+    # disconnect cancels this coroutine at the await, and a cancellation
+    # landing after the worker committed must not skip the audit line. The
+    # worker thread runs to completion regardless, and SEL writes are
+    # lock-guarded, so emitting from it is safe.
+    def _delete_and_audit() -> None:
+        store.delete_item(item_id)
+        _sel_log("item.delete", item_id=item_id)
+
+    await asyncio.to_thread(_delete_and_audit)
     # A now-empty source is reclaimed by the store's own orphan rule on the next
     # open, which checks the document-state tables, in-flight jobs and the location
     # table first. Deleting the row here instead raised on the foreign keys those
     # tables hold -- after the item delete had already committed -- and dropped a
     # source that still held documents by location.
-    _sel_log("item.delete", item_id=item_id)
     return web.json_response({"ok": True})
 
 
@@ -613,6 +568,12 @@ async def get_entity_graph(request: web.Request) -> web.Response:
         depth = min(5, max(1, int(request.query.get("depth", 2) or 2)))
     except ValueError:
         return web.json_response({"error": "invalid depth"}, status=400)
+    # Materialise the graph off-loop before touching it. The store defers the
+    # load to its first reader (#8329), and every `.graph` read below runs on
+    # the event loop, where the loop-stall watchdog is armed -- so the scan has
+    # to happen on a worker thread, the same way this module already offloads
+    # the store's SQL.
+    await asyncio.to_thread(store.ensure_graph_loaded)
     if not store.graph.has_node(entity_id):
         return web.json_response({"error": "entity not found"}, status=404)
     return web.json_response(store.get_entity_subgraph(entity_id, depth))
@@ -622,14 +583,35 @@ async def get_entity_items(request: web.Request) -> web.Response:
     """GET /api/knowledge/entities/by-name/{name}/items -- items containing entity."""
     store = _store(request)
     name = request.match_info["name"]
-    # Search items via FTS5 for the entity name
-    sanitized = name.replace('"', '""')
-    rows = store.db.execute(
+    rows = await asyncio.to_thread(_entity_items_rows, store, name)
+    return web.json_response([store._serialize_item(r) for r in rows])
+
+
+def _entity_items_rows(store, name: str) -> list:
+    """FTS lookup for an entity name. Runs on a worker thread, never the loop.
+
+    Off-loop for two reasons: a legacy database migrates its FTS index on first
+    read (`ensure_fts_index_current`), which is data-scaled, and the query itself
+    is sqlite I/O.
+
+    The name is matched as ONE FTS5 phrase over the segmented text, which is what
+    an entity name is -- a contiguous string, not a bag of words. For a name with
+    no CJK this is byte-identical to quoting the name directly, so a multi-word
+    ASCII entity ("New York") still requires those words adjacent rather than
+    merely both present. For a CJK name the segmentation makes the phrase address
+    the individual characters the index stores, which quoting the whole run
+    cannot.
+    """
+    store.ensure_fts_index_current()
+    segmented = fts5_segment_for_index(name).strip()
+    if not segmented:
+        return []
+    phrase = '"' + segmented.replace('"', '""') + '"'
+    return store.db.execute(
         "SELECT i.* FROM items i JOIN items_fts f ON i.rowid = f.rowid "
         "WHERE items_fts MATCH ? AND i.status = 'active' ORDER BY i.updated_at DESC LIMIT 50",
-        (f'"{sanitized}"',),
+        (phrase,),
     ).fetchall()
-    return web.json_response([store._serialize_item(r) for r in rows])
 
 
 async def get_related_items(request: web.Request) -> web.Response:
@@ -672,6 +654,12 @@ async def get_full_graph(request: web.Request) -> web.Response:
         limit = min(200, max(1, int(request.query.get("limit", 100) or 100)))
     except ValueError:
         return web.json_response({"error": "invalid limit"}, status=400)
+
+    # Materialise the graph off-loop before any `.graph` read below. The store
+    # defers the load to its first reader (#8329); this handler already offloads
+    # its SQL for the same reason, and the graph reads were only safe inline
+    # while the graph was built during construction.
+    await asyncio.to_thread(store.ensure_graph_loaded)
 
     # Source filter: restrict to entities mentioned in items from specific sources
     source_id_param = request.query.get("source_id", "").strip()
@@ -873,10 +861,10 @@ async def pick_folder(request: web.Request) -> web.Response:
 async def add_source(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources -- add a remote source."""
     store = _store(request)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name", "")
     source_type = body.get("source_type", "")
     uri = body.get("uri", "")
@@ -1184,31 +1172,14 @@ async def delete_source(request: web.Request) -> web.Response:
     row = store.db.execute("SELECT * FROM sources WHERE id = ?", (source_id,)).fetchone()
     if not row:
         return web.json_response({"error": "not found"}, status=404)
-    # An auto-discovered source must not come back on the next watcher sweep just
-    # because its folder still exists -- tombstone the URI. This is passed INTO
-    # the cascade so the tombstone and the delete share one transaction: written
-    # afterwards, a sweep landing in between would see neither a source row nor a
-    # tombstone and re-create what was just deleted. Only auto-added rows get a
-    # tombstone; a hand-added source has no discovery loop to resurrect it.
-    dismiss_uri = None
-    try:
-        props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
-        if isinstance(props, dict) and props.get(AUTO_ADDED_PROP):
-            dismiss_uri = row["uri"]
-    except Exception:
-        logger.warning("Could not read source properties for dismissal", exc_info=True)
     try:
         # BEGIN IMMEDIATE takes the write lock eagerly and the connection's
         # busy_timeout is 10s, so a concurrent ingestion writer could park this
         # call for that long -- never on the event loop.
-        await asyncio.to_thread(
-            store.delete_source_cascade, source_id, dismiss_uri=dismiss_uri
-        )
+        await asyncio.to_thread(store.delete_source_cascade, source_id)
     except Exception:
         logger.exception("delete_source failed: source_id=%s", source_id)
         return web.json_response({"error": "internal server error"}, status=500)
-    if dismiss_uri:
-        _sel_log("source.auto_dismiss", source_id=source_id, uri=dismiss_uri)
     _sel_log("source.delete", source_id=source_id)
     return web.json_response({"status": "deleted"})
 
@@ -1222,10 +1193,10 @@ async def rename_source(request: web.Request) -> web.Response:
     source_id = request.match_info["id"]
     if not store.db.execute("SELECT 1 FROM sources WHERE id = ?", (source_id,)).fetchone():
         return web.json_response({"error": "not found"}, status=404)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name")
     if not isinstance(name, str):
         return web.json_response({"error": "name must be a string"}, status=400)
@@ -1261,8 +1232,12 @@ async def confirm_source(request: web.Request) -> web.Response:
         _sel_log("source.confirm_denied", source_id=source_id, reason="sensitive_path")
         return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
     props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
-    props["sync_status"] = "active"
     props.pop("scan_paused", None)
+    # Confirming (or resuming) IS the user adopting this source, so stamp it as
+    # adopted in the same write that activates it. Without this, a row Kiro Crew
+    # registered itself would be refused by the scan funnel's gate immediately after
+    # the user satisfied that very gate, and bounce back to pending_confirmation.
+    props[AUTO_REGISTRATION_RETIRED_PROP] = True
     store.update_source(source_id, properties=props, sync_status="active")
     _sel_log("source.confirm", source_id=source_id)
     # Trigger scan
@@ -1288,12 +1263,9 @@ async def pause_source(request: web.Request) -> web.Response:
         return web.json_response({"error": "not found"}, status=404)
     props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
     props["scan_paused"] = True
-    # Keep the JSON copy in sync with the column: the watcher's pre-scan skip
-    # reads properties["sync_status"] (it selects `properties`, not the column),
-    # so leaving this stale meant a paused folder was still fully walked and
-    # delete-reconciled every sweep -- only the deeper scan_paused gate in
-    # folder_watcher stopped the ingestion. confirm/resume already do this.
-    props["sync_status"] = "paused"
+    # The watcher's pre-scan skip reads the sync_status COLUMN, so this write is
+    # what stops the sweep from walking and delete-reconciling the whole folder;
+    # the deeper scan_paused gate in folder_watcher stops the ingestion itself.
     store.update_source(source_id, properties=props, sync_status="paused")
     _sel_log("source.pause", source_id=source_id)
     return web.json_response({"status": "paused"})
@@ -1313,7 +1285,11 @@ async def resume_source(request: web.Request) -> web.Response:
         return web.json_response({"error": "Path is restricted for security reasons"}, status=403)
     props = json.loads(row["properties"]) if isinstance(row["properties"], str) else (row["properties"] or {})
     props.pop("scan_paused", None)
-    props["sync_status"] = "active"
+    # Confirming (or resuming) IS the user adopting this source, so stamp it as
+    # adopted in the same write that activates it. Without this, a row Kiro Crew
+    # registered itself would be refused by the scan funnel's gate immediately after
+    # the user satisfied that very gate, and bounce back to pending_confirmation.
+    props[AUTO_REGISTRATION_RETIRED_PROP] = True
     store.update_source(source_id, properties=props, sync_status="active")
     _sel_log("source.resume", source_id=source_id)
     # Trigger scan to pick up remaining files
@@ -1350,10 +1326,10 @@ async def retry_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/retry -- reset file to pending."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1372,10 +1348,10 @@ async def skip_file(request: web.Request) -> web.Response:
     """POST /api/knowledge/sources/{id}/files/skip -- mark file as skipped."""
     store = _store(request)
     source_id = request.match_info["id"]
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     file_path = body.get("file_path", "")
     if not file_path:
         return web.json_response({"error": "file_path required"}, status=400)
@@ -1400,10 +1376,10 @@ async def ingest_text(request: web.Request) -> web.Response:
     pipeline = _pipeline(request)
     if not pipeline:
         return web.json_response({"error": "pipeline not configured"}, status=503)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     text = body.get("text", "")
     if not text:
         return web.json_response({"error": "no text provided"}, status=400)
@@ -1658,10 +1634,10 @@ async def export_all(request: web.Request) -> web.Response:
 
 async def import_bundle(request: web.Request) -> web.Response:
     """POST /api/knowledge/import -- accept .knowledge JSON bundle."""
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     shape_error = _validate_knowledge_bundle(body)
     if shape_error is not None:
         _sel_log("import", outcome="rejected", reason=shape_error)
@@ -1684,8 +1660,25 @@ async def import_bundle(request: web.Request) -> web.Response:
         redacted_type = _redact(rel.get("relation_type"))
         rel["relation_type"] = redacted_type if redacted_type is not None else ""
         rel["description"] = _redact(rel.get("description"))
+    store = _store(request)
+
+    # BEGIN IMMEDIATE takes the write lock eagerly (busy_timeout 10s) and a
+    # large bundle inserts thousands of rows before the commit rebuilds the
+    # entity graph with a full table scan -- never on the event loop. The
+    # success audit rides in the same worker as the commit: a client
+    # disconnect cancels the awaiting coroutine, and a cancellation landing
+    # after the worker committed must not skip the SEL record (the worker
+    # thread runs to completion regardless; SEL writes are lock-guarded).
+    # The worker re-raises here, so every arm below still catches exactly
+    # what the synchronous call raised; the rejection arms keep their own
+    # audit lines because they are tied to the HTTP response they build.
+    def _import_and_audit() -> dict:
+        result = store.import_bundle(body)
+        _sel_log("import", **result)
+        return result
+
     try:
-        result = _store(request).import_bundle(body)
+        result = await asyncio.to_thread(_import_and_audit)
     except KnowledgeBundleError as exc:
         # The store enforces the JSON-column well-formedness invariant
         # (sources.properties / entities.aliases) at the writer; surface its
@@ -1726,7 +1719,6 @@ async def import_bundle(request: web.Request) -> web.Response:
             {"error": "internal server error", "code": "knowledge_import_failed"},
             status=500,
         )
-    _sel_log("import", **result)
     return web.json_response(result)
 
 
@@ -1764,7 +1756,12 @@ async def _rebuild_embeddings_job(app: web.Application, store, embedder, job_id:
     degrades gracefully during the rebuild instead of going dark.
     """
     try:
-        processed = await rebuild_embeddings(store, embedder, job_id=job_id, force=force)
+        # pace=False: this job exists because a human clicked Rebuild and is
+        # watching its progress bar — the load is expected, so it runs at the
+        # interactive scheduling class with no idling. The watcher self-heal
+        # path stays on the paced default.
+        processed = await rebuild_embeddings(store, embedder, job_id=job_id, force=force,
+                                             pace=False)
         store.db.execute(
             "UPDATE ingestion_jobs SET status = 'completed', items_processed = ?, updated_at = ? "
             "WHERE id = ?",
@@ -1804,10 +1801,10 @@ async def batch_embed_items(request: web.Request) -> web.Response:
     if not await embedder.is_available_async():
         return web.json_response({"error": "Embedding model not available"}, status=503)
 
-    body, body_err = await _json_object_body(request, allow_absent=True)
+    body, body_err = await read_bounded_json(request, max_bytes=None, allow_absent=True)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     rebuild = body.get("rebuild", False)
     force = body.get("force", False)
 
@@ -1978,10 +1975,10 @@ async def add_agent_document_route(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "pipeline not configured",
              "code": "pipeline_unavailable"}, status=503)
-    body, body_err = await _json_object_body(request)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
     if body_err is not None:
         return body_err
-    assert body is not None  # _json_object_body returns (dict, None) on success
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     result = await add_agent_document(
         pipeline,
         title=str(body.get("title") or ""),

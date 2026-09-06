@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from conftest import requires_symlinks
+from kiro_crew import mcp_cron
 from kiro_crew.mcp_cron import (
     _call_tool_inner,
     _glob_could_reach_credentials,
@@ -446,6 +447,98 @@ def test_vet_script_contents_allows_benign(body):
     assert _vet_script_contents(body) is None
 
 
+# A cron script body is PYTHON SOURCE, not a shell command line. Each body below
+# READS NOTHING: it describes, redacts or documents a fenced store. Every one was
+# refused at some point while the body was routed through the shell gate (#7912,
+# #8643) -- a backslash run read as a collapsible separator, a docstring read as a
+# `find` command line -- and each is the shape a redaction helper or a well-documented
+# script actually has. They must all vet clean.
+BENIGN_SOURCE_BODIES_NAMING_A_FENCED_STORE = [
+    'import re\nSCRUB = re.compile(r"%LOCALAPPDATA%\\\\kiro-cli")\n',
+    'import re\nSCRUB = re.compile(r"/home/\\\\S*/\\\\.kiro/crew/security_policy.json")\n',
+    'import re\nSCRUB = re.compile(pattern=r"%LOCALAPPDATA%\\\\\\\\kiro-cli")\n',
+    'import re\n\n\ndef scrub(s):\n    redacted = re.sub(r"%LOCALAPPDATA%\\\\\\\\kiro-cli", "<X>", s)\n    return str(redacted)\n',
+    # A prose docstring naming the store (previously an "accepted over-block").
+    'def run(ctx):\n    """Never touch %LOCALAPPDATA%\\\\kiro-cli -- it is the keystone."""\n',
+    # A docstring opening with a verb the shell traversal grammar models (#8643).
+    'def run(ctx):\n    """Find commits on main that belong to no pull request and report them.\n\n'
+    + "".join(f"    Step {i}: check `item_{i}` against `rule_{i}` and `note_{i}`.\n" for i in range(40))
+    + '    """\n    return None\n',
+    # Long enough that every line counted as a pipeline stage exhausted the shell
+    # gate's stage budget (#8563).
+    "".join(f"value_{i} = {i}\n" for i in range(700)),
+    # `os.environ` code plus a `|` in a regex literal plus a filter word in a comment,
+    # far apart -- the env-pipeline shape the ordered-existence rules assembled (#8563).
+    "import os\nregion = os.environ.get('AWS_REGION')\n"
+    + "x = 1\n" * 200
+    + "PAT = r'foo|bar'\n"
+    + "x = 2\n" * 200
+    + "# grep through the results later\n",
+]
+
+
+@pytest.mark.parametrize("body", BENIGN_SOURCE_BODIES_NAMING_A_FENCED_STORE)
+def test_vet_script_contents_allows_source_that_only_names_a_fenced_store(body):
+    assert _vet_script_contents(body) is None, f"should allow: {body[:80]!r}"
+
+
+# The control: the separator-run collapse is correct for a SHELL subject, where a
+# doubled separator still names the store the single spelling names (#6350), and it
+# stays on the COMMAND path. One per check pass 1b repeats: the path matcher, the
+# extraction control, and the relative-traversal matcher.
+COMMANDS_WITH_A_SEPARATOR_RUN = [
+    r'type "%LOCALAPPDATA%\\kiro-cli\config.json"',
+    r"cat %USERPROFILE%\\.ssh\id_rsa",
+    r"tar -xf evil.tar -C $HOME//.kiro/crew",
+    r"cat ..//.aws/credentials",
+]
+
+
+@pytest.mark.parametrize("cmd", COMMANDS_WITH_A_SEPARATOR_RUN)
+def test_vet_shell_command_still_blocks_a_separator_run(cmd):
+    err = _vet_shell_command(cmd)
+    assert err is not None and err.startswith("Error:"), f"should block: {cmd!r}"
+
+
+def test_script_body_is_never_a_shell_gate_subject(monkeypatch):
+    """RATCHET: the cron script gate must not route a source body through any shell
+    matcher. Four PRs (#4243, #7298, #7441, #8550 and its follow-ups) each added a
+    shell-grammar pass to ``is_sensitive_bash_command`` and each one produced a new
+    class of false denial on ordinary Python scripts -- separator collapse, stage
+    budget, ordered-existence env rules, `find`-grammar docstrings -- because a shell
+    matcher handed a document reads the document as one command line. The fix was to
+    stop handing it one, not to add another AST layer. If this test fails, the coupling
+    is back: put the detector in ``_vet_script_contents`` as a whole-body, source-aware
+    match, or leave the concern to the sandbox that runs the script.
+    """
+    from kiro_crew import mcp_cron, security
+
+    def trip(*a, **k):
+        raise AssertionError("shell matcher reached with a source body")
+
+    monkeypatch.setattr(security, "is_sensitive_bash_command", trip)
+    monkeypatch.setattr(mcp_cron, "is_sensitive_bash_command", trip)
+    for name in ("is_denied", "_check_alt_traversal_reaches_fence",
+                 "_check_find_traversal_reaches_fence", "_check_env_credential_access",
+                 "_fence_hit_in_collapsed", "_check_sensitive_via_normalizer"):
+        if hasattr(security, name):
+            monkeypatch.setattr(security, name, trip)
+    assert not hasattr(security, "is_sensitive_source_body"), (
+        "the source-body shell entry point was removed on purpose; do not reintroduce it"
+    )
+    for body in BENIGN_SOURCE_BODIES_NAMING_A_FENCED_STORE + BENIGN_SCRIPTS:
+        assert _vet_script_contents(body) is None
+    for body in MALICIOUS_SCRIPTS:
+        assert _vet_script_contents(body) is not None
+
+
+def test_vet_script_contents_refuses_an_oversized_body_rather_than_scanning_part():
+    body = "x = 1\n" * (mcp_cron._MAX_SCRIPT_SCAN_BYTES // 6 + 2)
+    assert len(body) > mcp_cron._MAX_SCRIPT_SCAN_BYTES
+    err = _vet_script_contents(body)
+    assert err is not None and "too large to security-scan" in err
+
+
 def test_vet_script_file_reads_and_blocks(tmp_path):
     f = tmp_path / "evil.py"
     f.write_text("import os\nopen(os.path.expanduser('~/.aws/credentials')).read()\n")
@@ -456,6 +549,55 @@ def test_vet_script_file_reads_and_blocks(tmp_path):
 def test_vet_script_file_missing_file_errors(tmp_path):
     err = _vet_script_file(str(tmp_path / "nope.py"))
     assert err is not None and err.startswith("Error:")
+
+
+class TestOversizedScriptIsRefusedNotTruncated:
+    """Reading exactly the cap is a fence BYPASS, not a bound: the vetter sees a body
+    at the limit, scans it clean, and the sandbox then executes the whole file. So the
+    read goes one character past the cap and an oversized script is refused."""
+
+    #: One long statement per line, ~607 chars, so a verdict here is about the read
+    #: boundary and not about line count.
+    _LINE = 'v = "' + "a" * 600 + '"\n'
+
+    def _body_over_the_cap(self) -> str:
+        return self._LINE * ((mcp_cron._MAX_SCRIPT_SCAN_BYTES // len(self._LINE)) + 2)
+
+    def test_the_read_probes_one_past_the_cap(self):
+        assert mcp_cron._SCRIPT_READ_PROBE_BYTES == mcp_cron._MAX_SCRIPT_SCAN_BYTES + 1
+
+    def test_a_credential_read_past_the_cap_is_not_allowed(self, tmp_path):
+        """The regression: with the read capped AT the limit this returned None and the
+        script ran in full."""
+        prefix = self._body_over_the_cap()
+        f = tmp_path / "evil.py"
+        f.write_text(prefix + 'open("/home/user/.aws/credentials").read()\n', encoding="utf-8")
+        assert len(prefix) > mcp_cron._MAX_SCRIPT_SCAN_BYTES, "payload must sit past the cap"
+
+        err = _vet_script_file(str(f))
+        assert err is not None, "a script whose tail was never scanned must not be allowed"
+        assert "too large to security-scan" in err
+
+    def test_a_script_at_the_cap_is_still_scanned_in_full(self, tmp_path):
+        """No false refusal at the boundary: the probe byte only fires ABOVE the cap."""
+        f = tmp_path / "big_ok.py"
+        body = (self._LINE * (mcp_cron._MAX_SCRIPT_SCAN_BYTES // len(self._LINE)))[
+            : mcp_cron._MAX_SCRIPT_SCAN_BYTES
+        ]
+        f.write_text(body, encoding="utf-8")
+        assert len(body) <= mcp_cron._MAX_SCRIPT_SCAN_BYTES
+        assert _vet_script_file(str(f)) is None
+
+    def test_a_credential_read_inside_the_cap_is_still_blocked(self, tmp_path):
+        """The refusal above is not doing the work a real scan should: a payload the
+        reader DOES reach is still denied on its merits, not on its size."""
+        f = tmp_path / "evil_small.py"
+        f.write_text(
+            self._LINE * 10 + 'open("/home/user/.aws/credentials").read()\n', encoding="utf-8"
+        )
+        err = _vet_script_file(str(f))
+        assert err is not None
+        assert "too large to security-scan" not in err
 
 
 class TestCronAddScriptGuard:

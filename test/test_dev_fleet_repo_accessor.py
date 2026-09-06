@@ -25,17 +25,36 @@ from __future__ import annotations
 
 import ast
 import inspect
+import locale
+from types import SimpleNamespace
 
 import pytest
 
-import kiro_crew.apps.builtins.dev_fleet.server as mod
+from kiro_crew.apps.builtins.dev_fleet import (
+    fleet_state,
+    http_api,
+    live,
+    repository,
+    runtime,
+    server,
+    worktree_ops,
+)
 
 # The accessor is the ONLY function whose body may read the bare global: it IS
 # the guard. The startup hook's discovery/re-resolve runs on a local and writes
 # the global exactly once (a Store, which this ratchet ignores), so even the
 # assignment site needs no exemption — and a git call added to startup, where
 # MAIN_REPO is most often still unresolved, is caught like anywhere else.
-_ALLOWED_FUNCS = {"_repo"}
+_DEV_FLEET_MODULES = (
+    runtime,
+    repository,
+    live,
+    fleet_state,
+    worktree_ops,
+    http_api,
+    server,
+)
+_ALLOWED_LOADS = {(repository.__name__, "_repo")}
 
 
 def _parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
@@ -55,7 +74,7 @@ def _enclosing_function(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str |
     return None
 
 
-def _is_bare_truthiness(node: ast.Name, parents: dict[ast.AST, ast.AST]) -> bool:
+def _is_bare_truthiness(node: ast.expr, parents: dict[ast.AST, ast.AST]) -> bool:
     """True when the load feeds a truthiness test and nothing else.
 
     Walking up from the Name, only ``BoolOp`` and ``not`` may intervene before
@@ -82,24 +101,25 @@ def _is_bare_truthiness(node: ast.Name, parents: dict[ast.AST, ast.AST]) -> bool
 
 
 def test_main_repo_loads_only_via_accessor_or_truthiness() -> None:
-    src = inspect.getsource(mod)
-    tree = ast.parse(src)
-    parents = _parent_map(tree)
     violations: list[str] = []
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Name) and node.id == "MAIN_REPO"):
-            continue
-        if not isinstance(node.ctx, ast.Load):
-            continue  # assignments (Store) stay on the global by design
-        func = _enclosing_function(node, parents)
-        if func in _ALLOWED_FUNCS:
-            continue
-        if _is_bare_truthiness(node, parents):
-            continue
-        violations.append(
-            f"line {node.lineno}: bare MAIN_REPO load in "
-            f"{func or '<module>'} — route it through _repo()"
-        )
+    for module in _DEV_FLEET_MODULES:
+        tree = ast.parse(inspect.getsource(module))
+        parents = _parent_map(tree)
+        for node in ast.walk(tree):
+            is_main_repo = (isinstance(node, ast.Name) and node.id == "MAIN_REPO") or (
+                isinstance(node, ast.Attribute) and node.attr == "MAIN_REPO"
+            )
+            if not is_main_repo or not isinstance(node.ctx, ast.Load):
+                continue  # assignments (Store) stay on the global by design
+            func = _enclosing_function(node, parents)
+            if (module.__name__, func) in _ALLOWED_LOADS:
+                continue
+            if _is_bare_truthiness(node, parents):
+                continue
+            violations.append(
+                f"{module.__name__}:{node.lineno}: MAIN_REPO load in "
+                f"{func or '<module>'} — route it through repository._repo()"
+            )
     assert not violations, (
         "MAIN_REPO's empty-string sentinel is fail-open when consumed "
         "directly (git -C '' runs against the process CWD). Use _repo():\n"
@@ -108,11 +128,30 @@ def test_main_repo_loads_only_via_accessor_or_truthiness() -> None:
 
 
 def test_repo_accessor_raises_on_unresolved_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(mod, "MAIN_REPO", "")
-    with pytest.raises(mod.RepoNotConfigured):
-        mod._repo()
+    monkeypatch.setattr(repository, "MAIN_REPO", "")
+    with pytest.raises(repository.RepoNotConfigured):
+        repository._repo()
 
 
 def test_repo_accessor_returns_resolved_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(mod, "MAIN_REPO", "/somewhere/kirocrew")
-    assert mod._repo() == "/somewhere/kirocrew"
+    monkeypatch.setattr(repository, "MAIN_REPO", "/somewhere/kirocrew")
+    assert repository._repo() == "/somewhere/kirocrew"
+
+
+def test_primary_checkout_resolution_preserves_the_host_text_decoder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Moving the startup probe must not reinterpret non-ASCII checkout paths."""
+    primary = tmp_path / "primary"
+    seen: dict[str, object] = {}
+
+    def _run(_argv, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout=str(primary / ".git"))
+
+    monkeypatch.setattr(runtime, "_trusted_bin", lambda _name: "git")
+    monkeypatch.setattr(repository.subprocess, "run", _run)
+
+    assert repository._resolve_primary_checkout(str(tmp_path / "linked")) == str(primary)
+    assert seen["text"] is True
+    assert seen["encoding"] == locale.getpreferredencoding(False)

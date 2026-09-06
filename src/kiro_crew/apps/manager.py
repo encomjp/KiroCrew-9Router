@@ -39,13 +39,16 @@ from kiro_crew.apps.manifest import (
 )
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import (
+    ConfigReadError,
     config_dir,
     config_local_path,
     config_path,
-    write_config_atomically,
+    update_config_locked,
 )
 from kiro_crew.loop_lock import LoopBoundLock
+from kiro_crew.pinned_fs import supports_pinned_walk
 from kiro_crew.platform import current_context, safe_context_call
+from kiro_crew.platform_compat import is_link_or_junction
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -1209,15 +1212,36 @@ def _drop_trust_grant(name: str) -> None:
     # Preserve the no-grant fast path: ordinary uninstalls perform no config write.
     if not (has_name or has_repository or has_local):
         return
-    agent_raw["apps_trusted"] = [
-        a for a in (base_grants if isinstance(base_grants, list) else []) if a != name
-    ]
-    if isinstance(repositories, dict):
-        repositories = dict(repositories)
-        repositories.pop(name, None)
-        agent_raw["apps_trusted_repositories"] = repositories
-    if isinstance(local_grants, list):
-        agent_raw["apps_trusted_local"] = [a for a in local_grants if a != name]
+
+    def _revoke(raw_locked: dict) -> dict | None:
+        # Re-derived under the advisory lock. The read above decided WHETHER a
+        # grant exists (and the fast path for the ordinary no-grant uninstall);
+        # this is the read the write is derived from, so a settings write that
+        # landed in between is carried forward instead of being reverted.
+        agent_locked = raw_locked.get("agent")
+        if not isinstance(agent_locked, dict):
+            return None
+        base_locked = agent_locked.get("apps_trusted")
+        repos_locked = agent_locked.get("apps_trusted_repositories")
+        local_locked = agent_locked.get("apps_trusted_local")
+        if not (
+            (isinstance(base_locked, list) and name in base_locked)
+            or (isinstance(repos_locked, dict) and name in repos_locked)
+            or (isinstance(local_locked, list) and name in local_locked)
+        ):
+            # Another writer already revoked it. Skip the write rather than
+            # rewriting the document with identical bytes.
+            return None
+        agent_locked["apps_trusted"] = [
+            a for a in (base_locked if isinstance(base_locked, list) else []) if a != name
+        ]
+        if isinstance(repos_locked, dict):
+            repos_copy = dict(repos_locked)
+            repos_copy.pop(name, None)
+            agent_locked["apps_trusted_repositories"] = repos_copy
+        if isinstance(local_locked, list):
+            agent_locked["apps_trusted_local"] = [a for a in local_locked if a != name]
+        return raw_locked
     # Concurrency: this is the repo's standard config read-modify-write, and it
     # inherits that model exactly — no cross-process lock, atomic (tmp+rename) on
     # the way out so no reader can see a torn file. `read_config_for_update`'s own
@@ -1235,7 +1259,13 @@ def _drop_trust_grant(name: str) -> None:
     # also a single-key edit of the raw document rather than a re-serialisation of
     # the whole config, so what it can clobber is bounded to a concurrent edit that
     # lands inside the same read-to-write window.
-    write_config_atomically(path, raw)
+    try:
+        update_config_locked(path, mutate=_revoke, stamp_meta=False)
+    except ConfigReadError as exc:
+        # RAISE rather than return, for the same reason as the read above: a
+        # silent bail is the "uninstalled but still trusted" state the caller
+        # must not reach. Fails closed, so nothing was written.
+        raise RuntimeError(f"{path} is unreadable: {exc}") from exc
     logger.info("Dropped third-party trust grant for uninstalled app %s", name)
     # Audited, because this REVOKES an execution permission. The dashboard's revoke
     # endpoint emits its own SEL event, but this path runs from `kirocrew app
@@ -1342,26 +1372,45 @@ def _restore_trust_grant(
     if _has_trust_grant(name):
         return
     path = config_path()
-    raw = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
-    if not isinstance(raw, dict):
-        raise RuntimeError(f"{path} does not hold a JSON object")
-    agent_raw = raw.setdefault("agent", {})
-    if not isinstance(agent_raw, dict):
-        raise RuntimeError(f"{path} has a non-object agent section")
-    grants = agent_raw.get("apps_trusted")
-    agent_raw["apps_trusted"] = [*(grants if isinstance(grants, list) else []), name]
-    if repository:
-        repositories = agent_raw.get("apps_trusted_repositories")
-        bindings = dict(repositories) if isinstance(repositories, dict) else {}
-        bindings[name] = repository
-        agent_raw["apps_trusted_repositories"] = bindings
-    if local:
-        local_grants = agent_raw.get("apps_trusted_local")
-        local_names = list(local_grants) if isinstance(local_grants, list) else []
-        if name not in local_names:
-            local_names.append(name)
-        agent_raw["apps_trusted_local"] = local_names
-    write_config_atomically(path, raw)
+
+    def _restore(raw: dict) -> dict:
+        # Read and write inside one hold of the ``<config>.json.lock`` sidecar,
+        # so the restore cannot republish a document that predates a concurrent
+        # settings write. The CLI runs this in its own process, which is exactly
+        # the writer an in-process asyncio lock cannot serialize against.
+        agent_raw = raw.setdefault("agent", {})
+        if not isinstance(agent_raw, dict):
+            raise RuntimeError(f"{path} has a non-object agent section")
+        # Append only when absent. The pre-lock ``_has_trust_grant`` check above
+        # answered "should this restore run at all"; it is not the read this write
+        # is derived from, so a dashboard re-grant landing between it and the
+        # acquire would otherwise be duplicated into the persisted list. Same
+        # guarded shape as the ``apps_trusted_local`` branch below, and the same
+        # re-derive-under-the-lock rule ``_drop_trust_grant`` follows.
+        grants = agent_raw.get("apps_trusted")
+        granted = list(grants) if isinstance(grants, list) else []
+        if name not in granted:
+            granted.append(name)
+        agent_raw["apps_trusted"] = granted
+        if repository:
+            repositories = agent_raw.get("apps_trusted_repositories")
+            bindings = dict(repositories) if isinstance(repositories, dict) else {}
+            bindings[name] = repository
+            agent_raw["apps_trusted_repositories"] = bindings
+        if local:
+            local_grants = agent_raw.get("apps_trusted_local")
+            local_names = list(local_grants) if isinstance(local_grants, list) else []
+            if name not in local_names:
+                local_names.append(name)
+            agent_raw["apps_trusted_local"] = local_names
+        return raw
+
+    try:
+        update_config_locked(path, mutate=_restore, stamp_meta=False)
+    except ConfigReadError as exc:
+        # Unchanged shape: a document that is not a readable JSON object refuses
+        # the restore, and ``uninstall_app`` folds it into ``restore_note``.
+        raise RuntimeError(f"{path} does not hold a JSON object: {exc}") from exc
 
     # The CLI and dashboard run in different processes, so a same-name
     # replacement can land after the pre-write check.  Recheck the exact durable
@@ -1624,6 +1673,39 @@ def get_app_manifest(name: str) -> AppManifest | None:
         return None
 
 
+def _absence_is_genuine(meta_path: Path) -> bool:
+    """Whether nothing at *meta_path* really means nothing is there.
+
+    The nearest ancestor that exists has to be a DIRECTORY. If something else
+    occupies part of the path, the file cannot exist for a reason that is NOT
+    absence, and that must not read as "the app was uninstalled".
+
+    Separated from the exception class deliberately: POSIX reports this as
+    ``NotADirectoryError`` while Windows raises ``FileNotFoundError``, so the class
+    identifies the platform rather than the condition.
+
+    ``is_link_or_junction`` is checked for the same reason, one predicate over:
+    ``is_symlink`` is False for a Windows directory junction, so a DANGLING junction
+    would present as ``is_dir=False, exists=False, is_symlink=False`` and this walk
+    would step over the thing occupying the path. Something IS at that component, so
+    the answer is unknown, not absence.
+
+    Walks upward because the non-directory component need not be the immediate
+    parent. Terminates: the filesystem root exists and is a directory. An ancestor
+    that cannot be inspected at all is treated as not-genuine, which is the same
+    fail-to-unknown direction as the rest of this function.
+    """
+    for ancestor in meta_path.parents:
+        try:
+            if ancestor.is_dir():
+                return True
+            if ancestor.exists() or ancestor.is_symlink() or is_link_or_junction(ancestor):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def app_enabled_state(name: str) -> bool | None:
     """Tri-state enablement: True, False, or None when the metadata cannot be READ.
 
@@ -1635,12 +1717,66 @@ def app_enabled_state(name: str) -> bool | None:
     unrecoverable. This keeps the two apart.
 
     A missing metadata file is a definite False — the app is not installed — not a
-    failure to read one.
+    failure to read one, and NOTHING ELSE is. Leading with ``Path.is_file()`` broke
+    that: it answers a silent False for five path shapes that are not absence, all
+    verified against this interpreter — a dangling symlink, a directory in the file's
+    place, a fifo in its place, a symlink loop (ELOOP), and a non-directory parent
+    component (ENOTDIR). Only a genuine ``stat`` fault such as EACCES was reported
+    correctly, because ``is_file`` re-raises that and the handler below turns it into
+    None.
+
+    Absence is decided from the path's SHAPE, never from the exception class, because
+    one condition does not produce one class across platforms: a non-directory parent
+    component raises ``NotADirectoryError`` (ENOTDIR) on POSIX but
+    ``FileNotFoundError`` on Windows, which maps ERROR_PATH_NOT_FOUND to ENOENT — the
+    same class a genuinely missing file raises. Keying "definitely not installed" on
+    ``FileNotFoundError`` therefore told the truth on Linux and not on Windows, where
+    a wrong-shape parent still read as a deliberate uninstall. See
+    :func:`_absence_is_genuine`; ``_spawn_exec_shim`` records the same lesson for
+    ``chdir`` ("the errno is not the thing to key on").
+
+    The cost of the wrong answer is asymmetric, which is why the callers that already
+    respect the tri-state are the ones that make this worth fixing. ``apps.backend``
+    reads it before DELETING materialized resources -- ``_drop_disabled_app_resources``
+    on a False, ``_undo_promotion_of_disabled_app`` likewise -- and its own comments
+    say a None "must not be collapsed into disabled" and is retried instead. That
+    contract was already written correctly; it was this function that did not honour
+    it, so a dangling symlink or a directory in the metadata's place deleted an app's
+    agent files.
+
+    ``apps.hook_reconcile`` consumes it too, and only because this fix put it there.
+    Its unattended 15s teardown decides "gone" from ``get_app`` -> ``_read_installed``,
+    which has the same ``Path.is_file()`` collapse and additionally folds a corrupt
+    JSON body into None -- so before this change every one of those shapes unloaded a
+    healthy app's routes and modules on the next tick. That reader has 24 callers and
+    ``get_app``/``list_apps`` 63, so it is not made tri-state here; the reconciler
+    confirms absence through THIS function instead and defers on unknown.
     """
     meta_path = app_dir(name) / INSTALLED_META_FILENAME
     try:
-        if not meta_path.is_file():
+        try:
+            st = meta_path.stat()
+        except FileNotFoundError:
+            # A dangling link is a path that EXISTS and whose target cannot be
+            # seen, which is not the same as nothing being there. Both predicates
+            # are asked because is_symlink is False for a Windows junction, and
+            # _absence_is_genuine below walks the PARENTS -- never meta_path itself.
+            if meta_path.is_symlink() or is_link_or_junction(meta_path):
+                logger.warning("Metadata path %s is a dangling link or junction", meta_path)
+                return None
+            # This class is reached for TWO different conditions depending on the
+            # platform, so it cannot decide the verdict on its own.
+            if not _absence_is_genuine(meta_path):
+                logger.warning(
+                    "Metadata path %s cannot exist: a component of it is not a "
+                    "directory",
+                    meta_path,
+                )
+                return None
             return False
+        if not stat.S_ISREG(st.st_mode):
+            logger.warning("Metadata path %s is not a regular file", meta_path)
+            return None
         data = json.loads(meta_path.read_text(encoding="utf-8"))
         return bool(InstalledApp.from_dict(data).enabled)
     # No `json.JSONDecodeError` member: it subclasses ValueError, so pairing the two is
@@ -2279,11 +2415,13 @@ def _rmtree_dirfd(fd: int) -> None:
 
 
 def _dirfd_ops_supported() -> bool:
-    return (
-        os.open in os.supports_dir_fd
-        and os.unlink in os.supports_dir_fd
-        and os.rmdir in os.supports_dir_fd
-    )
+    # supports_pinned_walk covers the openat capability itself (O_DIRECTORY,
+    # O_NOFOLLOW, os.open in supports_dir_fd); _rmtree_dirfd above also removes
+    # files AND directories relative to the pinned descriptor, so those two extra
+    # syscalls are probed on top -- the extras name the descriptor-relative calls
+    # this surface actually issues, the way prompts.py adds {os.unlink, os.mkdir}
+    # for its own.
+    return supports_pinned_walk() and {os.unlink, os.rmdir}.issubset(os.supports_dir_fd)
 
 
 def resolve_mcp_backend_url(mcp_servers: Any) -> str | None:

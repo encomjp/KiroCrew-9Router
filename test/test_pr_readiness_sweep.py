@@ -70,6 +70,7 @@ fi
 if [ "$1" = "api" ]; then
   case "${2:-}" in
     *"/check-runs") cat "$FIXTURES/check_runs.json"; exit 0 ;;
+    *"/comments") cat "$FIXTURES/comments.json"; exit 0 ;;
     *"/statuses")
       # Emulate a transport failure when the test asks for one: gh exits
       # non-zero having written nothing to stdout.
@@ -134,6 +135,8 @@ class Runner:
         max_dispatch: str = "10",
         pr_updated_at: str = "2020-01-01T00:00:00Z",
         extra_statuses: list[dict] | None = None,
+        disposition_at: str | None = None,
+        other_comments: list[dict] | None = None,
     ) -> list[str]:
         """Run the sweep over ONE pull request; return the dispatches recorded.
 
@@ -190,6 +193,20 @@ class Runner:
                 }
             )
         (self.fixtures / "check_runs.json").write_text(json.dumps(pages))
+        # Slurped shape for the issue-comments read mode 5 makes: an array of
+        # PAGES, each page being the endpoint's own array of comments.
+        comments = (
+            []
+            if disposition_at is None
+            else [
+                {
+                    "body": "<!-- ai-review-disposition target=gpt head=abc1234 -->\nruling",
+                    "updated_at": disposition_at,
+                }
+            ]
+        )
+        comments += other_comments or []
+        (self.fixtures / "comments.json").write_text(json.dumps([comments]))
         applied = self.fixtures / "dispatched.txt"
         applied.unlink(missing_ok=True)
 
@@ -679,3 +696,223 @@ def test_a_failed_statuses_read_is_not_treated_as_unpublished(runner: Runner) ->
     )
     assert dispatched == []
     assert "statuses lookup failed" in runner.last_stdout
+
+
+# ── The disposition-comment freeze (#6658 made the verdict depend on comments) ─
+
+
+def test_failure_with_a_later_disposition_edit_is_refired(runner: Runner) -> None:
+    """Since #6658 a disposition-rule violation fails readiness, so the verdict
+    depends on comment bytes -- and the aggregator has no `issue_comment`
+    trigger. Correcting the comment produces no event and no check-run, so
+    without this mode the red freezes on an unchanged commit."""
+    dispatched = runner.sweep(
+        state="failure",
+        status_at="2026-08-30T19:01:24Z",
+        check_completed_at="2026-08-30T18:55:00Z",
+        disposition_at="2026-08-30T19:20:00Z",
+    )
+    assert len(dispatched) == 1
+    assert "pr=2064" in dispatched[0]
+    assert "disposition record changed later" in runner.last_stdout
+
+
+def test_failure_with_an_older_disposition_is_left_alone(runner: Runner) -> None:
+    """The writer read the listing and ruled BEFORE the verdict -- that is the
+    ordinary case, and the red is current, not stale. Re-firing here would
+    dispatch every genuinely-violating PR every 15 minutes forever."""
+    assert (
+        runner.sweep(
+            state="failure",
+            status_at="2026-08-30T19:01:24Z",
+            check_completed_at="2026-08-30T18:55:00Z",
+            disposition_at="2026-08-30T18:40:00Z",
+        )
+        == []
+    )
+
+
+def test_disposition_refire_is_self_terminating(runner: Runner) -> None:
+    """After the nudge republishes, readiness is the newest timestamp again, so
+    the same comment edit is never counted twice -- the property that makes this
+    safe to run on a schedule."""
+    assert (
+        runner.sweep(
+            state="failure",
+            status_at="2026-08-30T19:25:00Z",
+            check_completed_at="2026-08-30T18:55:00Z",
+            disposition_at="2026-08-30T19:20:00Z",
+        )
+        == []
+    )
+
+
+def test_a_disposition_edit_in_the_same_second_is_not_new_evidence(runner: Runner) -> None:
+    assert (
+        runner.sweep(
+            state="failure",
+            status_at="2026-08-30T19:01:24Z",
+            check_completed_at="2026-08-30T18:55:00Z",
+            disposition_at="2026-08-30T19:01:24Z",
+        )
+        == []
+    )
+
+
+def test_a_later_ordinary_comment_is_not_disposition_evidence(runner: Runner) -> None:
+    """Only disposition-marked comments are evidence. A review bot rewriting its
+    comment in place, or any human reply, must not nudge a legitimately red PR --
+    that is what would turn this into a per-sweep re-fire."""
+    assert (
+        runner.sweep(
+            state="failure",
+            status_at="2026-08-30T19:01:24Z",
+            check_completed_at="2026-08-30T18:55:00Z",
+            other_comments=[
+                {
+                    "body": "<!-- codex-ai-review -->\nGPT 5.6 Review",
+                    "updated_at": "2026-08-30T19:40:00Z",
+                }
+            ],
+        )
+        == []
+    )
+
+
+def test_later_check_evidence_still_wins_without_reading_comments(runner: Runner) -> None:
+    """Mode 2 is unchanged and still reports its own reason: a PR with later
+    check evidence must not be re-attributed to the comment path."""
+    dispatched = runner.sweep(
+        state="failure",
+        status_at="2026-08-30T19:01:24Z",
+        check_completed_at="2026-08-30T19:16:13Z",
+    )
+    assert len(dispatched) == 1
+    assert "a check completed later" in runner.last_stdout
+    assert "disposition record changed later" not in runner.last_stdout
+
+
+def test_failure_with_no_checks_and_a_later_disposition_is_still_refired(
+    runner: Runner,
+) -> None:
+    """A PR whose head carries no completed check-run at all used to be skipped
+    outright by the failure arm. The comment path must still be reachable for
+    it, since a disposition violation can be the ONLY reason readiness is red."""
+    dispatched = runner.sweep(
+        state="failure",
+        status_at="2026-08-30T19:01:24Z",
+        check_completed_at=None,
+        disposition_at="2026-08-30T19:20:00Z",
+    )
+    assert len(dispatched) == 1
+    assert "disposition record changed later" in runner.last_stdout
+
+
+def test_green_verdict_with_a_later_disposition_is_refired(runner: Runner) -> None:
+    """The PERMITTING direction, and the half that matters: a writer can post a
+    rule-violating record AFTER readiness published success. The record carries
+    ledger downgrade power immediately, the revision now violates the rule, and
+    no event re-evaluates it -- so the required status stays green over a
+    revision that should be red, which permits a merge."""
+    dispatched = runner.sweep(
+        state="success",
+        status_at="2026-08-30T19:01:24Z",
+        check_completed_at="2026-08-30T18:55:00Z",
+        disposition_at="2026-08-30T19:20:00Z",
+    )
+    assert len(dispatched) == 1
+    assert "disposition record changed later" in runner.last_stdout
+
+
+def test_green_verdict_with_an_older_disposition_is_left_alone(runner: Runner) -> None:
+    assert (
+        runner.sweep(
+            state="success",
+            status_at="2026-08-30T19:01:24Z",
+            check_completed_at="2026-08-30T18:55:00Z",
+            disposition_at="2026-08-30T18:30:00Z",
+        )
+        == []
+    )
+
+
+def test_green_disposition_refire_is_self_terminating(runner: Runner) -> None:
+    assert (
+        runner.sweep(
+            state="success",
+            status_at="2026-08-30T19:25:00Z",
+            check_completed_at="2026-08-30T18:55:00Z",
+            disposition_at="2026-08-30T19:20:00Z",
+        )
+        == []
+    )
+
+
+def test_a_later_bot_comment_never_refires_a_green_verdict(runner: Runner) -> None:
+    """The review bots rewrite their comments in place on every push. If those
+    counted, this would re-fire most green PRs on every sweep."""
+    assert (
+        runner.sweep(
+            state="success",
+            status_at="2026-08-30T19:01:24Z",
+            other_comments=[
+                {
+                    "body": "<!-- design-review -->\nDesign Review",
+                    "updated_at": "2026-08-30T19:40:00Z",
+                }
+            ],
+        )
+        == []
+    )
+
+
+def test_failing_check_evidence_still_wins_on_a_green_verdict(runner: Runner) -> None:
+    dispatched = runner.sweep(
+        state="success",
+        status_at="2026-08-30T19:01:24Z",
+        check_completed_at="2026-08-30T19:16:13Z",
+        check_conclusion="failure",
+    )
+    assert len(dispatched) == 1
+    assert "a check FAILED later" in runner.last_stdout
+    assert "disposition record changed later" not in runner.last_stdout
+
+
+def test_a_disposition_three_seconds_after_a_red_verdict_is_evidence(runner: Runner) -> None:
+    """No margin on comment evidence. The check-evidence modes tolerate 5s so a
+    concurrently-completing check is not read as new; `-le` already excludes the
+    same second, so a margin here only created a 1-5s window in which a record
+    could be posted and then never re-examined -- nothing else observes
+    comments, so that window was permanent."""
+    dispatched = runner.sweep(
+        state="failure",
+        status_at="2026-08-30T19:01:24Z",
+        check_completed_at="2026-08-30T18:55:00Z",
+        disposition_at="2026-08-30T19:01:27Z",
+    )
+    assert len(dispatched) == 1
+
+
+def test_a_disposition_three_seconds_after_a_green_verdict_is_evidence(
+    runner: Runner,
+) -> None:
+    dispatched = runner.sweep(
+        state="success",
+        status_at="2026-08-30T19:01:24Z",
+        disposition_at="2026-08-30T19:01:27Z",
+    )
+    assert len(dispatched) == 1
+
+
+def test_a_same_second_disposition_still_terminates_the_loop(runner: Runner) -> None:
+    """The property the margin was there to protect, which strict `-le` already
+    gives: a record stamped in the same second as the publish is not evidence, so
+    a republish cannot re-fire on the record it just answered."""
+    assert (
+        runner.sweep(
+            state="success",
+            status_at="2026-08-30T19:01:24Z",
+            disposition_at="2026-08-30T19:01:24Z",
+        )
+        == []
+    )

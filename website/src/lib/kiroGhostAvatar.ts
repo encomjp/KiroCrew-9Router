@@ -112,6 +112,36 @@ const lid = (x: number, dip: number): string =>
   `<path d="M${x - 44} ${EY + (dip > 0 ? -20 : 26)}q44 ${dip} 88 0" stroke="${INK}" ` +
   `stroke-width="30" fill="none" stroke-linecap="round"/>`
 
+/* Pieces shared by the still (`EYES`) and animated (`WORKING_EYES`) tables. Named
+ * once so the two tables cannot drift apart: the working variant of an eye must
+ * draw exactly the geometry the seed drew, only wrapped in animation groups. */
+
+/** A four-point twinkle beside an eye. */
+const star = (x: number): string =>
+  `<path d="M${x + 12} ${EY - 46}l11 24 24 11-24 11-11 24-11-24-24-11 24-11z" ` +
+  `fill="${WHITE}"/>`
+
+const VISOR_BAR =
+  `<rect x="${EL - 52}" y="${EY - 50}" width="${ER - EL + 104}" height="100" rx="50" ` +
+  `fill="${INK}"/>`
+const VISOR_GLINT =
+  `<rect x="${EL - 22}" y="${EY - 26}" width="34" height="20" rx="10" fill="${WHITE}" ` +
+  `opacity="0.85"/>`
+
+const GLASSES_FRAMES =
+  pair(
+    (x) => `<circle cx="${x}" cy="${EY}" r="66" fill="none" stroke="${INK}" stroke-width="18"/>`,
+  ) +
+  // Absolute `L` endpoint rather than a relative `h` run: a template chunk that
+  // opens with `h` is read as an hours unit by the i18n unit-literal gate.
+  `<path d="M${EL + 66} ${EY}L${ER - 66} ${EY}" stroke="${INK}" stroke-width="16"/>` +
+  `<path d="M${EL - 66} ${EY - 10}l-46-26" stroke="${INK}" stroke-width="16" ` +
+  `stroke-linecap="round"/>`
+
+const heartEye = (x: number): string =>
+  `<path d="M${x} ${EY + 44}C${x - 60} ${EY} ${x - 42} ${EY - 48} ${x} ${EY - 18}` +
+  `C${x + 42} ${EY - 48} ${x + 60} ${EY} ${x} ${EY + 44}Z" fill="${INK}"/>`
+
 export const EYES: Record<string, string> = {
   /** The mark itself. Weighted so most of a roster looks exactly like Kiro. */
   canon: CANON,
@@ -121,30 +151,10 @@ export const EYES: Record<string, string> = {
   wide:
     pair((x) => `<circle cx="${x}" cy="${EY}" r="54" fill="${INK}"/>`) +
     pair((x) => `<circle cx="${x + 17}" cy="${EY - 20}" r="16" fill="${WHITE}"/>`),
-  sparkle:
-    CANON +
-    pair(
-      (x) =>
-        `<path d="M${x + 12} ${EY - 46}l11 24 24 11-24 11-11 24-11-24-24-11 24-11z" ` +
-        `fill="${WHITE}"/>`,
-    ),
+  sparkle: CANON + pair(star),
   /** One bar instead of two eyes: reads as a machine rather than a face. */
-  visor:
-    `<rect x="${EL - 52}" y="${EY - 50}" width="${ER - EL + 104}" height="100" rx="50" ` +
-    `fill="${INK}"/>` +
-    `<rect x="${EL - 22}" y="${EY - 26}" width="34" height="20" rx="10" fill="${WHITE}" ` +
-    `opacity="0.85"/>`,
-  glasses:
-    CANON +
-    pair(
-      (x) =>
-        `<circle cx="${x}" cy="${EY}" r="66" fill="none" stroke="${INK}" stroke-width="18"/>`,
-    ) +
-    // Absolute `L` endpoint rather than a relative `h` run: a template chunk that
-    // opens with `h` is read as an hours unit by the i18n unit-literal gate.
-    `<path d="M${EL + 66} ${EY}L${ER - 66} ${EY}" stroke="${INK}" stroke-width="16"/>` +
-    `<path d="M${EL - 66} ${EY - 10}l-46-26" stroke="${INK}" stroke-width="16" ` +
-    `stroke-linecap="round"/>`,
+  visor: VISOR_BAR + VISOR_GLINT,
+  glasses: CANON + GLASSES_FRAMES,
   cross:
     `<path d="M${EL - 38} ${EY - 34}l76 34-76 34z" fill="${INK}"/>` +
     `<path d="M${ER + 38} ${EY - 34}l-76 34 76 34z" fill="${INK}"/>`,
@@ -156,18 +166,151 @@ export const EYES: Record<string, string> = {
       (x) =>
         `<circle cx="${x}" cy="${EY}" r="46" fill="none" stroke="${INK}" stroke-width="20"/>`,
     ) + pair((x) => `<circle cx="${x}" cy="${EY}" r="10" fill="${INK}"/>`),
-  heart: pair(
-    (x) =>
-      `<path d="M${x} ${EY + 44}C${x - 60} ${EY} ${x - 42} ${EY - 48} ${x} ${EY - 18}` +
-      `C${x + 42} ${EY - 48} ${x + 60} ${EY} ${x} ${EY + 44}Z" fill="${INK}"/>`,
-  ),
+  heart: pair(heartEye),
   cyclops:
     `<ellipse cx="${(EL + ER) / 2}" cy="${EY}" rx="66" ry="84" fill="${INK}"/>` +
     `<circle cx="${(EL + ER) / 2 + 22}" cy="${EY - 28}" r="20" fill="${WHITE}"/>`,
 }
 
-/** Brows sit just above the eyes. The mark is browless, so `none` is weighted. */
-export const BROWS: Record<string, string> = {
+/* ────────────────────────── Working animation ──────────────────────────
+ *
+ * A running crew's avatar is ALIVE, not a different avatar. The rule that makes
+ * that safe: the working variant may only MOVE what the seed drew — animation
+ * groups and a `<style>` block wrap the same geometry `EYES` renders, and every
+ * keyframe is a transform or opacity that returns to rest. No trait is added,
+ * removed, or recolored (blush in particular stays exactly as the seed rolled
+ * it), so identity is untouched and `working` never consumes a prng draw.
+ *
+ * Eye idioms are per-variant because the eye vocabulary is semantic: a visor has
+ * no eyelid to blink and `closed` is already shut. A variant without an idiom
+ * falls back to its still art and gets the body layer only.
+ */
+
+export type WorkingIntensity = 'subtle' | 'full'
+
+/** Wrap `art` in an animation group, optionally pinning the transform origin
+ *  (user units of the 1200-space; SVG `transform-box` defaults to view-box). */
+const anim = (cls: string, art: string, origin?: [number, number], delay?: string): string =>
+  `<g class="${cls}"` +
+  (origin || delay
+    ? ` style="${origin ? `transform-origin:${origin[0]}px ${origin[1]}px` : ''}` +
+      `${origin && delay ? ';' : ''}${delay ? `animation-delay:${delay}` : ''}"`
+    : '') +
+  `>${art}</g>`
+
+/** Eye-center origin shared by both-eye squash animations (blink, squeeze). */
+const EYE_ORIGIN: [number, number] = [(EL + ER) / 2, 487]
+
+/**
+ * Animated counterparts of `EYES`. Each entry re-composes the SAME pieces its
+ * still twin is built from (`CANON`, `star`, `VISOR_*`, …), so the geometry
+ * cannot drift; the test suite strips the animation wrappers and asserts the
+ * remaining shapes equal the still art byte for byte.
+ */
+export const WORKING_EYES: Record<string, string> = {
+  /** Double-blink plus an occasional glance to the side. */
+  canon: anim('kg-look', anim('kg-blink', CANON, EYE_ORIGIN)),
+  /** Already shut — no idiom; the body layer alone reads as meditative work. */
+  closed: EYES.closed,
+  /** Drowsy lids lift and fall: fighting sleep but still on the job. */
+  sleepy: anim('kg-drowse', EYES.sleepy),
+  /** Only the open eye blinks; the wink is identity and stays. */
+  wink: anim('kg-blink', `<path d="${EYE_A}" fill="${INK}"/>`, [EL, 487]) + lid(ER, -52),
+  /** Alert darting: the wide stare scans around while it works. */
+  wide: anim('kg-dart', EYES.wide),
+  /** Canon eyes blink; the sparkles twinkle in alternation. */
+  sparkle:
+    anim('kg-blink', CANON, EYE_ORIGIN) +
+    anim('kg-tw', star(EL), [EL + 12, EY - 11]) +
+    anim('kg-tw', star(ER), [ER + 12, EY - 11], '.45s'),
+  /** The glint sweeps the bar: a machine scanning. */
+  visor: VISOR_BAR + anim('kg-scan', VISOR_GLINT),
+  /** Only the eyes behind the lenses blink; the frames are furniture. */
+  glasses: anim('kg-blink', CANON, EYE_ORIGIN) + GLASSES_FRAMES,
+  /** Strained high-frequency shiver: bearing down on the task. */
+  cross: anim('kg-jitter', EYES.cross),
+  /** Periodically squints even harder: taking aim. */
+  squint: anim('kg-squeeze', EYES.squint, EYE_ORIGIN),
+  /** Off-center rotation makes the spiral visibly churn: deep in thought. */
+  swirl:
+    pair((x) =>
+      anim(
+        'kg-spin',
+        `<circle cx="${x}" cy="${EY}" r="46" fill="none" stroke="${INK}" stroke-width="20"/>`,
+        [x + 14, EY],
+      ),
+    ) + pair((x) => `<circle cx="${x}" cy="${EY}" r="10" fill="${INK}"/>`),
+  /** Heartbeat: loves the work. */
+  heart: pair((x) => anim('kg-hb', heartEye(x), [x, EY])),
+  /** One slow blink of the single eye. */
+  cyclops: anim('kg-cyblink', EYES.cyclops, [(EL + ER) / 2, 487]),
+}
+
+/**
+ * Body-layer motion, two tiers: `subtle` for dense surfaces (roster rows) and
+ * `full` for a surface showing one avatar (a DM header). Same keyframes, only
+ * amplitudes and tempo differ.
+ *
+ * The `kg-fit` wrapper pre-shrinks and lowers the whole drawing so the bob's
+ * rise plus the stretch's lift cannot push tall head accessories (antenna ball
+ * at y≈104, halo, party hat) past the top of the 1200 tile — the margin above
+ * the artwork is smaller than the full-tier excursion, so headroom is made, not
+ * assumed.
+ */
+const MOTION: Record<
+  WorkingIntensity,
+  { fitScale: number; fitDrop: number; rise: number; sink: number; stretch: number; sway: number; secs: number }
+> = {
+  subtle: { fitScale: 0.97, fitDrop: 12, rise: 14, sink: 5, stretch: 0.02, sway: 1.6, secs: 2.4 },
+  full: { fitScale: 0.94, fitDrop: 28, rise: 34, sink: 12, stretch: 0.05, sway: 3.2, secs: 1.6 },
+}
+
+/** The `<style>` block for a working avatar. Eye idiom tempo is shared across
+ *  tiers — at roster size the eye is barely legible, so only body amplitude
+ *  scales. Reduced-motion users get the still frame: identity is identical, so
+ *  dropping every animation is a complete, lossless fallback. */
+export function workingStyle(intensity: WorkingIntensity): string {
+  const m = MOTION[intensity]
+  return (
+    '<style>' +
+    `@keyframes kg-bob{0%,100%{transform:translateY(${m.sink}px)}50%{transform:translateY(-${m.rise}px)}}` +
+    `@keyframes kg-sq{0%,100%{transform:scale(${1 + m.stretch},${1 - m.stretch})}50%{transform:scale(${1 - m.stretch / 2},${1 + m.stretch})}}` +
+    `@keyframes kg-sway{0%,100%{transform:rotate(-${m.sway}deg)}50%{transform:rotate(${m.sway}deg)}}` +
+    '@keyframes kg-blink{0%,80%,88%,96%,100%{transform:scaleY(1)}84%,92%{transform:scaleY(0.06)}}' +
+    '@keyframes kg-look{0%,26%,100%{transform:translateX(0)}34%,50%{transform:translateX(30px)}60%,84%{transform:translateX(-26px)}}' +
+    '@keyframes kg-drowse{0%,50%,100%{transform:translateY(0)}62%,80%{transform:translateY(-18px)}}' +
+    '@keyframes kg-dart{0%,18%,100%{transform:translate(0,0)}24%,42%{transform:translate(24px,-8px)}48%,66%{transform:translate(-20px,8px)}72%,88%{transform:translate(8px,-12px)}}' +
+    '@keyframes kg-tw{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.1;transform:scale(.5)}}' +
+    '@keyframes kg-scan{0%,100%{transform:translateX(-24px)}50%{transform:translateX(130px)}}' +
+    '@keyframes kg-jitter{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}50%{transform:translateX(7px)}75%{transform:translateX(-5px)}}' +
+    '@keyframes kg-squeeze{0%,66%,100%{transform:scaleY(1)}76%,90%{transform:scaleY(0.45)}}' +
+    '@keyframes kg-spin{to{transform:rotate(360deg)}}' +
+    '@keyframes kg-hb{0%,40%,100%{transform:scale(1)}12%{transform:scale(1.3)}26%{transform:scale(1.1)}}' +
+    '@keyframes kg-cyblink{0%,86%,96%,100%{transform:scaleY(1)}91%{transform:scaleY(0.05)}}' +
+    `.kg-fit{transform:translateY(${m.fitDrop}px) scale(${m.fitScale});transform-origin:600px 600px}` +
+    `.kg-sway{animation:kg-sway ${m.secs * 1.85}s ease-in-out infinite;transform-origin:600px 620px}` +
+    `.kg-bob{animation:kg-bob ${m.secs}s ease-in-out infinite}` +
+    `.kg-sq{animation:kg-sq ${m.secs}s ease-in-out infinite;transform-origin:600px 985px}` +
+    '.kg-blink{animation:kg-blink 2.6s infinite}' +
+    '.kg-look{animation:kg-look 4.4s ease-in-out infinite}' +
+    '.kg-drowse{animation:kg-drowse 3.6s ease-in-out infinite}' +
+    '.kg-dart{animation:kg-dart 2.4s ease-in-out infinite}' +
+    '.kg-tw{animation:kg-tw .9s infinite}' +
+    '.kg-scan{animation:kg-scan 1.3s ease-in-out infinite}' +
+    '.kg-jitter{animation:kg-jitter .3s linear infinite}' +
+    '.kg-squeeze{animation:kg-squeeze 2.4s ease-in-out infinite}' +
+    '.kg-spin{animation:kg-spin 1.4s linear infinite}' +
+    '.kg-hb{animation:kg-hb 1.1s infinite}' +
+    '.kg-cyblink{animation:kg-cyblink 3.2s infinite}' +
+    // `animation:none` alone is not a still frame: `.kg-fit` is a STATIC
+    // transform, so it must be reset too or a reduced-motion user sees a
+    // shrunken, lowered ghost with no motion to justify that headroom.
+    '@media (prefers-reduced-motion:reduce){*{animation:none!important}.kg-fit{transform:none}}' +
+    '</style>'
+  )
+}
+
+/** Brows sit just above the eyes. The mark is browless, so `none` is weighted. */export const BROWS: Record<string, string> = {
   none: '',
   raised: pair(
     (x) =>
@@ -363,6 +506,9 @@ export interface KiroGhostOptions {
   propProbability: number
   /** Off gives every tile the brand purple; on gives each seed a palette entry. */
   hueTile: boolean
+  /** Render the working (animated) variant at this intensity. A render option,
+   *  not a trait: it consumes no prng draw and defaults to the still frame. */
+  working: WorkingIntensity
 }
 
 export interface KiroGhostTraits {
@@ -379,27 +525,63 @@ export interface KiroGhostTraits {
 /**
  * The only composition path. `create` calls it with prng-drawn traits and tests
  * call it with explicit ones, so a fixture cannot drift from real output.
+ *
+ * `working` is a RENDER parameter, not a trait: it is never drawn from the prng
+ * (so it cannot re-roll a face) and with it unset the output is byte-identical
+ * to what this function has always produced. Set, it swaps each eye for its
+ * animated twin and wraps the drawing in the body-motion groups.
  */
-export function compose(t: KiroGhostTraits): string {
+export function compose(t: KiroGhostTraits, working?: WorkingIntensity | null): string {
+  const eyesArt = working ? (WORKING_EYES[t.eyes] ?? EYES[t.eyes] ?? '') : (EYES[t.eyes] ?? '')
   const inner = [
     `<path d="${BODY}" fill="${WHITE}"/>`,
     t.blush
       ? `<ellipse cx="${EL - 20}" cy="600" rx="46" ry="26" fill="${BLUSH}" opacity="0.55"/>` +
         `<ellipse cx="${ER + 34}" cy="600" rx="46" ry="26" fill="${BLUSH}" opacity="0.55"/>`
       : '',
-    EYES[t.eyes] ?? '',
+    eyesArt,
     BROWS[t.brows] ?? '',
     MOUTHS[t.mouth] ?? '',
     ACCESSORIES[t.accessory] ?? '',
     PROPS[t.prop] ?? '',
   ].join('')
+  // Body motion wraps INSIDE the flip group, so transform origins stay in the
+  // unmirrored coordinate space and a flipped ghost sways identically.
+  const core = working
+    ? `<g class="kg-fit"><g class="kg-sway"><g class="kg-bob"><g class="kg-sq">${inner}</g></g></g></g>`
+    : inner
   // The tile rect is painted here rather than through core's `backgroundColor` so
   // its color is drawn from the same prng as every other trait. It stays outside
   // the mirror group so flipping cannot move it.
   return (
+    (working ? workingStyle(working) : '') +
     `<rect width="1200" height="1200" fill="${t.tile}"/>` +
-    (t.flip ? `<g transform="translate(1200,0) scale(-1,1)">${inner}</g>` : inner)
+    (t.flip ? `<g transform="translate(1200,0) scale(-1,1)">${core}</g>` : core)
   )
+}
+
+/**
+ * Corner radius, as DiceBear's percent-of-viewport `radius` option and the
+ * equivalent rect `rx` in the mark's 1200-unit space. Both spellings exist
+ * because the seeded avatar path goes through DiceBear (which clips) while a
+ * pinned face is composed directly and must clip itself identically.
+ */
+export const GHOST_RADIUS_PCT = 12
+const GHOST_RADIUS_UNITS = (1200 * GHOST_RADIUS_PCT) / 100
+
+/**
+ * Compose explicit traits into the same data-URI form the seeded DiceBear
+ * path emits. Lives here (a `.ts` module, beside `compose`) rather than in a
+ * component: the use-lucide-icons rule bans an `<svg>` literal in any `.tsx`
+ * file unconditionally, and this wrapper is brand-mark geometry, which is
+ * exactly what this module already owns.
+ */
+export function ghostDataUri(traits: KiroGhostTraits, working?: WorkingIntensity | null): string {
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 1200">` +
+    `<clipPath id="r"><rect width="1200" height="1200" rx="${GHOST_RADIUS_UNITS}"/></clipPath>` +
+    `<g clip-path="url(#r)">${compose(traits, working)}</g></svg>`
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`
 }
 
 export const kiroGhost: Style<KiroGhostOptions> = {
@@ -418,6 +600,7 @@ export const kiroGhost: Style<KiroGhostOptions> = {
       flipProbability: { type: 'integer', minimum: 0, maximum: 100, default: 40 },
       propProbability: { type: 'integer', minimum: 0, maximum: 100, default: 30 },
       hueTile: { type: 'boolean', default: true },
+      working: { type: 'string', enum: ['subtle', 'full'] },
     },
   },
   create({ prng, options }: StyleCreateProps<KiroGhostOptions>) {
@@ -446,7 +629,7 @@ export const kiroGhost: Style<KiroGhostOptions> = {
     }
     return {
       attributes: { viewBox: '0 0 1200 1200' },
-      body: compose(traits),
+      body: compose(traits, options.working ?? null),
       extra: () => ({ ...traits }),
     }
   },

@@ -42,6 +42,9 @@ vi.mock('react-virtuoso', () => ({ Virtuoso: () => null }))
 // this a test of production behaviour rather than of the stub.
 vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
   useVirtualChat: (opts: { items?: unknown[]; getKey?: (it: unknown, i: number) => string }) => {
+    // Stashed for the duplicate-key wiring test below: the REAL getKey ChatPage
+    // hands the virtualizer, paired with the items of the same render.
+    ;(globalThis as Record<string, unknown>).__vcOpts = opts
     const items = opts.items ?? []
     return {
       virtualItems: items.map((data, index) => ({
@@ -49,8 +52,11 @@ vi.mock('../hooks/virtualizer/useVirtualChat', () => ({
         index,
         mounted: true,
         data,
+      farmIsMeasured: () => true,
+      farmRecord: () => true,
       })),
       isAtBottom: true,
+      getFollow: () => true,
       scrollToBottom: vi.fn(),
       mountIndex: vi.fn(),
       measureRef: () => () => {},
@@ -172,7 +178,10 @@ const rowNode = (container: HTMLElement) =>
   container.querySelector('[data-display-index="0"]') as HTMLElement | null
 
 describe('ChatPage — the virtualizer row survives steer reconciliation without remounting', () => {
-  beforeEach(() => { Object.keys(apiMocks).forEach(k => delete apiMocks[k]) })
+  beforeEach(() => {
+    Object.keys(apiMocks).forEach(k => delete apiMocks[k])
+    delete (globalThis as Record<string, unknown>).__vcOpts
+  })
 
   it('keeps the SAME row DOM node when the server ts replaces the optimistic one', () => {
     const { store, container } = renderChatPage([OPTIMISTIC])
@@ -206,5 +215,26 @@ describe('ChatPage — the virtualizer row survives steer reconciliation without
     const after = rowNode(container)
     expect(after).toBeTruthy()
     expect((after as HTMLElement & { __probe?: string }).__probe).toBeUndefined()
+  })
+
+  it('derives DISTINCT virtualizer keys for two rows stamped in the same tick', () => {
+    // A coarse OS clock can stamp two rows appended in one tick with the same
+    // `ts`; a `single` keys on `msgKey` alone, so without the list-level
+    // dedupe (uniqueRowKeys) both rows reach React AND the HeightCache under
+    // ONE key — a dropped sibling and a shared height slot. This asserts
+    // through the REAL getKey ChatPage hands the virtualizer (captured by the
+    // mock above), so it pins the WIRING, not just the helper.
+    const SAME_TS = '2026-06-23T20:00:00.000Z'
+    renderChatPage([
+      { role: 'user', content: 'first', cls: '', ts: SAME_TS },
+      { role: 'assistant', content: 'second', cls: '', ts: SAME_TS },
+    ])
+    const opts = (globalThis as Record<string, unknown>).__vcOpts as {
+      items: unknown[]
+      getKey: (it: unknown, i: number) => string
+    }
+    const keys = opts.items.map((it, i) => opts.getKey(it, i))
+    expect(keys.length).toBeGreaterThanOrEqual(2)
+    expect(new Set(keys).size).toBe(keys.length)
   })
 })

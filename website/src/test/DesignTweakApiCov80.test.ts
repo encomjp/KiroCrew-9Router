@@ -4,6 +4,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { ApiError } from '../api/apiError'
 import {
   addProject,
   api,
@@ -381,10 +382,18 @@ describe('createChatSlot', () => {
     expect(result).toEqual(payload)
   })
 
-  it('throws on non-OK with "chat API <status>"', async () => {
+  it('throws a typed ApiError carrying the status on non-OK', async () => {
+    // Was pinned to the bespoke `chat API <status>` message. That throw discarded
+    // the response body entirely, so the backend's reason never reached the UI;
+    // it now goes through the shared toApiError. The status is what the assertion
+    // was really protecting, and it is now a field rather than a substring.
     const fetchMock = vi.fn(async () => new Response('', { status: 401 }))
     vi.stubGlobal('fetch', fetchMock)
-    await expect(createChatSlot('x', 'y')).rejects.toThrow('chat API 401')
+    const e = (await createChatSlot('x', 'y').catch((err: unknown) => err)) as ApiError
+    expect(e).toBeInstanceOf(ApiError)
+    expect(e.status).toBe(401)
+    // Empty body keeps the HTTP <status> fallback the old message also carried.
+    expect(e.message).toBe('HTTP 401')
   })
 })
 

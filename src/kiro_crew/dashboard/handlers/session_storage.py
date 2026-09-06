@@ -26,15 +26,17 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.config.paths import config_dir
 from kiro_crew.dashboard.handlers._shared import _is_restricted_session, _read_session_key
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.history import transcript_stems
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 from kiro_crew.session_digest import digest
-from kiro_crew.session_map import SessionMap
+from kiro_crew.session_map import SESSION_MAP_FILENAME, SessionMap
 from kiro_crew.session_storage import (
     BUCKET_DAYS,
     MIN_RECLAIM_AGE_DAYS,
+    BatchIdentity,
     SessionIndex,
     SessionStorageError,
     SessionUnit,
@@ -105,6 +107,70 @@ def _build_index(state: DashboardState | None = None) -> SessionIndex:
         active_sids=frozenset(mapping.values()),
         live_sids=live_sids,
     )
+
+
+def _map_token() -> tuple[int, int, int] | None:
+    """Identity of the session map file, or ``None`` when it cannot be read.
+
+    ``(st_ino, st_mtime_ns, st_size)``. Every mapping write lands through
+    ``mkstemp`` plus ``os.replace`` (``SessionMap._write``), so the inode changes
+    on every write — a token that has not moved means no mapping has been written,
+    which mtime alone could not establish at this resolution.
+    """
+    try:
+        st = (config_dir() / SESSION_MAP_FILENAME).stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+class _MapBackedRefresh:
+    """A ``refresh`` for :func:`move_to_trash` that is cheap to call repeatedly.
+
+    ``move_to_trash`` calls ``refresh`` once per selected session, because the
+    index is the only place a resume that merely READS an old transcript shows up
+    (#7118): such a resume writes nothing, so the mtime guard inside the move loop
+    cannot see it, and the session's history would be staged out from under a live
+    slot.
+
+    Rebuilding per session cannot be paid for directly. :func:`_build_index` reads
+    and parses the whole session map — about 0.26 ms even for a 100-entry map,
+    because the floor is one file read plus one json parse — and the selection is
+    capped at :data:`_MAX_SELECTION`, so a naive per-session rebuild costs at least
+    ~56 s, and hours against a five-figure map.
+
+    So the rebuild is gated on the map file's identity, and the SAME object is
+    returned while that has not moved. ``move_to_trash`` recognises an unchanged
+    index by identity and skips re-deriving its sets, so an unmoved map costs one
+    stat (~2 us) — under a second for the whole cap.
+
+    Fails toward rebuilding rather than skipping: a token that could not be read is
+    ``None``, which never compares equal, so an unreadable map pays a real re-read.
+
+    RESIDUAL: ``SessionMap`` defers its write by ``_FLUSH_DEBOUNCE_SECS`` and this
+    reads the FILE, not the live in-process map, so a resume is invisible here for
+    up to that long. Bounded at ~50 ms instead of the whole move loop; closing it
+    outright needs the resume and reclaim paths to share a lock, which is the
+    change ``docs/system-specs/modules/session-storage.md`` already names.
+    """
+
+    def __init__(self) -> None:
+        self._token: tuple[int, int, int] | None = None
+        self._index: SessionIndex | None = None
+
+    def __call__(self) -> SessionIndex:
+        # Read the token BEFORE the rebuild, and store that one. A write landing
+        # while the rebuild is in flight then leaves a token the next call sees as
+        # moved, so it rebuilds again. Reading it afterwards would stamp the
+        # rebuilt index with a token that already includes the write it missed.
+        token = _map_token()
+        if self._index is not None and token is not None and token == self._token:
+            return self._index
+        # Deliberately without *state*: the running-session signal only LABELS a
+        # refusal, and this index is used to widen refusals, never to explain them.
+        self._index = _build_index()
+        self._token = token
+        return self._index
 
 
 def _deny(operation: str, request: web.Request) -> web.Response:
@@ -288,8 +354,11 @@ async def api_session_storage_cleanup(request: web.Request) -> web.Response:
             reason=REASON_POLICY,
             index=index,
             # Re-read the map inside the lock: the scan above can take long enough
-            # for a session to be resumed and mapped in the meantime.
-            refresh=_build_index,
+            # for a session to be resumed and mapped in the meantime, and so can
+            # the move loop, which calls this once per session. One instance per
+            # request — a shared one would serve a later request an index built
+            # before it started.
+            refresh=_MapBackedRefresh(),
         )
     except SessionStorageError as exc:
         return _refused(exc, "cleanup_refused")
@@ -424,11 +493,20 @@ def _empty_job_payload(job: _EmptyJob) -> dict[str, Any]:
     }
 
 
-async def _run_empty_job(job: _EmptyJob, batch_ids: list[str], caller: str) -> None:
+async def _run_empty_job(
+    job: _EmptyJob,
+    batch_ids: list[str],
+    caller: str,
+    identities: dict[str, BatchIdentity] | None = None,
+) -> None:
     """Run one empty to completion, then audit it.
 
     ``batch_ids`` is always explicit - never ``None`` for "all" - so the set the
     worker destroys is the set the request resolved, under the storage mutation lock.
+
+    ``identities`` carries what each of those ids pointed AT when it was resolved, so
+    the delete can refuse a directory swapped into an approved name during this
+    handoff. An id alone would have the worker delete whatever now answers to it.
 
     Deliberately not tied to the request that started it: the delete is minutes of
     filesystem work, and a user who closes the tab or walks to another page must
@@ -443,6 +521,7 @@ async def _run_empty_job(job: _EmptyJob, batch_ids: list[str], caller: str) -> N
             batch_ids,
             lambda freed: setattr(job, "freed_bytes", freed),
             job.skipped.append,
+            identities,
         )
     except SessionStorageError as exc:
         # Scrubbed, not passed through. A refusal's text can quote the argument that
@@ -563,7 +642,7 @@ async def api_session_storage_empty(request: web.Request) -> web.Response:
     # and leave a job that never finishes, making every later attempt a 409 for the
     # life of the process.
     try:
-        targets, job.total_bytes = await asyncio.to_thread(staged_targets, requested)
+        targets, job.total_bytes, identities = await asyncio.to_thread(staged_targets, requested)
     except SessionStorageError as exc:
         # A named id that is not a batch. Answered as the 400 it always was rather
         # than as a job, because nothing was dispatched and the caller can fix the
@@ -573,20 +652,36 @@ async def api_session_storage_empty(request: web.Request) -> web.Response:
         return _refused(exc, "empty_refused")
     except Exception:
         logger.exception("could not read the staged batches for the trash")
-        if requested is None:
-            # Fail closed, and SAY so on the job. "Everything currently staged"
-            # cannot be resolved, and handing the worker `None` so it re-enumerates
-            # later is the data loss this snapshot exists to prevent. The job is
-            # answered already-settled rather than 500'd so the screen has one shape
-            # to read and the user learns why nothing moved.
-            job.error = "The staged batches could not be read, so nothing was deleted."
-            job.finished_at = time.time()
-            job.done = True
-            return web.json_response(_empty_job_payload(job), status=202)
-        # An explicit selection needs no snapshot: the caller already named it, and a
-        # missing total only costs the progress bar its denominator.
-        targets = list(batch_ids or [])
-    job.task = asyncio.create_task(_run_empty_job(job, targets, _read_session_key(request)))
+        # Fail closed, for an explicit selection as much as for "everything staged", and
+        # SAY so on the job. The snapshot is not a convenience that buys a progress
+        # denominator: it is what turns a list of NAMES into approval of the directories
+        # those names pointed at. Dispatching without it deletes whatever answers to the
+        # names by the time the worker runs, which is the case this whole path exists to
+        # prevent - and the failure that lands here is not always benign (a tree deep
+        # enough to exhaust descriptors reaches this handler as an exception, and it is
+        # reached by writing into the trash). Answered already-settled rather than 500'd so
+        # the screen has one shape to read and the user learns why nothing moved.
+        job.error = "The staged batches could not be read, so nothing was deleted."
+        job.finished_at = time.time()
+        job.done = True
+        # Audited HERE because this return is the only outcome this request will have.
+        # Every other path through this endpoint reaches the audit inside
+        # `_run_empty_job`, and before this PR an explicit selection reached it too --
+        # it dispatched on a failed snapshot rather than refusing. Failing closed is
+        # the right call, but it moved the request off the audited path, and an
+        # irreversible operation that leaves no record of having been ATTEMPTED is a
+        # worse hole than the one it closed.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.empty",
+            outcome="refused",
+            source="dashboard",
+            resources="snapshot_unreadable",
+        )
+        return web.json_response(_empty_job_payload(job), status=202)
+    job.task = asyncio.create_task(
+        _run_empty_job(job, targets, _read_session_key(request), identities)
+    )
     return web.json_response(_empty_job_payload(job), status=202)
 
 
@@ -939,11 +1034,49 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             eligible,
             reason=REASON_MANUAL,
             index=index,
-            refresh=_build_index,
+            # Called once per selected session, so it is gated on the map file's
+            # identity rather than rebuilding every time. One instance per request:
+            # a shared one would serve a later request an index built before it
+            # started.
+            refresh=_MapBackedRefresh(),
         )
     except SessionStorageError as exc:
+        # Audited before returning. A refusal from inside the move is the same
+        # security-relevant outcome as the pre-flight one above -- someone asked to
+        # remove specific conversations and was told no -- and it is the ONLY record
+        # for the case where every selected session was protected, which returns
+        # here rather than through the success path. Resources names the selection
+        # rather than a per-uid reason: which one tripped it is in the message, and
+        # the whole batch was refused either way.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.trash",
+            outcome="denied",
+            source="dashboard",
+            resources=",".join(eligible)[:512],
+        )
         return _refused(exc, "trash_refused")
 
+    # A session resumed while the batch was being staged was left in place, and
+    # this endpoint's contract is that anything not taken is named. It joins the
+    # same list under the same code the pre-flight uses for a live session: the
+    # mechanism differs (caught by mtime during the move, not by the index before
+    # it) but the fact the reader needs is identical — it is in use, so it stayed.
+    revived_refusals = [{"uid": uid, "reason": "in_use"} for uid in batch.revived]
+    if revived_refusals:
+        # Audited for the same reason the pre-flight refusal above is, and it has
+        # to be its own event: that one is emitted before the move, so a session
+        # protected DURING the move would otherwise appear in the record only
+        # inside a "success", leaving the protection itself unlogged. Emitted
+        # before the success event so the trail reads in the same order as the
+        # pre-flight path.
+        _sel().log_api_access(
+            caller=_read_session_key(request),
+            operation="session_storage.trash",
+            outcome="denied",
+            source="dashboard",
+            resources=",".join(f"{r['uid']}:{r['reason']}" for r in revived_refusals)[:512],
+        )
     _sel().log_api_access(
         caller=_read_session_key(request),
         operation="session_storage.trash",
@@ -956,6 +1089,6 @@ async def api_session_inventory_trash(request: web.Request) -> web.Response:
             "sessions": batch.sessions,
             "bytes": batch.bytes,
             "batch_id": batch.batch_id,
-            "refused": refused,
+            "refused": refused + revived_refusals,
         }
     )

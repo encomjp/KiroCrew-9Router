@@ -750,17 +750,27 @@ def _load_agent_config(*, user_home: Path | None = None) -> dict[str, Any]:
 
     # Installed agent config (always check for mcpServers)
     from kiro_crew.agent import AGENT_FILENAME  # circular import: agent imports mcp_discovery
+    from kiro_crew.agent_discovery import _read_agent_spec
 
     installed = (
         (user_home / ".kiro" / "agents") if user_home else kiro_agents_dir()
     ) / AGENT_FILENAME
     if installed.is_file():
-        try:
-            loaded = json.loads(installed.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                configs.append(loaded)
-        except (json.JSONDecodeError, OSError):
-            pass
+        # The agents dir is user-writable and shared with other tools, so this
+        # goes through the hardened agent-spec reader (size cap,
+        # sensitive-symlink screen, non-object rejection, SEL denial event)
+        # rather than a bare read_text + json.loads. It also closes a hole the
+        # old ``except`` could not: ``encoding="utf-8"`` on a non-UTF-8 spec
+        # raises UnicodeDecodeError, a ValueError rather than an OSError or a
+        # JSONDecodeError, so it escaped this handler entirely. ``None``
+        # degrades as absent, exactly as the swallowed exceptions did.
+        loaded = _read_agent_spec(
+            installed,
+            operation="mcp_discovery_agent_config",
+            source="unknown",
+        )
+        if loaded is not None:
+            configs.append(loaded)
 
     if not configs:
         return {}
@@ -976,16 +986,28 @@ _MANAGED_SERVERS_CALLER_AWARE: frozenset[str] = frozenset(
 #: not-session-bound classification but not sufficient. ``kirocrew-computer``
 #: consumes the injected caller block (its pooled attribution is correct for
 #: every caller the gateway can name), but a caller the gateway CANNOT name
-#: proceeds under ``unresolved:<pid>`` by product decision — and on a pooled
-#: backend that pid is the shared process, so two unnamed co-tenants collapse
-#: onto one ``SnapshotIndex`` namespace and can act on each other's element
-#: indices (#5322). Unnamed is the NORMAL case on macOS, the only platform
-#: with a computer-use driver, so recommending co-tenancy would recommend the
-#: collision. Contrast ``kirocrew-dashboard``, which refuses an unidentified
-#: caller and is therefore safe to classify shareable. Remove this exception
-#: when #5322 gives unnamed callers isolated namespaces;
-#: ``test_mcp_managed_caller_identity.py`` pins it so it cannot silently
-#: persist or silently widen.
+#: proceeds under ``unresolved:<pid>`` by product decision — and unnamed is the
+#: NORMAL case on macOS, the only platform with a computer-use driver.
+#:
+#: #5322 gave those unnamed callers a per-CONNECTION nonce, so on a CURRENT
+#: gateway they no longer collapse onto one ``SnapshotIndex`` namespace. The
+#: entry stays because that is not the whole precondition. This set feeds
+#: ``managed_server_is_session_bound``, which feeds the shareability verdict,
+#: which ``mcp_gateway/seed.py`` turns into a CONFIG WRITE (``recommend_share``
+#: -> ``apply_seed``): promoting a name here can switch sharing ON for an
+#: operator who never chose it. And the daemon that would then serve those
+#: shared frames is not necessarily the one this code shipped with —
+#: ``mcp_gateway/manager.py`` ADOPTS whatever healthy daemon already holds the
+#: socket, so a gatewayd that outlived a package upgrade keeps running and
+#: injects no nonce (which is exactly why ``REGISTERED_CAPABILITIES`` exists).
+#: Promotion therefore has to wait until a nonce-blind gateway cannot serve a
+#: POOLED computer backend at all — negotiated, not assumed. Tracked as the
+#: #5322 follow-up.
+#:
+#: Contrast ``kirocrew-dashboard``, which refuses an unidentified caller and is
+#: therefore safe to classify shareable regardless of the daemon's generation.
+#: ``test_mcp_managed_caller_identity.py`` pins this so the entry can neither
+#: silently persist past its reason nor silently widen.
 _MANAGED_SERVERS_ADVERTISING_BUT_WITHHELD: frozenset[str] = frozenset(
     {"kirocrew-computer"}
 )
@@ -1210,6 +1232,19 @@ def list_servers() -> list[McpServerInfo]:
                 # agent file as ``disabled: true``, so the agent-side flag is
                 # the same signal, not an independent user override.
                 info = _server_from_spec(name, spec, "mcp.json")
+                info.disabled = True
+                servers[name] = info
+            elif spec.get("disabled") and name not in servers and name in disabled_in_agent:
+                # Switched off from the dashboard: ``/api/mcp/toggle`` writes
+                # ``disabled: true`` into the scope that holds the server AND
+                # onto the agent entry — the agent-side marker is what stops a
+                # running kiro-cli session's server. Step 1 skipped that agent
+                # entry, so without this arm the row would vanish the moment the
+                # user disabled it, leaving nothing to re-enable from. The row is
+                # built from the agent entry, which holds the full spec: the
+                # scope's copy may be the bare ``{"disabled": true}`` stub the
+                # toggle creates for a server it found nowhere else.
+                info = _server_from_spec(name, agent_cfg["mcpServers"][name], "agent")
                 info.disabled = True
                 servers[name] = info
 
@@ -1809,16 +1844,6 @@ async def probe_server(
         # start?" probe runs for real instead of fail-closing. Third-party
         # probes (and any customized managed command/args/env) pass False and
         # keep the full fail-close + opt-in behavior.
-        wrapped_argv, env, sandbox_cleanup = await sandboxed_spawn_argv_async(
-            [resolved, *(server.args or [])],
-            mode="standard",
-            env=env,
-            strip_python_env=True,
-            first_party_fixed_argv=_is_first_party_managed_argv(
-                server.name, server.command, server.args or [], server.env or {}
-            ),
-            _prepare=sandboxed_spawn_argv,
-        )
         # Probe temp containment (#5064): each probe gets its OWN private dir
         # under the managed root, cleaned in this function's finally -- unlike
         # a backend, a probe knows exactly when its lifecycle ends, so no
@@ -1827,23 +1852,74 @@ async def probe_server(
         # would cycle), created off-loop, and fail-open: a probe must run even
         # when containment cannot be set up.
         #
+        # Allocated BEFORE the sandbox wrap (#8653): the managed root lives at
+        # ``<data home>/run/mcp-tmp``, inside the runtime parent the sandbox
+        # seals read-only, so the wrap must know the directory to carve its
+        # write access out of that seal. Allocating after the wrap handed the
+        # child a ``TMPDIR`` it could not write -- a Bun-packaged server then
+        # failed the probe with "Cannot find the native Koffi module" because
+        # it could not extract its native module. The allocation failure path
+        # stays fail-open (probe runs with inherited temp, no carve-out), and
+        # the outer ``finally`` sweeps the dir even when the wrap itself
+        # raises.
+        #
         # Mirrors the backend chokepoint: a spec-DECLARED temp wins -- the
         # operator pointed this server at chosen storage, and overriding it
         # would trade litter for ENOSPC on the data-home volume. Checked
         # case-insensitively (Windows env keys are case-insensitive and the
         # sanitized spec preserves the author's spelling).
-        try:
-            _declared_temp_upper = {
-                key.upper()
-                for key in (server.env or {})
-                if key.upper() in ("TMPDIR", "TMP", "TEMP")
-            }
-            if not _declared_temp_upper:
-                from kiro_crew.mcp_gateway.backend_tmp import allocate_probe_tmp, tmp_env
+        _declared_temp_upper = {
+            key.upper()
+            for key in (server.env or {})
+            if key.upper() in ("TMPDIR", "TMP", "TEMP")
+        }
+        probe_scratch: "Path | None" = None
+        if not _declared_temp_upper:
+            try:
+                from kiro_crew.mcp_gateway.backend_tmp import (
+                    allocate_probe_tmp,
+                    probe_child_scratch,
+                )
 
                 probe_tmp = await asyncio.to_thread(allocate_probe_tmp)
-                env = {**env, **tmp_env(probe_tmp)}
-            else:
+                # The child gets a SCRATCH SUBDIR, never the allocation root:
+                # the root holds the ``.owner`` reclamation record, and the
+                # write carve-out below must not put that record inside the
+                # child's writable window (see probe_child_scratch).
+                probe_scratch = await asyncio.to_thread(probe_child_scratch, probe_tmp)
+            except Exception:
+                logger.debug("probe temp containment unavailable", exc_info=True)
+                if probe_tmp is not None and probe_scratch is None:
+                    # The allocation exists but its child-facing half does
+                    # not: reclaim now. Ownerless-or-provisional dirs are
+                    # deliberately never deleted by the sweeps until
+                    # owner-dead+idle, and no probe pid will ever be recorded
+                    # for this one.
+                    from kiro_crew.mcp_gateway.backend_tmp import sweep_backend_tmp
+
+                    await asyncio.to_thread(sweep_backend_tmp, probe_tmp)
+                    probe_tmp = None
+        wrapped_argv, env, sandbox_cleanup = await sandboxed_spawn_argv_async(
+            [resolved, *(server.args or [])],
+            mode="standard",
+            env=env,
+            strip_python_env=True,
+            extra_writable_dirs=(
+                (str(probe_scratch),) if probe_scratch is not None else ()
+            ),
+            first_party_fixed_argv=_is_first_party_managed_argv(
+                server.name, server.command, server.args or [], server.env or {}
+            ),
+            _prepare=sandboxed_spawn_argv,
+        )
+        try:
+            if probe_scratch is not None:
+                from kiro_crew.mcp_gateway.backend_tmp import tmp_env
+
+                # Merged AFTER the wrap so the managed triple lands on the
+                # SCRUBBED env the child actually receives.
+                env = {**env, **tmp_env(probe_scratch)}
+            elif _declared_temp_upper:
                 # Yielding alone is not enough: ambient temp keys are still in
                 # ``env`` and ``tempfile`` consults TMPDIR before TMP, so a
                 # spec declaring only TMP would silently write through the

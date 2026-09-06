@@ -34,8 +34,10 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.history import mint_row_mid
 from kiro_crew.messaging.attachments import append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
+from kiro_crew.messaging.commands import compact_unsupported_backend
 from kiro_crew.messaging.dispatch import (
     ChannelTurn,
     build_directive_consumer,
@@ -68,7 +70,8 @@ _DEFAULT_KIROCREW_AGENT = "kirocrew"
 # ── Bot-facing strings, owned here rather than inline at each send ──
 # One block so the channel's whole voice is visible at once and a wording change
 # is one edit. These are CHINESE because iLink addresses WeChat users in it;
-# backend-owned strings have no catalog path yet (AGENTS.md), so the owning module
+# backend-owned strings have no catalog path yet
+# (docs/system-specs/common/code-style.md), so the owning module
 # is the unit of ownership.
 _ATTACHMENT_WITH_COMMAND = "📎 附件未读取：这条是命令消息，请把附件单独发送。"
 _NEW_SESSION = "✅ 已开始新对话"
@@ -89,6 +92,9 @@ _COMPACT_BUSY = "⏳ 正在处理上一条消息，请稍后再试 /compact。"
 _COMPACT_NOTHING = "ℹ️ 当前没有可压缩的对话。"
 _COMPACT_DONE = "🗜️ 已压缩上下文。"
 _COMPACT_FAILED = "⚠️ 压缩失败，请重试。"
+#: This surface speaks Chinese; the wording translates
+#: ``messaging.commands.compact_unsupported_reply`` (#8156).
+_COMPACT_AUTO_MANAGED = "ℹ️ 当前后端会自动压缩上下文，无需手动 /compact。"
 
 
 class WeixinDispatcher:
@@ -436,12 +442,22 @@ class WeixinDispatcher:
         is_new: bool,
         agent: str | None = None,
     ) -> None:
-        """Record the turn to conversation_log (dashboard visibility + restart)."""
+        """Record the turn to conversation_log (dashboard visibility + restart).
+
+        Each row is stamped with a durable ``mid``. A channel turn runs on the
+        dispatcher's own session, so unlike the dashboard dual-writers there is no
+        ``_ChatSlot.append`` to mint the id and hand it back -- this writer is the
+        first and only place the row exists, so it mints its own. See
+        :func:`kiro_crew.history.mint_row_mid` for why the identity has to be
+        durable rather than re-derived per materialization.
+        """
         if self.conv_log is None:
             return
-        self.conv_log.append(session_key, "user", user_text, agent=agent)
+        self.conv_log.append(session_key, "user", user_text, agent=agent, mid=mint_row_mid())
         if reply_text:
-            self.conv_log.append(session_key, "assistant", reply_text, agent=agent)
+            self.conv_log.append(
+                session_key, "assistant", reply_text, agent=agent, mid=mint_row_mid()
+            )
         if is_new:
             title = (user_text or "").strip().replace("\n", " ")[:40] or "WeChat"
             self.conv_log.set_title(session_key, title)
@@ -462,6 +478,14 @@ class WeixinDispatcher:
         pct = self.sessions.check_context_usage(session_key, provider)
         hard = getattr(self.cfg.weixin, "hard_threshold_pct", 95)
         soft = getattr(self.cfg.weixin, "soft_threshold_pct", 80)
+        if pct >= soft:
+            # Capability gate (#8156): no forced compaction to run and the
+            # soft nudge's /compact advice cannot work — the backend compacts
+            # on its own as context fills.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                logger.debug("weixin: context notice skipped — %s compacts itself", unsupported)
+                return
         if pct >= hard:
             self._conv.clear_awaiting(user_id)
             try:
@@ -489,6 +513,15 @@ class WeixinDispatcher:
             provider = self.sessions.get_provider(session_key)
             if provider is None:
                 await self._say(user_id, _COMPACT_NOTHING)
+                return
+            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # backend that cannot serve a manual /compact treats the prompt as
+            # ordinary text and never answers, so dispatching would strand the
+            # unbounded wait below. Informational, never an error.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                logger.debug("weixin: manual /compact declined — %s compacts itself", unsupported)
+                await self._say(user_id, _COMPACT_AUTO_MANAGED)
                 return
             await provider.compact()
             await provider.wait_for_compaction()

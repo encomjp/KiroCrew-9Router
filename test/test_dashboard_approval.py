@@ -22,10 +22,12 @@ from kiro_crew.dashboard.state import (
     parse_cls_meta,
 )
 from kiro_crew.history import ConversationLog
-from kiro_crew.hooks import HOOK_EVENT_PRE_TOOL_USE, ToolHookResult
+from kiro_crew.hooks import HOOK_EVENT_PRE_TOOL_USE, ScriptHookResult, ToolHookResult
 from kiro_crew.providers.base import (
     EVENT_COMPLETE,
     EVENT_PERMISSION_REQUEST,
+    EVENT_TEXT_CHUNK,
+    EVENT_THINKING_CHUNK,
     LLMEvent,
 )
 
@@ -71,7 +73,17 @@ def _blocking_hook_store(reason: str, hook_name: str = "policy-hook") -> MagicMo
     hs = _make_hook_store()
     hs.fire = AsyncMock(
         return_value=[
-            MagicMock(exit_code=2, stderr=reason, stdout="", hook_name=hook_name)
+            # Real dataclass instance so a renamed production field fails
+            # loudly as a TypeError instead of silently configuring a stale
+            # attribute on a bare MagicMock.
+            ScriptHookResult(
+                hook_id="h-" + hook_name,
+                hook_name=hook_name,
+                event=HOOK_EVENT_PRE_TOOL_USE,
+                exit_code=2,
+                stderr=reason,
+                stdout="",
+            )
         ]
     )
     return hs
@@ -530,6 +542,100 @@ class TestApprovalModes:
         ), msgs
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "label,result_kwargs",
+        [
+            # asyncio.TimeoutError branch of run_script_hook: no exit_code is set,
+            # so the dataclass default (-1) stands and `error` carries the reason.
+            (
+                "timeout",
+                {"exit_code": -1, "error": "Timed out after 3s", "stderr": "", "stdout": ""},
+            ),
+            # Generic exception branch: same shape, exception text on `error`.
+            (
+                "crash",
+                {"exit_code": -1, "error": "boom", "stderr": "", "stdout": ""},
+            ),
+            # /bin/sh could not exec the hook command at all.
+            (
+                "missing binary",
+                {"exit_code": 127, "error": "", "stderr": "", "stdout": ""},
+            ),
+        ],
+    )
+    async def test_auto_approve_blocked_when_pretooluse_hook_delivers_no_verdict(
+        self, tmp_path, label, result_kwargs
+    ):
+        """A PreToolUse hook that cannot render a verdict must fail CLOSED.
+
+        Timeout, crash, and missing-binary all leave an exit code that is neither
+        0 nor 2. Treating those as "no opinion" means slowing, breaking, or
+        deleting a deny hook silently disables the policy it enforces, so the
+        auto-approve path must reject the tool instead of proceeding.
+        """
+        cb = _context_builder(ToolHookResult.auto_approve())
+        hook_store = _make_hook_store()
+        hook_store.fire = AsyncMock(
+            # A real ScriptHookResult (not a bare MagicMock) pins the test to
+            # the production dataclass: a renamed field fails loudly here as a
+            # TypeError instead of silently configuring a stale attribute.
+            return_value=[
+                ScriptHookResult(
+                    hook_id="h-policy-gate",
+                    hook_name="policy-gate",
+                    event=HOOK_EVENT_PRE_TOOL_USE,
+                    **result_kwargs,
+                )
+            ]
+        )
+        state, client = _make_state(tmp_path, context_builder=cb, hook_store=hook_store)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.reject_tool.assert_called_once()
+        client.approve_tool.assert_not_called()
+        msgs = _tool_messages(slot)
+        assert any(
+            "hook blocked" in m.get("content", "").lower() for m in msgs
+        ), (label, msgs)
+
+    @pytest.mark.asyncio
+    async def test_auto_approve_allowed_when_pretooluse_hook_exits_zero(self, tmp_path):
+        """Exit 0 is a delivered "allow" verdict and must still approve.
+
+        Pins the fail-closed branch to non-0/2 exits only, so a healthy hook that
+        approves silently is not caught by it.
+        """
+        cb = _context_builder(ToolHookResult.auto_approve())
+        hook_store = _make_hook_store()
+        hook_store.fire = AsyncMock(
+            return_value=[
+                # Real dataclass instance (see the no-verdict test above for why).
+                ScriptHookResult(
+                    hook_id="h-policy-gate",
+                    hook_name="policy-gate",
+                    event=HOOK_EVENT_PRE_TOOL_USE,
+                    exit_code=0,
+                    stdout="",
+                    stderr="",
+                    error="",
+                )
+            ]
+        )
+        state, client = _make_state(tmp_path, context_builder=cb, hook_store=hook_store)
+        slot = _make_slot()
+        _set_stream(client, [_permission_event(), _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.approve_tool.assert_called_once()
+        client.reject_tool.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_auto_approve_deny_by_default_on_unexpected_hook_output(self, tmp_path):
         """Non-list/None hook return must reject the tool (deny-by-default)."""
         cb = _context_builder(ToolHookResult.auto_approve())
@@ -781,6 +887,248 @@ class TestBatchRejection:
         assert slot._batch_rejected is False
 
 
+class TestDenialCascadeLifetime:
+    """The batch-rejection suppression must not outlive the group it belongs to.
+
+    Issue #7681: ``_batch_rejected`` was only cleared in the turn runner's
+    ``finally``, so it lived for the whole TURN. A user who denied one call had
+    every later call in that turn auto-denied without ever being shown a card —
+    breaking deny → discuss → agent revises → agent retries, and reporting the
+    phantom denial to the model as "User denied tool execution".
+    """
+
+    @pytest.mark.parametrize("resume_kind", [EVENT_TEXT_CHUNK, EVENT_THINKING_CHUNK])
+    @pytest.mark.asyncio
+    async def test_later_sequential_call_is_evaluated_independently(
+        self, tmp_path, resume_kind
+    ):
+        """Call N+1 gets its own prompt once the model resumed after N was denied."""
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        denied = _permission_event(title="tool_a")
+        denied.request_id = "req-1"
+        denied.tool_call_id = "tc-1"
+        # Model-authored output between the two calls: the denied group is over
+        # and req-2 is a NEW decision, not a remaining member of that group.
+        resumed = LLMEvent(kind=resume_kind, text="Understood - trying a different edit.")
+        revised = _permission_event(title="tool_b")
+        revised.request_id = "req-2"
+        revised.tool_call_id = "tc-2"
+        _set_stream(client, [denied, resumed, revised, _complete_event()])
+
+        async def _answer_both() -> None:
+            await _answer_approval(slot, "req-1", "rejected")
+            await _answer_approval(slot, "req-2", "approved")
+
+        answerer = asyncio.get_event_loop().create_task(_answer_both())
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+        await _drain(answerer)
+
+        # The denial itself still denies.
+        client.reject_tool.assert_any_call("req-1")
+        # The revised call was PROMPTED and could be approved — never swallowed.
+        client.approve_tool.assert_any_call("req-2")
+        assert ("req-2",) not in [c.args for c in client.reject_tool.call_args_list]
+
+    @pytest.mark.asyncio
+    async def test_same_group_still_cascades_after_the_fix(self, tmp_path):
+        """No model output between the calls → the remaining member stays denied.
+
+        Pins the blast-radius reduction as a LIFETIME change only: suppression
+        of the group the user actually refused is preserved.
+        """
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        evt1 = _permission_event(title="tool_a")
+        evt1.request_id = "req-1"
+        evt1.tool_call_id = "tc-1"
+        evt2 = _permission_event(title="tool_b")
+        evt2.request_id = "req-2"
+        evt2.tool_call_id = "tc-2"
+        _set_stream(client, [evt1, evt2, _complete_event()])
+
+        async def _reject_first() -> None:
+            await _answer_approval(slot, "req-1", "rejected")
+
+        rejecter = asyncio.get_event_loop().create_task(_reject_first())
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+        await _drain(rejecter)
+
+        client.reject_tool.assert_any_call("req-1")
+        client.reject_tool.assert_any_call("req-2")
+        client.approve_tool.assert_not_called()
+
+
+class TestBatchCascadeAttribution:
+    """A cascade behind a HOST auto-decline must not inherit user attribution.
+
+    Issue #8818: ``_batch_rejected`` is also set by the host-side auto-declines
+    (approval timeout, no turn budget, Slack delivery failure), and the cascade
+    used to answer every remaining batch member with nothing but kiro-cli's
+    generic "User denied tool execution" — a decline no user made. These pin the
+    provenance split: host-caused cascades steer one cause-specific in-band
+    notice for the whole remainder, user-refused batches keep the generic
+    message, which is true there.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_originated_cascade_steers_the_real_cause(self, tmp_path):
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        # Shrink only the per-slot bound; the config ceiling stays at its
+        # default, and the product takes the MINIMUM of the two.
+        state.approval_timeout_for = MagicMock(return_value=0.05)
+        evt1 = _permission_event(title="tool_a")
+        evt1.request_id = "req-1"
+        evt1.tool_call_id = "tc-1"
+        evt2 = _permission_event(title="tool_b")
+        evt2.request_id = "req-2"
+        evt2.tool_call_id = "tc-2"
+        _set_stream(client, [evt1, evt2, _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        # Nobody answered: the first tool was declined by the host, the second
+        # by the cascade — and each decline corrected its own attribution
+        # in-band. Two notices, two distinct facts: the expired prompt covers
+        # tool_a (#8219), the cascade notice covers the remainder (#8818).
+        client.reject_tool.assert_any_call("req-1")
+        client.reject_tool.assert_any_call("req-2")
+        assert client.steer.call_count == 2
+        timeout_notice = client.steer.call_args_list[0][0][0]
+        assert "approval prompt expired" in timeout_notice
+        assert "every remaining call in its batch" not in timeout_notice
+        notice = client.steer.call_args_list[1][0][0]
+        assert "every remaining call in its batch" in notice
+        assert "unanswered" in notice
+        assert "User denied tool execution" in notice
+        assert "NOT a user action" in notice
+
+    @pytest.mark.asyncio
+    async def test_no_budget_originated_cascade_steers_the_real_cause(self, tmp_path):
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        # Zero window is the no-budget branch: the host declines without
+        # waiting at all, so no answerer could ever race this decline.
+        state.approval_timeout_for = MagicMock(return_value=0)
+        evt1 = _permission_event(title="tool_a")
+        evt1.request_id = "req-1"
+        evt1.tool_call_id = "tc-1"
+        evt2 = _permission_event(title="tool_b")
+        evt2.request_id = "req-2"
+        evt2.tool_call_id = "tc-2"
+        _set_stream(client, [evt1, evt2, _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        client.reject_tool.assert_any_call("req-2")
+        client.steer.assert_called_once()
+        notice = client.steer.call_args[0][0]
+        assert "every remaining call in its batch" in notice
+        assert "no budget left" in notice
+
+    @pytest.mark.asyncio
+    async def test_user_refused_batch_cascades_without_a_steer(self, tmp_path):
+        # The exemption half: the person clicked Reject themselves, so the
+        # generic message is the TRUE attribution for the remainder and a host
+        # notice here would re-attribute the user's own decision to the host.
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        evt1 = _permission_event(title="tool_a")
+        evt1.request_id = "req-1"
+        evt1.tool_call_id = "tc-1"
+        evt2 = _permission_event(title="tool_b")
+        evt2.request_id = "req-2"
+        evt2.tool_call_id = "tc-2"
+        _set_stream(client, [evt1, evt2, _complete_event()])
+
+        async def _reject_first() -> None:
+            await _answer_approval(slot, "req-1", "rejected")
+
+        rejecter = asyncio.get_event_loop().create_task(_reject_first())
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+        await _drain(rejecter)
+
+        client.reject_tool.assert_any_call("req-1")
+        client.reject_tool.assert_any_call("req-2")
+        client.steer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_notice_covers_the_whole_cascaded_remainder(self, tmp_path):
+        # The notice speaks for the group, so a three-member batch must not
+        # steer three times — repeated notices are noise the model has to spend
+        # the very turn being corrected on.
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        state.approval_timeout_for = MagicMock(return_value=0.05)
+        events = []
+        for i in (1, 2, 3):
+            evt = _permission_event(title=f"tool_{i}")
+            evt.request_id = f"req-{i}"
+            evt.tool_call_id = f"tc-{i}"
+            events.append(evt)
+        _set_stream(client, [*events, _complete_event()])
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+
+        assert client.reject_tool.call_count == 3
+        # One notice for the expired prompt on tool_1, then exactly ONE for the
+        # cascaded remainder — never one per cascaded member.
+        assert client.steer.call_count == 2
+        cascade_notices = [
+            c[0][0]
+            for c in client.steer.call_args_list
+            if "every remaining call in its batch" in c[0][0]
+        ]
+        assert len(cascade_notices) == 1
+
+    @pytest.mark.asyncio
+    async def test_provenance_dies_with_the_group_it_belongs_to(self, tmp_path):
+        # Model output ends the denied group (#7681). What is OBSERVABLE here:
+        # the revised later call is prompted — not cascaded, not steered — and
+        # a host-recorded cause never survives past the turn. The paired
+        # cause-clear at each flag-clear site is pinned at source level in
+        # test_refusal_inband_notice.py (a stale cause is unreadable while the
+        # flag is down, so only a source guard can hold that pairing).
+        state, client = _make_state(tmp_path, context_builder=_context_builder())
+        slot = _make_slot()
+        state.approval_timeout_for = MagicMock(return_value=0.05)
+        timed_out = _permission_event(title="tool_a")
+        timed_out.request_id = "req-1"
+        timed_out.tool_call_id = "tc-1"
+        resumed = LLMEvent(kind=EVENT_TEXT_CHUNK, text="Retrying with a narrower edit.")
+        revised = _permission_event(title="tool_b")
+        revised.request_id = "req-2"
+        revised.tool_call_id = "tc-2"
+        _set_stream(client, [timed_out, resumed, revised, _complete_event()])
+
+        async def _approve_revised() -> None:
+            await _answer_approval(slot, "req-2", "approved")
+
+        approver = asyncio.get_event_loop().create_task(_approve_revised())
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+        await _drain(approver)
+
+        # The revised call was prompted and approved — never cascaded, so the
+        # cascade notice was never sent. The expired prompt on tool_a still
+        # steers its own notice (#8219); what must be absent is the cascade one.
+        client.approve_tool.assert_any_call("req-2")
+        assert client.steer.call_count == 1
+        assert "every remaining call in its batch" not in client.steer.call_args[0][0]
+        assert slot._batch_rejected_cause == ""
+
+
 class TestDenyOnce:
     """Verify 'rejected_once' denies a single tool without cascading."""
 
@@ -811,34 +1159,6 @@ class TestDenyOnce:
         client.reject_tool.assert_any_call("req-1")
         client.approve_tool.assert_any_call("req-2")
         # Batch rejection flag must NOT be set
-        assert slot._batch_rejected is False
-
-    @pytest.mark.asyncio
-    async def test_deny_all_still_cascades(self, tmp_path):
-        """Full 'rejected' still cascades to remaining batch tools."""
-        state, client = _make_state(tmp_path, context_builder=_context_builder())
-        slot = _make_slot()
-        evt1 = _permission_event(title="tool_a")
-        evt1.request_id = "req-1"
-        evt1.tool_call_id = "tc-1"
-        evt2 = _permission_event(title="tool_b")
-        evt2.request_id = "req-2"
-        evt2.tool_call_id = "tc-2"
-        _set_stream(client, [evt1, evt2, _complete_event()])
-
-        async def _reject_first() -> None:
-            await _answer_approval(slot, "req-1", "rejected")
-
-        rejecter = asyncio.get_event_loop().create_task(_reject_first())
-
-        with _patch_stats():
-            await _run_chat(state, slot, "hello")
-        await _drain(rejecter)
-
-        # Both tools rejected (second via batch cascade)
-        client.reject_tool.assert_any_call("req-1")
-        client.reject_tool.assert_any_call("req-2")
-        # Reset in finally block
         assert slot._batch_rejected is False
 
     @pytest.mark.asyncio
@@ -1138,6 +1458,117 @@ class TestRefusalRecovery:
         client.reject_tool.assert_called()
 
     @pytest.mark.asyncio
+    async def test_deny_after_an_answer_injects_awareness_not_a_redo(self, tmp_path):
+        """A denied call followed by a real answer must not ask for a resume.
+
+        The regression this pins: the turn answered the user's question despite
+        the block, then the continuation told it to "continue the task where you
+        left off" — so it answered the same question again, at full turn cost,
+        once per blocked call.
+        """
+        cb = _context_builder(
+            ToolHookResult.deny("Blocked by security policy: git push")
+        )
+        state, client = _make_state(tmp_path, context_builder=cb)
+        slot = _make_slot()
+        client.context_usage_pct = MagicMock(return_value=0.0)
+        client._client = client
+        client.last_prompt_stats = None
+
+        calls = {"n": 0}
+
+        def _stream(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Blocked, then the model answers anyway from what it already had.
+                return _async_iter(
+                    [
+                        _permission_event(),
+                        LLMEvent(kind=EVENT_TEXT_CHUNK, text="Here is the answer."),
+                        _complete_event(),
+                    ]
+                )
+            return _async_iter([_complete_event()])
+
+        client.stream = MagicMock(side_effect=_stream)
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+            if slot.task:
+                await slot.task
+
+        recovery = [
+            m["content"]
+            for m in slot.messages
+            if m.get("role") == "inject"
+            and m.get("content", "").startswith(REFUSAL_RECOVERY_PREFIX)
+        ]
+        assert recovery, "the block reason must still reach the model"
+        body = recovery[-1]
+        # Awareness is kept …
+        assert "security policy: git push" in body.lower()
+        assert "NOT a user action" in body
+        # … the redo instruction is not.
+        assert "continue the task where you left off" not in body
+        assert "Do NOT repeat" in body
+
+    @pytest.mark.asyncio
+    async def test_answer_before_the_block_also_gets_awareness_not_a_redo(self, tmp_path):
+        """The answer-THEN-block ordering must reach the same awareness body.
+
+        The sibling above covers block-then-answer, where the answer is still in
+        ``assistant_text`` at end of turn. Here the model answers FIRST and then
+        calls the blocked tool, and the tool boundary flushes that answer out of
+        ``assistant_text`` — so the end-of-turn buffer is empty even though the
+        user has already read the answer on screen. Keying the body on that buffer
+        alone sent the resume instruction for this ordering, which is the same
+        duplicate answer at full turn cost (GPT round on #8275).
+        """
+        cb = _context_builder(
+            ToolHookResult.deny("Blocked by security policy: git push")
+        )
+        state, client = _make_state(tmp_path, context_builder=cb)
+        slot = _make_slot()
+        client.context_usage_pct = MagicMock(return_value=0.0)
+        client._client = client
+        client.last_prompt_stats = None
+
+        calls = {"n": 0}
+
+        def _stream(*a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # The answer lands first; the blocked call ends the turn after it.
+                return _async_iter(
+                    [
+                        LLMEvent(kind=EVENT_TEXT_CHUNK, text="Here is the answer."),
+                        _permission_event(),
+                        _complete_event(),
+                    ]
+                )
+            return _async_iter([_complete_event()])
+
+        client.stream = MagicMock(side_effect=_stream)
+
+        with _patch_stats():
+            await _run_chat(state, slot, "hello")
+            if slot.task:
+                await slot.task
+
+        recovery = [
+            m["content"]
+            for m in slot.messages
+            if m.get("role") == "inject"
+            and m.get("content", "").startswith(REFUSAL_RECOVERY_PREFIX)
+        ]
+        assert recovery, "the block reason must still reach the model"
+        body = recovery[-1]
+        assert "security policy: git push" in body.lower()
+        assert "NOT a user action" in body
+        assert "continue the task where you left off" not in body
+        assert "Do NOT repeat" in body
+
+    @pytest.mark.asyncio
     async def test_clean_turn_does_not_enqueue_recovery(self, tmp_path):
         """An auto-approved tool with no refusal must not trigger recovery."""
         cb = _context_builder(ToolHookResult.auto_approve())
@@ -1192,6 +1623,43 @@ class TestBuildRefusalRecoveryPrompt:
         out = build_refusal_recovery_prompt([("bash", "reason")])
         assert REFUSAL_RECOVERY_PREFIX not in out
 
+    def test_answered_turn_gets_awareness_body_not_a_continuation(self):
+        """A turn that already answered must not be told to resume the task.
+
+        Same reasons, same remediation — but "continue the task where you left
+        off" is what made the model re-answer a question the user had already
+        read, once per blocked call.
+        """
+        out = build_refusal_recovery_prompt(
+            [("bash", "command accesses sensitive credential path")], answered=True
+        )
+        # The reason still reaches the model: on a backend without mid-turn steer
+        # this turn is the only channel for it.
+        assert "bash" in out
+        assert "sensitive credential path" in out
+        assert "NOT a user action" in out
+        # …but the premise flips from "ended the turn early" to awareness-only.
+        assert "ended the turn early" not in out
+        assert "this note is for awareness" in out
+        assert "continue the task where you left off" not in out
+        assert "Do NOT repeat" in out
+
+    def test_unanswered_turn_keeps_the_continuation_body(self):
+        out = build_refusal_recovery_prompt([("bash", "reason")], answered=False)
+        assert "ended the turn early" in out
+        assert "continue the task where you left off" in out
+        assert "this note is for awareness" not in out
+
+    def test_answered_keeps_per_class_remediation(self):
+        # The awareness variant drops the resume instruction, not the guidance:
+        # "how to do this properly" is the awareness the user is owed.
+        reason = "Blocked by security policy: cat ~/.aws/credentials"
+        assert build_refusal_recovery_prompt(
+            [("Running: cat creds", reason)], answered=True
+        ).count("How to do this properly:") == build_refusal_recovery_prompt(
+            [("Running: cat creds", reason)]
+        ).count("How to do this properly:")
+
 
 class TestPendingProjectReset:
     """Locks in the start-of-turn / end-of-turn dual-consume contract for
@@ -1208,7 +1676,7 @@ class TestPendingProjectReset:
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        state.sessions.reset.assert_any_await("dashboard:chat-1-test")
+        state.sessions.reset.assert_any_await("dashboard:chat-1-test", skip_if_busy=True)
         # reset() must appear before get_or_create() on the parent sessions mock.
         sess_calls = state.sessions.mock_calls
         reset_pos = next(i for i, c in enumerate(sess_calls) if c[0] == "reset")
@@ -1259,7 +1727,7 @@ class TestPendingProjectReset:
         with _patch_stats():
             await _run_chat(state, slot, "hello")
 
-        state.sessions.reset.assert_any_await("dashboard:chat-1-test")
+        state.sessions.reset.assert_any_await("dashboard:chat-1-test", skip_if_busy=True)
         assert slot._pending_reset_history_key is None
 
 

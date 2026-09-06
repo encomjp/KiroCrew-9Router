@@ -231,10 +231,11 @@ def test_transient_none_agrees_with_the_uncached_function() -> None:
 # ── bounds: entry count, total bytes, and per-entry rejection ─────────────────
 
 
-def test_cache_is_bounded_by_entry_count() -> None:
-    for i in range(chat_persistence._ENTRY_CACHE_MAX + 50):
+def test_cache_is_bounded_by_entry_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(chat_persistence, "_entry_cache_bounds_cached", (200, 10**9))
+    for i in range(250):
         _build_message_entry({"role": "assistant", "content": f"m{i}", "ts": f"t{i}"})
-    assert len(_entry_cache) == chat_persistence._ENTRY_CACHE_MAX
+    assert len(_entry_cache) == 200
 
 
 def test_byte_counter_tracks_the_stored_entries() -> None:
@@ -281,7 +282,7 @@ def test_total_byte_ceiling_evicts(monkeypatch: pytest.MonkeyPatch) -> None:
     """Bounding entries alone does not bound memory: an entry is as large as its
     message. With a low byte ceiling the cache must evict on bytes even though
     the entry count is nowhere near its own bound."""
-    monkeypatch.setattr(chat_persistence, "_ENTRY_CACHE_MAX_BYTES", 4000)
+    monkeypatch.setattr(chat_persistence, "_entry_cache_bounds_cached", (4096, 4000))
     for i in range(40):
         _build_message_entry({"role": "assistant", "content": "x" * 500, "ts": f"t{i}"})
     assert len(_entry_cache) < 40
@@ -323,7 +324,7 @@ def test_a_window_longer_than_the_bound_bypasses_the_cache(
     from kiro_crew.dashboard.chat import _save_slot_to_history
 
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    monkeypatch.setattr(chat_persistence, "_ENTRY_CACHE_MAX", 3)
+    monkeypatch.setattr(chat_persistence, "_entry_cache_bounds_cached", (3, 10**9))
     state = _make_state(tmp_path)
     slot = state.get_or_create_slot("s1")
     for i in range(5):
@@ -344,7 +345,7 @@ def test_a_window_within_the_bound_still_uses_the_cache(
     from kiro_crew.dashboard.chat import _save_slot_to_history
 
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    monkeypatch.setattr(chat_persistence, "_ENTRY_CACHE_MAX", 100)
+    monkeypatch.setattr(chat_persistence, "_entry_cache_bounds_cached", (100, 10**9))
     state = _make_state(tmp_path)
     slot = state.get_or_create_slot("s1")
     for i in range(5):
@@ -442,15 +443,14 @@ def test_a_window_past_the_byte_ceiling_bypasses_the_cache(
     """Such a window self-evicts through the byte ceiling at a message count well
     under the entry bound, so it hits 0% while still paying to hash every byte.
 
-    The message count stays under ``_ENTRY_CACHE_MAX`` and each message stays
+    The message count stays under the entry bound and each message stays
     under the per-entry cap, so neither of the other two bypasses can account for
     an empty cache here.
     """
     from kiro_crew.dashboard.chat import _save_slot_to_history
 
     monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
-    monkeypatch.setattr(chat_persistence, "_ENTRY_CACHE_MAX", 100)
-    monkeypatch.setattr(chat_persistence, "_ENTRY_CACHE_MAX_BYTES", 1000)
+    monkeypatch.setattr(chat_persistence, "_entry_cache_bounds_cached", (100, 1000))
     state = _make_state(tmp_path)
     slot = state.get_or_create_slot("s1")
     for i in range(5):
@@ -460,9 +460,151 @@ def test_a_window_past_the_byte_ceiling_bypasses_the_cache(
 
     _save_slot_to_history(state, slot, closed=True)
 
-    assert len(slot.messages) <= chat_persistence._ENTRY_CACHE_MAX
+    assert len(slot.messages) <= 100
     assert all(
         len(m.get("content") or "") < chat_persistence._ENTRY_MAX_CACHEABLE_BYTES
         for m in slot.messages
     )
+    assert len(_entry_cache) == 0
+
+
+# ── configurable bounds: the config values are what actually govern ───────────
+
+
+def _write_config(dashboard: dict) -> None:
+    """Write a minimal ``config.json`` under the test-pinned KIROCREW_HOME."""
+    from kiro_crew.config.loader import config_path
+
+    p = config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"dashboard": dashboard}), encoding="utf-8")
+
+
+def test_bounds_default_when_config_is_absent() -> None:
+    """With no config file the bounds are the built-in defaults, byte-identical
+    to the previous hardcoded constants -- making the cache configurable must
+    not change behaviour for anyone who has not configured it."""
+    from kiro_crew.config.loader import (
+        CHAT_ENTRY_CACHE_BYTES_DEFAULT,
+        CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
+    )
+
+    assert chat_persistence._entry_cache_bounds() == (
+        CHAT_ENTRY_CACHE_ENTRIES_DEFAULT,
+        CHAT_ENTRY_CACHE_BYTES_DEFAULT,
+    )
+    assert chat_persistence._entry_cache_bounds() == (4096, 32 * 1024 * 1024)
+
+
+def test_bounds_default_when_the_config_cannot_be_loaded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken config file must not break the save path: the bounds fall back
+    to the defaults, exactly like the restore paths tolerate a broken file."""
+
+    def boom() -> None:
+        raise RuntimeError("unreadable config")
+
+    monkeypatch.setattr(chat_persistence.KiroCrewConfig, "load", boom)
+    assert chat_persistence._entry_cache_bounds() == (4096, 32 * 1024 * 1024)
+
+
+def test_a_failing_config_read_does_not_latch_the_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient read failure must not discard an operator's setting for the
+    process lifetime: the memo is written only after a successful read, so the
+    next call retries and resolves the configured value."""
+    _write_config({"chat_entry_cache_max_entries": 512})
+
+    def boom() -> None:
+        raise OSError("transient read failure")
+
+    real_load = chat_persistence.KiroCrewConfig.load
+    monkeypatch.setattr(chat_persistence.KiroCrewConfig, "load", boom)
+    assert chat_persistence._entry_cache_bounds() == (4096, 32 * 1024 * 1024)
+    assert chat_persistence._entry_cache_bounds_cached is None  # not latched
+
+    monkeypatch.setattr(chat_persistence.KiroCrewConfig, "load", real_load)
+    assert chat_persistence._entry_cache_bounds()[0] == 512  # retried and won
+
+
+def test_bounds_are_read_from_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The configured values -- not the old constants -- are what the accessor
+    serves, and the read is memoised: a config change after the first resolve
+    is not observed until the next process (restart semantics)."""
+    _write_config(
+        {"chat_entry_cache_max_entries": 512, "chat_entry_cache_max_bytes": 8 * 1024 * 1024}
+    )
+    assert chat_persistence._entry_cache_bounds() == (512, 8 * 1024 * 1024)
+
+    calls = {"n": 0}
+    real_load = chat_persistence.KiroCrewConfig.load
+
+    def counting_load():
+        calls["n"] += 1
+        return real_load()
+
+    monkeypatch.setattr(chat_persistence.KiroCrewConfig, "load", counting_load)
+    assert chat_persistence._entry_cache_bounds() == (512, 8 * 1024 * 1024)
+    assert calls["n"] == 0  # memoised: no re-read per call
+
+
+def test_configured_entry_bound_governs_eviction() -> None:
+    """The CONFIGURED bound -- not the old 4096 constant -- is what evicts: a
+    workload above a configured 256 evicts down to exactly 256 (it would be
+    fully retained at the default), and re-resolving with a raised configured
+    bound retains the same workload. This is the property the config exists
+    for: a many-slot host raising the bound must actually stop the churn."""
+    workload = [
+        {"role": "assistant", "content": f"slot-window message {i}", "ts": f"t{i}"}
+        for i in range(300)
+    ]
+
+    _write_config({"chat_entry_cache_max_entries": 256})
+    for m in workload:
+        _build_message_entry(dict(m))
+    # Evicted at the configured 256; under the default 4096 all 300 would fit.
+    assert len(_entry_cache) == 256
+
+    _entry_cache.clear()
+    chat_persistence._entry_cache_bytes = 0
+    chat_persistence._entry_cache_bounds_cached = None  # re-resolve from config
+    _write_config({"chat_entry_cache_max_entries": 1024})
+    for m in workload:
+        _build_message_entry(dict(m))
+    assert len(_entry_cache) == 300  # retained under the raised configured bound
+
+    # And the retained entries are genuine hits on the next pass, not re-inserts.
+    for m in workload:
+        _build_message_entry(dict(m))
+    assert len(_entry_cache) == 300
+
+
+def test_flush_bypass_honors_the_configured_bounds(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flush-site whole-window bypass reads the same configured bounds the
+    cache evicts by: a window that bypasses at the default entry bound takes the
+    cached path once the configured bound covers it."""
+    from kiro_crew.dashboard.chat import _save_slot_to_history
+
+    monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
+    _write_config({"chat_entry_cache_max_entries": 256})
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("s1")
+    for i in range(5):
+        slot.append("assistant", f"message {i}")
+    slot.drain()
+
+    # Below the configured bound: cached path populates the cache.
+    _entry_cache.clear()
+    _save_slot_to_history(state, slot, closed=True)
+    assert len(_entry_cache) > 0
+
+    # A memoised bound smaller than the window flips the SAME save to the
+    # uncached path -- proving the bypass reads the plumbed value, not a constant.
+    chat_persistence._entry_cache_bounds_cached = (3, 10**9)
+    _entry_cache.clear()
+    _save_slot_to_history(state, slot, closed=True)
     assert len(_entry_cache) == 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pathlib
 import shutil
@@ -15,6 +16,7 @@ import pytest
 from hypothesis import HealthCheck, settings
 
 from kiro_crew.safety_override import reset_singleton as _reset_safety_override
+from kiro_crew.safety_override import reset_yolo_policy_state as _reset_yolo_policy_state
 from kiro_crew.slack.client import SlackClientOps
 from kiro_crew.slack.handler import _PHASE_EMOJIS, _build_phase_emojis
 
@@ -95,6 +97,19 @@ _HAS_SYMLINKS = _can_create_symlink()
 requires_symlinks = pytest.mark.skipif(
     not _HAS_SYMLINKS,
     reason="creating a symlink needs SeCreateSymbolicLinkPrivilege on Windows",
+)
+
+# Captured at import, BEFORE any test can monkeypatch the constant away: tests that
+# simulate the flag's absence must not be confused with a platform that truly lacks it.
+_HAS_O_NOFOLLOW = bool(getattr(os, "O_NOFOLLOW", 0))
+
+requires_o_nofollow = pytest.mark.skipif(
+    not _HAS_O_NOFOLLOW,
+    reason=(
+        "notification import refuses outright without O_NOFOLLOW, because a by-name "
+        "reparse check followed by a by-name open is a check-to-open window; the "
+        "refusal itself is covered by TestNotificationCopyRefusalWithoutONofollow"
+    ),
 )
 
 
@@ -420,10 +435,23 @@ def _release_stt_engine():
 
 @pytest.fixture(autouse=True)
 def _reset_safety_override_between_tests():
-    """Reset the SafetyOverride singleton between tests to prevent state leaking."""
+    """Reset the SafetyOverride singleton between tests to prevent state leaking.
+
+    The pushed ``approval_modes`` verdict is reset WITH it, because it is the same
+    leak wearing different clothes. That verdict is a module-level flag resolved when
+    a platform context is installed, and this suite installs contexts constantly
+    (~30 files call ``set_context``/``reset_context``). A DENY pushed by an earlier
+    test therefore keeps refusing yolo arms in a later one that never configured a
+    policy, which surfaces as INTERMITTENT failures in files that never touch
+    governance — which tests share an xdist worker decides whether the stale flag is
+    present. Resetting it here makes the next reader resolve the ceiling actually
+    installed.
+    """
     _reset_safety_override()
+    _reset_yolo_policy_state()
     yield
     _reset_safety_override()
+    _reset_yolo_policy_state()
 
 
 @pytest.fixture(autouse=True)
@@ -523,7 +551,7 @@ def _disable_dev_fleet_background_tasks(monkeypatch):
     still be running when the test's client tears down, and cancelling it then
     is what leaked into unrelated tests and flaked ``Gateway Tests (macOS)``
     (issue #1832). A test that wants the real refresher overrides this itself
-    via ``monkeypatch.setattr(mod, "_background_tasks_disabled", lambda: False)``.
+    via ``monkeypatch.setattr(worktree_ops, "_background_tasks_disabled", lambda: False)``.
     """
     monkeypatch.setenv("KIROCREW_DEVFLEET_NO_BACKGROUND", "1")
 
@@ -583,16 +611,25 @@ def _isolate_message_entry_cache():
 
     The byte counter is part of the same state, so resetting only the dict would
     leave the memory ceiling mis-accounted and evict a healthy cache.
+
+    The memoised config bounds are reset for the same reason: they are resolved
+    once per process from whatever KIROCREW_HOME the first caller saw, so a test
+    that resolved them under its own home would otherwise leak its bounds into
+    every later test's cache behaviour.
     """
     from kiro_crew.dashboard import chat_persistence as _cp
 
     _cp._entry_cache.clear()
     _cp._entry_cache_bytes = 0
+    _cp._entry_cache_bounds_cached = None
+    _cp._entry_cache_bounds_read_warned = False
     try:
         yield
     finally:
         _cp._entry_cache.clear()
         _cp._entry_cache_bytes = 0
+        _cp._entry_cache_bounds_cached = None
+        _cp._entry_cache_bounds_read_warned = False
 
 
 @pytest.fixture(autouse=True)
@@ -1230,3 +1267,121 @@ def healthy_host_memory(monkeypatch: pytest.MonkeyPatch) -> None:
     # Also keeps the 5s-TTL refresh thread behind the cached verdict from
     # starting, so no test leaves one probing the host after it ends.
     monkeypatch.setattr(subagent, "cached_admission_check", _admit)
+
+
+@pytest.fixture(autouse=True)
+def _reset_create_rate_limit_buckets():
+    """Clear the session/folder creation rate limiter between tests.
+
+    ``kiro_crew.dashboard.create_rate_limit`` keeps its per-(verb, caller)
+    buckets in MODULE-LEVEL state (deliberately: the production guard needs no
+    durable state), so every session-creating test in a pytest process
+    accumulates timestamps under shared caller keys. A shard whose test
+    composition performs more than the per-window budget of creates within one
+    wall-clock window then refuses a legitimate test create with
+    ``create_rate_limited`` — a pass/fail outcome decided by shard composition
+    and runner speed, not the code under test (#7836; observed twice on the
+    Windows shard in one day, on PRs touching neither the limiter nor
+    session_control). The limiter's own direct tests build their scenarios on
+    top of a clean slate, so clearing between tests changes nothing for them.
+    """
+    from kiro_crew.dashboard import create_rate_limit
+
+    with create_rate_limit._lock:
+        create_rate_limit._buckets.clear()
+    yield
+    with create_rate_limit._lock:
+        create_rate_limit._buckets.clear()
+
+
+#: Test modules that own direct coverage of ``mcp_core``'s HTTP plumbing itself.
+#: They call the real ``_post`` (or drive a tool through it) with the transport
+#: patched BELOW it (``loopback_urlopen`` / ``_api_urlopen``), so a recorder
+#: stub above ``_post`` would blind exactly the assertions those modules exist
+#: to make. An exemption is NOT permission to reach the network: the fixture
+#: below leaves ``_post`` real for these modules but replaces the transport
+#: with a refuser, so a test here that forgets its own transport patch gets a
+#: deterministic local failure instead of dialling the operator's gateway.
+_REAL_MCP_POST_MODULES = frozenset(
+    {
+        "test_ephemeral_sessions",
+        "test_mcp_api_base_resolution",
+        "test_mcp_core",
+        "test_mcp_core_coverage",
+        "test_mcp_internal_caller",
+    }
+)
+
+
+class _InertGatewayPosts(list):
+    """What an exempt module sees if it requests ``gateway_posts`` by name.
+
+    No recorder ever appends here, so an equality check would pass vacuously
+    (``== []``) or fail for a reason unrelated to the code under test. Refusing
+    the comparison turns that silent vacuity into an immediate, named failure.
+    """
+
+    def __eq__(self, other: object) -> bool:  # pragma: no cover - failure path
+        raise AssertionError(
+            "gateway_posts is inert in a _REAL_MCP_POST_MODULES module: the"
+            " recorder is not installed there, so nothing is ever appended."
+            " Assert against your own transport patch instead."
+        )
+
+    __hash__ = None  # type: ignore[assignment]
+
+
+@pytest.fixture(autouse=True)
+def gateway_posts(request, monkeypatch):
+    """Record ``mcp_core._post`` calls instead of letting them reach a gateway.
+
+    ``mcp_tools.control._emit_directive`` publishes every directive out of band
+    via ``mcp_core._post("/api/session-directive", ...)`` on the resolved API
+    port and swallows every exception — so a test that emits a directive
+    without stubbing ``_post`` makes a REAL request to whatever is listening
+    there, silently. On a developer machine that is the operator's own live
+    gateway, and the request carries a real-looking session key. The suite only
+    avoided a live write because this conftest's ``KIROCREW_HOME`` pin makes
+    the client read a different instance credential, so the gateway refuses the
+    call — an unrelated guard no test is entitled to rely on. Stubbing here
+    makes reaching the network opt-in for the whole suite rather than opt-out.
+
+    A RECORDER rather than a black hole, so the stub also buys coverage: the
+    out-of-band publish is half of the directive contract (marker + parked
+    record), and a test can request this fixture by name and assert on the
+    ``(path, payload)`` records. The payload is round-tripped through JSON so a
+    non-serializable body fails HERE — the point where the real ``_post`` would
+    have failed (and ``_emit_directive`` would have silently swallowed it). The
+    stub returns ``{}``: falsy for ``.get("ok")`` readers and free of
+    ``"error"``, it invents no success shape the real ``_post`` never promised.
+
+    Opting back in stays explicit and layered: a test's own
+    ``monkeypatch.setattr(mcp_core, "_post", ...)`` simply replaces this stub
+    for that test, and a module that owns direct coverage of ``_post``'s own
+    plumbing lists itself in ``_REAL_MCP_POST_MODULES``. For those modules the
+    transport is replaced with a refuser instead (their per-test transport
+    patches override it), so the no-traffic property holds per test rather
+    than resting on every future test remembering its own patch.
+    """
+    from kiro_crew import mcp_core
+
+    if getattr(request.module, "__name__", "") in _REAL_MCP_POST_MODULES:
+
+        def _refuse_network(*args, **kwargs):
+            raise AssertionError(
+                "test reached mcp_core's real transport: patch"
+                " loopback_urlopen/_api_urlopen (or _post) in the test itself"
+            )
+
+        monkeypatch.setattr(mcp_core, "loopback_urlopen", _refuse_network)
+        yield _InertGatewayPosts()
+        return
+
+    posted: list[tuple[str, dict | None]] = []
+
+    def _capture(path: str, body: dict | None = None, **kwargs) -> dict:
+        posted.append((path, json.loads(json.dumps(body)) if body is not None else None))
+        return {}
+
+    monkeypatch.setattr(mcp_core, "_post", _capture)
+    yield posted

@@ -196,320 +196,27 @@ rendering, including the computed-`className` case.
 Any new primitive that pairs a `md:`-prefixed base padding with `twMerge` re-opens
 the same hole, so either yield the axis the same way or keep the base unprefixed.
 Stated honestly: `Card` is currently the ONLY primitive in `ui.tsx` with a
-breakpoint-scoped base padding — `Btn`, `Input`, `StatCard` and `Chip` are all
+breakpoint-scoped base padding — `Btn`, `Input` and `StatCard` are all
 unprefixed — so this note has no other instance to fix today. It is here because the
 failure is silent and desktop-only, which is exactly the kind a reader will not
 re-derive when they reach for `md:px-*` in a new primitive.
 
-### Other narrow-viewport recommendations
+### Where the narrow-viewport rules live
 
-Also recommendations, not gates. Each earned its place by breaking on a real screen,
-and each carries the measurement that settled it — reach for the measurement before
+The measurement record sits in [narrow-viewport.md](narrow-viewport.md), one hop
+away. Everything in it is a recommendation rather than a gate, and each item
+carries the measurement that settled it, so reach for the measurement before
 arguing with the rule.
 
-**A collapsed side rail becomes a horizontal bar across the TOP, never a thin vertical
-strip.** Horizontal is the one axis a phone cannot spare; vertical it can. A 44px strip
-overflows nothing, so it looks fixed while the reading column still pays for it.
-
-**Hiding is not collapsing.** A control removed below `md` needs an entry point at that
-width — an overflow menu, a drawer, a disclosure. A pane that hides the only host of the
-phase-advance controls leaves the phone user unable to advance the phase at all.
-
-**Gate on the constraint, not the viewport.** When a pane can be narrow at any viewport
-(a split, a resizable rail, an embedded panel), measure the PANE with a `ResizeObserver`
-rather than calling `useIsMobile()`. A 1280px window can hold a 200px pane.
-
-**A tabbed shell's pane needs its own top inset once the header goes away — and it
-must be the only one.** `SidePanelLayout` drops the desktop header block below `md` —
-the block whose `pb-3` put 12px between a tab's title and its content — and replaces it
-with a pill strip that ends in a drawn `border-b`. The pane kept no inset of its own, so
-a tab whose first element is a `Card` or a `StatCard` rendered that element's own border
-ON the divider: two lines touching, measured at a 0px gap on four of Agent Capabilities'
-seven tabs and on seven of Developer's eight renderable ones at 390px. The pane carries
-`pt-3` on the narrow branch only — desktop must stay at 0 or the two insets stack.
-
-That inset is shared by all three pages built on the shell (Agent Capabilities,
-Developer, Settings), which makes the second half of the rule as load-bearing as the
-first: **a tab must not add a top margin to its own first element.** Doing so stacks on
-the pane and lands that tab 28px down while its siblings sit at 12px — the inconsistency
-reads as sloppiness precisely because the tabs are one keystroke apart. Two shapes, and
-the difference is whether the heading can ever have a sibling above it:
-
-- **A heading at the tab's root** (`SkillsTab`, `SteeringTab`) drops the margin outright.
-  Do NOT reach for `first:mt-0` here: `SkillsTab` renders `PendingSkillsPanel` above the
-  heading, and that panel returns `null` when nothing is pending — so the heading moves in
-  and out of `:first-child` with the pending count, and a positional rule would make the
-  gap depend on it. (A conditionally rendered `Modal` does NOT have this effect: it
-  `createPortal`s to `document.body` and never occupies a sibling slot.)
-- **A heading that repeats within one tab** (`SettingsSection`, used many times per
-  Settings tab; `LocalStorageDebug`'s section headings) keeps `mt-4`, because the gap
-  between two sections is real, and pairs it with `first:mt-0`. The fragment adds no DOM
-  node, so every section header is a sibling in one parent and only the leading one
-  matches — and when a tab renders something of its own above the first section, the
-  header stops being first and correctly keeps the margin.
-
-Measured at 390px with `website/scripts/capture-side-panel-pane-inset.mjs`, which reports
-the divider→first-in-flow-box distance per tab: all 31 renderable tabs across the three
-pages now read 12px. Residual differences in where the first *pixel* lands (21px on
-Connections, on Developer > System, on Settings > Instances) are a control's own internal
-padding — a sub-tab's or a segmented button's tap target — not stacked page padding, and
-tightening those would shrink a touch target.
-
-**An unbounded action cluster leaves the text row; it does not shrink it.** A row of
-actions whose count depends on state (enabled, updatable, uninstallable) and that carries
-`shrink-0` takes its natural width, and the text column gets the remainder — measured at
-34px on a 390px screen, and 0px at 320px. Move the cluster to its own row below the text.
-
-**A per-character-breaking script collapses instead of overflowing, so overflow metrics
-cannot see it.** CJK text reaches `scrollWidth == clientWidth` while wrapping to one or
-two characters per line. Judge a reading column by its WIDTH, not by whether anything
-overflowed.
-
-**Two coupled numbers must be pinned by a test.** A negative margin that cancels an inset
-(`-mx-2 md:mx-0` against `Card`'s own `px-2`), or a pull-back sized to a tile's width plus a
-gap, is ONE number written twice. Changing one alone misaligns silently — nothing
-overflows, so only a test that asserts the pair catches it.
-
-**An icon alone cannot carry a state-changing action.** `aria-label` fixes the screen
-reader, not the sighted user, who is left guessing what a bare glyph does. Icon-only is
-for neutral, recoverable affordances (refresh, expand), not for a write.
-
-**Verify at 320px, not only 390px.** 320 is the floor every major design system bottoms
-out at, and it is where a layout that merely looks tight at 390 actually breaks — the
-Apps card measured a 34px text column at 390px and 0px at 320px.
-
-**Build touch targets to 44px; grade them in two tiers.** 44px is the number every system
-recommends. WCAG 2.2 SC 2.5.8's floor is 24x24, but it carries a **spacing** exception: an
-undersized target still conforms if a 24px circle centred on it does not intersect a
-neighbour's. So under 24x24 *and* crowded is a conformance failure; under 44x44 alone is a
-convention miss. Reporting every sub-44 control as a violation over-reports by roughly 3x.
-
-**`overflow: hidden` on ANY ancestor kills `position: sticky` — use `overflow: clip`.**
-Same family: a `transform` on an ancestor re-anchors `position: fixed` children, and
-`align-self: start` is the most common silent sticky failure in flex and grid. A sticky
-element also cannot escape its own parent's box, so a bar that must outlive a scrolling
-sibling has to be that sibling's SIBLING, not its child.
-
-**`100vh` resolves against the LARGE viewport.** A `100vh` panel overflows while the URL
-bar is showing and its bottom controls fall off screen. Use `svh` for app shells, since it
-does not reflow as the bar animates, and `dvh` only for surfaces that must track the exact
-visible area (a chat container, a modal). Safe area is **padding, not size**:
-`padding-bottom: env(safe-area-inset-bottom)`, which resolves to 0 without
-`viewport-fit=cover`.
-
-**The shell is an application, not a zoomable document — page zoom is off on touch.**
-Pinching magnifies a `position: fixed` / `h-dvh` layout whose scrollers are all
-*inner*, so there is no axis left to reach what the magnification pushed outside the
-visual viewport: topbar, composer and drawer leave at once and only a second pinch
-brings them back. Three mechanisms enforce it because no single one covers every
-engine — `maximum-scale=1, user-scalable=no` in `index.html` (Blink, Gecko), a root
-`html { touch-action: pan-x pan-y }` under `@media (pointer: coarse)` in `index.css`
-(Blink's pinch and double-tap paths), and cancelling Safari's `gesturestart` in
-`utils/pageZoom.ts` (WebKit has ignored the viewport zoom keys for user gestures
-since iOS 10). Pointer-fine devices are untouched: ctrl+wheel and the trackpad pinch
-are a desktop convention this has no business changing.
-
-The corollary is the part to get right. **A surface that must magnify owns its own
-zoom — it does not ask for `pinch-zoom` back.** `touch-action` is intersected from
-the hit-test target up to the root, so a descendant cannot re-grant a behaviour the
-root withheld; declaring `touch-pinch-zoom` there buys a dead gesture, not a working
-one.
-
-**Count the surfaces this rule binds before believing it holds.** There are **three**
-full-viewport magnify overlays — the image viewer (`Lightbox` in
-`MarkdownRenderer.tsx`), the diagram viewer (`DiagramLightbox.tsx`), and the
-screenshot viewer in `pages/AppDetailPage.tsx` — and when page zoom was first
-switched off only the first owned a gesture. The second silently
-became unmagnifiable by any gesture, because its content is fit-scaled vector whose
-labels are smallest at exactly the state it opens in. The rule read as satisfied
-because the *documented example* obeyed it; nothing had counted the instances. The
-first two
-now share `hooks/usePinchZoom.ts` (contact tracking, focal anchoring, pan clamping),
-so a further such surface gets the gesture by using the hook rather than by
-re-deriving the math — and `touch-none` on the transform target is what opts it out
-of the root's `pan-x pan-y`.
-
-**A trackpad is a third input class, not a touchscreen.** A trackpad pinch emits no
-pointer events at all, so it reaches none of the contact-tracking code: Blink
-reports it as a `wheel` carrying `ctrlKey`, WebKit as
-`gesturestart`/`gesturechange` carrying a **cumulative** `scale`. The hook claims
-both, which is what gives a laptop — and `ctrl`+scroll on a mouse — the same
-magnification a touchscreen gets from two fingers. Four constraints are
-load-bearing and each is easy to get wrong:
-
-- **`gesture*` binds only under `(pointer: fine)`.** The converse of "a trackpad
-  pinch emits no pointer events" does not hold: a gesture event does not imply a
-  trackpad. **iOS Safari fires `gesturestart`/`gesturechange` for a two-finger
-  TOUCH pinch too**, and those fingers are already driving the contact-tracking
-  path — so binding both on a touch device puts two independent formulas on one
-  pinch and zooms twice. The media query keeps this an *additional* input path for
-  pointing devices rather than a second one for touch. `wheel` is deliberately
-  **not** gated: a coarse-pointer device can still carry a mouse. Absent
-  `matchMedia` counts as coarse, because failing closed costs only a trackpad path
-  on a platform that has none, while failing open restores the double zoom.
-
-- **The listeners cannot be React props.** React attaches `wheel` at the root
-  *passively*, so `preventDefault()` inside an `onWheel` prop is ignored and the
-  browser page-zooms anyway. They are manual `addEventListener` calls with
-  `{ passive: false }`.
-- **They sit on `window` and gate on containment**, not on the element. A viewer's
-  element ref is null until it opens, so an effect reading the element at mount
-  would bind nothing. Containment is the **overlay**, not the transform target: the
-  letterbox around a small image is visually the viewer, and letting a pinch there
-  fall through page-zooms the whole app behind a viewer that looks unchanged.
-- **Binding is gated on the consumer being in a zoomable state**, which carries two
-  distinct costs. A non-passive listener makes the compositor wait on main-thread
-  dispatch for *every* wheel event, so an always-mounted consumer would tax
-  scrolling app-wide while its viewer is shut. And claiming a gesture the consumer
-  ignores would suppress page zoom — which, on content that is **not** fit-scaled,
-  genuinely does magnify. So a no-viewBox diagram binds nothing and keeps that
-  fallback.
-- **Only `ctrl`+wheel is claimed.** A plain wheel belongs to whatever scroller owns
-  it, which is what a no-viewBox diagram depends on to reach its edges.
-
-And note why page zoom is not a substitute for any of this: a fit-to-viewport
-surface is *invariant* under page zoom. At 200% the viewport's CSS-pixel width
-halves, the `fixed inset-0` box halves with it, and the content re-fits to the
-smaller box while each CSS pixel covers two device pixels — the two cancel, and the
-labels come out the same apparent size.
-
-The guard that enforces this sweeps **both** `components/**` and `pages/**`, because
-a magnify overlay can live in either and a population scoped to one directory counts
-instances of a set it has itself narrowed. `AppDetailPage.tsx` is carried in that
-guard as a named, issue-linked exception rather than excluded by the glob: an
-exception a reader can see is a debt with an owner, a glob boundary is not. Giving it
-the gesture is tracked separately because its overlay also owns arrow-key navigation
-between screenshots and click-to-dismiss, so a pinch there has to be reconciled with
-a prev/next seam the other two do not have.
-
-Code blocks take the other legitimate route and scroll
-horizontally instead. And note what is *not* lost — the OS Display Zoom setting sits
-outside the viewport contract and still magnifies anything. A browser tab's own
-text-size control does too, but it is **not** a fallback in the installed app: a
-standalone PWA has no Safari toolbar to reach it from, so on a home-screen install
-Display Zoom is the only route. State it with that qualification everywhere the
-claim appears (`website/index.html`, `docs/guides/remote-and-mobile.md`) — an
-unqualified version points a low-vision user at a control that is not there.
-
-**Any touch input below 16px zooms the viewport on focus, and WebKit does not zoom
-back out.** The scale is `clampTo(16 / fontSize, minimumScale, maximumScale)` from the
-FIELD's computed size, so a `text-sm` field can leave the user zoomed in — and with
-page zoom off there is no pinch-out to undo it. **An app-wide floor for this was
-written and withdrawn, and it should stay withdrawn** unless someone brings evidence
-from a real device, because CSS cannot express a floor at all: it can only SET a
-size, so the two available shapes are wrong in opposite directions. A rule broad
-enough to reach every field SHRINKS the ones that are deliberately larger — measured,
-not hypothetical: `input:not([type=…]):not([type=…])` is (0,2,1) and beat the artifact
-rename field's `text-2xl`, snapping a 24px title to 16px on a phone. A narrower
-selector list misses fields instead, because a size can arrive as a named utility, an
-arbitrary value (`text-[13px]`), an `!important` modifier or an inline style, and no
-list contains the next one. A guard test rescues neither shape: ~120 of this app's
-fields are routed through `<Input>` / `<Textarea>` rather than a native tag, so a
-source sweep for `<input>` cannot see them and reports green.
-
-Two things make withholding the floor the safer side of that trade. The focus zoom is
-**pre-existing** — it is not introduced by suppressing pinch, which removes only the
-recovery gesture — and whether it can fire at all once `maximum-scale=1` is authored
-depends on the same engine path that decides whether WebKit honours the viewport keys,
-which is not answerable from source. Settle it on a device; if it does fire, the fix
-belongs in the field components, where a real `max(16px, authored)` is expressible.
-
-**The `meta-viewport` axe rule is left ENABLED, deliberately.** `@axe-core/react` scans
-every render, so `user-scalable=no` reports a critical WCAG 1.4.4 finding on every scan.
-A waiver for it was written and removed; do not re-add one. The argument for waiving was
-that a permanent finding nobody can action trains contributors to ignore the console —
-but the finding *is* actionable, because it is a decision, and a decision does not stop
-being owed because a scanner keeps asking for it. That recurring report is currently the
-only automated reminder that suppressing page zoom is an accessibility trade with no
-in-app text-size control substituting for it. Revisit the waiver only once that decision
-is recorded, and then record the decision rather than the silence.
-
-**Use the line-length cap in reverse to tell "ugly" from "broken".** WCAG 1.4.8 caps a
-reading measure at 80 characters, 40 for CJK. Run it backwards and a squeezed pane stops
-being a matter of taste: a 50px column at 13px holds three CJK glyphs, which is a defect
-you can state as a number.
-
-**Reach for a `Card` less often on a phone.** A card buys grouping with a drawn border
-plus its own inset — on a 390px screen that is 16px of width and a line the screen edge
-already implies. Where a section is the only thing on the page, or where the grouping is
-already obvious from a heading, prefer a heading plus content and let the page gutter do
-the work. Cards earn their keep when several peer groups must be told apart on one
-screen; they cost the most when they are nested, since each level charges its inset
-again.
-
-**An overflowing action row belongs in an overflow menu — not wrapped, not silently
-scrolled.** This is the one place the design systems are unanimous (Primer's `ActionBar`,
-Carbon's five-action cap, Apple's "define which items move to the overflow menu"), and it
-is what `AUTOSDE.yaml`'s `max-two-buttons-per-row` encodes. Wrapping such a row below `md`
-keeps the controls reachable, but it is an interim, not the answer.
-
-### Horizontal insets below the breakpoint
-
-Padding stacks, and the eye reads the SUM. On a wide viewport a page gutter plus a card
-inset plus a row inset is comfortable; at 390px it is not. The skill-budget row measured
-16px (page) + 20px (`Card`) + 16px (row) = **52px** before its text, against 16px for the
-same text in chat.
-
-The page container keeps the `px-4 md:px-6 pb-8` the skeleton above prescribes -- that is what
-`AUTOSDE.yaml`'s `page-layout-pattern` requires, and it is not the layer to change. The
-third layer is the one to drop:
-
-**Below `md`, prefer no horizontal padding on a row that is a DIRECT child of a `Card`.**
-The page gutter and the card's own inset already supply it:
-
-```tsx
-<div className="… py-2 md:px-4">   {/* row: the card supplies the inset while narrow */}
-```
-
-Gate **every** row in that card the same way -- section header, group header, data row,
-footnote. Gating only some of them leaves the data rows sitting to the left of the headers
-that label them, which reads as rows escaping their own section.
-
-**The direct-child part is the precondition, not a detail.** The rule works because the
-card is what supplies the inset the row gives up. Put an unpadded bordered pane between
-them and that stops being true:
-
-```tsx
-<Card>                                                   {/* 20px */}
-  <div className="… border border-border rounded-md">    {/* 0px, draws a visible edge */}
-    <div className="… px-4 py-2.5 border-b">             {/* row: px-4 is its ONLY gutter */}
-```
-
-Here the row's `px-4` is load-bearing -- gating it puts the text flush against the border.
-The excess inset belongs to the card, but the card is NOT what yields: halve the card's inset
-below `md` and pull the pane out by exactly that amount, on the shell the pane and its
-loading skeleton share so the layout does not jump when data arrives. The two numbers
-are ONE number -- changing the inset without the margin pushes the pane past the border:
-
-```tsx
-const PANE_SHELL_CLASS = 'flex gap-3 -mx-2 md:mx-0 …'  /* cancels `Card`'s own px-2 */
-```
-
-From the boxes at 390px on the Skills tab: the pane goes from left 25 / width 340 to
-left 17 / width 356, so a row inside it starts at ~34px instead of ~42px, against 16px
-for the same text in chat. (The pattern was first measured on a page that ran a 16px
-gutter and a 20px card inset, where the same pull-back moved the pane from left 37 /
-width 316 to left 17 / width 356.)
-
-**Do not flush the card itself** (a `px-0` override). Its padding is also the only gutter the
-toolbar above the pane has, and removing it puts the search field's rounded border
-directly against the card's border -- measured as a 0px gap, and the first thing a reader
-calls ugly. `Card`'s own narrow inset (`px-2`, 8px) keeps the field off the border
-while giving the row back most of the width. An inset toolbar above a full-bleed list is the ordinary phone pattern; the
-two do not need to share a left edge.
-
-This does not touch the page container's `px-4 md:px-6 pb-8`, which is what `AUTOSDE.yaml`'s
-`page-layout-pattern` names and is not the layer to change. For a pane that must reach the
-SCREEN edge, past the page gutter, cancel the gutter itself inside the pane (`-mx-3` while
-narrow) -- the same one-number-written-twice pairing, so pin it with a test.
-
-**Status: a direction, not a description of the repo.** Two shapes are migrated --
-`SkillContextBudget` (direct-child rows) and the `SkillsTab` / `SteeringTab` split panes
-(card flush). A scan for `className="…px-4…py-2"` under `website/src/pages` matches ~27
-rows across 15 files, but a hit is not a work item: most are toolbars, banners, sticky
-bars and buttons that own the only gutter their content has, and rows inside a bordered
-pane must keep theirs. There is no lint gate for this. Read the structure around a hit
-before gating it, and see kirodotdev/KiroCrew#3939 for the triage of all 27.
+| Rule | Where it is stated |
+|---|---|
+| Page zoom off on touch, and the surfaces that own their own zoom | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
+| The 44px touch-target rule and its two-tier grading | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
+| The drag-widget `touch-action: none` exemption | [narrow-viewport.md](narrow-viewport.md#a-horizontal-drag-on-mobile-belongs-to-the-nav-drawer-unless-a-page-claims-it) |
+| The 16px gutter derivation and the field floor that was not adopted | [narrow-viewport.md](narrow-viewport.md#layout-and-sizing) |
+| The nav-drawer swipe contract and `data-owns-swipe` | [narrow-viewport.md](narrow-viewport.md#a-horizontal-drag-on-mobile-belongs-to-the-nav-drawer-unless-a-page-claims-it) |
+| Binding a panel's gesture live to its offset | [narrow-viewport.md](narrow-viewport.md#a-panel-that-gains-a-gesture-must-be-bound-live-to-its-offset) |
+| Horizontal insets below the breakpoint, and `Card`'s measured budget | [narrow-viewport.md](narrow-viewport.md#horizontal-insets-below-the-breakpoint) |
 
 ## Stat cards
 
@@ -596,9 +303,14 @@ Inline within a `Card`, built from the shared primitives:
   reliably hand a finger drag to that shape — Settings → Voice → Language showed
   7 of its ~41 codes with the rest unreachable. A themed list nobody can scroll
   is worse than an OS-drawn list that works. Because the choice lives inside
-  `SimpleSelect`, no call site makes it: keep reaching for the components above
-  and the touch case is already handled. `NativeSelect` is the single file
-  exempted from the `no-restricted-syntax` rule; do not add a second.
+  `SimpleSelect`, no call site makes it — and `SettingsSelect` inherits it by
+  wrapping `SimpleSelect`. It goes no further: `SearchableSelect`,
+  `DropdownMenu` and `AgentSelector` keep the themed popup on a coarse pointer,
+  since a native `<select>` cannot host a filter box, per-option sublabels or a
+  command menu. Reaching for one of those does not mean the touch case has been
+  handled for you; whether that scroller is a real defect on a phone is
+  unresolved in #5551. `NativeSelect` is the single file exempted from the
+  `no-restricted-syntax` rule; do not add a second.
 - `Toggle` for a boolean switch. It carries `role="switch"`, `aria-checked` and
   `aria-disabled` itself, so do not re-add them.
 

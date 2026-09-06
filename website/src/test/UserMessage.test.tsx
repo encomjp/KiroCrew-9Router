@@ -186,6 +186,38 @@ describe('UserMessage', () => {
     expect(screen.queryByText('Steered into the running turn')).not.toBeInTheDocument()
   })
 
+  // #7246: the badge asserts the message reached the RUNNING turn, which only a
+  // backend `steering_consumed` echo proves. A steer whose bytes were merely
+  // accepted (`written`), or which the turn ended without taking and the teardown
+  // requeued (`requeued`), was never injected -- so neither may render the badge.
+  it('does not render the steer badge for a written-but-unconfirmed steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'written' }} messageTs="steer-written" renderContent={renderContent} />)
+    expect(screen.queryByText('Steered into the running turn')).not.toBeInTheDocument()
+  })
+
+  it('does not render the steer badge for a requeued steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'requeued' }} messageTs="steer-requeued" renderContent={renderContent} />)
+    expect(screen.queryByText('Steered into the running turn')).not.toBeInTheDocument()
+  })
+
+  it('renders the steer badge once the backend confirms consumption', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'consumed' }} messageTs="steer-consumed" renderContent={renderContent} />)
+    expect(screen.getByText('Steered into the running turn')).toBeInTheDocument()
+  })
+
+  // The client mints its own bubble as `{ steer: true, optimistic: true }` with no
+  // state before the server has answered at all -- the least confirmed a steer can
+  // be. It must not fall through to the legacy state-less case and claim success.
+  it('does not render the steer badge on the client optimistic bubble', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, optimistic: true }} messageTs="steer-optimistic" renderContent={renderContent} />)
+    expect(screen.queryByText('Steered into the running turn')).not.toBeInTheDocument()
+  })
+
+  it('renders the steer badge on a reconciled optimistic bubble the backend confirmed', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, optimistic: true, steerState: 'consumed' }} messageTs="steer-optimistic-consumed" renderContent={renderContent} />)
+    expect(screen.getByText('Steered into the running turn')).toBeInTheDocument()
+  })
+
   it('applies the accent bubble treatment only to a steered message', () => {
     const { container: steered } = render(<UserMessage content="steered" meta={{ steer: true }} messageTs="steer-ts-2" renderContent={renderContent} />)
     const steerBubble = steered.querySelector('.msg-content') as HTMLElement
@@ -231,6 +263,182 @@ describe('UserMessage', () => {
     const second = render(<UserMessage content="steer me" meta={{ steer: true, clientTs: 'client-ts-guard' }} messageTs="server-ts-guard" renderContent={renderContent} />)
     expect(second.container.querySelector(ringSelector)).toBeNull()
   })
+
+  // The PRODUCTION path, which the test above sidesteps by mounting without
+  // `optimistic`. A real steer mounts as `{ steer: true, optimistic: true }` with
+  // no `steerState` -- the least-confirmed state, where the entrance must NOT
+  // play -- and `steerState: 'consumed'` is patched onto the SAME row later. That
+  // patch carries no key change, so React reuses the instance and there is no
+  // remount: a mount-only `useState` initializer would stay false forever and the
+  // entrance would never play at all. Reading the ring overlay because it renders
+  // only while the entrance is playing.
+  it('plays the steer entrance when consumed arrives after the optimistic mount', () => {
+    const ringSelector = '.border-2.border-accent'
+    const { container, rerender } = render(
+      <UserMessage content="steer me later" meta={{ steer: true, optimistic: true }} messageTs="ts-late-consume" renderContent={renderContent} />,
+    )
+    // Nothing is confirmed yet, so no entrance -- this is the state the change exists to protect.
+    expect(container.querySelector(ringSelector)).toBeNull()
+
+    rerender(
+      <UserMessage content="steer me later" meta={{ steer: true, steerState: 'consumed' }} messageTs="ts-late-consume" renderContent={renderContent} />,
+    )
+    expect(container.querySelector(ringSelector)).not.toBeNull()
+  })
+})
+
+// #8069: the two HONEST intermediate states get their own treatment. A steer the
+// backend has not confirmed (written, or the client's optimistic bubble with no
+// state yet) shows a muted pending indicator where the accent badge would sit; a
+// requeued steer says the redirect failed and the message ran as its own turn.
+// Neither may wear the consumed badge (#7997's invariant: the accent badge
+// asserts backend confirmation), and no treatment may leak onto ordinary user
+// messages.
+describe('steer pending / requeued treatments', () => {
+  const PENDING = 'Steering…'
+  const REQUEUED = 'Turn ended before this applied — runs as its own message.'
+  const BADGE = 'Steered into the running turn'
+  const ringSelector = '.border-2.border-accent'
+
+  it('renders the pending indicator for a written steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'written' }} messageTs="pend-written" slotRunning renderContent={renderContent} />)
+    expect(screen.getByText(PENDING)).toBeInTheDocument()
+    expect(screen.queryByText(BADGE)).not.toBeInTheDocument()
+  })
+
+  it('renders the pending indicator for the optimistic un-stated steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, optimistic: true }} messageTs="pend-optimistic" slotRunning renderContent={renderContent} />)
+    expect(screen.getByText(PENDING)).toBeInTheDocument()
+    expect(screen.queryByText(BADGE)).not.toBeInTheDocument()
+  })
+
+  it('does not render the pending indicator for a consumed steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'consumed' }} messageTs="pend-consumed" slotRunning renderContent={renderContent} />)
+    expect(screen.queryByText(PENDING)).not.toBeInTheDocument()
+    expect(screen.getByText(BADGE)).toBeInTheDocument()
+  })
+
+  it('does not render the pending indicator for a requeued steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'requeued' }} messageTs="pend-requeued" slotRunning renderContent={renderContent} />)
+    expect(screen.queryByText(PENDING)).not.toBeInTheDocument()
+  })
+
+  it('does not render the pending indicator for a legacy state-less steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true }} messageTs="pend-legacy" slotRunning renderContent={renderContent} />)
+    expect(screen.queryByText(PENDING)).not.toBeInTheDocument()
+    expect(screen.getByText(BADGE)).toBeInTheDocument()
+  })
+
+  it('renders the requeued line only for a requeued steer', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'requeued' }} messageTs="req-only" slotRunning renderContent={renderContent} />)
+    expect(screen.getByText(REQUEUED)).toBeInTheDocument()
+    expect(screen.queryByText(BADGE)).not.toBeInTheDocument()
+  })
+
+  it('does not render the requeued line for written, optimistic, consumed, or legacy steers', () => {
+    for (const [meta, ts] of [
+      [{ steer: true, steerState: 'written' }, 'req-not-written'],
+      [{ steer: true, optimistic: true }, 'req-not-optimistic'],
+      [{ steer: true, steerState: 'consumed' }, 'req-not-consumed'],
+      [{ steer: true }, 'req-not-legacy'],
+    ] as const) {
+      const { unmount } = render(<UserMessage content="go north" meta={meta as Record<string, unknown>} messageTs={ts} slotRunning renderContent={renderContent} />)
+      expect(screen.queryByText(REQUEUED)).not.toBeInTheDocument()
+      unmount()
+    }
+  })
+
+  it('renders no steer treatment on an ordinary user message', () => {
+    render(<UserMessage content="plain message" messageTs="plain-no-leak" slotRunning renderContent={renderContent} />)
+    expect(screen.queryByText(PENDING)).not.toBeInTheDocument()
+    expect(screen.queryByText(REQUEUED)).not.toBeInTheDocument()
+    expect(screen.queryByText(BADGE)).not.toBeInTheDocument()
+  })
+
+  it('keeps the pending indicator muted, never the accent badge treatment', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'written' }} messageTs="pend-muted" slotRunning renderContent={renderContent} />)
+    const line = screen.getByText(PENDING).closest('div') as HTMLElement
+    expect(line.className).toContain('text-muted')
+    expect(line.className).not.toContain('text-accent')
+    expect(line.className).not.toContain('font-semibold')
+  })
+
+  // UX review on #9037: "steer" is unexplained jargon to a first-time user, so
+  // the pending indicator carries an explainer. It rides the focusable
+  // click-to-open InfoTip pattern (#3626) -- a bare title attribute would be
+  // hover-only and unreachable on touch or keyboard.
+  it('explains the pending indicator via an accessible InfoTip', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'written' }} messageTs="pend-title" slotRunning renderContent={renderContent} />)
+    const tip = screen.getByTitle('Redirecting the running turn — not yet confirmed.')
+    expect(tip.tagName).toBe('BUTTON')
+    fireEvent.click(tip)
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Redirecting the running turn — not yet confirmed.')
+  })
+
+  // UX review on #9037: the backend settle is best-effort, so a row can be
+  // stranded in `written` forever. Without a running turn the pulsing
+  // indicator would assert in-flight work that ended -- including on a row
+  // re-read from history days later -- so the pending treatment requires a
+  // live running turn and the stranded row renders as a plain message.
+  it('does not render the pending indicator for a written steer when the slot has no running turn', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'written' }} messageTs="pend-stranded" renderContent={renderContent} />)
+    expect(screen.queryByText(PENDING)).not.toBeInTheDocument()
+    expect(screen.queryByText(BADGE)).not.toBeInTheDocument()
+  })
+
+  it('does not render the pending indicator for an optimistic steer when the slot has no running turn', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, optimistic: true }} messageTs="pend-stranded-opt" renderContent={renderContent} />)
+    expect(screen.queryByText(PENDING)).not.toBeInTheDocument()
+  })
+
+  // UX review on #9037: all three lifecycle states must read as ONE indicator
+  // family -- the requeued line keeps the Target icon the pending indicator and
+  // consumed badge share, not a different glyph.
+  it('keeps the Target icon on the requeued line so the family reads as one indicator', () => {
+    render(<UserMessage content="go north" meta={{ steer: true, steerState: 'requeued' }} messageTs="req-icon" slotRunning renderContent={renderContent} />)
+    const line = screen.getByText(REQUEUED)
+    expect(line.querySelector('svg.lucide-target')).not.toBeNull()
+  })
+
+  it('does not play the entrance animation on a pending row', () => {
+    const { container } = render(<UserMessage content="go north" meta={{ steer: true, steerState: 'written' }} messageTs="pend-no-ring" slotRunning renderContent={renderContent} />)
+    expect(container.querySelector(ringSelector)).toBeNull()
+  })
+
+  // The pending -> consumed hand-off: the muted indicator is REPLACED by the
+  // accent badge, and the one-shot entrance still fires on that transition (the
+  // pending row must not pre-claim the animatedSteers guard).
+  it('replaces the pending indicator with the badge and plays the entrance when consumed arrives', () => {
+    const { container, rerender } = render(
+      <UserMessage content="go north" meta={{ steer: true, steerState: 'written' }} messageTs="trans-written-consumed" slotRunning renderContent={renderContent} />,
+    )
+    expect(screen.getByText(PENDING)).toBeInTheDocument()
+    expect(container.querySelector(ringSelector)).toBeNull()
+
+    rerender(
+      <UserMessage content="go north" meta={{ steer: true, steerState: 'consumed' }} messageTs="trans-written-consumed" slotRunning renderContent={renderContent} />,
+    )
+    expect(screen.queryByText(PENDING)).not.toBeInTheDocument()
+    expect(screen.getByText(BADGE)).toBeInTheDocument()
+    expect(container.querySelector(ringSelector)).not.toBeNull()
+  })
+
+  // The pending -> requeued hand-off: the indicator is replaced by the requeued
+  // line, and nothing celebrates -- the redirect failed.
+  it('replaces the pending indicator with the requeued line when the teardown requeues', () => {
+    const { container, rerender } = render(
+      <UserMessage content="go north" meta={{ steer: true, optimistic: true }} messageTs="trans-opt-requeued" slotRunning renderContent={renderContent} />,
+    )
+    expect(screen.getByText(PENDING)).toBeInTheDocument()
+
+    rerender(
+      <UserMessage content="go north" meta={{ steer: true, steerState: 'requeued' }} messageTs="trans-opt-requeued" slotRunning renderContent={renderContent} />,
+    )
+    expect(screen.queryByText(PENDING)).not.toBeInTheDocument()
+    expect(screen.getByText(REQUEUED)).toBeInTheDocument()
+    expect(screen.queryByText(BADGE)).not.toBeInTheDocument()
+    expect(container.querySelector(ringSelector)).toBeNull()
+  })
 })
 
 describe('action footer on touch devices', () => {
@@ -254,9 +462,9 @@ describe('action footer on touch devices', () => {
   it('enlarges the actions to 40px touch targets where the pointer cannot hover', () => {
     render(<UserMessage content="hello" renderContent={renderContent} />)
     const cls = footer().className
-    expect(cls).toContain('[@media(hover:none)]:[&_button]:p-2.5')
-    expect(cls).toContain('[@media(hover:none)]:[&_svg]:h-5')
-    expect(cls).toContain('[@media(hover:none)]:[&_svg]:w-5')
+    expect(cls).toContain('[@media(hover:none)]:[&_button]:p-3')
+    expect(cls).toContain('[@media(hover:none)]:[&_svg]:h-4')
+    expect(cls).toContain('[@media(hover:none)]:[&_svg]:w-4')
     // Three 40px actions plus a localized timestamp can exceed a narrow
     // phone's width, so the grown row must wrap rather than clip.
     expect(cls).toContain('[@media(hover:none)]:flex-wrap')
@@ -265,5 +473,21 @@ describe('action footer on touch devices', () => {
   it('keeps the compact sizing on the buttons for pointer devices', () => {
     render(<UserMessage content="hello" renderContent={renderContent} />)
     expect(screen.getByTitle('Copy').className).toContain('p-0.5')
+  })
+
+  // The pin toggle is a stateful control: assistive tech needs its on/off
+  // state via aria-pressed, not only the title/aria-label text swap.
+  it('exposes aria-pressed on the pin toggle reflecting the pinned prop', () => {
+    const { rerender } = render(
+      <UserMessage content="hi" renderContent={renderContent} messageTs="ts-pin" onTogglePin={() => {}} />
+    )
+    const unpinned = screen.getByTitle('Pin message')
+    expect(unpinned).toHaveAttribute('aria-pressed', 'false')
+
+    rerender(
+      <UserMessage content="hi" renderContent={renderContent} messageTs="ts-pin" pinned onTogglePin={() => {}} />
+    )
+    const pinned = screen.getByTitle('Unpin message')
+    expect(pinned).toHaveAttribute('aria-pressed', 'true')
   })
 })

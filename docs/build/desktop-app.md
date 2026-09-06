@@ -334,14 +334,21 @@ same way). Key details:
 - **Local dictation runtime bundled** — supported desktop builds include
   `pywhispercpp`, the platform `imageio-ffmpeg` executable used for compressed
   recordings, and all transitive runtime dependencies. The build imports the
-  recognizer and executes the exact packaged decoder before publishing. Model
+  recognizer and executes the exact packaged decoder before publishing — and
+  distinguishes a decoder that fails to AUTHENTICATE, which fails the build, from
+  one that authenticates but will not run on the build host, which warns and
+  ships (see [stt-streaming](../system-specs/modules/stt-streaming.md)). Model
   weights are deliberately excluded from the installer: the user selects a
   model and clicks **Download now**, with no package manager or separate
   dependency step. Intel macOS is the unsupported recognizer exception.
   Every bundled executable ships **uncompressed** — the Apple notary service
   decompresses archive members and rejects an unsigned executable found inside
   one, which fails the whole macOS release (see
+<<<<<<< HEAD
   [stt-streaming](../system-specs/features/stt-streaming.md) for how the runtime
+=======
+  [stt-streaming](../system-specs/modules/stt-streaming.md) for how the runtime
+>>>>>>> upstream/main
   then authenticates a decoder whose bytes signing rewrote).
 - **Dashboard bundled** — the SPA is staged into
   `lib/python3.12/site-packages/kiro_crew/static/dist/` inside the bundle.
@@ -350,12 +357,28 @@ same way). Key details:
 
 ## How the app finds and launches the backend
 
-When the app starts, [`main.js`](../../website/electron/main.js) first checks
-whether a gateway is already running. An existing gateway—including a local SSH
-forward to a remote gateway—is reused. Otherwise the shell locates the backend
-binary via [`find-bin.js`](../../website/electron/find-bin.js), spawns it as
-`kirocrew gateway --no-open`, polls `/api/status`, and loads the dashboard once
-it is healthy.
+When the app starts, [`main.js`](../../website/electron/main.js) composes the
+desktop lifecycle and delegates gateway ownership to
+[`gateway-supervisor.js`](../../website/electron/gateway-supervisor.js). The
+supervisor first checks whether a gateway is already running. An existing
+gateway—including a local SSH forward to a remote gateway—is reused. Otherwise
+it locates the backend binary via
+[`find-bin.js`](../../website/electron/find-bin.js), spawns it as `kirocrew
+gateway --no-open`, polls `/api/status`, and loads the dashboard once it is
+healthy.
+
+Host-runtime discovery stays behind the same main-process ownership boundaries.
+The `wsl:detect` handler in
+[`ipc-registrar.js`](../../website/electron/ipc-registrar.js) fails closed unless
+the sender has the fixed primary origin,
+[`window-lifecycle.js`](../../website/electron/window-lifecycle.js) proves that
+its window uses a local gateway rather than a configured tunnel, and
+[`gateway-supervisor.js`](../../website/electron/gateway-supervisor.js)
+positively identifies the primary listener as Kiro Crew or its service. A
+manual SSH tunnel, foreign listener, unbound port, or unavailable owner probe is
+therefore refused; only then may
+[`wsl-detection.js`](../../website/electron/wsl-detection.js) run the trusted
+system `wsl.exe` path.
 
 Before spawning a **bundled** backend the shell checks that the bundle's Python
 stdlib is fully on disk
@@ -401,8 +424,9 @@ Only a **bundled** backend qualifies — a user's own install or a `PATH` `kiroc
 failing on a stdlib import is a broken environment, and "wait for the installer"
 would be misleading advice there. And only the **current launch attempt** is read:
 the log is append-only across launches, so the text is sliced from the last spawn
-marker (`SPAWN_MARKER`, owned by `bundle-integrity.js` and logged by `main.js` so
-writer and reader cannot drift). Without that, an older traceback could relabel
+marker (`SPAWN_MARKER`, owned by `bundle-integrity.js` and logged by
+`gateway-supervisor.js` so writer and reader cannot drift). Without that, an
+older traceback could relabel
 this attempt's unrelated failure — a `SIGKILL`, or a bound port whose real remedy
 is force-stop rather than a bare Retry — and show a reassuring dialog over a live
 fault. When the marker has scrolled out of the tail, attribution is unknowable and
@@ -484,9 +508,9 @@ closes the popup and collapses the labels back to the hamburger. The menu surfac
 uses the dashboard theme because native Windows popups capture window input and
 cannot support hover switching; a narrow IPC bridge keeps command execution and
 standard Electron roles in the main process.
-When a remote crew is connected, the instance switcher shares the same bounded
-left region as the menu: it is a single trigger naming the crew on screen (see
-InstanceTabBar's SwitcherMenu), not a row of per-crew tabs, so it costs constant
+When a remote instance is connected, the instance switcher shares the same bounded
+left region as the menu: it is a single trigger naming the instance on screen (see
+InstanceTabBar's SwitcherMenu), not a row of per-instance tabs, so it costs constant
 width whether the menu is collapsed to a hamburger or expanded to full labels.
 The centered command palette yields that region rather than the reverse — the
 correct priority while the menu is open is labels > instance status > an idle
@@ -557,7 +581,7 @@ The function is pure — `fs`, `os`, `path`, `process.resourcesPath`,
 `__dirname`, and the arch are injected — so both arch branches are
 unit-testable without mocking globals.
 
-### `main.js` — spawning the gateway
+### `gateway-supervisor.js` — owning the gateway lifecycle
 
 - Ensures `KIROCREW_HOME` (default `~/.kiro/crew`, overridable via the
   `KIROCREW_HOME` env var) exists, then spawns the backend with
@@ -582,8 +606,10 @@ unit-testable without mocking globals.
   per-user install at `%LOCALAPPDATA%\Kiro-Cli` — so desktop launches find
   user-local installations without mutating the shell environment or requiring
   the already-running gateway to inherit an installer-updated `PATH`.
-- On window close the app hides to the tray; quitting sends `SIGTERM` to the
-  gateway process.
+- [`window-lifecycle.js`](../../website/electron/window-lifecycle.js) hides the
+  app to the tray on window close; the composition root delegates quit-time
+  gateway teardown to the supervisor, which performs the graceful shutdown and
+  signal escalation contract.
 
 ## Code signing & notarization (macOS)
 
@@ -827,9 +853,75 @@ About panel:
 `managedBy` names the owning system in the "updates are managed by …"
 message; `updateCommand` renders as a copyable command. An empty or
 unparsable body still counts as managed — an operator who dropped the file
-gets the safe behavior even when the metadata is wrong. For local testing,
-the `KIROCREW_EXTERNALLY_MANAGED` env var points at a marker file (any other
-non-empty value marks the install managed with no metadata).
+gets the safe behavior even when the metadata is wrong.
+
+The body is only read when the marker's **provenance** can be established:
+neither the marker nor its directory may be owned by the account the app runs
+as, and neither may be group- or world-writable. Ownership rather than current
+mode bits, because a POSIX owner can always `chmod +w` back — a marker the app's
+own user owns is one a prompt-injected agent shell could have planted and then
+made read-only. `updateCommand`/`checkCommand` are executed through a shell on
+the managed auto-update path, so a marker in a user-owned resources directory
+(Homebrew, `pip --user`, `~/Applications`) is treated as a bare marker: managed,
+updater off, no metadata and nothing to run. Packagers that want the managed
+commands honored must install the resources directory root-owned.
+
+The commands run with a **constructed environment**, not the app's own. Only an explicit pass-through set reaches them — `USER`, `LOGNAME`, `TZ`, `TMPDIR`, the `LANG`/`LC_*` locale vars, and the proxy vars — plus a narrowed system-only `PATH` and `cwd=/`. `HOME` is deliberately excluded: Python derives its user-site directory from it, so passing it through would let a planted `sitecustomize.py` run on every `python` start. Everything else is absent by construction, because `shell: true` means a shell interprets the command and a shell reads its environment as code: the loader family (`LD_*`/`DYLD_*`), the interpreter family (`PYTHON*`, `NODE_OPTIONS`), the startup files (`BASH_ENV`, `ENV`), the tracing pair (`SHELLOPTS` plus a command-substituting `PS4`), word splitting (`IFS`), and exported shell functions (`BASH_FUNC_*`, which shadow a command name outright). A packager whose updater needs any other variable must set it inside its own command rather than relying on inheritance.
+
+**On Windows a loose marker's commands are never honored.** There is no POSIX
+owner to read and `access(W_OK)` does not model ACLs, so no honest provenance
+verdict exists; the check fails closed by declaration and every loose Windows
+marker is treated as bare (managed, updater off). A Windows packager either
+drives updates with its own installer or bakes the marker in (next).
+
+### Baking the marker into the app (editions)
+
+The provenance rule above refuses every install the app's own user owns, which
+is every per-user package manager (a Toolbox, Homebrew, `~/Applications`), and
+can never pass on Windows. An **edition** — a build that IS produced by the
+package manager's owner — does not need to drop a file beside the app after the
+fact; it declares the marker at build time:
+
+```bash
+KIROCREW_MANAGED_INSTALL_MARKER=/path/to/marker.json bash packaging/build-desktop.sh
+```
+
+`build-desktop.sh` validates the file (a JSON object of string fields
+`managedBy` / `updateCommand` / `checkCommand`, under 8 KiB, with an
+`updateCommand` — a marker that disables updates while offering none fails the
+build rather than shipping silently) and copies it to
+`website/electron/EXTERNALLY-MANAGED`, which electron-builder packs **into
+`app.asar` next to `main.js`**. The running app reads that copy first and
+trusts it without any ownership probe, on every platform: it is part of the
+application's own code, so anyone positioned to rewrite it is already
+positioned to rewrite the code that reads it, and no file-ownership check could
+add to that. On macOS the baked copy is additionally sealed by codesign. A baked
+marker outranks a loose one when both exist — a build-time declaration by the
+edition that produced the binary beats a file dropped next to it later.
+
+The default build ships no baked marker (the file is gitignored and removed at
+the start of every build), so a plain checkout keeps the loose-marker contract
+exactly as described above.
+
+The commands themselves still run under the constructed environment described
+above: **no app environment variable reaches them** — not `HOME`, and not
+anything the edition's own wrapper exported before launching the app. So a
+command must not rely on `$HOME` or `~` expanding (derive the home directory
+from `USER`, which is passed through, or name paths that do not depend on it),
+and must not reference a variable it expects the app to have inherited. On
+Windows that failure is silent: `cmd.exe` leaves an undefined `%VAR%` in the
+command line **as the literal text `%VAR%`**, not as an empty string, so a
+wrapper argument such as `"%SOME_VAR%"` arrives as that string. The one value
+the constructed environment does derive for the command is
+`KIROCREW_MANAGED_ARGV0` — the running app executable's absolute path
+(`process.execPath`, taken from the process, never from the environment) — so a
+wrapper that verifies its relaunch target has a trustworthy answer without any
+inheritance.
+
+For local testing, the `KIROCREW_EXTERNALLY_MANAGED` env var points at a marker
+file (any other non-empty value marks the install managed with no metadata).
+It is honored on unpackaged builds only — a packaged app ignores it, because
+its launch environment is user-writable.
 
 The gateway has the matching seam for its own surfaces: an operator's
 `security_policy.json` `updates` block (`check_command` / `apply_command`)

@@ -1,17 +1,18 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react'
-import { Zap, FolderOpen, ChevronRight, TriangleAlert } from 'lucide-react'
+import { Zap, FolderOpen, ChevronRight, Check } from 'lucide-react'
 import Modal from './Modal'
+import ErrorNotice from './ErrorNotice'
 import { Input, Btn } from './ui'
 import ProjectPicker from './ProjectPicker'
 import SimpleSelect from './SimpleSelect'
 import { FOLDER_COLOR_PALETTE } from './folderColorCatalog'
 import { useImeGuard } from '../hooks/useImeGuard'
 import { resolveFolderProjectDir } from '../utils/folderAgent'
-import { ChatFolder } from '../types'
+import { ChatFolder, ChatTag } from '../types'
 import { i18nT } from '../i18n/t'
 
 /** The folder fields this modal owns. */
-export type FolderConfigField = 'name' | 'color' | 'projectDir' | 'defaultAgent'
+export type FolderConfigField = 'name' | 'color' | 'projectDir' | 'defaultAgent' | 'tags'
 
 export interface FolderConfigDraft {
   name: string
@@ -19,6 +20,8 @@ export interface FolderConfigDraft {
   color: string
   projectDir: string
   defaultAgent: string
+  /** Tag ids the folder carries; copied onto new chats filed into it. */
+  tags: string[]
   /** Fields the USER actually edited, measured against what the modal opened
    *  with. The caller must build its PATCH from this rather than diffing the
    *  draft against live cache: a field another client changed while the modal
@@ -41,6 +44,16 @@ interface Props {
   installedAgents: { name: string }[]
   /** Global default agent, shown as what an empty agent choice falls back to. */
   globalDefaultAgent?: string
+  /** The tag vocabulary, powering the folder-tag picker. Empty/absent hides the
+   *  picker entirely — a folder can only carry tags that already exist. */
+  availableTags?: ChatTag[]
+  /** True when the chat-tags query FAILED (vs still loading) — renders an
+   *  error line instead of asserting an in-progress state indefinitely. */
+  availableTagsFailed?: boolean
+  /** Retries the failed tag-vocabulary query in place — rendered as an inline
+   *  Retry action on the error line so recovery never requires dismissing the
+   *  modal (closing would discard a mid-draft form). */
+  onRetryTags: () => void
   /** Resolves on a persisted save; REJECTS on failure so the modal can stay
    *  open with the draft intact and surface the reason. */
   onSubmit: (draft: FolderConfigDraft) => Promise<void>
@@ -60,7 +73,15 @@ function ancestorChain(folders: ChatFolder[], id: string | undefined): ChatFolde
   return out
 }
 
-const EMPTY: FolderConfigDraft = { name: '', color: '', projectDir: '', defaultAgent: '', touched: [] }
+const EMPTY: FolderConfigDraft = { name: '', color: '', projectDir: '', defaultAgent: '', tags: [], touched: [] }
+
+/** Set-equality on two tag-id lists (order-insensitive): the picker toggles
+ *  membership, so "changed?" is about which ids are present, not their order. */
+function sameTags(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false
+  const s = new Set(a)
+  return b.every(id => s.has(id))
+}
 
 /**
  * One modal for both "New folder" and "Folder settings".
@@ -76,7 +97,7 @@ const EMPTY: FolderConfigDraft = { name: '', color: '', projectDir: '', defaultA
  * spatial cue the inline input got for free from its own indentation.
  */
 export default function FolderConfigModal({
-  open, onClose, mode, parentId, folder, folders, installedAgents, globalDefaultAgent, onSubmit,
+  open, onClose, mode, parentId, folder, folders, installedAgents, globalDefaultAgent, availableTags, availableTagsFailed, onRetryTags, onSubmit,
 }: Props) {
   const [draft, setDraft] = useState<FolderConfigDraft>(EMPTY)
   const [pickerOpen, setPickerOpen] = useState(false)
@@ -108,16 +129,32 @@ export default function FolderConfigModal({
   // keep-open-on-error fix exists to preserve.
   const folderRef = useRef(folder)
   folderRef.current = folder
+  // Read through a ref for the same reason as `folderRef`: the vocabulary must
+  // not be an effect dependency, or a tag edit elsewhere would re-seed and
+  // erase an open draft.
+  const availableTagsRef = useRef(availableTags)
+  availableTagsRef.current = availableTags
   const seedKey = mode === 'edit' ? folder?.id : ''
   useEffect(() => {
     if (!open) return
     const f = folderRef.current
+    // Seed only ids that exist in the current vocabulary — but ONLY when the
+    // vocabulary is actually known. `availableTags` is undefined while the
+    // tags query is unresolved; filtering against that as if it were an empty
+    // vocabulary would seed a partial list on a cold load, and the next save
+    // would silently delete the folder's existing tags. Unknown vocabulary
+    // keeps the raw ids; the submit-time prune below (which runs once the
+    // vocabulary has resolved) still clears genuinely dangling ids, so a save
+    // never 400s over a reference the picker cannot display.
+    const known = Array.isArray(availableTagsRef.current)
+    const vocab = new Set((availableTagsRef.current ?? []).map(t => t.id))
     const seeded: FolderConfigDraft = mode === 'edit' && f
       ? {
         name: f.name ?? '',
         color: f.color ?? '',
         projectDir: f.project_dir ?? '',
         defaultAgent: f.default_agent ?? '',
+        tags: Array.isArray(f.tags) ? (known ? f.tags.filter(t => vocab.has(t)) : [...f.tags]) : [],
         touched: [],
       }
       : EMPTY
@@ -176,11 +213,21 @@ export default function FolderConfigModal({
   const submit = useCallback(async () => {
     if (!canSubmit || saving) return
     const seeded = seedRef.current
+    // THE tag-payload invariant: `tags` enters the PATCH only when the user
+    // actually toggled a chip (draft differs from what this modal seeded).
+    // A rename-only save must omit `tags` entirely — sending any list would
+    // overwrite tags another client added to the folder while this modal sat
+    // open. No client-side dangling-id prune is needed: the folder endpoint
+    // silently filters unknown ids exactly like the slot-tags endpoint it
+    // mirrors, so a stale reference is shed by the server on save and can
+    // never 400 the folder.
+    const tagsEdited = !sameTags(draft.tags, seeded.tags)
     const edited: FolderConfigField[] = []
     if (trimmedName !== seeded.name) edited.push('name')
     if (draft.color !== seeded.color) edited.push('color')
     if (draft.projectDir !== seeded.projectDir) edited.push('projectDir')
     if (draft.defaultAgent !== seeded.defaultAgent) edited.push('defaultAgent')
+    if (tagsEdited) edited.push('tags')
     setSaving(true); setSaveErr('')
     try {
       await onSubmit({ ...draft, name: trimmedName, touched: edited })
@@ -202,6 +249,7 @@ export default function FolderConfigModal({
   if (draft.color !== seed.color) touched.push('color')
   if (draft.projectDir !== seed.projectDir) touched.push('projectDir')
   if (draft.defaultAgent !== seed.defaultAgent) touched.push('defaultAgent')
+  if (!sameTags(draft.tags, seed.tags)) touched.push('tags')
   const isDirty = touched.length > 0
 
   return (
@@ -223,13 +271,10 @@ export default function FolderConfigModal({
         }
       >
         <div className="flex flex-col gap-4">
-          {saveErr && (
-            <div data-testid="folder-config-error" role="alert"
-              className="flex items-start gap-2 text-[11.5px] text-text bg-danger-subtle border border-danger rounded-lg px-3 py-2">
-              <TriangleAlert size={13} className="shrink-0 mt-[1px] text-danger" />
-              <span className="min-w-0 break-words">{saveErr}</span>
-            </div>
-          )}
+          {/* No hand-off: the folder name / color / project dir / default agent /
+              tags form is unsaved — the save that failed is exactly what the
+              draft was about, and the navigation would discard it. */}
+          <ErrorNotice message={saveErr} testId="folder-config-error" />
 
           {/* Read-only destination. Not an input: the entry point already fixed it. */}
           <div data-testid="folder-config-destination" className="flex items-center gap-1.5 flex-wrap text-[11.5px] text-muted bg-bg-accent border border-border rounded-lg px-3 py-2">
@@ -301,6 +346,104 @@ export default function FolderConfigModal({
               })}
             </div>
           </div>
+
+          {/* Tags — chips from the tag vocabulary, copied onto every new chat
+           *  filed into this folder. Three vocabulary states, three renders:
+           *  UNKNOWN (undefined, query unresolved/failed) renders nothing —
+           *  showing the "create tags" hint would falsely tell a user who HAS
+           *  tags that none exist; KNOWN-EMPTY shows the onboarding hint
+           *  rather than vanishing — a hidden section makes the feature
+           *  undiscoverable from the one place it lives; KNOWN-NON-EMPTY
+           *  renders the picker. UNRESOLVED (query still loading) keeps the
+           *  section heading with a muted placeholder instead of nothing, so
+           *  the feature never silently vanishes and the layout does not
+           *  shift when the vocabulary resolves after open. FAILED renders an
+           *  error line, not the loading hint — a dead query must not assert
+           *  an in-progress state indefinitely. */}
+          {availableTags === undefined ? (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.tags')}</span>
+              {availableTagsFailed ? (
+                <span className="flex items-center gap-1.5 flex-wrap">
+                  {/* No hand-off: the same unsaved folder form (see the save
+                      notice above) — a read failure, but it sits inside it. */}
+                  <ErrorNotice
+                    variant="inline"
+                    className="text-[11px]"
+                    message={i18nT('components.folderConfigModal.tags_error_hint')}
+                    testId="folder-config-tags-error"
+                  />
+                  <button
+                    type="button"
+                    data-testid="folder-config-tags-retry"
+                    onClick={onRetryTags}
+                    className="text-[11px] underline underline-offset-2 text-danger hover:opacity-80 bg-transparent border-none p-0 cursor-pointer"
+                  >
+                    {i18nT('components.folderConfigModal.tags_retry')}
+                  </button>
+                </span>
+              ) : (
+                <span data-testid="folder-config-tags-loading" className="text-[11px] text-muted-strong">
+                  {i18nT('components.folderConfigModal.tags_loading_hint')}
+                </span>
+              )}
+            </div>
+          ) : availableTags.length > 0 ? (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.tags')}</span>
+              <div data-testid="folder-config-tags" className="flex items-center gap-1.5 flex-wrap">
+                {availableTags.map(tag => {
+                  const selected = draft.tags.includes(tag.id)
+                  return (
+                    <label
+                      key={tag.id}
+                      htmlFor={`folder-config-tag-input-${tag.id}`}
+                      data-testid={`folder-config-tag-${tag.id}`}
+                      className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11.5px] cursor-pointer transition-transform hover:scale-105 focus-within:ring-2 focus-within:ring-accent focus-within:ring-offset-1 focus-within:ring-offset-bg ${selected ? 'ring-1 ring-accent ring-offset-1 ring-offset-bg' : ''}`}
+                      style={{
+                        background: selected
+                          ? `color-mix(in srgb, ${tag.color} 30%, var(--bg-elevated))`
+                          : 'var(--bg-elevated)',
+                        borderColor: tag.color,
+                        color: 'var(--text)',
+                      }}
+                    >
+                      {/* A hidden checkbox, not a <button>: the chips are a
+                       *  multi-select choice control, and rendering them as
+                       *  sibling buttons would read as an unbounded action row
+                       *  (AUTOSDE max-two-buttons-per-row). The label supplies
+                       *  the accessible name; checked state carries selection. */}
+                      <input
+                        type="checkbox"
+                        id={`folder-config-tag-input-${tag.id}`}
+                        aria-label={tag.name}
+                        className="sr-only"
+                        checked={selected}
+                        onChange={() => setDraft(d => ({
+                          ...d,
+                          tags: selected ? d.tags.filter(t => t !== tag.id) : [...d.tags, tag.id],
+                        }))}
+                      />
+                      <span aria-hidden className="w-2 h-2 rounded-full shrink-0" style={{ background: tag.color }} />
+                      <span className="truncate max-w-[140px]">{tag.name}</span>
+                      {/* Same "tag is on" glyph SlotTagPopover uses: selection
+                       *  must not hinge on a 1px ring-width difference from the
+                       *  keyboard-focus ring of the same accent color. */}
+                      {selected && <span aria-hidden className="text-accent"><Check size={11} /></span>}
+                    </label>
+                  )
+                })}
+              </div>
+              <span className="text-[11px] text-muted-strong">{i18nT('components.folderConfigModal.tags_hint')}</span>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[11.5px] font-semibold text-muted">{i18nT('components.folderConfigModal.tags')}</span>
+              <span data-testid="folder-config-tags-empty" className="text-[11px] text-muted-strong">
+                {i18nT('components.folderConfigModal.tags_empty_hint')}
+              </span>
+            </div>
+          )}
 
           {/* Project directory */}
           <div className="flex flex-col gap-1.5">

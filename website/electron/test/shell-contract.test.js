@@ -20,7 +20,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const ROOT = path.join(__dirname, "..");
-const MAIN_SOURCE = fs.readFileSync(path.join(ROOT, "main.js"), "utf-8");
+const WINDOW_SOURCE = fs.readFileSync(path.join(ROOT, "window-lifecycle.js"), "utf-8");
+const GATEWAY_SOURCE = fs.readFileSync(path.join(ROOT, "gateway-supervisor.js"), "utf-8");
+const PRELOAD_SOURCE = fs.readFileSync(path.join(ROOT, "preload.js"), "utf-8");
+const IPC_REGISTRAR_SOURCE = fs.readFileSync(path.join(ROOT, "ipc-registrar.js"), "utf-8");
 
 /** Every shipped .js under electron/ (tests and deps excluded). */
 function sourceFiles() {
@@ -65,7 +68,9 @@ test("packaging allowlist covers every relatively-required module", () => {
 
 test("packaging allowlist has no stale entries", () => {
   const listed = require(path.join(ROOT, "package.json")).build.files;
-  const stale = listed.filter((f) => !fs.existsSync(path.join(ROOT, f)));
+  // Build-time inputs are staged by build-desktop.sh, not present in a checkout.
+  const { BUILD_TIME_INPUTS: buildTimeInputs } = require("./build-time-inputs");
+  const stale = listed.filter((f) => !buildTimeInputs.has(f) && !fs.existsSync(path.join(ROOT, f)));
   assert.deepStrictEqual(
     stale,
     [],
@@ -75,20 +80,26 @@ test("packaging allowlist has no stale entries", () => {
 
 test("macOS New Window opens the blank-session route on the existing gateway", () => {
   assert.match(
-    MAIN_SOURCE,
-    /createConnectionWindow\(BACKEND_URL, PORT, "\/chat\?new=1"\)/,
+    WINDOW_SOURCE,
+    /createConnectionWindow\(backendUrl, port, "\/chat\?new=1"\)/,
   );
   assert.match(
-    MAIN_SOURCE,
-    /showLoadingThenConnect\(win, BACKEND_URL, \{ initialPath: "\/chat\?new=1" \}\)/,
+    WINDOW_SOURCE,
+    /connectWindow\(win, backendUrl, \{ initialPath: "\/chat\?new=1" \}\)/,
   );
 });
 
 test("only the primary local window owns the gateway liveness monitor", () => {
-  const guardedStarts = MAIN_SOURCE.match(
-    /backendUrl === BACKEND_URL && win === mainWindow\) startLivenessMonitor\(win\)/g,
+  const guardedStarts = GATEWAY_SOURCE.match(
+    /if \(targetBackendUrl === BACKEND_URL && window === mainWindow\(\)\) \{\s*startLivenessMonitor\(window\);\s*\}/g,
   ) || [];
   assert.strictEqual(guardedStarts.length, 2, "authenticated and unauthenticated handoffs stay guarded");
+  const allStarts = GATEWAY_SOURCE.match(/startLivenessMonitor\(window\);/g) || [];
+  assert.strictEqual(
+    allStarts.length,
+    guardedStarts.length,
+    "every liveness start must remain inside the primary-local-window guard",
+  );
 });
 
 // ── IPC channel contract ──────────────────────────────────────────────────
@@ -111,6 +122,41 @@ function channels(src, pattern) {
   }
   return found;
 }
+
+test("the WSL preload invoke is registered by the IPC owner", () => {
+  assert.match(
+    PRELOAD_SOURCE,
+    /detect:\s*\(\)\s*=>\s*ipcRenderer\.invoke\("wsl:detect"\)/,
+    "window.wslAPI.detect must invoke the read-only wsl:detect channel",
+  );
+  assert.match(
+    IPC_REGISTRAR_SOURCE,
+    /ipcMain\.handle\("wsl:detect",\s*async\s*\(event\)\s*=>/,
+    "ipc-registrar must own the handler exposed by preload.js",
+  );
+});
+
+// The three-gate local-dashboard check guards `wsl:detect` and both
+// `crash-reports:*` channels. It was briefly written out twice, and two
+// hand-maintained spellings of a security check is one of them being tightened
+// while the other is not. The port probe is gate 3 and appears in no other code
+// path, so counting its call sites counts the copies.
+test("the local-dashboard gate has exactly one spelling", () => {
+  const probes = IPC_REGISTRAR_SOURCE.match(/probePrimaryPortOwner\(\)/g) || [];
+  assert.strictEqual(
+    probes.length,
+    1,
+    "gate 3 must be reached through the single assertLocalDashboard helper; "
+      + `found ${probes.length} probe call sites, so the gate has been copied`,
+  );
+  for (const channel of ["wsl:detect", "crash-reports:get", "crash-reports:reveal"]) {
+    assert.match(
+      IPC_REGISTRAR_SOURCE,
+      new RegExp(`assertLocalDashboard\\(event, "${channel}"\\)`),
+      `${channel} must route through the shared local-dashboard gate`,
+    );
+  }
+});
 
 test("every mochi channel main SENDS is received by a preload", () => {
   const mainSrc = readAll(sourceFiles().map(rel).filter((f) => !PRELOADS.includes(f)));

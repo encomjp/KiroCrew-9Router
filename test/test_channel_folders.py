@@ -500,6 +500,105 @@ class TestFilingOnSurface:
         assert slot.folder_id == ""
         assert slot._channel_folder_filed is True
 
+    def test_first_filing_inherits_the_folders_tags(self, dashboard_state: Any) -> None:
+        """A channel chat BORN into a tagged folder inherits like a dashboard chat.
+
+        Inheritance is creation-only across the whole feature (#5419); the
+        channel default-filing branch is a birth, so the caller-resolved tags
+        are copied by value here and nowhere else.
+        """
+        slot = channel_slots.surface_channel_session(
+            dashboard_state, self._info(), {}, [], folder_id="f1", folder_tags=["t1", "t2"]
+        )
+        assert slot is not None
+        assert slot.folder_id == "f1"
+        assert sorted(slot.tags) == ["t1", "t2"]
+
+    def test_restoring_a_filed_session_never_re_tags(self, dashboard_state: Any) -> None:
+        """The restore branch (persisted folder_id) is not a birth — no tags.
+
+        Even when the caller supplies folder_tags, a conversation whose
+        metadata already carries a folder was filed long ago; re-stamping it
+        would be the retro-tagging the creation-only rule forbids.
+        """
+        slot = channel_slots.surface_channel_session(
+            dashboard_state,
+            self._info(),
+            {"folder_id": "user-choice"},
+            [],
+            folder_id="f1",
+            folder_tags=["t1"],
+        )
+        assert slot is not None
+        assert slot.folder_id == "user-choice"
+        assert slot.tags == []
+
+    def test_persisted_tags_are_recovered_after_a_crash(self, dashboard_state: Any) -> None:
+        """Tags stored with the filing marker are applied on restore.
+
+        The reconcile pass persists the inherited tags in the SAME metadata
+        write as the filing marker. If the process crashes before the slot's
+        first save, the marker exists but the slot line does not — this read
+        is what recovers the inheritance instead of losing it forever (the
+        marker blocks re-inheritance by design).
+        """
+        dashboard_state._tags = [{"id": "t1", "name": "alpha", "color": "#123456"}]
+        dashboard_state._tags_authoritative = True
+        slot = channel_slots.surface_channel_session(
+            dashboard_state,
+            self._info(),
+            {"channel_folder_filed": True, "folder_id": "f1", "tags": ["t1"]},
+            [],
+        )
+        assert slot is not None
+        assert slot.folder_id == "f1"
+        assert slot.tags == ["t1"]
+        # Recovery, not re-inheritance: the filed marker is still honored.
+        assert slot._channel_folder_filed is True
+
+    def test_persisted_tags_are_validated_against_the_vocabulary(
+        self, dashboard_state: Any
+    ) -> None:
+        """Meta tags are hardened like every other restore path.
+
+        The metadata line is on-disk state: a non-string entry must not crash
+        the surface, and an id deleted from the vocabulary since the filing
+        must be dropped, not resurrected.
+        """
+        dashboard_state._tags = [{"id": "t1", "name": "alpha", "color": "#123456"}]
+        dashboard_state._tags_authoritative = True
+        slot = channel_slots.surface_channel_session(
+            dashboard_state,
+            self._info(),
+            {"channel_folder_filed": True, "tags": ["t1", {"bad": 1}, "ghost"]},
+            [],
+        )
+        assert slot is not None
+        assert slot.tags == ["t1"]
+
+    def test_restore_fails_open_when_the_vocabulary_is_not_authoritative(
+        self, dashboard_state: Any
+    ) -> None:
+        """An unreadable tags.json must not erase a filed chat's tags.
+
+        The three sibling restore paths gate their prune on
+        ``_tags_authoritative``; this path must match. Intersecting with an
+        unknown (empty) vocabulary would drop every persisted id, the next
+        save would write the empty list to disk, and the sticky filing marker
+        would block re-inheritance forever — silent, permanent loss from one
+        bad boot.
+        """
+        dashboard_state._tags = []
+        dashboard_state._tags_authoritative = False
+        slot = channel_slots.surface_channel_session(
+            dashboard_state,
+            self._info(),
+            {"channel_folder_filed": True, "tags": ["t1", "t2"]},
+            [],
+        )
+        assert slot is not None
+        assert slot.tags == ["t1", "t2"]
+
 
 class _FakeLog:
     """Minimal ConversationLog stand-in: one channel session, one message.
@@ -804,6 +903,112 @@ class TestReconcilePassFiling:
         assert stored.get("channel_folder_filed") is True, (
             "filing was not recorded on disk; the next pass would file this "
             "conversation a second time and undo a manual move"
+        )
+
+    def test_inherited_tags_ride_the_same_filing_write(self, dashboard_state: Any) -> None:
+        """Marker and tags are persisted atomically, or a crash loses the tags.
+
+        The filing marker is what tells every later pass (and a post-crash
+        restore) that inheritance already ran. Persisting it WITHOUT the tags
+        opens a window: crash after the metadata write but before the slot's
+        first save, and the restored conversation has the marker, no tags, and
+        no way to ever get them — the marker blocks re-inheritance by design.
+        One write closes the window.
+        """
+        _write_config("discord", "Discord")
+        key = "discord:kirocrew:direct:U1"
+        fid = asyncio.run(
+            channel_folders.ensure_channel_folder(dashboard_state, "discord", "Discord")
+        )
+        dashboard_state._tags = [{"id": "t1", "name": "alpha", "color": "#123456"}]
+        dashboard_state._tags_authoritative = True
+        for f in dashboard_state._folders:
+            if f["id"] == fid:
+                f["tags"] = ["t1"]
+        log = _FakeLog([key])
+        dashboard_state.conversation_log = log
+        dashboard_state.push_slots_update = lambda: None  # type: ignore[method-assign]
+
+        assert asyncio.run(channel_slots.reconcile_channel_slots(dashboard_state, 0)) == 1
+        slot = dashboard_state._slots[channel_slots.channel_slot_name(key)]
+        assert slot.tags == ["t1"]
+
+        stored = log.get_metadata(key)
+        assert stored.get("channel_folder_filed") is True
+        assert stored.get("tags") == ["t1"], (
+            "inherited tags were not persisted with the filing marker; a crash "
+            "before the slot's first save would lose them permanently"
+        )
+
+    def test_a_tag_deleted_before_the_filing_write_is_not_resurrected(
+        self, dashboard_state: Any
+    ) -> None:
+        """Validation runs at the write boundary, not resolve time.
+
+        The reconcile pass reads folder tags early, then awaits transcript and
+        config reads before filing. A tag deleted in that window must not be
+        written onto the freshly filed chat — the filing write validates the
+        ids against the vocabulary as it is at write time. Modeled here by a
+        folder carrying an id the vocabulary no longer contains.
+        """
+        _write_config("discord", "Discord")
+        key = "discord:kirocrew:direct:U1"
+        fid = asyncio.run(
+            channel_folders.ensure_channel_folder(dashboard_state, "discord", "Discord")
+        )
+        # The folder still references "deleted"; the vocabulary no longer has it.
+        dashboard_state._tags = [{"id": "t1", "name": "alpha", "color": "#123456"}]
+        dashboard_state._tags_authoritative = True
+        for f in dashboard_state._folders:
+            if f["id"] == fid:
+                f["tags"] = ["deleted", "t1"]
+        log = _FakeLog([key])
+        dashboard_state.conversation_log = log
+        dashboard_state.push_slots_update = lambda: None  # type: ignore[method-assign]
+
+        assert asyncio.run(channel_slots.reconcile_channel_slots(dashboard_state, 0)) == 1
+        slot = dashboard_state._slots[channel_slots.channel_slot_name(key)]
+        assert slot.tags == ["t1"]
+        assert log.get_metadata(key).get("tags") == ["t1"], (
+            "a deleted tag id was resurrected into the filing write"
+        )
+
+    def test_filing_validate_and_write_hold_the_tags_write_lock(
+        self, dashboard_state: Any
+    ) -> None:
+        """The vocabulary intersection and the filing write are ONE critical
+        section under ``tags_write_lock``, mirroring ``api_chat_slot_tags``: a
+        tag deletion committing between the intersection and the write would
+        resurrect the deleted id onto the filed chat, and the sticky filing
+        marker means no later pass ever re-validates it."""
+        from kiro_crew.dashboard.chat_tags import tags_write_lock
+
+        _write_config("discord", "Discord")
+        key = "discord:kirocrew:direct:U1"
+        fid = asyncio.run(
+            channel_folders.ensure_channel_folder(dashboard_state, "discord", "Discord")
+        )
+        dashboard_state._tags = [{"id": "t1", "name": "alpha", "color": "#123456"}]
+        dashboard_state._tags_authoritative = True
+        for f in dashboard_state._folders:
+            if f["id"] == fid:
+                f["tags"] = ["t1"]
+        log = _FakeLog([key])
+        held_at_write: list[bool] = []
+        orig = log.update_metadata_if
+
+        def _spy(*args: Any, **kwargs: Any) -> Any:
+            held_at_write.append(tags_write_lock(dashboard_state).locked())
+            return orig(*args, **kwargs)
+
+        log.update_metadata_if = _spy  # type: ignore[method-assign]
+        dashboard_state.conversation_log = log
+        dashboard_state.push_slots_update = lambda: None  # type: ignore[method-assign]
+
+        assert asyncio.run(channel_slots.reconcile_channel_slots(dashboard_state, 0)) == 1
+        assert held_at_write == [True], (
+            "the filing write ran outside tags_write_lock; a concurrent tag "
+            "deletion could resurrect a deleted id onto the filed chat"
         )
 
     def test_a_save_cannot_erase_a_marker_it_never_loaded(

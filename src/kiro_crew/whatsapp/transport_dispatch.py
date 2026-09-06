@@ -14,12 +14,14 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from kiro_crew.history import mint_row_mid
 from kiro_crew.messaging.approval import (
     TextReplyApprovalDecider,
     deliver_verdict,
     parse_approval_reply,
     pending_for,
 )
+from kiro_crew.messaging.commands import compact_unsupported_backend
 from kiro_crew.messaging.conversation import ConversationState
 from kiro_crew.messaging.dispatch import (
     ChannelTurn,
@@ -31,6 +33,7 @@ from kiro_crew.messaging.driver import APPROVAL_INTERACTIVE
 from kiro_crew.messaging.link import build_dm_session_key, seed_generation
 from kiro_crew.messaging.transport import InboundMessage
 from kiro_crew.whatsapp.commands import (
+    COMPACT_AUTO_MANAGED_TEXT,
     COMPACT_AUTO_TEXT,
     COMPACT_BUSY_TEXT,
     COMPACT_FAILED_TEXT,
@@ -242,6 +245,15 @@ class WhatsAppDispatcher:
             provider = self.sessions.get_provider(session_key)
             if provider is None:
                 await self._say(scope, COMPACT_NOTHING_TEXT)
+                return
+            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # backend that cannot serve a manual /compact treats the prompt as
+            # ordinary text and never answers, so dispatching would strand the
+            # unbounded wait below. Informational, never an error.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                logger.debug("whatsapp: manual /compact declined — %s compacts itself", unsupported)
+                await self._say(scope, COMPACT_AUTO_MANAGED_TEXT)
                 return
             await provider.compact()
             await provider.wait_for_compaction()
@@ -470,6 +482,17 @@ class WhatsAppDispatcher:
         pct = self.sessions.check_context_usage(session_key, provider)
         may_speak = not unprompted and not delivery_is_muted(self.sessions, session_key, "whatsapp")
         wa = self.cfg.whatsapp
+        if pct >= wa.soft_threshold_pct:
+            # Capability gate (#8156): no forced compaction to run and the
+            # soft nudge's /compact advice cannot work — the backend compacts
+            # on its own as context fills.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                logger.debug(
+                    "whatsapp: context notice skipped — %s compacts itself",
+                    unsupported,
+                )
+                return
         if pct >= wa.hard_threshold_pct:
             self._conv.clear_awaiting(scope)
             try:
@@ -494,9 +517,9 @@ class WhatsAppDispatcher:
         """Record the turn to conversation_log (dashboard visibility + restart)."""
         if self.conv_log is None:
             return
-        self.conv_log.append(session_key, "user", user_text)
+        self.conv_log.append(session_key, "user", user_text, mid=mint_row_mid())
         if reply_text:
-            self.conv_log.append(session_key, "assistant", reply_text)
+            self.conv_log.append(session_key, "assistant", reply_text, mid=mint_row_mid())
         if is_new:
             title = (user_text or "").strip().replace("\n", " ")[:40] or "WhatsApp"
             self.conv_log.set_title(session_key, title)

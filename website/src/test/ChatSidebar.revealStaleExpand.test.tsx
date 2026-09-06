@@ -138,7 +138,7 @@ describe('reveal-in-sidebar pre-expands the stale-session section', () => {
     await withScrollStub(async () => {
       const utils = renderSidebar([
         slot('fresh', 'fresh session', 2),
-        slot('dormant', 'dormant session', 5 * 24),
+        slot('dormant', 'dormant session', 10 * 24),
       ], { activeSlot: 'fresh' })
       // Precondition: the target really is collapsed before the reveal.
       await waitFor(() => expect(utils.getByTestId('stale-expander-root')).toBeInTheDocument())
@@ -155,8 +155,8 @@ describe('reveal-in-sidebar pre-expands the stale-session section', () => {
       const folders = [{ id: 'f1', name: 'Work', order: 0, collapsed: false }]
       const utils = renderSidebar([
         slot('fresh', 'fresh session', 2),
-        slot('in-dormant', 'foldered dormant', 5 * 24, { folder_id: 'f1' }),
-        slot('root-dormant', 'root dormant', 5 * 24),
+        slot('in-dormant', 'foldered dormant', 10 * 24, { folder_id: 'f1' }),
+        slot('root-dormant', 'root dormant', 10 * 24),
       ], { folders, activeSlot: 'fresh' })
       await waitFor(() => expect(utils.getByTestId('stale-expander-f1')).toBeInTheDocument())
       expect(utils.queryByText('foldered dormant')).toBeNull()
@@ -173,7 +173,7 @@ describe('reveal-in-sidebar pre-expands the stale-session section', () => {
     await withScrollStub(async () => {
       const utils = renderSidebar([
         slot('fresh', 'fresh session', 2),
-        slot('dormant', 'dormant session', 5 * 24),
+        slot('dormant', 'dormant session', 10 * 24),
       ], { activeSlot: 'fresh' })
       await waitFor(() => expect(utils.getByTestId('stale-expander-root')).toBeInTheDocument())
 

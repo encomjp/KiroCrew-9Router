@@ -121,9 +121,67 @@ Concretely:
 - **The dashboard's own store stays unmarked entirely.** The store is ours by
   definition; the marker only ever appears in files we do not own.
 - **The emitted agent spec is stripped of the marker.** kiro-cli never sees it;
-  the spec is rendered output, not an owned file.
+  the spec is rendered output, not an owned file. (It does carry a separate
+  field-provenance key — see the next section — because that spec is also read
+  back as an input.)
 - **Connections sync is the only writer that stamps**, and only for names the
   store manages.
+
+## Field provenance in the rendered spec (a second, separate key)
+
+The section above is about ENTRY authorship in files we do not own. There is a
+second question, in the one file this note calls pure output: **which FIELDS of a
+rendered entry did the rebuild compute?**
+
+`rebuild_agent_config` reads its own previous output back as a merge source, so
+that a field the user set and Kiro Crew never models survives a rebuild. One field
+in that output is not the user's — the resolved absolute `command`. Reading a
+computed value back as if it were authored is what makes it permanent:
+`_resolve_command` accepts an absolute existing executable without a PATH search,
+so no later change to how commands resolve can rebind one that was stored once
+(#4955).
+
+    "x-kirocrew-derived": { "from": "npx", "emitted": "/abs/npx" }
+
+Both halves are load-bearing. `from` is what the next rebuild re-derives from, which
+is also why the source stays IN the file: a server whose only persisted home is the
+agent spec would otherwise lose the field entirely. `emitted` is the ownership proof
+— a field is restored only while it still holds exactly what we wrote, so a hand
+edit is left alone. That is this note's reclamation rule at field granularity, and
+it must hold across REPEATED rebuilds: recording a value we merely passed through
+would make our own record read as proof on the next pass, which is how an unearned
+claim becomes an overwrite.
+
+Deliberately a second key rather than a field inside `x-kirocrew`. The two records
+answer different questions about different files, and the marker's invariant is
+that it appears only in files we do not own — folding this in would put the marker
+into the very file that exclusion is about, and expose it to `without_marker`,
+which the shared-entry copy path applies. Both keys rely on the same `x-`
+namespace argument.
+
+### Scope: only a server with no other home
+
+The record applies **only to a server no other config source declares**. For a
+scope-owned server the record and the live declaration can disagree, and choosing
+between them correctly means selecting a per-field source AFTER resolution — the
+merge picks a winner by which command resolves, then adopts that winner's
+`args`/`env` as a unit. Any pre-resolution guess is wrong in one of two directions:
+scanning per field mixes sources, and taking the first owning scope picks a source
+the merge would not have chosen. That is a merge-precedence question, not a
+provenance one, and it belongs with the ownership work in #6171.
+
+The ownership test is deliberately conservative and compares by ALIAS, not raw key:
+a scope keys entries by its own raw name while the config's slash-containing keys
+were rewritten to aliases, so a raw-key probe would miss the owner of an aliased
+entry and wrongly read it as having no other home. Over-matching only declines to
+apply the record, which is today's behaviour; under-matching would let the record
+shadow a live declaration.
+
+`env.PATH` is the rebuild's other computed field and needs no record here. For a
+server with no other home the declaration IS the stored value, so narrowing it is
+an edit the ownership guard reads as the user's, and the next emit expands what
+they wrote. `env.PATH` becomes irrevocable only when the declaration lives in a
+different file from the expansion — the scope-owned case above.
 
 ## What this is not
 

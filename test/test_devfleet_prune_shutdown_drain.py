@@ -37,22 +37,23 @@ import asyncio
 import pytest
 
 import kiro_crew.apps.builtins.dev_fleet.server as mod
+from kiro_crew.apps.builtins.dev_fleet import live, repository, runtime, worktree_ops
 
 
 @pytest.fixture(autouse=True)
 def _reset_module_state(monkeypatch):
     """Isolate each test from shared module state."""
-    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {})
-    monkeypatch.setattr(mod, "_SHUTDOWN_IN_PROGRESS", False)
-    monkeypatch.setattr(mod, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
-    monkeypatch.setattr(mod, "_PRUNE_LOCK", asyncio.Lock())
+    monkeypatch.setattr(runtime, "_ACTIVE_RUNS", {})
+    monkeypatch.setattr(runtime, "_SHUTDOWN_IN_PROGRESS", False)
+    monkeypatch.setattr(runtime, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
+    monkeypatch.setattr(worktree_ops, "_PRUNE_LOCK", asyncio.Lock())
     # ``raising=False`` so this suite still SETS UP against the pre-fix module
     # that lacks ``_prune_task`` -- the failure must land in the test body
     # (worker survives cleanup), not the fixture, so the regression is provable
     # by reverting the production hunk alone.
-    monkeypatch.setattr(mod, "_prune_task", None, raising=False)
+    monkeypatch.setattr(worktree_ops, "_prune_task", None, raising=False)
     monkeypatch.setattr(
-        mod,
+        worktree_ops,
         "_PRUNE_STATE",
         {
             "running": False,
@@ -63,9 +64,9 @@ def _reset_module_state(monkeypatch):
             "items": {},
         },
     )
-    monkeypatch.setattr(mod, "_refresher_task", None)
-    monkeypatch.setattr(mod, "_warm_task", None)
-    monkeypatch.setattr(mod, "_reaper_task", None)
+    monkeypatch.setattr(worktree_ops, "_refresher_task", None)
+    monkeypatch.setattr(worktree_ops, "_warm_task", None)
+    monkeypatch.setattr(worktree_ops, "_reaper_task", None)
     yield
 
 
@@ -88,11 +89,11 @@ async def _start_prune(monkeypatch, *, remove_impl):
         entered.set()
         return await remove_impl()
 
-    monkeypatch.setattr(mod, "_find_worktree", fake_find)
-    monkeypatch.setattr(mod, "_worktree_remove", fake_remove)
+    monkeypatch.setattr(repository, "_find_worktree", fake_find)
+    monkeypatch.setattr(worktree_ops, "_worktree_remove", fake_remove)
 
     # Force the item so no gh verdict is required (keeps the test hermetic).
-    res = await mod._prune_run([], force_names={"wt-x"})
+    res = await worktree_ops._prune_run([], force_names={"wt-x"})
     assert res["ok"] is True
     await asyncio.wait_for(entered.wait(), timeout=5.0)
     return entered
@@ -109,11 +110,11 @@ async def test_worker_is_retained(monkeypatch):
 
     await _start_prune(monkeypatch, remove_impl=blocking)
     try:
-        assert mod._prune_task is not None
-        assert not mod._prune_task.done()
+        assert worktree_ops._prune_task is not None
+        assert not worktree_ops._prune_task.done()
     finally:
         gate.set()
-        await asyncio.wait_for(mod._prune_task, timeout=5.0)
+        await asyncio.wait_for(worktree_ops._prune_task, timeout=5.0)
 
 
 @pytest.mark.asyncio
@@ -126,14 +127,14 @@ async def test_cleanup_drains_prune_worker_and_clears_handle(monkeypatch):
         return {"ok": True}
 
     await _start_prune(monkeypatch, remove_impl=blocking)
-    prune_task = mod._prune_task
+    prune_task = worktree_ops._prune_task
     assert prune_task is not None
 
     app = object()  # dev_fleet_cleanup only reads the arg, never touches it
     await asyncio.wait_for(mod.dev_fleet_cleanup(app), timeout=5.0)
 
     assert prune_task.done()
-    assert mod._prune_task is None, "the handle must be cleared after the drain"
+    assert worktree_ops._prune_task is None, "the handle must be cleared after the drain"
 
 
 @pytest.mark.asyncio
@@ -159,7 +160,7 @@ async def test_run_uninterruptible_drains_before_reraising(monkeypatch):
 
     async def caller() -> None:
         try:
-            await mod._run_uninterruptible(inner())
+            await runtime._run_uninterruptible(inner())
         except asyncio.CancelledError:
             reraised["value"] = True
             raise
@@ -196,8 +197,8 @@ async def test_cleanup_stays_pending_and_holds_lock_until_mutation_releases(monk
     returns.
     """
     # Fresh lock instance for this test so we can probe contention.
-    monkeypatch.setattr(mod, "_GIT_MUTATION_LOCK", asyncio.Lock())
-    monkeypatch.setattr(mod, "_MAKE_LIVE_LOCK", asyncio.Lock())
+    monkeypatch.setattr(worktree_ops, "_GIT_MUTATION_LOCK", asyncio.Lock())
+    monkeypatch.setattr(live, "_MAKE_LIVE_LOCK", asyncio.Lock())
 
     mutation_started = asyncio.Event()
     release_mutation = asyncio.Event()
@@ -221,17 +222,17 @@ async def test_cleanup_stays_pending_and_holds_lock_until_mutation_releases(monk
         # note on the fake in _start_prune).
         # Mirror the production shape: hold _GIT_MUTATION_LOCK across the
         # uninterruptible destructive mutation.
-        async with mod._GIT_MUTATION_LOCK:
-            await mod._run_uninterruptible(
+        async with worktree_ops._GIT_MUTATION_LOCK:
+            await runtime._run_uninterruptible(
                 fake_run_cmd(["git", "-C", "/repo", "worktree", "remove", "/wt/wt-x"])
             )
         return {"ok": True}
 
-    monkeypatch.setattr(mod, "_run_cmd", fake_run_cmd)
-    monkeypatch.setattr(mod, "_find_worktree", fake_find)
-    monkeypatch.setattr(mod, "_worktree_remove", fake_remove)
+    monkeypatch.setattr(runtime, "_run_cmd", fake_run_cmd)
+    monkeypatch.setattr(repository, "_find_worktree", fake_find)
+    monkeypatch.setattr(worktree_ops, "_worktree_remove", fake_remove)
 
-    res = await mod._prune_run([], force_names={"wt-x"})
+    res = await worktree_ops._prune_run([], force_names={"wt-x"})
     assert res["ok"] is True
     await asyncio.wait_for(mutation_started.wait(), timeout=5.0)
 
@@ -246,15 +247,15 @@ async def test_cleanup_stays_pending_and_holds_lock_until_mutation_releases(monk
     assert cleanup not in done, "cleanup must stay pending until removal releases"
     assert not mutation_returned["value"]
     # (2) The git-mutation lock must still be held -- a competitor cannot take it.
-    assert mod._GIT_MUTATION_LOCK.locked(), "lock must not be released early"
+    assert worktree_ops._GIT_MUTATION_LOCK.locked(), "lock must not be released early"
 
     # Release the destructive mutation: now cleanup can complete.
     release_mutation.set()
     await asyncio.wait_for(cleanup, timeout=5.0)
 
     assert mutation_returned["value"], "the mutation must run to completion"
-    assert not mod._GIT_MUTATION_LOCK.locked(), "lock released after the drain"
-    assert mod._prune_task is None
+    assert not worktree_ops._GIT_MUTATION_LOCK.locked(), "lock released after the drain"
+    assert worktree_ops._prune_task is None
 
 
 @pytest.mark.asyncio

@@ -80,6 +80,19 @@ def _read_cursor() -> set[str]:
     A corrupt or missing cursor must degrade to "re-check everything" rather than
     "assume nothing needs importing" — the second would silently leave the index
     permanently stale.
+
+    Deliberately lenient even though this read feeds a write. Elsewhere in the
+    tree a lenient read that becomes the base of a whole-file rewrite is a
+    data-loss bug (see ``aws_control/backend/backup._read_state_for_update`` and
+    its precedents), because the rewrite publishes the empty base over state it
+    never read. Here the write is a UNION — ``_write_cursor(cursor | newly)`` —
+    so an empty base drops previously recorded ids from the cursor while
+    deleting nothing the cursor points at: the next import re-checks the
+    dropped ids and the store's case-insensitive 80-char-prefix dedupe
+    (:meth:`write_episodic`'s text-hash check, strictly broader than exact
+    equality) absorbs the repeats. Self-healing re-check is exactly the fault
+    behaviour the paragraph above asks for, so leniency is correct here and a
+    strict-for-update split would add failure modes without protecting anything.
     """
     try:
         raw = json.loads(_cursor_path().read_text(encoding="utf-8"))
@@ -164,7 +177,7 @@ def import_pending(store: Any, *, limit: int = MAX_PER_IMPORT) -> dict[str, int]
         if wrote:
             result["written"] += 1
         else:
-            # Already present (the store's own exact-text check) — cursor it so the
+            # Already present (the store's own prefix-dedup check) — cursor it so the
             # next import does not pay for the round trip again.
             result["skipped"] += 1
 
@@ -173,6 +186,15 @@ def import_pending(store: Any, *, limit: int = MAX_PER_IMPORT) -> dict[str, int]
 
     if result["written"]:
         try:
+            # PACED, even though a caller blocks on this: the only caller is the
+            # ledger-hygiene CRON (`routes.py:_handle_ledger_hygiene`, "Called by
+            # the ledger-hygiene cron"; no UI path reaches it). A cron holds the
+            # response open but nobody attends it, and the PR's rule is
+            # attendance, not blocking. Left unpaced this was a side door around
+            # the whole fix: the sweep is whole-corpus, so a post-migration
+            # backlog would be re-embedded flat out — at the full interactive
+            # thread count, since `pace=False` also selects the thread class — on
+            # the next daily tick.
             result["embedded"] = int(store.backfill_missing_embeddings() or 0)
         except Exception:  # noqa: BLE001 — rows stay keyword-searchable if this fails
             logger.exception("ops-mission-control: embedding backfill failed")

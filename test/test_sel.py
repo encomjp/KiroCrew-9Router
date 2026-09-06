@@ -2417,6 +2417,106 @@ class TestHmacKeyTrustDirMigration:
         self._reset()
 
 
+class TestTrustRootPathReResolution:
+    """``sel_hmac_key_path()`` re-resolves per call (#2588).
+
+    ``_hmac_key_file`` is decided once at init, and a failed legacy migration
+    leaves it on the legacy location; a sibling process that later completes the
+    migration deletes the file this process still names. The accessor follows the
+    key instead of every dependent protocol growing its own recovery — but only
+    to a file whose bytes are the anchor this process already validated, and
+    never by moving what the audit chain signs with.
+    """
+
+    def _reset(self) -> None:
+        SecurityEventLog._instance = None
+        SecurityEventLog._initialized = False
+
+    def test_resolved_path_is_returned_while_it_loads(self, tmp_path: Path) -> None:
+        SecurityEventLog(base_dir=tmp_path, sync=True)
+        assert sel_mod.sel_hmac_key_path() == tmp_path / "trust" / "sel_hmac.key"
+
+    def test_relocation_to_the_trust_dir_is_followed(self, tmp_path: Path) -> None:
+        """The #2539 shape: this process kept the legacy path after a failed
+        migration, then a sibling process completed it."""
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        canonical = tmp_path / "trust" / "sel_hmac.key"
+        # Pin the instance to the legacy location the way a failed migration does.
+        log._hmac_key_file = tmp_path / "sel_hmac.key"
+        assert not (tmp_path / "sel_hmac.key").exists()
+
+        assert sel_mod.sel_hmac_key_path() == canonical
+
+    def test_relocation_to_the_legacy_location_is_followed(self, tmp_path: Path) -> None:
+        SecurityEventLog(base_dir=tmp_path, sync=True)
+        legacy = tmp_path / "sel_hmac.key"
+        os.replace(tmp_path / "trust" / "sel_hmac.key", legacy)
+
+        assert sel_mod.sel_hmac_key_path() == legacy
+
+    def test_a_candidate_with_other_bytes_is_not_adopted(self, tmp_path: Path) -> None:
+        """The no-downgrade property. The resolved path vanishing is exactly when
+        an actor who can write the trust dir would plant a key of their own;
+        handing a dependent protocol that path hands it signing material."""
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        canonical = tmp_path / "trust" / "sel_hmac.key"
+        planted = b"p" * 32
+        assert log._hmac_key != planted
+        canonical.write_bytes(planted)
+        log._hmac_key_file = tmp_path / "sel_hmac.key"
+
+        # Unchanged, so the operator report still names the file that broke and
+        # session_pid_sig recovers from the validated in-memory copy instead.
+        assert sel_mod.sel_hmac_key_path() == tmp_path / "sel_hmac.key"
+
+    def test_a_short_candidate_is_not_adopted(self, tmp_path: Path) -> None:
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        (tmp_path / "trust" / "sel_hmac.key").write_bytes(b"short")
+        log._hmac_key_file = tmp_path / "sel_hmac.key"
+
+        assert sel_mod.sel_hmac_key_path() == tmp_path / "sel_hmac.key"
+
+    def test_re_resolution_never_moves_what_the_chain_signs_with(self, tmp_path: Path) -> None:
+        """The reason item 1 of #2588 was deferred does not apply: the accessor
+        returns a PATH the signing and verification code never reads, so a
+        relocation cannot orphan records already chained."""
+        log = SecurityEventLog(base_dir=tmp_path, sync=True)
+        log.log_tool_invocation(
+            session_key="s1", tool_name="t1", tool_kind="tool", outcome="ok"
+        )
+        anchor = log._hmac_key
+        legacy = tmp_path / "sel_hmac.key"
+        os.replace(tmp_path / "trust" / "sel_hmac.key", legacy)
+
+        assert sel_mod.sel_hmac_key_path() == legacy
+        assert log._hmac_key == anchor
+        log.log_tool_invocation(
+            session_key="s2", tool_name="t2", tool_kind="tool", outcome="ok"
+        )
+        total, valid = log.verify_integrity()
+        assert (total, valid) == (2, 2)
+
+    def test_no_singleton_resolves_the_trust_default(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setattr(sel_mod, "_default_dir", lambda: tmp_path)
+        assert SecurityEventLog._instance is None
+
+        assert sel_mod.sel_hmac_key_path() == tmp_path / "trust" / "sel_hmac.key"
+
+    def test_key_loads_predicate_rejects_a_directory(self, tmp_path: Path) -> None:
+        d = tmp_path / "sel_hmac.key"
+        d.mkdir()
+        assert sel_mod._trust_root_key_loads(d) is False
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO semantics")
+    def test_key_loads_predicate_rejects_a_fifo(self, tmp_path: Path) -> None:
+        """Asserted on the predicate rather than through the accessor on purpose:
+        without the ``S_ISREG`` guard the failure mode is an unbounded in-kernel
+        block on open, which would hang CI instead of failing it."""
+        fifo = tmp_path / "sel_hmac.key"
+        os.mkfifo(fifo)
+        assert sel_mod._trust_root_key_loads(fifo) is False
+
+
 class TestSizeRotation:
     """The log is closed at a size cap and retained as N segments (issue #4843).
 

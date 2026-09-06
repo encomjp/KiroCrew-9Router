@@ -36,6 +36,23 @@ def _recipe(tmp_path: Path, **kw) -> pr.GitHubPRRecipe:
     )
 
 
+def test_push_refuses_before_git_when_repository_safety_changed(tmp_path: Path) -> None:
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "init", "-q", str(clone)], check=True)
+    subprocess.run(
+        ["git", "-C", str(clone), "config", "diff.external", "/attacker/host-code"],
+        check=True,
+    )
+    recipe = _recipe(tmp_path)
+    recipe._git = MagicMock()  # type: ignore[method-assign]
+
+    ok, note = recipe._push_fix_branch(branch="auto-improvement/bug-abc")
+
+    assert ok is False
+    assert "isolation changed" in note
+    recipe._git.assert_not_called()
+
+
 def _simulate_legacy_locale(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make omitted ``Path.write_text`` encodings deterministic on every host."""
     original = Path.write_text
@@ -122,6 +139,39 @@ class TestQueueEncoding:
         )
         assert (recipe.queue_dir / "stub.diff").read_text(encoding="utf-8") == self._diff
         assert self._description in (recipe.queue_dir / "stub.pr.md").read_text(encoding="utf-8")
+
+
+class TestReproduceRepositorySafety:
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_retirement_precedes_reproduce_verdict_or_error(self, raises: bool) -> None:
+        ledger = MagicMock()
+        ledger.status_of.return_value = None
+        measurer = MagicMock()
+        if raises:
+            measurer.reproduce.side_effect = RuntimeError("gate failed")
+        else:
+            measurer.reproduce.return_value = MagicMock()
+        retire = MagicMock(return_value=True)
+        pipeline = CrPipeline(
+            ledger=ledger,
+            measurer=measurer,
+            retire_if_unsafe=retire,
+        )
+        winner = SimpleNamespace(candidate=SimpleNamespace(kind="perf", target="parser"))
+
+        outcome = pipeline.emit_perf(
+            profile=MagicMock(),
+            winner=winner,  # type: ignore[arg-type]
+            verify=MagicMock(),
+            cycle=1,
+            gated_commit_sha="abc",
+            diff_ref="diff",
+            base_anchor="main @ abc",
+        )
+
+        assert outcome.repository_retired is True
+        assert outcome.filed is False and outcome.committed_ready is False
+        retire.assert_called_once_with("reproduce")
 
 
 class TestProtocolConformance:
@@ -480,6 +530,8 @@ class TestEveryPushPathScansContent:
         ):
             src = (root / rel).read_text(encoding="utf-8")
             assert "scan_content_for_secrets" in src, f"{rel} does not scan pushed content"
+            assert "--no-ext-diff" in src, f"{rel} permits external diff execution"
+            assert "diff.external=" in src, f"{rel} does not clear the external diff helper"
             # No path may re-import the raw scanners and hand-roll the decision.
             assert "redact_credentials" not in src, f"{rel} should delegate, not re-implement"
 

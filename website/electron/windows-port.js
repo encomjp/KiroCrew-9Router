@@ -33,6 +33,7 @@ function windowsSystemToolPaths(
     ),
     wmic: path.win32.join(system32, "wbem", "wmic.exe"),
     taskkill: path.win32.join(system32, "taskkill.exe"),
+    wsl: path.win32.join(system32, "wsl.exe"),
   });
 }
 

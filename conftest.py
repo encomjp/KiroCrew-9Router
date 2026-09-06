@@ -13,7 +13,7 @@ test collected from any testpath, because what they protect is the
 developer's machine rather than the correctness of one suite. Everything that is
 merely suite-specific isolation stays in ``test/conftest.py``.
 
-The floor has seven parts, and each one exists because the "remember to isolate
+The floor has eight parts, and each one exists because the "remember to isolate
 this" contract failed at least once:
 
 * **Services.** ``$XDG_CONFIG_HOME`` is redirected and the stdlib spawn funnels
@@ -29,6 +29,14 @@ this" contract failed at least once:
   ``JIRA_TOKEN_<HEX>`` keys are restored after every test, so a fabricated
   ``.env`` cannot silently override the next test's credentials in the same
   worker.
+* **The inherited shell environment.** The entries ``name_grant`` refuses as
+  inherited preloads are removed for each test's duration and restored
+  afterwards: the ``_ENV_PRELOAD_VARS`` names (``BASH_ENV``, ``ENV``, ...) and
+  exported bash functions (``BASH_FUNC_*`` keys, or the legacy bare-name
+  spelling whose value starts with ``() {``). RHEL-family hosts export ``which``
+  as a function from ``/etc/profile.d/which2.sh``, and that refusal is checked
+  before every narrower code, so 79 of 163 name-grant tests observed the wrong
+  refusal on those hosts while Ubuntu CI stayed green (issue #8395).
 * **The agent-spec home.** ``kiro_agents_dir()`` is a LAZY resolver, so neither of
   the two above reaches it, and a test that reaches the spec write path rewrites
   the machine-wide ``<kiro home>/agents/kirocrew.json`` -- the file that decides
@@ -470,11 +478,80 @@ def _isolate_sandbox_mount_source_roots(_sandbox_mount_source_root, monkeypatch)
     # ``_mount_pinned_source_names`` itself; ``TestMountPinnedSourceNames``
     # imports the function by name at module import, so the parser's own unit
     # tests are unaffected by this module-attribute patch.
+    _SANDBOX_SWEEP_ORIGINALS.setdefault(
+        "_mount_pinned_source_names", sandbox_mod._mount_pinned_source_names
+    )
     monkeypatch.setattr(
         sandbox_mod,
         "_mount_pinned_source_names",
-        lambda proc_root="/proc": (set(), False),
+        lambda proc_root="/proc", **_kw: (set(), False),
     )
+    # Third half, same floor, for the LEGACY (pre-prefix ``tmp*``) sweep. It
+    # resolves its own narrower root chain -- the launcher's two tmpfs roots,
+    # deliberately excluding the redirected system tempdir -- so without this it
+    # would scan the developer's real /run/user/$UID and /dev/shm, and there it
+    # matches names no Kiro Crew build has created since #6268: an unpinned test
+    # could delete a stranger's temp entry on the host. The bind scan is
+    # defaulted fail-closed for the same reason as the pin scan above: a test
+    # that forgets to fix its answer gets an INERT sweep (coverage unproven ->
+    # removes nothing, stamps nothing) rather than one reading host /proc.
+    _SANDBOX_SWEEP_ORIGINALS.setdefault("_launcher_tmpfs_roots", sandbox_mod._launcher_tmpfs_roots)
+    monkeypatch.setattr(
+        sandbox_mod,
+        "_launcher_tmpfs_roots",
+        lambda: [str(_sandbox_mount_source_root)],
+    )
+    _SANDBOX_SWEEP_ORIGINALS.setdefault(
+        "_bound_source_basenames", sandbox_mod._bound_source_basenames
+    )
+
+    def _unproven_bound_sources(proc_root="/proc", *, coverage=None, **_kw):
+        # Fail closed on BOTH claims the legacy gate accepts, so no test can
+        # reach the developer's real runtime tmpfs through it.
+        if coverage is not None:
+            coverage.covered = False
+        return (set(), False)
+
+    monkeypatch.setattr(sandbox_mod, "_bound_source_basenames", _unproven_bound_sources)
+
+
+@pytest.fixture(autouse=True)
+def _pin_kill_and_reap_group_probe(monkeypatch):
+    """Stop ``kill_and_reap``'s group-kill skip from reading host process state.
+
+    ``platform_compat.kill_and_reap()`` skips the process-GROUP kill when the
+    child shares the gateway's own group (spawned without
+    ``start_new_session``, so it leads no tree of its own). That decision is a
+    live ``os.getpgid()`` probe -- and almost every test of this path hands it a
+    SYNTHETIC pid (4242 is the shared convention) with the tree kill mocked. The
+    probe then resolves that fake pid against the runner's REAL process table:
+    when some genuine process happens to own it AND sits in the pytest run's own
+    process group, the skip fires, no tree kill is recorded, and the assertion
+    fails. Under xdist the runner spawns plenty of low-pid children in exactly
+    that group, which is why this flaked in batches -- four tests across three
+    files in one run -- and passed on re-run.
+
+    The pin is the child-leads-its-own-group answer, i.e. tree kill attempted,
+    which is what every one of those tests is written to assert. It is safe as a
+    floor because the skip is an optimisation, not a safety guard: it exists so
+    a routine timeout does not trip :func:`kill_process_tree`'s broadcast
+    refusal on every same-group child. That refusal is the actual protection and
+    is untouched here, so even a real same-group child reached through this
+    fixture is refused a group signal and falls through to the pid-scoped kill.
+    Pinning the shared ``_OWN_PGID`` instead WOULD disarm that refusal, which is
+    why the seam is this one function.
+
+    A test that wants the skip patches ``_shares_own_process_group`` itself -- a
+    later patch wins and reverts independently (see
+    ``TestKillAndReap::test_skips_the_group_kill_for_a_same_group_child``).
+    Tolerant of a partial checkout, and STRICT on the attribute: a silent miss
+    on a rename would quietly restore the flake this exists to remove.
+    """
+    try:
+        platform_compat = importlib.import_module("kiro_crew.platform_compat")
+    except Exception:  # pragma: no cover - a partial checkout must not break collection
+        return
+    monkeypatch.setattr(platform_compat, "_shares_own_process_group", lambda _pid: False)
 
 
 @pytest.fixture(autouse=True)
@@ -520,6 +597,82 @@ def _no_credential_env_residue():
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = before[key]
+
+
+@pytest.fixture(autouse=True)
+def _scrub_inherited_preload_env(monkeypatch):
+    """Hide the entries ``name_grant`` refuses as inherited preloads, then restore them.
+
+    RHEL-family distributions (Amazon Linux 2023, RHEL, CentOS Stream, Fedora) ship
+    ``/etc/profile.d/which2.sh``, which exports ``which`` as a shell function -- so
+    ``BASH_FUNC_which%%`` sits in ``os.environ`` of any login shell before pytest even
+    starts. ``name_grant._inherited_preload()`` fires its AMBIGUOUS_ENV refusal on
+    exactly that shape, and that refusal is checked before every narrower code, so on
+    such a host 79 of the 163 tests in ``test/test_name_grant.py`` observed
+    ``inherited_env_can_redefine_programs`` instead of the code they assert, while
+    Ubuntu CI (no ``which2.sh``) stayed green (issue #8395). The detector's OTHER half
+    is host state just as easily: a login profile exporting ``BASH_ENV``, or a
+    container image setting ``ENV``, reproduces the same failure shape with no
+    ``which2.sh`` anywhere. The PRODUCT behaviour is correct -- an inherited preload
+    genuinely can redefine a program the agent runs -- the gap was that this floor
+    pins the data home, the credential env and the temp base, but not the environment
+    the run inherited.
+
+    The predicate is IMPORTED from ``name_grant`` rather than restated, so the scrub
+    and the detector cannot drift apart, and it mirrors BOTH halves the detector
+    checks: the ``_ENV_PRELOAD_VARS`` names (matched truthy, exactly as the detector's
+    ``os.environ.get(var)`` reads them -- an empty value triggers no refusal and is
+    left alone), and the exported-function pair (the ``BASH_FUNC_`` key prefix, plus
+    the legacy bare-name spelling whose value starts with ``() {``). It is also
+    deliberately no WIDER than that predicate: this is not a general "no exported
+    functions" floor -- how wide the detector should be is ``name_grant``'s design
+    question, and the scrub merely mirrors its answer. The import is deliberately
+    UNGUARDED, like ``_no_credential_env_residue``'s: an ImportError escape hatch
+    would disarm the scrub silently on a broken checkout and hand back the exact
+    79-failure pattern this fixture exists to remove, as a wall of wrong refusal
+    codes instead of one clear error.
+
+    The removals are recorded on the test's shared ``monkeypatch`` instance rather
+    than hand-rolled, and that is load-bearing, not convenience. Same-scope autouse
+    fixtures are ordered so that OTHER monkeypatch users run first (alphabetically in
+    practice), so a hand-rolled save/restore here tears down BEFORE monkeypatch's
+    undo -- and for a test that ``monkeypatch.setenv``-overrides the SAME key the
+    host inherited (recorded "was absent", because this scrub had removed it), the
+    undo then deletes the inherited value the hand-rolled restore had just put back,
+    leaking the removal out of the test. On one shared undo stack the nesting is
+    correct BY CONSTRUCTION: the test's later record is undone first (its delete
+    tolerates the key already being gone), then this fixture's ``delenv`` record
+    restores the inherited value. ``test_name_grant.py::TestInheritedHostEnvironment``
+    pins exactly that same-key case, and
+    ``test_host_isolation_floor.py::TestInheritedShellEnvironmentIsScrubbed`` drives
+    one real cycle of this fixture directly.
+
+    The deliberate AMBIGUOUS_ENV tests lose nothing: they construct their entries
+    inside the test body, after the scrub. The teardown sweep below is the
+    ``_no_credential_env_residue`` half of the contract: a matching entry still
+    present at teardown is either a raw ``os.environ`` write (no undo record --
+    swept here, stays gone) or a monkeypatch-managed one (its undo re-deletes
+    tolerantly or restores what it recorded), so nothing this fixture scrubbed and
+    nothing a test leaked survives past the test on this worker.
+    """
+    from kiro_crew.name_grant import (
+        _BASH_FUNC_KEY_PREFIX,
+        _BASH_FUNC_VALUE_PREFIX,
+        _ENV_PRELOAD_VARS,
+    )
+
+    def _is_inherited_preload(key: str, value: str) -> bool:
+        if key in _ENV_PRELOAD_VARS:
+            return bool(value)
+        return key.startswith(_BASH_FUNC_KEY_PREFIX) or value.startswith(_BASH_FUNC_VALUE_PREFIX)
+
+    for key in [k for k, v in os.environ.items() if _is_inherited_preload(k, v)]:
+        monkeypatch.delenv(key)
+    try:
+        yield
+    finally:
+        for key in [k for k, v in os.environ.items() if _is_inherited_preload(k, v)]:
+            os.environ.pop(key, None)
 
 
 @pytest.fixture(autouse=True)
@@ -1042,6 +1195,79 @@ def _restore_log_record_factory():
     yield
     if logging.getLogRecordFactory() is not before:
         logging.setLogRecordFactory(before)
+
+
+# ── the CLI log queue listener goes back after every test ────────────
+
+
+@pytest.fixture(autouse=True)
+def _restore_log_queue_listener():
+    """Stop the ``QueueListener`` a test leaves running, so no later test inherits it.
+
+    ``cli._LOG_QUEUE_LISTENER`` is ONE process-global slot, per worker, and the sibling of
+    the record factory above: ``_setup_cli_logging`` installs BOTH in the same
+    ``command in _LONG_LIVED_COMMANDS`` branch, so every test that drives the real
+    ``cli.main()`` for ``serve`` / ``gateway`` / ``chat`` leaks both. The factory half has
+    been floored since it was found; this half was not, and it is the one the SHORT-LIVED
+    branch then trips over. ``_setup_cli_logging("status", ...)`` takes the ``else`` path,
+    which correctly never touches the global -- the listener a long-lived command started
+    genuinely still exists -- so a test asserting "a short-lived verb starts no listener"
+    reads the PREVIOUS test's listener and fails at its own first line.
+
+    Measured: two tests in ``test_cli_logging.py`` assert that global is ``None`` after a
+    short-lived setup -- ``TestDrainBeforeHardExit::test_no_listener_is_a_silent_no_op``
+    and ``TestQueueOffLoop::test_short_lived_command_keeps_sync_handler`` -- and both go
+    red whenever ``test_cli.py`` or ``test_cpp_seam_failclosed.py`` precede them on the
+    worker, reading ``assert <QueueListener object ...> is None``. That file's own
+    ``_pristine_logging`` cannot absorb it: it clears the global in TEARDOWN only, which
+    makes the file self-clean but leaves it defenceless against a leak that is already
+    present at its SETUP. Under ``-n auto --dist loadgroup`` which worker an ordinary test
+    lands on varies run to run, so it surfaces as an intermittent failure rather than a
+    reproducible ordering bug -- it cost upstream PR #6798 a red ``Backend Tests (3.10, 1)``
+    shard while ``(3.12, 1)`` passed at the identical commit.
+
+    STOPPING rather than only reassigning, which is where this differs from the factory:
+    the leak is a live daemon thread holding the file handler's open descriptor on a
+    ``gateway.log`` under a ``tmp_path`` the next test deletes, so dropping the reference
+    alone would clear the assertion and keep the thread and the fd. ``cli`` is reached
+    through ``sys.modules`` rather than imported, as ``_no_leaked_telemetry_exporter``
+    does: a worker that never imported it cannot hold a listener, and importing it here
+    would charge every testpath ~0.5s and ~54MB for the ratchet in
+    ``test_cli_lazy_imports.py`` to then measure in a subprocess anyway.
+
+    Restoring rather than blaming, for the same reason as ``_restore_log_record_factory``
+    above: starting the listener is what the entry point under test is FOR, and production
+    starts it once per process and never undoes it. The damage is to OTHER tests, so
+    stopping it propagating is the whole job.
+
+    HANDLERS stay untouched, the boundary ``_restore_logger_levels`` below draws and for
+    its reasons. The ``_CliLogQueueHandler`` left on the ``kiro_crew`` logger therefore
+    outlives the listener it fed, holding an unattended queue; it is the same handler
+    accumulation that fixture already records as a separate defect, and
+    ``test_cli_logging.py``'s ``_pristine_logging`` is what absorbs it today by clearing
+    both handler lists at setup.
+
+    The restore target is what the test INHERITED, so a higher-scoped fixture that starts
+    a listener for a whole class or module is not torn out from under its second test --
+    and, as there, such a fixture has to stop its own listener, because every later test
+    then inherits it and so restores to it.
+    """
+    cli = sys.modules.get("kiro_crew.cli")
+    before = getattr(cli, "_LOG_QUEUE_LISTENER", None)
+    yield
+    cli = sys.modules.get("kiro_crew.cli")
+    if cli is None:
+        return
+    after = getattr(cli, "_LOG_QUEUE_LISTENER", None)
+    if after is before:
+        return
+    if after is not None:
+        # Drains and joins the listener thread, then closes the file handler. Suppressed
+        # because a floor must not fail a test for state it is only cleaning up, and the
+        # restore below has to happen either way.
+        with contextlib.suppress(Exception):
+            cli._stop_log_queue_listener()
+    cli._LOG_QUEUE_LISTENER = before
 
 
 # ── logger levels go back after every test ──────────────────────────
@@ -1775,6 +2001,67 @@ def _isolate_sel_default_dir(tmp_path_factory):
         _sel.SecurityEventLog._instance = original_instance
 
 
+@pytest.fixture
+def sel_private_root(tmp_path_factory):
+    """Bind the SEL singleton to a directory PRIVATE to the requesting test.
+
+    ``_isolate_sel_default_dir`` above gives every test on a worker ONE shared
+    SEL directory, which is the right default tier: the writer is a daemon
+    thread on a process singleton, and a per-test ``tmp_path`` would be deleted
+    underneath it (see that fixture's docstring). But one shared root also
+    means one shared CHAIN LOCK, and a test whose assertion transitively
+    depends on a fail-closed critical audit WINNING that lock can be refused by
+    a concurrent writer it never created — the loop-side acquire is a single
+    non-blocking attempt by design (issue #7029, the issue-radar trust flake).
+
+    This is the per-test tier of the same seam. It rebinds the singleton to a
+    fresh directory nothing else writes, so no other test — on this worker or
+    any other — can hold this test's chain lock:
+
+    * The directory comes from ``tmp_path_factory``, whose numbered dirs are
+      never deleted mid-run (a lingering writer can never resurrect a removed
+      path) and whose basetemp is already per-xdist-worker (``popen-gwN``), so
+      the isolation holds across workers as well as across tests.
+    * The instance is built ``sync=True``: every event is written inline on its
+      caller's thread and NO background writer starts, so the only writers on
+      this root are the test's own threads — which the module-level chain-hold
+      registry already lets join one another.
+    * ``_default_dir()`` is deliberately NOT repointed: the displaced shared
+      directory stays reachable through it, which is what lets a differential
+      test hold the SHARED root's lock and prove this test no longer contends
+      for it.
+
+    Teardown restores the PRIOR singleton (not ``None``), so later tests on
+    this worker resume the session default exactly where it left off instead of
+    minting a second instance — and a second writer thread — on the same
+    directory.
+    """
+    try:
+        from kiro_crew.sel import SecurityEventLog
+    except ImportError:  # pragma: no cover - partial checkout
+        yield None
+        return
+    root = tmp_path_factory.mktemp("sel-private")
+    prior_instance = SecurityEventLog._instance
+    SecurityEventLog._instance = None
+    SecurityEventLog._initialized = False
+    try:
+        # Inside the try: ``__new__`` publishes to ``_instance`` before
+        # ``__init__`` runs, so a failing ``_init_locked`` would otherwise
+        # orphan the half-built object AND lose ``prior_instance`` — every
+        # later test on this worker would then re-init against the shared
+        # default with a second writer thread, the exact hazard the restore
+        # exists to prevent.
+        SecurityEventLog(base_dir=root, sync=True)
+        yield root
+    finally:
+        SecurityEventLog._instance = prior_instance
+        # Class attribute only (each instance shadows it in __new__); reset to
+        # the declared default for symmetry with test_sel.py's convention —
+        # the restored instance keeps its own per-instance _initialized=True.
+        SecurityEventLog._initialized = False
+
+
 #: ``~/.kiro`` paths production binds at IMPORT time, which ``KIROCREW_HOME`` cannot
 #: reach: the module captured an absolute path from ``Path.home()`` before any test
 #: set an environment variable, so the env override is read too late to matter.
@@ -2353,3 +2640,151 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
         "cwd=<a directory under tmp_path> to the spawn, and scope any assertion "
         "about the file to where that child actually ran."
     )
+
+
+# ── Check-run annotations that name the failing test (issue #7296) ──────────
+#
+# A red shard is read from its check run's ANNOTATIONS, not from the log: that
+# is what the PR page shows, what a fork contributor sees, and all that survives
+# in a triage report. Nothing in this repo wrote one, so the annotations came
+# from the `python` problem matcher that `actions/setup-python` registers by
+# default, whose pattern is a traceback frame (`File "...", line N, in f`)
+# followed by `raise SomeError('msg')`.
+#
+# MEASURED on the six Backend Tests jobs cited in #7296: that pattern matched
+# pytest's WARNINGS SUMMARY every time and a pytest failure not once. All six
+# reds were annotated only `Event loop is closed` at line 545 -- which is
+# `asyncio/base_events.py:545` inside `_check_closed`, reached from a
+# `PytestUnraisableExceptionWarning` about a garbage-collected coroutine, i.e. a
+# WARNING. The reds themselves were ordinary named failures (a `git add`
+# timeout, a missing diag.jsonl, sandbox-dependent project tests) and appeared
+# in no annotation at all. Four unrelated PRs were triaged as an event-loop
+# teardown flake on the strength of that, and the class had been "fixed" four
+# times before.
+#
+# Replacing the matcher with a better matcher is not the fix. `--color=yes` is
+# in the addopts, so the summary line a matcher would have to scrape reads
+# `\x1b[31mFAILED\x1b[0m test/x.py::\x1b[1mtest_y\x1b[0m - AssertionError: ...`
+# with escape sequences INSIDE the node id. The report objects already carry the
+# path, the line and the node id as data, so the annotation is emitted from them
+# here and nothing is parsed back out of rendered output.
+
+#: Failures that get their own annotation before the rest are only counted.
+#: GitHub keeps a bounded number per check run and drops the excess with no
+#: notice, so past this point the annotation list stops being something anyone
+#: reads and the short test summary in the log is the better artifact.
+_MAX_ANNOTATED_FAILURES = 10
+
+#: Annotation messages are cut to this many characters. A full assertion diff is
+#: a page long, does not fit the check-run UI, and is already in the log.
+_MAX_ANNOTATION_CHARS = 400
+
+
+def _gha_escape(value: str, *, is_property: bool) -> str:
+    """Escape *value* for a GitHub Actions workflow command.
+
+    The runner splits a command on ``,`` and on ``::``, and every pytest node id
+    contains ``::`` -- unescaped, the annotation is truncated at the first one
+    and names the FILE instead of the test, which is most of the defect this
+    exists to fix. Property values need the two structural characters escaped on
+    top of the data set, per the workflow-commands spec.
+    """
+    escaped = value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    if is_property:
+        escaped = escaped.replace(":", "%3A").replace(",", "%2C")
+    return escaped
+
+
+def _report_location(report: object) -> tuple[str, int | None]:
+    """Repository-relative path and 1-based line for *report*, best effort.
+
+    ``report.location`` is a ``(path, lineno, domain)`` triple whose line is
+    0-BASED, while an annotation line is 1-based. A collection error carries no
+    line at all, and a guessed one points the reader at the wrong statement, so
+    ``None`` means "omit ``line=``" rather than "line 1".
+    """
+    location = getattr(report, "location", None) or ()
+    path = location[0] if len(location) >= 1 and isinstance(location[0], str) else ""
+    if not path:
+        path = str(getattr(report, "fspath", "") or "")
+    raw_line = location[1] if len(location) >= 2 else None
+    line = raw_line + 1 if isinstance(raw_line, int) and raw_line >= 0 else None
+    return path, line
+
+
+def _cut(reason: str) -> str:
+    """*reason* trimmed to :data:`_MAX_ANNOTATION_CHARS`."""
+    reason = reason.strip()
+    if len(reason) > _MAX_ANNOTATION_CHARS:
+        return reason[: _MAX_ANNOTATION_CHARS - 3] + "..."
+    return reason
+
+
+def _failure_reason(report: object) -> str:
+    """One-line reason for *report*, cut to :data:`_MAX_ANNOTATION_CHARS`.
+
+    Prefers the line pytest marks with ``E`` in the first column, which is the
+    error itself. ``longrepr.reprcrash.message`` looks like the obvious source
+    and is right for an assertion, but for a FIXTURE error it is the preamble --
+    MEASURED, an annotation built from it reads ``file <path>, line 5`` and
+    spends its whole width saying nothing, while the ``E`` line two rows down
+    says ``fixture 'x' not found``. Source lines in the same block are indented,
+    so anchoring at column 0 does not mistake a statement for the verdict.
+
+    ``reprcrash`` is the fallback, then the first rendered line; a report with
+    none of the three still gets an annotation, because the node id was the part
+    that was missing.
+    """
+    rendered = str(getattr(report, "longreprtext", "") or "")
+    for raw in rendered.splitlines():
+        if raw.startswith("E ") and raw[1:].strip():
+            return _cut(raw[1:])
+    crash = getattr(getattr(report, "longrepr", None), "reprcrash", None)
+    reason = str(getattr(crash, "message", "") or "")
+    if not reason.strip():
+        reason = rendered
+    lines = [line for line in reason.strip().splitlines() if line.strip()]
+    if not lines:
+        return "no failure detail in the report"
+    return _cut(lines[0])
+
+
+def pytest_terminal_summary(
+    terminalreporter: object, exitstatus: int, config: pytest.Config
+) -> None:
+    """Emit one ``::error`` annotation per failing test. See the note above.
+
+    Controller-only: under xdist a worker's reports are sent back and counted
+    here, so annotating from the worker too would double every line. Gated on
+    ``GITHUB_ACTIONS`` because outside Actions these lines are noise nothing
+    interprets, and a green run writes nothing at all.
+    """
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    if hasattr(config, "workerinput"):  # pragma: no cover - xdist worker
+        return
+    stats = getattr(terminalreporter, "stats", None) or {}
+    reports = [report for key in ("failed", "error") for report in stats.get(key, [])]
+    if not reports:
+        return
+    write = getattr(terminalreporter, "write_line", None)
+    if write is None:  # pragma: no cover - no terminal reporter (e.g. -p no:terminal)
+        return
+    for report in reports[:_MAX_ANNOTATED_FAILURES]:
+        nodeid = str(getattr(report, "nodeid", "") or "") or "<unknown test>"
+        path, line = _report_location(report)
+        properties = []
+        if path:
+            properties.append(f"file={_gha_escape(path, is_property=True)}")
+        if line is not None:
+            properties.append(f"line={line}")
+        properties.append(f"title={_gha_escape(nodeid, is_property=True)}")
+        message = _gha_escape(f"{nodeid} - {_failure_reason(report)}", is_property=False)
+        write(f"::error {','.join(properties)}::{message}")
+    hidden = len(reports) - _MAX_ANNOTATED_FAILURES
+    if hidden > 0:
+        write(
+            f"::notice::{len(reports)} tests failed or errored on this job; the first "
+            f"{_MAX_ANNOTATED_FAILURES} are annotated. The remaining {hidden} are in "
+            "this job's short test summary."
+        )

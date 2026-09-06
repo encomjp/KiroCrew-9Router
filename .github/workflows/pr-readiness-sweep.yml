@@ -64,6 +64,20 @@ name: PR Readiness Self-Heal Sweep
 #      check-runs (`Strip stale workflow-change override`, `Fork workflow-change
 #      guard`) legitimately complete long after a verdict and would otherwise
 #      re-fire every green PR on every sweep.
+#
+#   5. `failure` with a DISPOSITION COMMENT that changed after it was published.
+#      Since #6658 readiness also fails on a disposition-rule violation, so the
+#      verdict depends on comment bytes -- and `pr-readiness.yml` has no
+#      `issue_comment` trigger. Correcting the offending comment emits no event
+#      and produces no check-run, so mode 2's test cannot see it and the red
+#      freezes on an unchanged commit. Same evidence-after-verdict shape and the
+#      same self-terminating argument as mode 2, with the comment's `updated_at`
+#      as the evidence. An `issue_comment` trigger on the aggregator was the
+#      alternative and is the wrong trade: it is already the majority of this
+#      repository's run creation and the review bots rewrite their comments in
+#      place on every push, so the dispatch would be spent per bot edit, per PR,
+#      repo-wide. Deleting the record with no replacement leaves nothing
+#      observable and waits for a push or a manual dispatch.
 on:
   schedule:
     # Every 15 minutes. A normal fan-out publishes terminal state via events
@@ -79,10 +93,23 @@ permissions:
   statuses: read        # read the "PR Readiness" commit status
 
 concurrency:
-  # Collapse an overlapping sweep into one. The sweep is idempotent, so
-  # cancelling an in-flight run is safe.
+  # Collapse overlap WITHOUT cancelling the incumbent. The group alone already
+  # dedupes: GitHub keeps at most one PENDING run per group, and a newer pending
+  # run supersedes the older pending one. `cancel-in-progress: true` would also
+  # cancel the run currently HOLDING the slot -- and a run that is queued
+  # waiting for a runner already holds it, so once repo-wide queue latency
+  # exceeds the 15-minute cron interval every run is killed by its own
+  # successor before executing a single step and the sweep never runs again,
+  # exactly when Actions saturation makes the backstop most needed (#8026).
+  # With `false` the incumbent -- queued or executing -- is never cancelled by
+  # a successor; a queued run that never gets a runner still expires on
+  # GitHub's own queued-run TTL, after which the next tick takes the slot. So
+  # under saturation the sweep degrades to running less often instead of never.
+  # (The old "the sweep is idempotent, so cancelling an in-flight run is safe"
+  # reasoning considered only an executing run and missed that queued runs are
+  # cancellation targets too.)
   group: pr-readiness-sweep
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   sweep:
@@ -116,6 +143,32 @@ jobs:
 
           now_epoch="$(date -u +%s)"
           stale_seconds=$(( STALE_MINUTES * 60 ))
+
+          # Newest disposition-record timestamp on a PR, as an epoch; 0 when
+          # there is none or the read fails. Shared by BOTH staleness arms
+          # below, because the freeze it detects runs in both directions: a
+          # violating record posted AFTER a green verdict leaves the required
+          # status green over a revision that now violates the rule, which
+          # PERMITS a merge, and a corrected record after a red verdict leaves
+          # the red frozen, which blocks one. Only the marker prefix is matched,
+          # so the five review bots rewriting their own comments in place on
+          # every push are not evidence -- without that narrowing this would
+          # re-fire most PRs on every sweep and prove nothing.
+          #
+          # `--slurp` for the same reason the check-run reads use it: without it
+          # `--paginate` emits one document per page and `max` would produce one
+          # timestamp per page, which `date -d` then rejects.
+          newest_disposition_epoch() {
+            local pr_number="$1" newest
+            newest="$(gh api "repos/$REPO/issues/$pr_number/comments" \
+              --paginate --slurp 2>/dev/null \
+              | jq -r '[.[][]? | select((.body // "")
+                         | startswith("<!-- ai-review-disposition ")) | .updated_at]
+                       | map(select(. != null)) | max // empty' \
+              || echo "")"
+            [ -n "$newest" ] || { echo 0; return 0; }
+            date -u -d "$newest" +%s 2>/dev/null || echo 0
+          }
 
           # Open PRs with their current head SHA and last-activity time. A
           # single cheap list call.
@@ -253,15 +306,63 @@ jobs:
                   | jq -r '[.[].check_runs[]? | select(.status == "completed") | .completed_at]
                            | map(select(. != null)) | max // empty' \
                   || echo "")"
-                [ -n "$newest_check" ] || continue
-                newest_epoch="$(date -u -d "$newest_check" +%s 2>/dev/null || echo 0)"
-                [ "$newest_epoch" -ne 0 ] || continue
+                newest_epoch=0
+                if [ -n "$newest_check" ]; then
+                  newest_epoch="$(date -u -d "$newest_check" +%s 2>/dev/null || echo 0)"
+                fi
                 # Strictly newer, with a small margin so a check completing in
                 # the same second as the publish does not look like new evidence.
-                if [ "$newest_epoch" -le $(( updated_epoch + 5 )) ]; then
-                  continue
+                if [ "$newest_epoch" -gt $(( updated_epoch + 5 )) ]; then
+                  reason="failure published at $updated_at but a check completed later at $newest_check"
+                else
+                  # Mode 5: COMMENT evidence. Since #6658 readiness also fails on
+                  # a disposition-rule violation, so the verdict now depends on
+                  # comment bytes -- and `pr-readiness.yml` has no
+                  # `issue_comment` trigger. Correcting the offending comment
+                  # therefore emits NO event and produces NO check-run, so mode 2
+                  # above cannot see it and the red freezes on an unchanged
+                  # commit. That is this sweep's own subject matter, in the red
+                  # direction.
+                  #
+                  # Same shape and same safety argument as mode 2: the test is
+                  # "a disposition record changed AFTER the verdict was
+                  # published", which makes the verdict stale by construction and
+                  # is self-terminating, because republishing makes readiness the
+                  # newest timestamp again. A PR that genuinely violates the rule
+                  # is nudged at most once per edit, never once per sweep.
+                  #
+                  # An `issue_comment` trigger on `pr-readiness.yml` was the
+                  # alternative and is the wrong trade: that workflow is already
+                  # the majority of this repository's run creation, the review
+                  # bots rewrite their comments in place on every push, and the
+                  # dispatch is spent whether or not a job-level `if` then skips
+                  # the run. A scheduled sweep that already iterates these PRs
+                  # pays one extra read per candidate PR instead.
+                  #
+                  # The marker prefix in the helper SELECTS candidate comments; it
+                  # does not evaluate the rule. A drift in that prefix changes
+                  # only how often a nudge fires, never what counts as a
+                  # violation -- which is why this is not the "fourth parser"
+                  # #6658 forbids. Deletion with no replacement leaves nothing
+                  # observable: in the red direction that residual waits for a
+                  # push or a manual dispatch, and the docs say so. In the green
+                  # direction it needs no rescue, because removing a record can
+                  # only remove a violation.
+                  disposition_epoch="$(newest_disposition_epoch "$number")"
+                  [ "$disposition_epoch" -ne 0 ] || continue
+                  # STRICT, with no margin. The check-evidence modes carry a
+                  # 5s margin so a check completing in the same second as the
+                  # publish is not read as new evidence; `-le` already excludes
+                  # the same second by itself, so for comment evidence that
+                  # margin bought nothing and cost a 1-5s window in which a
+                  # record could be posted and then never re-examined, since
+                  # nothing else observes comments. Self-termination is
+                  # unaffected: republishing moves the verdict past the record.
+                  if [ "$disposition_epoch" -le "$updated_epoch" ]; then
+                    continue
+                  fi
+                  reason="failure published at $updated_at but a disposition record changed later at $(date -u -d "@$disposition_epoch" +%Y-%m-%dT%H:%M:%SZ)"
                 fi
-                reason="failure published at $updated_at but a check completed later at $newest_check"
                 ;;
               success|error)
                 # Mode 2's mechanism does not care which way the re-run went. A
@@ -295,13 +396,46 @@ jobs:
                              | .completed_at]
                            | map(select(. != null)) | max // empty' \
                   || echo "")"
-                [ -n "$newest_fail" ] || continue
-                newest_fail_epoch="$(date -u -d "$newest_fail" +%s 2>/dev/null || echo 0)"
-                [ "$newest_fail_epoch" -ne 0 ] || continue
-                if [ "$newest_fail_epoch" -le $(( updated_epoch + 5 )) ]; then
-                  continue
+                newest_fail_epoch=0
+                if [ -n "$newest_fail" ]; then
+                  newest_fail_epoch="$(date -u -d "$newest_fail" +%s 2>/dev/null || echo 0)"
                 fi
-                reason="$state published at $updated_at but a check FAILED later at $newest_fail"
+                if [ "$newest_fail_epoch" -gt $(( updated_epoch + 5 )) ]; then
+                  reason="$state published at $updated_at but a check FAILED later at $newest_fail"
+                else
+                  # Mode 5 in the PERMITTING direction, and this is the half that
+                  # actually matters. A writer can post a rule-violating
+                  # disposition record AFTER readiness published success: the
+                  # record immediately carries adjudication-ledger downgrade
+                  # power, the revision now violates the rule, and no event
+                  # re-evaluates it -- so the required status stays green over a
+                  # revision that should be red, which PERMITS a merge. Mode 4's
+                  # own reasoning applies verbatim: a stale green permits, a
+                  # stale red merely blocks, so the permitting direction is the
+                  # one that must not be left unrescued.
+                  #
+                  # No narrowing is needed here beyond the marker prefix the
+                  # helper already applies. Mode 4 has to restrict check evidence
+                  # to failure-class conclusions because housekeeping check-runs
+                  # complete late on every long-lived PR; a disposition record, by
+                  # contrast, is only ever written by a writer ruling on this PR,
+                  # and each one is counted at most once because republishing
+                  # makes readiness the newest timestamp again.
+                  disposition_epoch="$(newest_disposition_epoch "$number")"
+                  [ "$disposition_epoch" -ne 0 ] || continue
+                  # STRICT, with no margin. The check-evidence modes carry a
+                  # 5s margin so a check completing in the same second as the
+                  # publish is not read as new evidence; `-le` already excludes
+                  # the same second by itself, so for comment evidence that
+                  # margin bought nothing and cost a 1-5s window in which a
+                  # record could be posted and then never re-examined, since
+                  # nothing else observes comments. Self-termination is
+                  # unaffected: republishing moves the verdict past the record.
+                  if [ "$disposition_epoch" -le "$updated_epoch" ]; then
+                    continue
+                  fi
+                  reason="$state published at $updated_at but a disposition record changed later at $(date -u -d "@$disposition_epoch" +%Y-%m-%dT%H:%M:%SZ)"
+                fi
                 ;;
               *)
                 # Any state this sweep does not model is left to a real event.

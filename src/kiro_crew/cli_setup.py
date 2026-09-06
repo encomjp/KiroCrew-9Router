@@ -23,12 +23,13 @@ from kiro_crew.config.loader import (
     CRED_OWNER_ID,
     CRED_SLACK_APP_TOKEN,
     CRED_SLACK_BOT_TOKEN,
+    ConfigReadError,
     _default_workspace_base,
     _workspace_dir_file,
     config_local_path,
     config_path,
     env_path,
-    write_config_atomically,
+    update_config_locked,
 )
 from kiro_crew.constants import DATA_WARNING, MIN_NODE_MAJOR
 from kiro_crew.sandbox import unavailable_kind
@@ -414,8 +415,11 @@ def _maybe_setup_cloud() -> None:
     print("  AWS account; credentials stay in the aws CLI — never stored here).")
     try:
         answer = input("  Launch KiroCrew on AWS now? [y/N]: ").strip().lower()
-    except EOFError:
-        # Piped/non-interactive setup — take the default (skip).
+    except (EOFError, UnicodeDecodeError):
+        # Piped/non-interactive setup or a non-UTF-8 locale (e.g. C/POSIX on
+        # Amazon Linux Cloud Desktop) — input() decodes stdin with the locale
+        # encoding and can raise UnicodeDecodeError before it ever returns a
+        # string. Treat it like EOF: no usable answer, so take the default.
         answer = ""
     if answer not in ("y", "yes"):
         print("  ⏭  Skipped. Launch later: kirocrew cloud launch\n")
@@ -626,17 +630,42 @@ def _setup_whatsapp() -> None:
             print(f"  ⚠️  {cfg_file} does not contain a JSON object; skipping.\n")
             return
         cfg = loaded
-    if not isinstance(cfg.get("whatsapp"), dict):
-        if "whatsapp" in cfg:
-            print("  ⚠️  'whatsapp' section is not an object; leaving config untouched.\n")
-            return
-        cfg["whatsapp"] = {}
-    cfg["whatsapp"]["enabled"] = True
+    if not isinstance(cfg.get("whatsapp"), dict) and "whatsapp" in cfg:
+        print("  ⚠️  'whatsapp' section is not an object; leaving config untouched.\n")
+        return
+
+    # The read above answered "may this step run"; it is NOT the read the write
+    # is derived from. That one happens inside ``update_config_locked``'s hold on
+    # the ``<config>.lock`` sidecar, so a dashboard settings write or a
+    # ``kirocrew config set`` landing between the two is carried forward instead
+    # of being replaced by this older snapshot.
+    section_clash: list[str] = []
+
+    def _enable(data: dict) -> dict | None:
+        section = data.get("whatsapp")
+        if not isinstance(section, dict):
+            if "whatsapp" in data:
+                # Re-checked under the lock: another writer may have replaced the
+                # section since the read above. Skip the write, report outside.
+                section_clash.append("whatsapp")
+                return None
+            section = {}
+            data["whatsapp"] = section
+        section["enabled"] = True
+        return data
+
     try:
-        write_config_atomically(cfg_file, cfg)
+        update_config_locked(cfg_file, mutate=_enable, stamp_meta=False)
+    except ConfigReadError as exc:
+        # Does not inherit OSError, so it needs naming next to the write failure.
+        print(f"  ⚠️  Could not read {cfg_file}: {exc}\n")
+        return
     except OSError as exc:
         print(f"  ⚠️  Could not write {cfg_file}: {exc}")
         print("     Nothing was enabled. Enable it from Settings → Channels instead.\n")
+        return
+    if section_clash:
+        print("  ⚠️  'whatsapp' section is not an object; leaving config untouched.\n")
         return
     print("  ✅ Recorded: whatsapp.enabled = true")
     print("     Next: start the gateway, then scan the QR from")
@@ -713,12 +742,14 @@ def _input_or_skip(prompt: str) -> str | None:
     as "keep the default / skip this step". A closed/piped stdin is a different
     condition and must not be silently coerced to ``""`` (that used to admit an
     empty default and cascade the failure into the NEXT step's bare
-    ``input()``) — see ``_SetupAborted``.
+    ``input()``) — see ``_SetupAborted``. A non-UTF-8 locale (e.g. C/POSIX)
+    makes ``input()`` raise ``UnicodeDecodeError`` the same way, so it is
+    treated identically.
     """
 
     try:
         answer = input(prompt).strip()
-    except EOFError as exc:
+    except (EOFError, UnicodeDecodeError) as exc:
         raise _SetupAborted("stdin closed; setup cannot continue") from exc
     return answer or None
 
@@ -735,7 +766,16 @@ def _setup_slash_command() -> None:
             return
 
     print("── Slash Command ──\n")
-    current = cfg.get("slack", {}).get("command", "kirocrew")
+    # A non-object ``slack`` is an operator value this step cannot merge into.
+    # Guarded HERE as well as in the write below, because this read is what runs
+    # first: ``.get("slack", {}).get(...)`` raised AttributeError on a scalar and
+    # took the whole wizard down with a traceback. Refusing the step is the same
+    # answer the whatsapp and sandbox steps give for their own sections.
+    slack_section = cfg.get("slack")
+    if slack_section is not None and not isinstance(slack_section, dict):
+        print("  ⚠️  'slack' section is not an object; leaving config untouched.\n")
+        return
+    current = (slack_section or {}).get("command", "kirocrew")
     # EOF keeps the current value (same reasoning as the workspace step).
     raw = _input_or_skip(f"  Slash command name [{current}]: ") or ""
     if raw:
@@ -749,8 +789,32 @@ def _setup_slash_command() -> None:
         print("  ⚠️  Command name too long (max 32 chars).")
         raw = current
 
-    cfg.setdefault("slack", {})["command"] = raw
-    write_config_atomically(cfg_file, cfg)
+    # Re-checked under the lock, and it must ABORT rather than replace: a
+    # non-dict ``slack`` is an operator value this step did not write and cannot
+    # merge into, so overwriting it with a fresh object would destroy it while
+    # reporting success. Absent is the only case that may be created. Same rule
+    # as the whatsapp and sandbox steps above.
+    section_clash: list[str] = []
+
+    def _apply(data: dict) -> dict | None:
+        section = data.get("slack")
+        if not isinstance(section, dict):
+            if "slack" in data:
+                section_clash.append("slack")
+                return None
+            section = {}
+            data["slack"] = section
+        section["command"] = raw
+        return data
+
+    try:
+        update_config_locked(cfg_file, mutate=_apply, stamp_meta=False)
+    except ConfigReadError as exc:
+        print(f"  ⚠️  Could not read {cfg_file}: {exc}")
+        return
+    if section_clash:
+        print("  ⚠️  'slack' section is not an object; leaving config untouched.\n")
+        return
     print(f"  ✅ Slash command: /{raw}\n")
 
 
@@ -865,11 +929,9 @@ def _setup_sandbox_consent() -> None:
         print(f"     in {cfg_file}\n")
         return
 
-    if not isinstance(cfg.get("agent"), dict):
-        if "agent" in cfg:
-            print("  ⚠️  'agent' section is not an object; leaving config untouched.\n")
-            return
-        cfg["agent"] = {}
+    if not isinstance(cfg.get("agent"), dict) and "agent" in cfg:
+        print("  ⚠️  'agent' section is not an object; leaving config untouched.\n")
+        return
 
     # Audit-or-deny, BEFORE the write: this persists an execution permission, so
     # it belongs in the tamper-evident log next to the ``denied`` event
@@ -899,9 +961,29 @@ def _setup_sandbox_consent() -> None:
         print("     left fail-closed. Fix the audit log, then re-run setup.\n")
         return
 
-    cfg["agent"]["sandbox_allow_unsandboxed_exec"] = True
+    # Under the sidecar lock, and the grant is applied to the document as it
+    # stands there -- the snapshot read before the prompt is only what decided
+    # whether to ask. The audit above stays ahead of the acquire, so the
+    # audit-then-write ordering is unchanged.
+    section_clash: list[str] = []
+
+    def _grant(data: dict) -> dict | None:
+        section = data.get("agent")
+        if not isinstance(section, dict):
+            if "agent" in data:
+                section_clash.append("agent")
+                return None
+            section = {}
+            data["agent"] = section
+        section["sandbox_allow_unsandboxed_exec"] = True
+        return data
+
     try:
-        write_config_atomically(cfg_file, cfg)
+        update_config_locked(cfg_file, mutate=_grant, stamp_meta=False)
+    except ConfigReadError as exc:
+        print(f"  ⚠️  Could not read {cfg_file}: {exc}")
+        print("     Nothing was granted — the host stays fail-closed.\n")
+        return
     except OSError as exc:
         # A locked or read-only config (common on Windows when another process
         # holds it) must not abort the whole wizard after the user has already
@@ -910,6 +992,9 @@ def _setup_sandbox_consent() -> None:
         print(f"  ⚠️  Could not write {cfg_file}: {exc}")
         print("     Nothing was granted — the host stays fail-closed. Set")
         print("     agent.sandbox_allow_unsandboxed_exec=true by hand to opt in.\n")
+        return
+    if section_clash:
+        print("  ⚠️  'agent' section is not an object; leaving config untouched.\n")
         return
     print("  ✅ Recorded: agent.sandbox_allow_unsandboxed_exec = true\n")
 
@@ -994,8 +1079,18 @@ def _setup_timezone() -> None:
                 print("  ⏭  Skipped after too many attempts.\n")
                 return
 
-    data["timezone"] = tz_val
-    write_config_atomically(cfg_file, data)
+    def _apply(existing: dict) -> dict:
+        existing["timezone"] = tz_val
+        return existing
+
+    try:
+        update_config_locked(cfg_file, mutate=_apply, stamp_meta=False)
+    except ConfigReadError as exc:
+        # The pre-prompt read already refuses a corrupt config; this covers a
+        # file that went bad while the operator was answering, and refuses the
+        # same way rather than surfacing a traceback out of the wizard.
+        print(f"  ⚠️  Could not read {cfg_file}: {exc}")
+        return
     print(f"  ✅ Timezone saved: {tz_val}\n")
 
 
@@ -1042,14 +1137,28 @@ def _maybe_setup_dashboard_url() -> None:
         print("  ⏭  Skipped. Dashboard will bind to localhost only.\n")
         return
 
-    # Persist to config.json
-    try:
-        data: dict = {}
-        if cfg_file.exists():
-            data = json.loads(cfg_file.read_text(encoding="utf-8"))
-        dashboard = data.setdefault("dashboard", {})
+    # Persist to config.json. The read is inside the lock hold, so the URL
+    # cannot be written over a document that predates another writer's change.
+    #
+    # A non-dict ``dashboard`` RAISES rather than being replaced: it is an
+    # operator value this step cannot merge into, and the broad handler below
+    # already reports exactly that as "Failed to save" and writes nothing --
+    # which is what this step did before it took the lock, when the same shape
+    # raised out of ``setdefault``.
+    def _apply(data: dict) -> dict:
+        dashboard = data.get("dashboard")
+        if dashboard is None and "dashboard" not in data:
+            dashboard = {}
+            data["dashboard"] = dashboard
+        elif not isinstance(dashboard, dict):
+            raise TypeError(
+                f"'dashboard' in {cfg_file} is not an object; refusing to replace it"
+            )
         dashboard["url"] = answer
-        write_config_atomically(cfg_file, data)
+        return data
+
+    try:
+        update_config_locked(cfg_file, mutate=_apply, stamp_meta=False)
         print(f"  ✅ Dashboard URL saved: {answer}")
         print("  Token auth will be required for all requests.\n")
     except Exception as e:

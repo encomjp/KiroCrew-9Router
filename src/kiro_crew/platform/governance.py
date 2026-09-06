@@ -67,6 +67,7 @@ from kiro_crew.platform.admission import (
 )
 from kiro_crew.platform.context import PlatformCompositionError
 from kiro_crew.platform.governance_health import mark_governance_incident
+from kiro_crew.platform.tool_paths import TARGET_PATH_KEYS, target_paths
 from kiro_crew.sel import sel
 
 logger = logging.getLogger(__name__)
@@ -469,23 +470,43 @@ _KIND_READ = "read"
 _KIND_EDIT = "edit"
 _KIND_FETCH = "fetch"
 
-_PATH_ARG_KEYS = ("path", "file_path", "filePath")
+# The accepted path spellings are OWNED by the shared low-level walk
+# (``kiro_crew.platform.tool_paths.TARGET_PATH_KEYS``) so the governance
+# intersection plane and the hooks sensitive-path keystone can never drift on
+# which keys count as a target. Aliased here under the historic name for local
+# readers; do NOT redefine the tuple.
+_PATH_ARG_KEYS = TARGET_PATH_KEYS
+
+# Synthetic, never-permittable item emitted for a filesystem scope when the
+# bounded path walk TRUNCATED (see the truncation branch in
+# ``classify_tool_args``).  It is deliberately not a real path: it contains a NUL
+# byte and glob metacharacters, so no operator allow-list pattern
+# (``allow: ['~/project/**']``) or literal can ever match it, while a deny-mode
+# ceiling that governs the scope still binds on it.  The marker text names why it
+# exists so a denial audit is self-explanatory.
+_TRUNCATED_SCAN_ITEM = "\x00<governance:path-scan-truncated-unverifiable>"
 
 
-def _tool_arg_paths(raw_params: Mapping[str, object]) -> Tuple[str, ...]:
-    """Return every distinct, non-empty path carried under a supported alias.
+def _tool_arg_paths(raw_params: Mapping[str, object]) -> Tuple[Tuple[str, ...], bool]:
+    """Return every distinct, non-empty path carried under a supported alias,
+    at ANY nesting depth, plus whether the bounded scan was TRUNCATED.
 
-    Tool backends use all three spellings, sometimes in the same payload.  Every
-    value must be governed: choosing the first truthy alias would let a benign
+    Tool backends use all three spellings, sometimes in the same payload, and a
+    batch-shaped tool buries its real targets inside an array argument (e.g.
+    ``{"operations": [{"mode": "Line", "path": …}]}``).  Every value must be
+    governed at every depth: choosing the first truthy alias would let a benign
     ``path`` mask a sensitive ``filePath`` (and a truthy non-string value could
-    mask every later alias entirely).
+    mask every later alias entirely), and reading only the TOP level would let a
+    nested path escape the operator ceiling entirely — the reported bypass.
+
+    Delegates to the shared, iterative, bounded walk so the extraction is
+    IDENTICAL to the hooks keystone's (single source of truth).  The second
+    element is the walk's ``truncated`` flag: the caller must not treat a
+    truncated scan as "no governed target present" — see the truncation branch in
+    :func:`classify_tool_args`.
     """
-    paths: list[str] = []
-    for key in _PATH_ARG_KEYS:
-        value = raw_params.get(key)
-        if isinstance(value, str) and value.strip() and value not in paths:
-            paths.append(value)
-    return tuple(paths)
+    found = target_paths(raw_params)
+    return tuple(found), found.truncated
 
 
 def classify_tool_args(
@@ -518,19 +539,58 @@ def classify_tool_args(
 
     Returns an empty tuple when the params carry no governed item (an ungoverned
     scope permits, so this only ever tightens).
+
+    **Truncated scan (open-question-2 policy on this permit-by-default plane).**
+    The shared path walk is bounded (``_TARGET_PATH_MAX_PATHS`` /
+    ``_TARGET_PATH_MAX_NODES``); a payload padded past those caps returns a
+    ``truncated`` result whose path list may be INCOMPLETE.  On this plane a
+    truncated scan that yielded no path must NOT silently reach the caller's
+    permit-by-default ``if not pairs`` branch — that is exactly the fail-open the
+    reported bypass exploits (bury the governed path past 10_000 nodes to escape
+    the operator ceiling).  The keystone in ``hooks`` fails SAFE by hard-denying
+    any truncated scan, but this plane is permit-by-default and must NOT
+    blanket-deny an UNGOVERNED standalone host that happens to send a huge
+    payload.  So we thread the needle (issue option (c)): on truncation we emit
+    the filesystem scope(s) the ``tool_kind`` implies against a synthetic,
+    never-permittable item (``_TRUNCATED_SCAN_ITEM``).  Result: an operator
+    ceiling that governs that filesystem scope DENIES the unverifiable call
+    (closing the fail-open), while an ungoverned scope still permits it (the
+    standalone default is preserved, and no unrelated scope is touched).  The
+    truncation is auditable via the synthetic item text in the denial reason.
+    Rejected alternatives: (a) permit as before = keep the fail-open; (b) deny the
+    whole call unconditionally = over-blocks ungoverned hosts and every unrelated
+    scope.
+
+    Precise semantics of the marker against the two ruleset modes (both correct):
+    a PREFIX-BOUNDED ALLOW-mode ceiling (``allow: ['~/workspace/**']`` — confine
+    to a workspace, the exact profile the reported bypass targets) does NOT match
+    the synthetic item, so the truncated call is DENIED — the fail-open is closed.
+    (A CATCH-ALL ALLOW pattern — ``**`` / ``/**`` / ``*`` — does match the marker
+    because fnmatch ``*`` crosses separators, so it permits the truncated scan;
+    that is not a bypass, since such a ceiling confines nothing and is
+    unconstrained anyway.)  A DENY-mode
+    ceiling that blocks only specific paths (``deny: ['~/secrets/**']``) permits
+    the marker, because a targeted deny is not a general confinement and a partial
+    scan cannot prove the buried path hit that one pattern; the always-on,
+    resolved ``is_sensitive_path`` keystone in ``hooks`` (which hard-denies ANY
+    truncated scan) remains the authoritative guard for the sensitive tiers there.
     """
     if not raw_params or not isinstance(raw_params, Mapping):
         return ()
     pairs: list = []
-    paths = _tool_arg_paths(raw_params)
+    paths, paths_truncated = _tool_arg_paths(raw_params)
     url = raw_params.get("url") or raw_params.get("uri")
     has_command = bool(raw_params.get("command"))  # a shell tool → commands scope
     if tool_kind == _KIND_EDIT:
         for path in paths:
             pairs.append(("filesystem.write", path))
+        if paths_truncated:
+            pairs.append(("filesystem.write", _TRUNCATED_SCAN_ITEM))
     elif tool_kind == _KIND_READ:
         for path in paths:
             pairs.append(("filesystem.read", path))
+        if paths_truncated:
+            pairs.append(("filesystem.read", _TRUNCATED_SCAN_ITEM))
     elif tool_kind == _KIND_FETCH:
         if isinstance(url, str) and url:
             host = _url_host(url)
@@ -548,6 +608,12 @@ def classify_tool_args(
             # ceilings (tightest-wins; an ungoverned scope permits).
             pairs.append(("filesystem.read", path))
             pairs.append(("filesystem.write", path))
+        if paths_truncated:
+            # Unknown kind → we cannot tell read from write, so a truncated scan
+            # must consult BOTH filesystem ceilings against the never-permittable
+            # marker (see the truncated-scan policy in the docstring).
+            pairs.append(("filesystem.read", _TRUNCATED_SCAN_ITEM))
+            pairs.append(("filesystem.write", _TRUNCATED_SCAN_ITEM))
     return tuple(pairs)
 
 
@@ -877,9 +943,17 @@ class CapabilityGate:
             for k, v in raw_scopes.items()
             if isinstance(v, dict)
         }
-        enabled = d.get("enabled")
+        if "enabled" not in d:
+            enabled_flag = default_enabled
+        else:
+            enabled = d["enabled"]
+            if not isinstance(enabled, bool):
+                raise PlatformCompositionError(
+                    f"CapabilityGate.enabled must be a boolean, got {enabled!r}"
+                )
+            enabled_flag = enabled
         return CapabilityGate(
-            enabled=bool(enabled) if enabled is not None else default_enabled,
+            enabled=enabled_flag,
             scopes=scopes,
         )
 
@@ -995,6 +1069,12 @@ class ScopeSpec:
     capability_default: bool = False  # see the CAPABILITY-DEFAULT CONTRACT note below
     # for CapabilityGate: scope-name -> matcher for its inner ScopedRulesets
     scope_matchers: Mapping[str, str] = field(default_factory=dict)
+    # Identifiers this scope may never forbid, checked at PARSE time so a policy
+    # that removes the floor is refused instead of booting into a state with no
+    # usable option. Data rather than a scope-name branch in the parser: the
+    # loader's contract is that registering a scope needs no loader edit, and a
+    # second scope with a floor should be a catalog entry, not another `if`.
+    always_permitted: tuple[str, ...] = ()
 
 
 # ── CAPABILITY-DEFAULT CONTRACT (read before touching any capability_default) ──
@@ -1037,6 +1117,28 @@ class ScopeSpec:
 # fails closed — the asymmetry is documented on ``_parse_controls``.)
 SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     "tools": ScopeSpec(RULESET, matcher="identifier"),
+    # Dashboard tool-approval modes. Today this scope governs exactly ONE mode:
+    # ``yolo`` (auto-approve every tool everywhere), e.g.
+    # ``{"approval_modes": {"mode": "deny", "deny": ["yolo"]}}``. An absent scope
+    # permits every mode (unchanged behavior).
+    #
+    # ``always_permitted`` carries the three modes this scope may not forbid, for two
+    # DIFFERENT reasons, both enforced at parse time so a policy author is told
+    # rather than left with a control that silently does not hold:
+    #
+    # * ``normal`` is the interactive floor. Denying it would leave no selectable
+    #   mode and brick tool approval, and the trust-root ``security_policy.json`` is
+    #   the one file the dashboard may not rewrite to repair itself.
+    # * ``trust`` and ``trust_reads`` are NOT YET GOVERNED. Their grants are honoured
+    #   by consumption predicates this scope does not reach — the in-memory trusted
+    #   set, and the session ``approval_policy`` a spawned subagent inherits — so
+    #   accepting a deny for them would advertise enforcement that does not exist.
+    #   Governing those read paths is tracked separately.
+    "approval_modes": ScopeSpec(
+        RULESET,
+        matcher="identifier",
+        always_permitted=("normal", "trust", "trust_reads"),
+    ),
     "mcp": ScopeSpec(RULESET, matcher="mcp"),
     "apps": ScopeSpec(RULESET, matcher="identifier"),
     "commands": ScopeSpec(RULESET, matcher="command"),
@@ -1060,6 +1162,34 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # by kiro_crew.safety_override at the activation seam, against the HOST
     # profile and fail-closed.
     "yolo_duration": ScopeSpec(RULESET, matcher="identifier"),
+    # Which ACP harness a deployment may select (``agent.acp_backend``).
+    #
+    # Distinct from the selectable-backend REGISTRY in ``kiro_crew.acp_backends``:
+    # that answers "what can this BUILD serve", which is a capability fact and is
+    # not governable. This row answers "what may THIS DEPLOYMENT select", so a
+    # managed fleet can qualify one harness and bound the rest.
+    #
+    # ADDITIVE over a floor, which is the semantics decision #6622 was blocked on:
+    #   {"agent_backend": {"mode": "allow", "allow": ["claude"]}}
+    # means "ALSO allow claude", not "only claude" — ``kiro`` stays selectable
+    # because ``acp_backends.GOVERNANCE_FLOOR_BACKEND`` is never submitted to this
+    # scope at all. The alternative reading (exclusive) can empty the set, and an
+    # install with no startable harness cannot be recovered from the dashboard,
+    # since the trust-root policy is the one file it may not write.
+    #
+    # Members are POLICY ids, not the code's spelling: ``kiro`` / ``kas`` /
+    # ``claude`` (see ``acp_backends.POLICY_ID_BY_BACKEND``) — the kiro backend is
+    # the empty string internally, which no identifier matcher can carry.
+    #
+    # Consulted by ``kiro_crew.agent_backend_governance`` at exactly ONE place: it
+    # recomputes the ``acp_backends`` registry, from ``bootstrap_context`` at boot and
+    # from ``policy_distribution.apply_ceiling`` on every runtime ceiling install.
+    # Deliberately NOT consulted at provider construction — harness-parity H13 forbids
+    # the Kiro construction path gaining a conditional in service of an adapter, and a
+    # test asserts ``create_provider_factory`` contains no governance call. The
+    # existing single gate ``resolve_selected_backend`` reads the narrowed registry, so
+    # it degrades a denied persisted value with no second check.
+    "agent_backend": ScopeSpec(RULESET, matcher="identifier"),
     # Capabilities (registered defaults — see the CAPABILITY-DEFAULT CONTRACT above):
     "capabilities.spawn": ScopeSpec(
         CAPABILITY, capability_default=True, scope_matchers={"agents": "identifier"}
@@ -1076,6 +1206,13 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     "capabilities.script_hooks": ScopeSpec(CAPABILITY, capability_default=False),
     "capabilities.cron": ScopeSpec(CAPABILITY, capability_default=False),
     "capabilities.messaging": ScopeSpec(CAPABILITY, capability_default=False),
+    # Agent workload identity + Gateway MCP (opt-in, like messaging/publish).
+    # Inner ``posture`` is policy data (``workload`` | ``login``), not a second
+    # scope and not an evaluator input. An ``enabled: true`` document with a
+    # missing or unknown posture fails closed — treated as disabled, or
+    # boot-abort when ``boot.fail_closed``. Data row only; CONTRACT_VERSION
+    # and the evaluator are untouched.
+    "capabilities.agentcore": ScopeSpec(CAPABILITY, capability_default=False),
     # Publishing an artifact's bytes to an external destination is an
     # exfil/external-side-effect surface (like messaging), so it is opt-in
     # (capability_default=False): a policy that names ``publish`` while omitting
@@ -1179,6 +1316,37 @@ SCOPE_CATALOG: Dict[str, ScopeSpec] = {
     # Data row only — CONTRACT_VERSION and the evaluator are untouched (mirrors
     # telemetry).
     "capabilities.tailnet_origin": ScopeSpec(CAPABILITY, capability_default=True),
+    # "Connect your phone": minting a live mobile session credential (tailnet QR
+    # or one-time login link) is an auth-surface widening an enterprise POLICY
+    # must be able to close wholesale or narrow per method. The ``methods``
+    # ruleset binds on the MobileConnectMethod ids the CPP seam contributes
+    # (mirrors capabilities.publish's ``destinations``); WHO implements a method
+    # is the orthogonal MobileConnectProvider seam — this gate only decides
+    # WHETHER + WHICH. Default True: naming the row without ``enabled`` keeps
+    # the personal-install pair working; a governing policy can pin it off.
+    # Enforced fail-closed at the methods listing AND at each mint endpoint
+    # (the filtered list is presentation, never the control). Data row only —
+    # CONTRACT_VERSION and the evaluator are untouched (mirrors publish).
+    "capabilities.mobile_connect": ScopeSpec(
+        CAPABILITY, capability_default=True, scope_matchers={"methods": "identifier"}
+    ),
+    # "Share as image": the dashboard turns an assistant reply into a branded
+    # PNG card and offers a prefilled post to X / LinkedIn. The card itself is
+    # rendered and exported in the browser (no upload — copy / download stay
+    # local), but the intent buttons hand the reply's caption text to a
+    # third-party site in a URL, so the feature is an egress path for agent
+    # output that a managed fleet may forbid wholesale. There is no server-side
+    # share action to refuse; the control is the dashboard entry, and the
+    # dashboard learns whether to draw it from ``GET /api/dashboard/config``
+    # (``social_share_enabled``), which resolves this row server-side so the
+    # frontend never guesses. Default True: naming the row without ``enabled``
+    # keeps the entry for the standalone user; a governing ceiling — policy or
+    # a profile bound to the dashboard surface — withdraws it
+    # (``dashboard/social_share.py``: evaluated on the pinned ``dashboard:ui``
+    # surface through ``vet_and_audit``, fail-closed, mirroring the
+    # mobile_connect listing). Data row only — CONTRACT_VERSION and the
+    # evaluator are untouched.
+    "capabilities.social_share": ScopeSpec(CAPABILITY, capability_default=True),
 }
 
 
@@ -1705,6 +1873,22 @@ class GovernanceCeiling:
     # fallback is still intersected with this ceiling, so it can only ever narrow
     # it — it trades strict fail-closed for keeping the unlisted planes available.
     fallback_profile: "Optional[Profile]" = None
+    # Policy-only composed posture for ``capabilities.agentcore``
+    # (``workload`` | ``login``). Not a CapabilityGate field — that type stays
+    # ``enabled`` + ``scopes``. Read through :func:`agentcore_posture`, which
+    # returns ``None`` when the capability is off, omitted, or fail-closed
+    # disabled. A profile cannot compose a different posture onto this field
+    # (policy-wins).
+    agentcore_identity_posture: Optional[str] = None
+    # Policy-only Gateway MCP URL (``capabilities.agentcore.gateway_url``).
+    # Empty when omitted or the capability is off. Not a CapabilityGate field.
+    # A profile cannot carry this key. Read through
+    # :func:`agentcore_gateway_url`.
+    agentcore_gateway_url: str = ""
+    # Policy-only workload identity name (``capabilities.agentcore.workload_name``).
+    # Empty when omitted — runtime then uses env or a later default. A profile
+    # cannot carry this key. Read through :func:`agentcore_workload_name`.
+    agentcore_workload_name: str = ""
 
     def get(self, scope: str) -> Optional[object]:
         return self.controls.get(scope)
@@ -1825,6 +2009,173 @@ def _command_deny_patterns(control: object) -> Tuple[str, ...]:
     return ()
 
 
+_AGENTCORE_SCOPE = "capabilities.agentcore"
+_AGENTCORE_POSTURES = frozenset({"workload", "login"})
+_AGENTCORE_POLICY_ONLY = frozenset({"posture", "gateway_url", "workload_name"})
+
+
+def _capability_raw_for_gate(
+    scope: str, raw: Mapping[str, object], *, is_policy: bool
+) -> Mapping[str, object]:
+    """Drop inner policy data that is not a CapabilityGate field.
+
+    ``capabilities.agentcore.posture``, ``gateway_url``, and
+    ``workload_name`` are policy data, not a second scope and not an
+    evaluator input. Strip them on a policy document so
+    ``CapabilityGate.from_dict`` stays ``additionalProperties: false``.
+    A profile (or policy fallback body) that carries either key is
+    rejected — Rule 6, same fail-closed raise as ``ScopedMap.posture``.
+    """
+    if scope != _AGENTCORE_SCOPE:
+        return raw
+    extra = _AGENTCORE_POLICY_ONLY.intersection(raw)
+    if not extra:
+        return raw
+    if not is_policy:
+        name = "posture" if "posture" in extra else next(iter(extra))
+        raise PlatformCompositionError(
+            f"capabilities.agentcore.{name} is policy-only; not allowed on a profile"
+        )
+    return {key: value for key, value in raw.items() if key not in _AGENTCORE_POLICY_ONLY}
+
+
+def _apply_agentcore_posture(
+    data: Mapping[str, object],
+    controls: Dict[str, object],
+    boot: "BootControls",
+) -> Optional[str]:
+    """Validate agentcore posture and return the value to persist on the ceiling.
+
+    Missing or unknown ``posture`` with ``enabled: true`` aborts when
+    ``boot.fail_closed``; otherwise the row is treated as disabled. Disabled
+    (or unnamed) rows do not require a posture and yield ``None``.
+    """
+    raw_caps = data.get("capabilities")
+    if not isinstance(raw_caps, dict):
+        return None
+    raw = raw_caps.get("agentcore")
+    if not isinstance(raw, dict):
+        return None
+    control = controls.get(_AGENTCORE_SCOPE)
+    if not isinstance(control, CapabilityGate) or not control.enabled:
+        return None
+    posture = raw.get("posture")
+    if isinstance(posture, str) and posture in _AGENTCORE_POSTURES:
+        return posture
+    reason = (
+        f"capabilities.agentcore is enabled but posture is {posture!r}; "
+        "expected 'workload' or 'login'"
+    )
+    if boot.fail_closed:
+        raise PlatformCompositionError(reason)
+    controls[_AGENTCORE_SCOPE] = CapabilityGate(enabled=False, scopes=control.scopes)
+    return None
+
+
+def agentcore_posture(ceiling: Optional[GovernanceCeiling]) -> Optional[str]:
+    """Return the policy posture if ``capabilities.agentcore`` is enabled.
+
+    ``\"workload\"`` or ``\"login\"`` when the ceiling enables the capability
+    with a known posture. ``None`` when there is no ceiling, the capability is
+    omitted, disabled, or fail-closed-disabled. The single reader later work
+    must use — do not re-parse raw policy JSON for this field.
+    """
+    if ceiling is None:
+        return None
+    stored = ceiling.agentcore_identity_posture
+    if stored not in _AGENTCORE_POSTURES:
+        return None
+    control = ceiling.controls.get(_AGENTCORE_SCOPE)
+    if not isinstance(control, CapabilityGate) or not control.enabled:
+        return None
+    return stored
+
+
+def _apply_agentcore_gateway_url(
+    data: Mapping[str, object],
+    controls: Dict[str, object],
+    boot: "BootControls",
+) -> str:
+    """Validate and return the policy Gateway URL, or empty.
+
+    Missing / empty is legal (the crew may still name a posture and add
+    the URL later). A present but unusable value aborts when
+    ``boot.fail_closed``; otherwise it is ignored.
+    """
+    from kiro_crew.platform.agentcore_schema import normalize_agentcore_gateway_url
+
+    raw_caps = data.get("capabilities")
+    if not isinstance(raw_caps, dict):
+        return ""
+    raw = raw_caps.get("agentcore")
+    if not isinstance(raw, dict):
+        return ""
+    control = controls.get(_AGENTCORE_SCOPE)
+    if not isinstance(control, CapabilityGate) or not control.enabled:
+        return ""
+    value = raw.get("gateway_url")
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        reason = "capabilities.agentcore.gateway_url must be a string"
+        if boot.fail_closed:
+            raise PlatformCompositionError(reason)
+        return ""
+    try:
+        return normalize_agentcore_gateway_url(value)
+    except ValueError as exc:
+        if boot.fail_closed:
+            raise PlatformCompositionError(str(exc)) from exc
+        return ""
+
+
+def agentcore_gateway_url(ceiling: Optional[GovernanceCeiling]) -> str:
+    """Return the policy Gateway URL if ``capabilities.agentcore`` is enabled."""
+    if ceiling is None or agentcore_posture(ceiling) is None:
+        return ""
+    return str(ceiling.agentcore_gateway_url or "")
+
+
+def _apply_agentcore_workload_name(
+    data: Mapping[str, object],
+    controls: Dict[str, object],
+    boot: "BootControls",
+) -> str:
+    """Validate and return the policy workload name, or empty."""
+    from kiro_crew.platform.agentcore_schema import normalize_agentcore_workload_name
+
+    raw_caps = data.get("capabilities")
+    if not isinstance(raw_caps, dict):
+        return ""
+    raw = raw_caps.get("agentcore")
+    if not isinstance(raw, dict):
+        return ""
+    control = controls.get(_AGENTCORE_SCOPE)
+    if not isinstance(control, CapabilityGate) or not control.enabled:
+        return ""
+    value = raw.get("workload_name")
+    if value in (None, ""):
+        return ""
+    if not isinstance(value, str):
+        reason = "capabilities.agentcore.workload_name must be a string"
+        if boot.fail_closed:
+            raise PlatformCompositionError(reason)
+        return ""
+    try:
+        return normalize_agentcore_workload_name(value)
+    except ValueError as exc:
+        if boot.fail_closed:
+            raise PlatformCompositionError(str(exc)) from exc
+        return ""
+
+
+def agentcore_workload_name(ceiling: Optional[GovernanceCeiling]) -> str:
+    """Return the policy workload name if ``capabilities.agentcore`` is enabled."""
+    if ceiling is None or agentcore_posture(ceiling) is None:
+        return ""
+    return str(ceiling.agentcore_workload_name or "")
+
+
 def _parse_control(scope: str, spec: ScopeSpec, raw: object, *, is_policy: bool) -> object:
     """Parse one raw JSON control value into its archetype, per the catalog."""
     if not isinstance(raw, dict):
@@ -1832,7 +2183,30 @@ def _parse_control(scope: str, spec: ScopeSpec, raw: object, *, is_policy: bool)
             return OrdinalControl(scale=spec.ordinal_scale, value=raw)
         raise PlatformCompositionError(f"scope {scope!r} must be an object")
     if spec.kind == RULESET:
-        return ScopedRuleset.from_dict(raw, matcher=spec.matcher)
+        ruleset = ScopedRuleset.from_dict(raw, matcher=spec.matcher)
+        for floor in spec.always_permitted:
+            # An ``always_permitted`` identifier is one this scope may not forbid.
+            # Two reasons qualify, and the catalog entry says which applies: the
+            # scope cannot FUNCTION without it (``approval_modes``' ``normal``, the
+            # interactive floor -- denying it would brick tool approval), or its
+            # enforcement is NOT IMPLEMENTED yet, so accepting a deny would
+            # advertise a control that does not hold. Either way, refuse at parse
+            # time rather than boot into a state the policy misdescribes -- and
+            # refuse HERE because the trust-root ``security_policy.json`` is the one
+            # file the dashboard may not rewrite to repair itself.
+            #
+            # An ALLOW-list that merely omits the floor denies it just as
+            # effectively, which is why this asks the resolved ruleset rather than
+            # inspecting the deny list.
+            if not ruleset.permits(floor).permitted:
+                raise PlatformCompositionError(
+                    f"scope {scope!r} must not forbid {floor!r} - it is not deniable "
+                    f"in this scope, either because the scope cannot function "
+                    f"without it or because its enforcement is not implemented yet; "
+                    f"a deny is refused rather than accepted and left unenforced. "
+                    f"Omit it from 'deny', or include it in 'allow'"
+                )
+        return ruleset
     if spec.kind == ORDINAL:
         # Accept {"value": ...} / {"min_level": ...} / {"mode": ...}; a bare
         # string value is handled above.
@@ -1841,8 +2215,9 @@ def _parse_control(scope: str, spec: ScopeSpec, raw: object, *, is_policy: bool)
             raise PlatformCompositionError(f"ordinal scope {scope!r} needs a string value")
         return OrdinalControl(scale=spec.ordinal_scale, value=value)
     if spec.kind == CAPABILITY:
+        gate_raw: Mapping[str, object] = _capability_raw_for_gate(scope, raw, is_policy=is_policy)
         return CapabilityGate.from_dict(
-            raw, default_enabled=spec.capability_default, scope_matchers=spec.scope_matchers
+            gate_raw, default_enabled=spec.capability_default, scope_matchers=spec.scope_matchers
         )
     if spec.kind == SCOPEDMAP:
         return ScopedMap.from_dict(raw, allow_posture=is_policy)
@@ -2110,6 +2485,9 @@ def parse_policy(
         fail_closed=bool(boot_raw.get("fail_closed", True)),
     )
     controls = _parse_controls(data, is_policy=True)
+    composed_posture = _apply_agentcore_posture(data, controls, boot)
+    composed_gateway_url = _apply_agentcore_gateway_url(data, controls, boot)
+    composed_workload_name = _apply_agentcore_workload_name(data, controls, boot)
     identity = data.get("identity") or {}
     issuer = str(identity.get("issuer", "")) if isinstance(identity, dict) else ""
     signature = str(identity.get("signature", "")) if isinstance(identity, dict) else ""
@@ -2157,6 +2535,9 @@ def parse_policy(
         updates=UpdatePins.from_dict(raw_updates or {}),
         distribution=PolicyDistribution.from_dict(raw_distribution or {}),
         fallback_profile=fallback_profile,
+        agentcore_identity_posture=composed_posture,
+        agentcore_gateway_url=composed_gateway_url,
+        agentcore_workload_name=composed_workload_name,
     )
 
 

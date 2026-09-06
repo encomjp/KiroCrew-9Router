@@ -24,6 +24,7 @@ import {
   TILES,
   BRAND_PURPLE,
   EYES,
+  WORKING_EYES,
   BROWS,
   MOUTHS,
   ACCESSORIES,
@@ -230,5 +231,102 @@ describe('kiroGhost style', () => {
     for (const k of seen.mouth) expect(MOUTHS).toHaveProperty(k as string)
     for (const k of seen.accessory) expect({ ...ACCESSORIES, none: '' }).toHaveProperty(k as string)
     for (const k of seen.prop) expect(PROPS).toHaveProperty(k as string)
+  })
+})
+
+describe('working (animated) variant', () => {
+  // The safety contract: a working avatar is the SAME avatar, moving. These
+  // tests hold the two halves of that — geometry identical, prng untouched.
+
+  /** Remove everything the working variant is allowed to add: the style block
+   *  and the animation wrapper groups. What remains must be the still art. */
+  const stripAnimation = (svg: string): string =>
+    svg
+      .replace(/<style>[\s\S]*?<\/style>/g, '')
+      .replace(/<g class="kg-[^"]*"(?: style="[^"]*")?>/g, '')
+      .replace(/<\/g>/g, '')
+
+  it('draws exactly the geometry the seed drew, for every eye variant', () => {
+    for (const eyes of Object.keys(EYES)) {
+      const t = { ...BARE, eyes }
+      const still = compose(t)
+      const working = compose(t, 'full')
+      // The still path has no <g> at all under BARE-like traits (no flip, no
+      // prop group), so stripping animation wrappers from the working output
+      // must reproduce it byte for byte.
+      expect(stripAnimation(working), `eyes=${eyes}`).toBe(still)
+    }
+  })
+
+  it('leaves blush exactly as the seed rolled it', () => {
+    // Blush is an identity trait: the working variant must neither add it to a
+    // seed without it (covered above, blush: false) nor drop or rewrap it.
+    const t = { ...BARE, blush: true }
+    expect(stripAnimation(compose(t, 'full'))).toBe(compose(t))
+  })
+
+  it('covers every eye variant with an explicit working entry', () => {
+    // A key missing here would silently fall back to the still art — legal at
+    // render time, but for the shipped vocabulary every eye made a deliberate
+    // choice (closed's choice IS its still art).
+    for (const k of Object.keys(EYES)) expect(WORKING_EYES).toHaveProperty(k)
+  })
+
+  it('is a render option, not a trait: prng stream and identity are untouched', () => {
+    const traitsOf = (opts: Record<string, unknown>) =>
+      createAvatar(kiroGhost, { seed: 'oncall', ...opts }).toJson().extra
+    expect(traitsOf({ working: 'full' })).toEqual(traitsOf({}))
+    // Unset working reproduces the still render byte for byte.
+    expect(createAvatar(kiroGhost, { seed: 'oncall' }).toString()).not.toContain('kg-bob')
+    expect(createAvatar(kiroGhost, { seed: 'oncall', working: 'full' }).toString()).toContain(
+      'kg-bob',
+    )
+  })
+
+  it('honors prefers-reduced-motion and tiers intensity', () => {
+    const subtle = compose(BARE, 'subtle')
+    const full = compose(BARE, 'full')
+    for (const svg of [subtle, full]) {
+      expect(svg).toContain('prefers-reduced-motion')
+      expect(svg).toContain('kg-fit') // top headroom for tall accessories
+      // The fallback must be a true still frame: animations off AND the
+      // kg-fit static shrink/drop reset -- a static transform survives
+      // `animation:none`, which would leave a permanently shrunken ghost.
+      expect(svg).toMatch(
+        /@media \(prefers-reduced-motion:reduce\)\{[^}]*animation:none[^}]*\}\.kg-fit\{transform:none\}/,
+      )
+    }
+    // Same keyframe vocabulary, different amplitudes.
+    expect(subtle).not.toBe(full)
+  })
+
+  it('keeps body motion inside the flip group so origins stay unmirrored', () => {
+    const flipped = compose({ ...BARE, flip: true }, 'full')
+    const mirror = flipped.indexOf('<g transform="translate(1200,0) scale(-1,1)">')
+    const fit = flipped.indexOf('<g class="kg-fit">')
+    expect(mirror).toBeGreaterThan(-1)
+    expect(fit).toBeGreaterThan(mirror)
+  })
+
+  it('never lifts the tallest accessory past the top of the tile', () => {
+    // The antenna ball is the highest artwork: circle cy=104 r=44 → top y=60.
+    // At each tier's peak excursion (fit, then max stretch about y=985, then
+    // full rise) that point must stay inside the tile with real margin, or a
+    // member wearing it gets decapitated mid-bounce. Numbers mirror MOTION;
+    // if an amplitude bump fails this, grow fitDrop / shrink rise.
+    const TOP_Y = 60
+    for (const svg of [compose(BARE, 'subtle'), compose(BARE, 'full')]) {
+      const num = (re: RegExp) => Number((svg.match(re) ?? [])[1])
+      const fitDrop = num(/\.kg-fit\{transform:translateY\((-?[\d.]+)px\) scale\(([\d.]+)\)/)
+      const fitScale = Number(
+        (svg.match(/\.kg-fit\{transform:translateY\(-?[\d.]+px\) scale\(([\d.]+)\)/) ?? [])[1],
+      )
+      const stretch = num(/50%\{transform:scale\([\d.]+,([\d.]+)\)\}/)
+      const rise = num(/50%\{transform:translateY\(-([\d.]+)px\)\}/)
+      const afterFit = (TOP_Y - 600) * fitScale + 600 + fitDrop
+      const afterStretch = 985 - (985 - afterFit) * stretch
+      const peak = afterStretch - rise
+      expect(peak).toBeGreaterThan(30)
+    }
   })
 })

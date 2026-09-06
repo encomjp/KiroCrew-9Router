@@ -535,6 +535,7 @@ def file_lock(
     *,
     exclusive: bool = True,
     required: bool = False,
+    wait: bool = True,
 ) -> Iterator[None]:
     """Acquire an advisory lock on ``fd`` for the duration of the block.
 
@@ -557,12 +558,28 @@ def file_lock(
     the outcome (both paths refuse to proceed without the lock). On POSIX the
     acquire blocks until the lock is free, as before.
 
+    *wait* is for a caller whose work is OPTIONAL and retried later, and which
+    may run on the event-loop thread: with ``wait=False`` the acquire is
+    single-shot on every platform and raises :class:`BlockingIOError` at once
+    when the lock is held, instead of blocking the loop for as long as the holder
+    keeps it. POSIX gets that from ``LOCK_NB``; Windows already behaves this way
+    on the loop thread, and a zero timeout makes it uniform off the loop too.
+    ``BlockingIOError`` is an ``OSError``, so it is a NARROWING of what a caller
+    already had to handle, and it separates "someone else is writing right now"
+    from the stuck-holder ceiling above. It changes only how long we are willing
+    to wait, never whether the critical section is serialized -- a contended
+    ``wait=False`` acquire raises rather than proceeding.
+
     Note: on Windows, ``msvcrt.locking`` requires seeking to byte 0, so the
     ``fd`` must be a dedicated lock file; callers must not rely on the file
     offset being preserved across the context manager boundary.
     """
     if IS_POSIX:
         mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if not wait:
+            # BlockingIOError (an OSError) when held: same fail-closed contract
+            # as the Windows branch, reported by the platform rather than by us.
+            mode |= fcntl.LOCK_NB
         fcntl.flock(fd, mode)
         try:
             yield
@@ -579,9 +596,17 @@ def file_lock(
         # strictly safer, and callers already run under `with`, so the fd is
         # cleaned up. `required` is retained for call-site intent but no longer
         # changes the outcome — both paths now refuse to proceed lock-less.
-        if not _win_acquire_blocking(fd):
+        timeout = _WIN_LOCK_TIMEOUT_SECS if wait else 0.0
+        # Called with no keyword on the waiting path, so the default-argument
+        # call shape existing tests stub out stays exactly as it was.
+        acquired = _win_acquire_blocking(fd) if wait else _win_acquire_blocking(fd, timeout=0.0)
+        if not acquired:
+            if not wait:
+                # Held right now. BlockingIOError so the caller can tell this
+                # from the stuck-holder ceiling below, matching POSIX LOCK_NB.
+                raise BlockingIOError("file lock is held; not waiting for it")
             raise OSError(
-                f"could not acquire exclusive file lock within {_WIN_LOCK_TIMEOUT_SECS:g}s "
+                f"could not acquire exclusive file lock within {timeout:g}s "
                 "(a holder is stuck); refusing to proceed unserialized"
             )
         try:
@@ -920,6 +945,17 @@ _DARWIN_PROC_BSDINFO_SIZE = 136
 _DARWIN_PBI_START_TVSEC_OFFSET = 120
 _DARWIN_PBI_START_TVUSEC_OFFSET = 128
 
+# ``proc_pidinfo(PROC_PIDTASKINFO)`` fills a ``proc_taskinfo`` struct that opens
+# with six uint64 fields — ``pti_virtual_size``, ``pti_resident_size``,
+# ``pti_total_user``, ``pti_total_system``, ``pti_threads_user``,
+# ``pti_threads_system`` (48 bytes) — followed by twelve int32 counters (48),
+# for a struct size of 96. Only the two total-CPU fields matter here, and both
+# are already NANOSECONDS; the total size doubles as the layout check.
+_DARWIN_PROC_PIDTASKINFO = 4
+_DARWIN_PROC_TASKINFO_SIZE = 96
+_DARWIN_PTI_TOTAL_USER_OFFSET = 16
+_DARWIN_PTI_TOTAL_SYSTEM_OFFSET = 24
+
 _darwin_libproc: Any = None
 _darwin_libproc_loaded = False
 
@@ -1019,6 +1055,245 @@ def _darwin_process_start_microtime(pid: int) -> str | None:
         if sec <= 0:
             return None
         return f"{sec}.{usec:06d}"
+    except Exception:
+        return None
+
+
+def _darwin_process_cpu_nanos(pid: int) -> int | None:
+    """macOS total (user+system) CPU nanoseconds of *pid* via ``libproc``.
+
+    Same contract as the start-time probe above: no entitlement is needed for a
+    same-uid process, nothing is exec'd, and a fill size other than the exact
+    struct size means the assumed layout no longer matches, so the answer is
+    refused rather than sliced out of the wrong place.
+    """
+    lib = _darwin_libproc_handle()
+    if lib is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_PROC_TASKINFO_SIZE)
+        filled = lib.proc_pidinfo(
+            pid,
+            _DARWIN_PROC_PIDTASKINFO,
+            0,
+            buf,
+            _DARWIN_PROC_TASKINFO_SIZE,
+        )
+        if filled != _DARWIN_PROC_TASKINFO_SIZE:
+            return None
+        # Both x86_64 and arm64 macOS are little-endian.
+        user = int.from_bytes(
+            buf.raw[_DARWIN_PTI_TOTAL_USER_OFFSET:_DARWIN_PTI_TOTAL_SYSTEM_OFFSET], "little"
+        )
+        system = int.from_bytes(
+            buf.raw[_DARWIN_PTI_TOTAL_SYSTEM_OFFSET : _DARWIN_PTI_TOTAL_SYSTEM_OFFSET + 8],
+            "little",
+        )
+        return user + system
+    except Exception:
+        return None
+
+
+# Further ``proc_bsdinfo`` fields the liveness backend reads: ``pbi_status`` is
+# the second uint32 (offset 4). ``SZOMB`` is the BSD process-state code for
+# a zombie; in practice the kernel refuses ``PROC_PIDTBSDINFO`` for a zombie
+# outright, so the code is a second line of defence, not the primary test.
+_DARWIN_PBI_STATUS_OFFSET = 4
+_DARWIN_SZOMB = 5
+
+# ``proc_pidpath`` fails unless handed ``PROC_PIDPATHINFO_MAXSIZE`` bytes, which
+# is four times ``MAXPATHLEN``.
+_DARWIN_PIDPATH_MAXSIZE = 4 * _DARWIN_MAXPATHLEN
+
+# ``sysctl(CTL_KERN, KERN_PROCARGS2, pid)`` returns an ``int`` argc, the exec
+# path, NUL padding, then the argv strings and finally the environment. The
+# kernel truncates silently to the buffer handed in (no error), so a bounded
+# buffer costs at most the tail of an unusually long argv — never a failure.
+_DARWIN_CTL_KERN = 1
+_DARWIN_KERN_PROCARGS2 = 49
+_DARWIN_PROCARGS_BUFSIZE = 64 * 1024
+
+# ``proc_listchildpids`` writes ``pid_t`` values and returns HOW MANY it wrote.
+# A childless parent and a pid that does not exist both answer 0, so a caller
+# that needs to tell them apart reads the parent's own facts first.
+_DARWIN_CHILD_LIST_INITIAL = 1024
+
+
+class DarwinProcessFacts(NamedTuple):
+    """One process as ``PROC_PIDTBSDINFO`` describes it.
+
+    ``start_secs`` is the absolute wall-clock start instant (``pbi_start_tvsec``
+    + ``pbi_start_tvusec``), i.e. the same clock ``time.time()`` reads — the pair
+    a caller compares to date a process against an event it stamped itself.
+    """
+
+    zombie: bool
+    start_secs: float
+
+
+_darwin_libproc_tree_bound = False
+
+
+def _darwin_libproc_tree_handle() -> Any:
+    """The cached ``libproc`` handle with the tree-walk entry points declared.
+
+    Declared lazily and separately from :func:`_darwin_libproc_handle` so a
+    libproc missing either symbol still serves the cwd / start-time / CPU probes
+    that need only ``proc_pidinfo``. Returns None when the extra entry points
+    cannot be bound.
+    """
+    global _darwin_libproc_tree_bound
+    lib = _darwin_libproc_handle()
+    if lib is None:
+        return None
+    if _darwin_libproc_tree_bound:
+        return lib
+    try:
+        lib.proc_listchildpids.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        lib.proc_listchildpids.restype = ctypes.c_int
+        lib.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        lib.proc_pidpath.restype = ctypes.c_int
+    except Exception:
+        return None
+    _darwin_libproc_tree_bound = True
+    return lib
+
+
+def darwin_child_pids(ppid: int) -> list[int] | None:
+    """Direct children of *ppid* via ``proc_listchildpids``; None when unreadable.
+
+    In-process and unprivileged: pid enumeration needs no entitlement for any
+    process. The buffer grows until the kernel's answer fits, so a parent with
+    more children than the initial capacity is enumerated completely rather than
+    truncated. An empty list is a genuine answer only for a parent that exists —
+    the syscall answers 0 for an unknown pid too — so callers that assert
+    absence pair this with :func:`darwin_process_facts` on the parent.
+    """
+    lib = _darwin_libproc_tree_handle()
+    if lib is None:
+        return None
+    capacity = _DARWIN_CHILD_LIST_INITIAL
+    try:
+        while True:
+            buf = ctypes.create_string_buffer(capacity * 4)
+            count = lib.proc_listchildpids(ppid, buf, capacity * 4)
+            if count < 0:
+                return None
+            if count < capacity:
+                return list(struct.unpack_from(f"<{count}i", buf.raw, 0))
+            capacity *= 2
+    except Exception:
+        return None
+
+
+def darwin_process_facts(pid: int) -> DarwinProcessFacts | None:
+    """``PROC_PIDTBSDINFO`` of *pid*, or None when the process cannot be read.
+
+    None covers "gone", "zombie" (the kernel refuses the query for one) and
+    "not ours to inspect" (another user's process) alike: each is a process the
+    caller cannot attribute work to. A same-uid live process always answers.
+    """
+    lib = _darwin_libproc_handle()
+    if lib is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_PROC_BSDINFO_SIZE)
+        filled = lib.proc_pidinfo(pid, _DARWIN_PROC_PIDTBSDINFO, 0, buf, _DARWIN_PROC_BSDINFO_SIZE)
+        if filled != _DARWIN_PROC_BSDINFO_SIZE:
+            return None
+        status = struct.unpack_from("<I", buf.raw, _DARWIN_PBI_STATUS_OFFSET)[0]
+        sec = struct.unpack_from("<Q", buf.raw, _DARWIN_PBI_START_TVSEC_OFFSET)[0]
+        usec = struct.unpack_from("<Q", buf.raw, _DARWIN_PBI_START_TVUSEC_OFFSET)[0]
+        if sec <= 0:
+            return None
+        return DarwinProcessFacts(zombie=status == _DARWIN_SZOMB, start_secs=sec + usec / 1_000_000)
+    except Exception:
+        return None
+
+
+def darwin_process_path(pid: int) -> str | None:
+    """Executable path of *pid* via ``proc_pidpath``, or None when unreadable."""
+    lib = _darwin_libproc_tree_handle()
+    if lib is None:
+        return None
+    try:
+        buf = ctypes.create_string_buffer(_DARWIN_PIDPATH_MAXSIZE)
+        length = lib.proc_pidpath(pid, buf, _DARWIN_PIDPATH_MAXSIZE)
+        if length <= 0:
+            return None
+        return buf.raw[:length].decode("utf-8", errors="replace") or None
+    except Exception:
+        return None
+
+
+_darwin_libc_sysctl: Any = None
+_darwin_libc_sysctl_loaded = False
+
+
+def _darwin_sysctl_handle() -> Any:
+    """Cached ``libc`` handle with ``sysctl`` declared, or None when unavailable.
+
+    Cached for the same reason as the libproc handle: the argv probe runs per
+    descendant on the liveness oracle's cadence, and a fresh ``CDLL`` per call
+    would dlopen every time.
+    """
+    global _darwin_libc_sysctl, _darwin_libc_sysctl_loaded
+    if _darwin_libc_sysctl_loaded:
+        return _darwin_libc_sysctl
+    _darwin_libc_sysctl_loaded = True
+    try:
+        path = ctypes.util.find_library("c")
+        if path is None:
+            return None
+        libc = ctypes.CDLL(path)
+        libc.sysctl.argtypes = [
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        libc.sysctl.restype = ctypes.c_int
+        _darwin_libc_sysctl = libc
+    except Exception:
+        _darwin_libc_sysctl = None
+    return _darwin_libc_sysctl
+
+
+def darwin_process_argv(pid: int) -> list[str] | None:
+    """argv of *pid* via ``sysctl KERN_PROCARGS2``, or None when unreadable.
+
+    Same-uid processes only (the kernel answers EPERM for another user's), and
+    bounded to :data:`_DARWIN_PROCARGS_BUFSIZE` — the kernel truncates rather
+    than fails, so a very long argv comes back with its tail cut, which still
+    carries the program and the head of its arguments. Returns None rather than
+    an empty list when the record cannot be parsed, so a caller can fall back to
+    the executable path instead of treating "unreadable" as "no arguments".
+    """
+    libc = _darwin_sysctl_handle()
+    if libc is None:
+        return None
+    try:
+        mib = (ctypes.c_int * 3)(_DARWIN_CTL_KERN, _DARWIN_KERN_PROCARGS2, pid)
+        buf = ctypes.create_string_buffer(_DARWIN_PROCARGS_BUFSIZE)
+        size = ctypes.c_size_t(_DARWIN_PROCARGS_BUFSIZE)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+        raw = buf.raw[: size.value]
+        if len(raw) < 4:
+            return None
+        argc = struct.unpack_from("<i", raw, 0)[0]
+        if argc <= 0:
+            return None
+        rest = raw[4:]
+        exe_end = rest.find(b"\0")
+        if exe_end < 0:
+            return None
+        rest = rest[exe_end:].lstrip(b"\0")
+        parts = rest.split(b"\0")[:argc]
+        argv = [p.decode("utf-8", errors="replace") for p in parts if p]
+        return argv or None
     except Exception:
         return None
 
@@ -3143,6 +3418,33 @@ async def kill_process_tree_async(pid: int, sig: int = SIGTERM) -> bool:
 REAP_TIMEOUT_SECS: float = 10
 
 
+def _shares_own_process_group(pid: int) -> bool:
+    """True when *pid* runs in the gateway's OWN process group.
+
+    Such a child was spawned without ``start_new_session``, so it has no tree
+    of its own to signal — see :func:`kill_and_reap`, whose group kill this
+    gates. Fail-closed (``False``) on every probe failure: the pid may be gone
+    or unreadable, and the tree kill it guards is itself best-effort and
+    protected by :func:`kill_process_tree`'s own broadcast/self-group guard.
+
+    This is a named seam on purpose. The probe reads the LIVE process table,
+    so a test handing :func:`kill_and_reap` a synthetic pid was at the mercy
+    of whichever real process happened to own that pid: when it landed inside
+    the runner's own group the skip fired and the expected tree kill never
+    happened. The rootdir ``conftest`` pins this one function instead of the
+    shared ``_OWN_PGID`` — pinning that would also disarm
+    :func:`kill_process_tree`'s self-group refusal, the guard that keeps a
+    test from broadcasting a signal to the whole pytest run.
+    """
+
+    if not IS_POSIX:
+        return False
+    try:
+        return os.getpgid(pid) == _OWN_PGID
+    except Exception:
+        return False
+
+
 async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | None = None) -> None:
     """Kill *proc* AND its descendants, then wait for it under a bound.
 
@@ -3177,11 +3479,9 @@ async def kill_and_reap(proc: asyncio.subprocess.Process, *, timeout: float | No
     """
 
     async def _cleanup() -> None:
-        same_group = False
-        if IS_POSIX:
-            with contextlib.suppress(Exception):
-                same_group = os.getpgid(proc.pid) == _OWN_PGID
-        if not same_group:
+        # Bare-name lookup so a test can pin the probe (see
+        # ``_shares_own_process_group``) without reaching into ``os``.
+        if not _shares_own_process_group(proc.pid):
             # Bare-name lookup resolves through this module's namespace at
             # call time, so tests patching ``kiro_crew.platform_compat.
             # kill_process_tree_async`` still intercept the tree kill.
@@ -3292,15 +3592,23 @@ def rmtree_force(path: str | os.PathLike) -> bool:
     # `onexc` replaced `onerror` in 3.12 and the old name warns; this project
     # still supports 3.9+, so pick by capability rather than by version number.
     kwarg = "onexc" if sys.version_info >= (3, 12) else "onerror"
-    if kwarg == "onerror":  # pragma: no cover - exercised on Python < 3.12
+    try:
+        if kwarg == "onerror":  # pragma: no cover - exercised on Python < 3.12
 
-        def _legacy(func: Any, target: str, exc_info: Any) -> None:
-            _clear_readonly_and_retry(func, target, exc_info[1])
+            def _legacy(func: Any, target: str, exc_info: Any) -> None:
+                _clear_readonly_and_retry(func, target, exc_info[1])
 
-        shutil.rmtree(path, onerror=_legacy)
-    else:
-        shutil.rmtree(path, onexc=_clear_readonly_and_retry)  # type: ignore[call-arg]
-    return not os.path.exists(path)
+            shutil.rmtree(path, onerror=_legacy)
+        else:
+            shutil.rmtree(path, onexc=_clear_readonly_and_retry)  # type: ignore[call-arg]
+    except FileNotFoundError:
+        # A missing ROOT is success. A nested entry can disappear during rmtree while
+        # the root survives, especially through the Python <3.12 onerror path.
+        return not os.path.lexists(path)
+    except OSError:
+        logger.warning("Cannot remove %s", path)
+        return False
+    return not os.path.lexists(path)
 
 
 def symlink_or_junction(target: str | os.PathLike, link: str | os.PathLike) -> None:
@@ -3429,6 +3737,87 @@ def unlink_link_or_junction(path: str | os.PathLike) -> None:
         return
     # Neither — let the caller's own logic handle a real file/dir.
     os.unlink(path)
+
+
+#: ``CreateFileW`` arguments for :func:`pin_directory`. ``BACKUP_SEMANTICS`` is
+#: what lets a directory be opened at all; ``OPEN_REPARSE_POINT`` opens the
+#: reparse point ITSELF instead of following it, so a junction planted at the
+#: name is seen for what it is rather than silently traversed. The share mode
+#: deliberately omits ``FILE_SHARE_DELETE``: that omission is the pin.
+_WIN_GENERIC_READ = 0x80000000
+_WIN_FILE_SHARE_READ_WRITE = 0x00000001 | 0x00000002
+_WIN_OPEN_EXISTING = 3
+_WIN_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WIN_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WIN_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_WIN_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+
+
+def pin_directory(path: str | os.PathLike) -> int:
+    """Open *path* as a directory and return a descriptor that PINS it.
+
+    For code that must let a child process write to ``<dir>/<name>`` by path:
+    the string is re-resolved at the child's open, so a same-UID watcher that
+    renames ``<dir>`` away and plants a link at its name between our check and
+    that open redirects the write. Holding the directory open closes the
+    window differently on each platform:
+
+    * Windows: the handle is opened without ``FILE_SHARE_DELETE``, and a
+      directory with such a handle open can be neither renamed nor deleted --
+      nor can any directory above it -- for as long as the handle lives. The
+      open itself refuses to follow a reparse point, so a junction already
+      sitting at the name fails here instead of being pinned in its target's
+      place.
+    * POSIX: ``O_DIRECTORY | O_NOFOLLOW`` refuses a symlink or a file at the
+      name, and the returned descriptor is usable as ``dir_fd`` so the caller's
+      own opens resolve against the directory it inspected. Holding it does not
+      block a rename (POSIX has no such lock); callers rely on the sandbox mask
+      for that and use the descriptor for their own opens.
+
+    Refuses anything that is not a real directory: a file or a Windows reparse
+    point raises ``NotADirectoryError``; a POSIX symlink fails with whichever
+    of ``ENOTDIR`` / ``ELOOP`` the kernel reports for ``O_DIRECTORY |
+    O_NOFOLLOW``. Release with ``os.close``.
+    """
+    if IS_POSIX:
+        return os.open(
+            os.fspath(path),
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(
+        os.fspath(path),
+        _WIN_GENERIC_READ,
+        _WIN_FILE_SHARE_READ_WRITE,
+        None,
+        _WIN_OPEN_EXISTING,
+        _WIN_FILE_FLAG_BACKUP_SEMANTICS | _WIN_FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())  # type: ignore[attr-defined]
+    # Wrapping the handle in a CRT descriptor lets ``os.fstat`` read the
+    # attributes of what was actually opened, and ``os.close`` release it.
+    fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)  # type: ignore[attr-defined]
+    try:
+        attrs = getattr(os.fstat(fd), "st_file_attributes", 0)
+        if not attrs & _WIN_FILE_ATTRIBUTE_DIRECTORY or attrs & _WIN_FILE_ATTRIBUTE_REPARSE_POINT:
+            raise NotADirectoryError(errno.ENOTDIR, "not a real directory", os.fspath(path))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
 
 
 # Well-known SID for the file's *owner* (implicit). Under a self-relative DACL
@@ -4127,17 +4516,17 @@ def _is_windows_store_python_stub(path: str) -> bool:
 
 
 def find_python_interpreter(reject: Optional[Callable[[str], bool]] = None) -> str | None:
-    """Resolve a real CPython >= 3.10 interpreter, or None.
+    """Resolve a real CPython >= 3.12 interpreter, or None.
 
     Single source of truth for "where is a usable system python" on every
-    platform. Prefers versioned names (3.12/3.11), then bare ``python``/
-    ``python3``, with free-threaded-prone ``python3.13`` LAST so a usable
-    3.12/3.11/3.10 wins first. Rejects
+    platform. Prefers the exact tested version (``python3.12``), then bare
+    ``python``/``python3``, with free-threaded-prone ``python3.13`` LAST so a
+    usable 3.12 wins first. Rejects
     Brazil-path/build interpreters and — critically on Windows — the Microsoft
     Store alias stub (see :func:`_is_windows_store_python_stub`): running that
     stub is what emits the "Python was not found" nag, so we must never spawn it.
 
-    ``reject`` is an optional predicate run against each >= 3.10 candidate path;
+    ``reject`` is an optional predicate run against each >= 3.12 candidate path;
     return True to skip it and FALL THROUGH to the next candidate (not abort).
     Callers with extra constraints the shared resolver can't express — e.g. the
     STT prereq probe needs pip and a non-free-threaded build — pass it here so a
@@ -4149,9 +4538,9 @@ def find_python_interpreter(reject: Optional[Callable[[str], bool]] = None) -> s
     whisper installs that must not land in the gateway's venv).
     """
     names = (
-        ("python3.12", "python3.11", "python3.10", "python", "python3")
+        ("python3.12", "python", "python3")
         if IS_WINDOWS
-        else ("python3.12", "python3.11", "python3.10", "python3", "python3.13")
+        else ("python3.12", "python3", "python3.13")
     )
     for name in names:
         p = shutil.which(name)
@@ -4174,11 +4563,11 @@ def find_python_interpreter(reject: Optional[Callable[[str], bool]] = None) -> s
                 **UTF8_TEXT,
             ).strip()
             major, _, minor = out.partition(".")
-            if not (int(major) == 3 and int(minor) >= 10):
+            if not (int(major) == 3 and int(minor) >= 12):
                 continue
         except (OSError, ValueError, subprocess.SubprocessError):
             continue
-        # >= 3.10 and resolvable. Let the caller veto it (e.g. free-threaded /
+        # >= 3.12 and resolvable. Let the caller veto it (e.g. free-threaded /
         # no pip) and keep searching the remaining candidates.
         if reject is not None and reject(p):
             continue
@@ -4373,6 +4762,111 @@ def proc_rss_bytes() -> int:
     return 0 if counters is None else int(counters.WorkingSetSize)
 
 
+HEAP_TRIM_INTERVAL_SECONDS = 10 * 60.0
+HEAP_TRIM_RSS_THRESHOLD_BYTES = 1536 * 1024 * 1024
+HEAP_TRIM_LOG_THRESHOLD_BYTES = 16 * 1024 * 1024
+# Must remain below the heartbeat interval.  A queued or wedged default-executor
+# worker forfeits this maintenance pass instead of starving the liveness beat.
+HEAP_TRIM_TIMEOUT_SECONDS = 2.0
+
+
+def _malloc_trim() -> bool:
+    """Ask glibc to return wholly-free heap pages, or no-op elsewhere."""
+    try:
+        libc = ctypes.CDLL(None)
+        getattr(libc, "gnu_get_libc_version")
+        trim = libc.malloc_trim
+        trim.argtypes = [ctypes.c_size_t]
+        trim.restype = ctypes.c_int
+        return bool(trim(0))
+    except (AttributeError, OSError):
+        return False
+
+
+def trim_heap_if_needed(
+    *,
+    rss_reader: Callable[[], int | None] | None = None,
+    trimmer: Callable[[], bool] | None = None,
+) -> int:
+    """Return bytes released from a large Linux gateway heap.
+
+    A high threshold avoids allocator-wide work on healthy gateways. This must
+    use Linux's current RSS directly: :func:`proc_rss_bytes` deliberately falls
+    back to peak RSS when procfs is unavailable, which would turn one historic
+    spike into repeated trim attempts. Unsupported libc and probe failures are
+    harmless because reclamation is optional.
+    """
+    if not IS_LINUX:
+        return 0
+    try:
+        read_rss = rss_reader or _linux_current_rss_bytes
+        before = read_rss()
+        if before is None:
+            return 0
+        if before < HEAP_TRIM_RSS_THRESHOLD_BYTES:
+            return 0
+        if not (trimmer or _malloc_trim)():
+            return 0
+        after = read_rss()
+        if after is None:
+            return 0
+    except Exception:  # noqa: BLE001 - optional maintenance must not stop the heartbeat
+        return 0
+    return max(0, before - after)
+
+
+class HeapTrimMaintainer:
+    """Self-gate bounded, best-effort heap reclamation for the gateway.
+
+    The heartbeat calls :meth:`maybe_trim` on every tick. Cadence and in-flight
+    ownership live here so the heartbeat stays cadence-free. A timed-out worker
+    may continue running because Python cannot cancel native work already in a
+    thread; ``_inflight`` prevents another from being submitted until that
+    worker returns. If cancellation wins before the worker starts, maintenance
+    remains disabled for this object, which is the safe failure mode.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        trim: Callable[[], int] = trim_heap_if_needed,
+    ) -> None:
+        self._clock = clock
+        self._trim = trim
+        self._next_trim = clock() + HEAP_TRIM_INTERVAL_SECONDS
+        self._inflight = False
+
+    async def maybe_trim(self) -> int:
+        """Return bytes released, or zero when skipped, timed out, or failed."""
+        try:
+            if not IS_LINUX:
+                return 0
+            now = self._clock()
+            if now < self._next_trim or self._inflight:
+                return 0
+            self._next_trim = now + HEAP_TRIM_INTERVAL_SECONDS
+            self._inflight = True
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(self._run_trim),
+                    timeout=HEAP_TRIM_TIMEOUT_SECONDS,
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.debug("gateway heap trim timed out; maintenance pass skipped")
+                return 0
+        except Exception:  # noqa: BLE001 - maintenance must not stop the heartbeat
+            logger.debug("gateway heap trim failed", exc_info=True)
+            return 0
+
+    def _run_trim(self) -> int:
+        """Worker-thread wrapper that releases the single in-flight slot."""
+        try:
+            return self._trim()
+        finally:
+            self._inflight = False
+
+
 def proc_peak_rss_bytes() -> int:
     """Return this process's PEAK resident set size in bytes, or 0 on failure.
 
@@ -4482,6 +4976,273 @@ def proc_rss_bytes_for_pid(pid: int) -> int | None:
             kernel32.CloseHandle(handle)
     except Exception:
         return None
+
+
+# --- /proc process-subtree sampling ----------------------------------------
+#
+# ONE walk for the two callers that used to carry their own copy of it:
+# ``mcp_gateway.pool`` and ``subagent`` each had a line-for-line BFS over
+# ``/proc/<pid>/task/<tid>/children`` and its own ``256`` ceiling, so a fix to
+# either policy reached only one surface. :func:`proc_subtree_sample` is now the
+# single entry point for BOTH, and the helpers below are the per-process reads it
+# is built from -- module-private, because no caller outside this module wants a
+# single read on its own. Pure stdlib: on a host without ``/proc`` every access
+# raises ``OSError`` and each reading degrades to its own sentinel.
+#
+# NOT the only way this repository walks a process tree, and deliberately so.
+# ``session_pid._build_child_map`` sums a session's tree from a full ``/proc``
+# scan of every process's ``stat`` ``PPid`` field, precisely because the
+# ``children`` file this walk reads needs ``CONFIG_PROC_CHILDREN`` and is
+# documented as reliable only for frozen tasks -- for a live task it can return
+# an incomplete child set and silently drop a descendant subtree from the sum.
+# That trade is the right one there (an under-counted tree would make the RSS
+# watchdog no-op) and the wrong one here: these two callers sample per backend
+# and per live agent on a timer, where a whole-machine scan per sample is the
+# larger cost, and an under-count degrades a displayed number rather than
+# disabling a protection. Reconsidering the method for these two surfaces is a
+# behaviour change to figures users already read, not part of this
+# consolidation -- but it is now ONE place to reconsider instead of two.
+
+#: Upper bound on processes walked in one subtree sample. A real tree is tiny
+#: (a launcher plus a handful of workers); the cap only guards against a
+#: pathological or looping ``/proc`` graph.
+_SUBTREE_MAX_PROCS = 256
+
+
+def _proc_status_rss_kb(pid: int) -> int:
+    """RSS (KiB) of a single *pid* from ``/proc/<pid>/status``, or -1.
+
+    Reads ``VmRSS``, so the figure matches ``ps -o rss=`` for that one process.
+    Distinct from :func:`proc_rss_bytes_for_pid`, which reads ``statm`` pages and
+    has a Windows path: this one is the Linux subtree walk's per-process read and
+    keeps ``-1`` as its "unreadable" sentinel rather than ``None``.
+    """
+    try:
+        with open(f"/proc/{pid}/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return -1
+
+
+def _proc_children(pid: int) -> list[int]:
+    """Direct child PIDs of *pid* via ``/proc/<pid>/task/<tid>/children``.
+
+    Uses the kernel-provided children list (``CONFIG_PROC_CHILDREN``), so no
+    ``pgrep``/full-table scan. Returns ``[]`` if the file is unavailable.
+    """
+    kids: list[int] = []
+    task_dir = f"/proc/{pid}/task"
+    try:
+        tids = os.listdir(task_dir)
+    except OSError:
+        return kids
+    for tid in tids:
+        try:
+            with open(f"{task_dir}/{tid}/children", encoding="ascii") as fh:
+                kids.extend(int(tok) for tok in fh.read().split())
+        except (OSError, ValueError):
+            continue
+    return kids
+
+
+def _parse_cpu_jiffies(stat: bytes) -> int:
+    """Sum utime+stime (clock ticks) from raw ``/proc/<pid>/stat`` bytes.
+
+    Splits after the final ``)`` so a ``comm`` containing spaces/parens is
+    handled. utime/stime are fields 14/15 (1-indexed) → indices 11/12 of the
+    post-comm tokens. Returns 0 on any parse error.
+    """
+    try:
+        rparen = stat.rindex(b")")
+        fields = stat[rparen + 2 :].split()
+        return int(fields[11]) + int(fields[12])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _proc_cpu_jiffies(pid: int) -> int:
+    """utime+stime (clock ticks) for a single pid, 0 on error."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            return _parse_cpu_jiffies(fh.read())
+    except OSError:
+        return 0
+
+
+def proc_cpu_nanos_for_pid(pid: int) -> int | None:
+    """Total (user+system) CPU time of *pid* in NANOSECONDS, or None.
+
+    The per-pid, cross-platform counterpart to :func:`proc_cpu_seconds`, which
+    can only measure the CALLING process. A caller samples this twice and
+    consumes the DELTA as evidence that a process is doing work; ``None`` means
+    no per-pid counter is readable on this host, which is evidence of neither
+    work nor death.
+
+    - Linux: ``_proc_cpu_jiffies`` scaled by ``SC_CLK_TCK``. Never None — an
+      unreadable pid reads 0 there, which a delta correctly sees as flat.
+    - macOS: ``libproc.proc_pidinfo(PROC_PIDTASKINFO)``, already nanoseconds.
+    - Windows: ``GetProcessTimes`` kernel+user (100-ns units) over a query-only
+      handle.
+    - Any other platform: None.
+
+    Root pid ONLY — deliberately no subtree walk here: this probe runs on a read
+    loop's cadence and Windows has no child enumeration cheap enough for that. A
+    caller that needs the subtree total uses :func:`proc_subtree_sample` on Linux,
+    or walks :func:`darwin_child_pids` and sums this per pid on macOS (the
+    liveness oracle's darwin backend does exactly that).
+    """
+    if type(pid) is not int or pid <= 0:
+        return None
+    if IS_LINUX:
+        try:
+            ticks = os.sysconf("SC_CLK_TCK") or 100
+        except (AttributeError, OSError, ValueError):
+            ticks = 100
+        return _proc_cpu_jiffies(pid) * (1_000_000_000 // ticks)
+    if IS_MACOS:
+        return _darwin_process_cpu_nanos(pid)
+    if not IS_WINDOWS:
+        return None
+    handle = _open_process_query_handle(pid)
+    if handle is None:
+        return None
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        creation = wintypes.FILETIME()
+        exited = wintypes.FILETIME()
+        kernel = wintypes.FILETIME()
+        user = wintypes.FILETIME()
+        if not kernel32.GetProcessTimes(
+            wintypes.HANDLE(handle),
+            ctypes.byref(creation),
+            ctypes.byref(exited),
+            ctypes.byref(kernel),
+            ctypes.byref(user),
+        ):
+            return None
+
+        def _hundred_ns(value: "wintypes.FILETIME") -> int:
+            return (value.dwHighDateTime << 32) | value.dwLowDateTime
+
+        return (_hundred_ns(kernel) + _hundred_ns(user)) * 100
+    except Exception:
+        return None
+    finally:
+        _close_process_handle(handle)
+
+
+class SubtreeSample(NamedTuple):
+    """Every reading one subtree walk can produce, from ONE frontier.
+
+    Each field keeps its own sentinel, because the readings are unmeasurable in
+    different ways and collapsing any of them into zero is a bug class in its own
+    right:
+
+    * ``rss_kb`` — summed KiB, or ``-1`` when the root pid's own status is
+      unreadable (it is gone, or the host has no ``/proc``).
+    * ``jiffies`` — summed utime+stime clock ticks; an unreadable pid contributes
+      0, since a *delta* of jiffies is what a caller consumes.
+    * ``procs`` / ``matched`` — how many processes the subtree carries, and how
+      many of their command lines contain one of the caller's ``needles``.
+      ``None`` means UNMEASURABLE, never zero: rendering "0 processes" for a live
+      tree would be a lie, so a surface renders ``None`` as an em dash instead.
+    """
+
+    rss_kb: int
+    jiffies: int
+    procs: Optional[int]
+    matched: Optional[int]
+
+
+def proc_subtree_sample(
+    pid: Optional[int],
+    *,
+    rss: bool = True,
+    jiffies: bool = True,
+    counts: bool = False,
+    needles: tuple[str, ...] = (),
+) -> SubtreeSample:
+    """Walk *pid*'s process subtree ONCE and return every requested reading.
+
+    A tracked process is frequently a thin launcher whose real memory lives in a
+    child, so every reading describes the whole subtree rather than the root pid
+    alone.
+
+    The point of one pass is not only the fewer ``/proc`` reads: separate readers
+    run at separate instants, so a process that exits between them is counted by
+    one and missed by another. Reading every metric off a single frontier is what
+    makes "the same set of processes" true of the *result* and not merely of the
+    walk rules.
+
+    ``rss`` / ``jiffies`` / ``counts`` let a caller skip the per-process reads it
+    does not want, so sharing this walk costs each caller what its own walk cost:
+    a CPU-only caller pays no ``status`` read, and an RSS-only caller pays no
+    ``stat`` read. A skipped reading comes back as its own sentinel. When nothing
+    remains to accumulate — RSS unreadable at the root, no jiffies, nothing
+    countable — the descendants are not walked at all.
+
+    ``counts`` is Linux-only (it matches command lines via
+    :func:`process_matches`) and yields ``(None, None)`` elsewhere.
+
+    Coverage caveat for a new caller: the walk reads
+    ``/proc/<pid>/task/<tid>/children``, which needs ``CONFIG_PROC_CHILDREN`` and
+    is documented as reliable only for frozen tasks, so a live tree can come back
+    short. That is acceptable for the periodic per-process figures the two
+    callers display; a reading that must not under-count (the RSS watchdog's
+    recycle decision) uses ``session_pid._build_child_map`` instead, which pays a
+    full ``/proc`` scan for completeness.
+
+    Blocking: reads a handful of ``/proc`` entries per process in the subtree, so
+    it belongs on an executor thread, never on the event loop.
+    """
+    if not pid:
+        return SubtreeSample(-1, 0, None, None)
+    # The counts share RSS's liveness probe: a root pid whose own status cannot
+    # be read has nothing to attribute, so there is nothing to count either.
+    own_rss = _proc_status_rss_kb(pid) if (rss or counts) else -1
+    countable = counts and IS_LINUX and own_rss >= 0
+    rss_total = own_rss if (rss and own_rss >= 0) else -1
+    total_jiffies = _proc_cpu_jiffies(pid) if jiffies else 0
+    procs = 1
+    matched = 1 if countable and process_matches(pid, needles) else 0
+    if rss_total < 0 and not jiffies and not countable:
+        # Nothing a descendant could add — do not pay for the walk.
+        return SubtreeSample(-1, total_jiffies, None, None)
+    seen = {pid}
+    frontier = [pid]
+    while frontier and len(seen) < _SUBTREE_MAX_PROCS:
+        nxt: list[int] = []
+        for parent in frontier:
+            for child in _proc_children(parent):
+                if child in seen:
+                    continue
+                seen.add(child)
+                if rss_total >= 0:
+                    kb = _proc_status_rss_kb(child)
+                    if kb > 0:
+                        rss_total += kb
+                if jiffies:
+                    total_jiffies += _proc_cpu_jiffies(child)
+                if countable:
+                    procs += 1
+                    if process_matches(child, needles):
+                        matched += 1
+                nxt.append(child)
+        frontier = nxt
+    if not countable:
+        return SubtreeSample(rss_total, total_jiffies, None, None)
+    return SubtreeSample(rss_total, total_jiffies, procs, matched)
 
 
 def proc_rss_tree_mb_for_pid(pid: int) -> float | None:

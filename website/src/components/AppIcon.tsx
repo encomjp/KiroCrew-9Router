@@ -19,6 +19,12 @@
  * being declared): the detail page hands an installed app's own local art route
  * here, so an unreachable registry CDN degrades to the app's real mark instead
  * of the generic glyph. Omitted, the pair is inert and behaviour is unchanged.
+ *
+ * The two paths also differ in GEOMETRY, which is what ``rasterFill`` exists
+ * for: a glyph is line art that needs air around it and is always inset at
+ * ``size``, while an app-supplied raster icon is a finished square tile that a
+ * plate-drawing caller wants bled to the edges. The flag reaches only the
+ * ``<img>`` branches, so no caller can accidentally crop a glyph with it.
  */
 import { useEffect, useId, useMemo, useState } from 'react'
 import DOMPurify from 'dompurify'
@@ -72,6 +78,7 @@ export default function AppIcon({
   iconUrlFallback,
   iconUrlFallbackDark,
   size = 20,
+  rasterFill = false,
   selected = false,
 }: {
   icon?: string
@@ -103,6 +110,33 @@ export default function AppIcon({
   iconUrlFallback?: string
   iconUrlFallbackDark?: string
   size?: number
+  /**
+   * Let a RASTER icon bleed to the edges of its container instead of sitting
+   * inset at ``size``. An app-supplied icon file is a finished tile — the
+   * publishing guide asks for a 512x512 opaque square — so on any surface that
+   * already draws a rounded plate for it the icon IS the plate, and rendering it
+   * inset leaves the app looking like a small sticker stuck on that plate.
+   *
+   * Deliberately scoped to the raster ``<img>`` branches, so it CANNOT change
+   * the two glyph paths: a first-party ``/app-assets/`` SVG and a lucide
+   * ``ICON_MAP`` fallback are line-art marks drawn to be read with air around
+   * them, and bleeding those to the edge would crop their strokes against the
+   * plate's border. That split is the whole reason this is one flag on the
+   * component rather than a size the caller raises to the container's width.
+   *
+   * Fills by ``object-cover``, so an off-spec non-square icon is centre-cropped
+   * rather than letterboxed.
+   *
+   * CALLER CONTRACT — the plate must be BOTH ``relative`` and
+   * ``overflow-hidden``. The image is absolutely inset, so an unpositioned plate
+   * hands it to the nearest positioned ancestor instead and the icon escapes the
+   * plate entirely (on the store's spotlight that ancestor is the 16:9 art
+   * panel, so the icon would render as hero art); and the clip is what makes the
+   * bled image take the plate's own radius. A test pins both classes at every
+   * call site that passes this flag, because neither failure is visible in the
+   * diff — only in the render.
+   */
+  rasterFill?: boolean
   /** Lit (accent-dominant) vs idle (muted + accent highlight). */
   selected?: boolean
 }) {
@@ -167,6 +201,18 @@ export default function AppIcon({
     setFallbackFailed(false)
   }, [fallbackUrl])
 
+  // Raster geometry, shared by BOTH <img> branches so the second-chance
+  // fallback can never render at a different size than the icon it stands in
+  // for. Inset at ``size`` is the default; under ``rasterFill`` the image is
+  // absolutely inset to the container's edges and carries NO radius of its own
+  // — the container is ``overflow-hidden`` and already has one, and a second
+  // radius here would disagree with it (the Library's tile is 15px, the store's
+  // rows are 8px).
+  const rasterClass = rasterFill
+    ? 'absolute inset-0 w-full h-full object-cover'
+    : 'rounded-lg object-contain'
+  const rasterStyle = rasterFill ? undefined : { width: size, height: size }
+
   // Themeable inline SVG path. The `.app-icon` class sets idle tokens
   // (--ico-a: muted, --ico-b: accent); `data-selected` OR an ancestor
   // `.group:hover` promotes to the lit accent-dominant state (see index.css).
@@ -190,11 +236,12 @@ export default function AppIcon({
   // from theme tokens, which is the whole reason ``iconUrlDark`` exists.
   if (url && !imgFailed) {
     return (
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- onError is an image-load lifecycle handler (degrade to the fallback URL, then the glyph), not a user interaction; there is nothing here for a keyboard to reach
       <img
         src={url}
         alt=""
-        className="rounded-lg object-contain"
-        style={{ width: size, height: size }}
+        className={rasterClass}
+        style={rasterStyle}
         onError={() => setImgFailed(true)}
       />
     )
@@ -213,8 +260,8 @@ export default function AppIcon({
       <img
         src={fallbackUrl}
         alt=""
-        className="rounded-lg object-contain"
-        style={{ width: size, height: size }}
+        className={rasterClass}
+        style={rasterStyle}
         onError={() => setFallbackFailed(true)}
       />
     )

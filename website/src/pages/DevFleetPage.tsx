@@ -2,7 +2,7 @@
  * Dev Fleet — worktree management page ported to KiroCrew SPA.
  * Manages git worktrees, pod instances, syncing, pruning, and rebasing.
  */
-import { useState, useRef, useCallback, useEffect, type CSSProperties, type ReactNode } from 'react'
+import { useState, useRef, useCallback, useEffect, type CSSProperties, type ReactNode, type RefObject } from 'react'
 import { createPortal } from 'react-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Card, CardTitle, Btn, Checkbox, StatCard, EmptyState, ContentSkeleton, PageHeader, SearchInput, Badge } from '../components/ui'
@@ -10,8 +10,10 @@ import SimpleSelect from '../components/SimpleSelect'
 import InfoTip from '../components/InfoTip'
 import Modal from '../components/Modal'
 import Clickable from '../components/Clickable'
+import ErrorNotice from '../components/ErrorNotice'
 import { useNavigate } from 'react-router-dom'
 import { useDocumentImeLatch } from '../hooks/useImeGuard'
+import { useDialogFocusTrap } from '../hooks/useDialogFocusTrap'
 import { handleMenuKeydown } from '../hooks/useMenuKeyboard'
 import { useAppDispatch } from '../store'
 import { addNotification } from '../store/notificationsSlice'
@@ -32,11 +34,30 @@ let _dispatch: any = null
 
 type Toast = { id: number; msg: string; type: 'success' | 'error' | 'info' }
 const _toastListeners = new Set<(t: Toast) => void>()
+// Error fan-out. A toast auto-dismisses in 7s and used to be the ONLY report
+// ~30 catch sites in this file make of a failed pod / remove / rebase / prune /
+// restart — so errors now go here instead, and the page keeps the latest
+// failure in view (through ErrorNotice, with the agent hand-off) until it is
+// dismissed. Routing on `type` inside `notify` gives every existing site the
+// in-page surface without touching them; success/info keep the toast.
+const _actionErrorListeners = new Set<(msg: string) => void>()
+// The latest failure also lives here, outside the component: a background
+// poll (Pull+Build, provision) can fail while the page is unmounted, when no
+// listener is registered. The page seeds its notice from this on mount and
+// clears it on dismiss, so a failure that landed while the user was elsewhere
+// is still on the page when they come back, not only in the notification bell.
+let _lastActionError: string | null = null
+/** Test seam: the latest-error slot is module state, so a suite that fails an
+ *  action in one test would otherwise seed the next test's page with it. */
+export function __resetDevFleetNoticesForTests(): void { _lastActionError = null }
 let _toastSeq = 1
 
 function notify(msg: string, opts?: { type?: 'success' | 'error' | 'info' }) {
   const t: Toast = { id: _toastSeq++, msg, type: opts?.type || 'info' }
-  _toastListeners.forEach((fn) => fn(t))
+  if (t.type === 'error') {
+    _lastActionError = msg
+    _actionErrorListeners.forEach((fn) => fn(msg))
+  } else _toastListeners.forEach((fn) => fn(t))
   if (!_dispatch) return
   _dispatch(addNotification({
     ts: String(Date.now()),
@@ -371,11 +392,13 @@ function MenuBtn({ items }: { items: (MenuItemDef | null)[] }) {
   // reasoning about the gaps a filtered/disabled mix would otherwise leave.
   const itemRefs = useRef<(HTMLDivElement | null)[]>([])
   const visible = items.filter(Boolean) as MenuItemDef[]
-  // Composition latch shared with the sibling ConfirmBtn trap: a Tab or
-  // Escape the IME owns is choosing/cancelling a candidate, not navigating
-  // the menu (native-event contract in useImeGuard.ts). Menu items are
-  // non-editable today, so no composition can start on them — the latch pins
-  // that this stays safe if the menu ever grows a focusable text field.
+  // Composition latch for the Escape branch and the shared menu contract
+  // below: a Tab or Escape the IME owns is choosing/cancelling a candidate,
+  // not navigating the menu (native-event contract in useImeGuard.ts). Menu
+  // items are non-editable today, so no composition can start on them — the
+  // latch pins that this stays safe if the menu ever grows a focusable text
+  // field. (The sibling ConfirmBtn popover reaches the same guard through
+  // `useDialogFocusTrap`, which carries its own latch.)
   const imeLatch = useDocumentImeLatch(open)
 
   // Explicit dismissal (Escape, an item click) restores focus to the trigger.
@@ -410,7 +433,7 @@ function MenuBtn({ items }: { items: (MenuItemDef | null)[] }) {
       if (e.key === 'Escape') {
         // An Escape the IME owns is cancelling a candidate, not the menu —
         // and close() also yanks focus back to the trigger. Same claim, same
-        // reason as the sibling ConfirmBtn trap.
+        // reason as the dialog contract's own Escape branch.
         if (!imeLatch.claimKey(e)) return
         close()
         return
@@ -515,6 +538,57 @@ interface ConfirmBtnProps { title: string; desc: string; confirmLabel?: string; 
 // more lines than assumed here.
 const CONFIRM_W = 264
 const CONFIRM_EST_H = 180
+
+interface ConfirmPopoverProps {
+  popRef: RefObject<HTMLDivElement>
+  title: string
+  desc: string
+  confirmLabel?: string
+  posStyle: CSSProperties
+  openUp: boolean
+  onCancel: () => void
+  onConfirm: () => void
+}
+/**
+ * The popover half of ConfirmBtn, split into a component of its own so it
+ * MOUNTS when the popover opens. That is what makes the shared dialog contract
+ * usable here: `useDialogFocusTrap`'s focus effects key on MOUNT, and
+ * ConfirmBtn itself is a persistent component — a hook call up there would run
+ * the focus effect once at page load against a null container.
+ *
+ * The trap owns Escape, the boundary-Tab ring, and the IME latch that guards
+ * both, so this surface no longer spells its own (#5542). Two pieces stay with
+ * the host because they are the host's own semantics: WHERE the popover sits
+ * (portal + flip geometry) and WHAT dismissal means (`onCancel` returns focus
+ * to the trigger).
+ */
+function ConfirmPopover({ popRef, title, desc, confirmLabel, posStyle, openUp, onCancel, onConfirm }: ConfirmPopoverProps) {
+  // `restoreFocus: false` — the host's `close()` already returns focus to the
+  // trigger, and for a trigger-anchored popover that is the more correct of the
+  // two: the hook captures `document.activeElement`, which on Safari is NOT the
+  // clicked trigger, and its restore is unconditional where dismissal by an
+  // outside click must leave focus where the click put it (#2533). The hook's
+  // own note carries the full reasoning.
+  useDialogFocusTrap(popRef, onCancel, { restoreFocus: false })
+  return (
+    <div
+      ref={popRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label={title}
+      data-placement={openUp ? 'up' : 'down'}
+      style={{ ...posStyle, zIndex: 4000, overflowY: 'auto', background: 'var(--card, #16161a)', border: '1px solid var(--border)', borderRadius: 10, padding: '10px 12px', width: CONFIRM_W, boxShadow: '0 8px 24px rgba(0,0,0,0.45)', textAlign: 'left' as const } as CSSProperties}
+    >
+      <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 4 }}>{title}</div>
+      <div style={{ fontSize: 11.5, color: 'var(--muted)', lineHeight: 1.5, marginBottom: 9 }}>{desc}</div>
+      <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' } as CSSProperties}>
+        <Btn onClick={onCancel}>{i18nT('pages.devFleetPage.cancel')}</Btn>
+        <Btn primary onClick={onConfirm}>{confirmLabel || i18nT('pages.devFleetPage.start')}</Btn>
+      </div>
+    </div>
+  )
+}
+
 function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: ConfirmBtnProps) {
   const [open, setOpen] = useState(false)
   // Trigger rect captured on open; drives the portaled popover's fixed
@@ -524,12 +598,6 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
   const [rect, setRect] = useState<DOMRect | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const popRef = useRef<HTMLDivElement>(null)
-  const cancelRef = useRef<HTMLButtonElement>(null)
-  const confirmRef = useRef<HTMLButtonElement>(null)
-  // Shared IME latch for the boundary-Tab trap below (see the comment on the
-  // Tab branches): the trap listens at document capture, so it receives
-  // NATIVE KeyboardEvents that the synthetic-only guard cannot consume.
-  const imeLatch = useDocumentImeLatch(open)
 
   const close = useCallback(() => {
     setOpen(false)
@@ -541,51 +609,25 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
     // Portaled to <body>, so the popover is not a DOM descendant of the
     // trigger — the outside-click guard must exclude BOTH, or every click
     // inside the popover (including Cancel/Start) would close it first.
+    // Closing this way deliberately does NOT move focus: the browser routes
+    // focus per the click target, so the user is already elsewhere by their
+    // own action (#2533).
     const onDown = (e: MouseEvent) => {
       const t = e.target as Node
       if (!triggerRef.current?.contains(t) && !popRef.current?.contains(t)) setOpen(false)
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        // An Escape the IME owns is cancelling a candidate, not the popover —
-        // and `close()` also yanks focus back to the trigger, the same harm
-        // as the Tab wrap below. Same claim, same reason.
-        if (!imeLatch.claimKey(e)) return
-        close()
-      } else if (e.key === 'Tab' && e.shiftKey && document.activeElement === cancelRef.current) {
-        // A boundary Tab the IME owns must not cycle focus — the user is
-        // choosing a candidate, not leaving the field. `claimKey` owns the
-        // whole decline (native-event contract in useImeGuard.ts) and must
-        // run before the preventDefault() and focus move. Both ring
-        // boundaries are buttons today, so no composition can start on them —
-        // the guard pins that this stays safe if the popover ever grows a
-        // text field. Mid-popover Tabs fall through: they are the browser's
-        // to move, so they are also not the trap's to claim.
-        if (!imeLatch.claimKey(e)) return
-        e.preventDefault()
-        confirmRef.current?.focus()
-      } else if (e.key === 'Tab' && !e.shiftKey && document.activeElement === confirmRef.current) {
-        if (!imeLatch.claimKey(e)) return
-        e.preventDefault()
-        cancelRef.current?.focus()
-      }
     }
     // position:fixed desyncs from any scrolling ancestor — close on scroll
     // (capture phase catches nested scrollers) and on resize.
     const onScrollOrResize = () => setOpen(false)
     document.addEventListener('mousedown', onDown)
-    // Keep the focus boundary intact even when an action button handles keys.
-    document.addEventListener('keydown', onKey, true)
     window.addEventListener('scroll', onScrollOrResize, true)
     window.addEventListener('resize', onScrollOrResize)
-    cancelRef.current?.focus()
     return () => {
       document.removeEventListener('mousedown', onDown)
-      document.removeEventListener('keydown', onKey, true)
       window.removeEventListener('scroll', onScrollOrResize, true)
       window.removeEventListener('resize', onScrollOrResize)
     }
-  }, [close, open, imeLatch])
+  }, [open])
 
   const toggle = () => {
     if (!open && triggerRef.current) setRect(triggerRef.current.getBoundingClientRect())
@@ -615,21 +657,16 @@ function ConfirmBtn({ title, desc, confirmLabel, onConfirm, btn, children }: Con
     <span style={{ display: 'inline-flex' } as CSSProperties}>
       <Btn ref={triggerRef} {...(btn || {})} onClick={toggle} aria-haspopup="dialog" aria-expanded={open}>{children}</Btn>
       {open && rect && createPortal(
-        <div
-          ref={popRef}
-          role="dialog"
-          aria-modal="true"
-          aria-label={title}
-          data-placement={openUp ? 'up' : 'down'}
-          style={{ ...posStyle, zIndex: 4000, overflowY: 'auto', background: 'var(--card, #16161a)', border: '1px solid var(--border)', borderRadius: 10, padding: '10px 12px', width: CONFIRM_W, boxShadow: '0 8px 24px rgba(0,0,0,0.45)', textAlign: 'left' as const } as CSSProperties}
-        >
-          <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 4 }}>{title}</div>
-          <div style={{ fontSize: 11.5, color: 'var(--muted)', lineHeight: 1.5, marginBottom: 9 }}>{desc}</div>
-          <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' } as CSSProperties}>
-            <Btn ref={cancelRef} onClick={close}>{i18nT('pages.devFleetPage.cancel')}</Btn>
-            <Btn ref={confirmRef} primary onClick={() => { close(); onConfirm() }}>{confirmLabel || i18nT('pages.devFleetPage.start')}</Btn>
-          </div>
-        </div>,
+        <ConfirmPopover
+          popRef={popRef}
+          title={title}
+          desc={desc}
+          confirmLabel={confirmLabel}
+          posStyle={posStyle}
+          openUp={openUp}
+          onCancel={close}
+          onConfirm={() => { close(); onConfirm() }}
+        />,
         document.body,
       )}
     </span>
@@ -787,7 +824,7 @@ function ToastHost() {
   useEffect(() => {
     const on = (t: Toast) => {
       setToasts((ts) => [...ts, t])
-      window.setTimeout(() => setToasts((ts) => ts.filter((x) => x.id !== t.id)), t.type === 'error' ? 7000 : 4000)
+      window.setTimeout(() => setToasts((ts) => ts.filter((x) => x.id !== t.id)), 4000)
     }
     _toastListeners.add(on)
     return () => { _toastListeners.delete(on) }
@@ -820,11 +857,29 @@ export default function DevFleetPage() {
 
   /* ─── react-query: disk data ─── */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const { data: disk } = useQuery<any>({
+  const { data: disk, isError: diskFailed, error: diskError } = useQuery<any>({
     queryKey: ['dev-fleet', 'disk'],
     queryFn: () => api.get('/disk'),
     refetchInterval: 30000,
   })
+
+  // Latest failed action (see `_actionErrorListeners`). Cleared by its own
+  // dismiss only — a later success does not erase it, because the failure it
+  // names may be a different worktree's.
+  const [actionError, setActionError] = useState<string | null>(() => _lastActionError)
+  const actionErrorRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    const on = (msg: string) => setActionError(msg)
+    _actionErrorListeners.add(on)
+    return () => { _actionErrorListeners.delete(on) }
+  }, [])
+  const dismissActionError = useCallback(() => { _lastActionError = null; setActionError(null) }, [])
+  // The notice lives at the top of a long, scrolling list while the click that
+  // failed may be far below it — bring it into view so the failure is not read
+  // as a dead click. (Replaces what the viewport-anchored toast used to do.)
+  useEffect(() => {
+    if (actionError) actionErrorRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' })
+  }, [actionError])
 
   // Every call below happens right after a user-initiated mutation (or the
   // explicit Refresh button), so the fleet has to be REBUILT rather than
@@ -853,7 +908,6 @@ export default function DevFleetPage() {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [detail, setDetail] = useState<Record<string, any>>({})
   const [detailLoading, setDetailLoading] = useState<Record<string, boolean>>({})
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [prov, setProv] = useState<Record<string, ProvRun | null>>({})
   const [provLogOpen, setProvLogOpen] = useState<Record<string, boolean>>({})
   const provDoneTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
@@ -1662,7 +1716,9 @@ export default function DevFleetPage() {
   const needsSetup = !fleetError && !!fleet?.needs_setup
   // Either way the fleet is UNKNOWN, so the same chrome is wrong: counts would
   // assert numbers nobody measured, and the row actions have nothing to act on.
-  const noFleet = needsSetup || isDiscoveryError
+  // A rejected fleet read is the same unknown: "Worktrees (0)" beside a
+  // "Backend unavailable" notice would claim a measurement that never happened.
+  const noFleet = needsSetup || isDiscoveryError || !!fleetError
   const ql = q.trim().toLowerCase()
   const matchesRow = (w: Worktree) => !ql || (w.name + ' ' + (w.branch || '')).toLowerCase().includes(ql)
   const statusRank = (w: Worktree) => (w.is_main ? 0 : w.running ? 1 : (!w.has_dist ? 3 : 2))
@@ -1819,8 +1875,26 @@ export default function DevFleetPage() {
       podsAvailable && w.running ? { label: i18nT('pages.devFleetPage.stop_pod'), icon: <Square size={13} className="lucide-inline" />, onClick: () => act(w.name, 'down'), danger: true } : null,
     ]} />)
     const rr = rebaseResult[w.name]
-    if (rr) out.push(<Clickable key="rr" aria-label={i18nT('pages.devFleetPage.dismiss')} onClick={() => dismissRebaseResult(w.name)} style={{ fontSize: 11, color: rr.kind === 'ok' ? 'var(--ok)' : 'var(--danger)', cursor: 'pointer', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: 'none', border: 'none', padding: 0 } as CSSProperties}>{rr.text}</Clickable>)
+    // Success keeps its click-to-dismiss chip here. An error or a conflict is
+    // rendered by `renderRebaseFailure` in its own row-spanning block below the
+    // action row: the notice carries two controls (hand-off + dismiss), which
+    // would push this group past max-two-buttons-per-row.
+    if (rr?.kind === 'ok') {
+      out.push(<Clickable key="rr" aria-label={i18nT('pages.devFleetPage.dismiss')} onClick={() => dismissRebaseResult(w.name)} style={{ fontSize: 11, color: 'var(--ok)', cursor: 'pointer', maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', background: 'none', border: 'none', padding: 0 } as CSSProperties}>{rr.text}</Clickable>)
+    }
     return out
+  }
+
+  /** A failed or conflicting rebase, as its own block under the row. The inputs
+   *  are all in git (nothing typed here), so the hand-off is on. */
+  function renderRebaseFailure(w: Worktree) {
+    const rr = rebaseResult[w.name]
+    if (!rr || rr.kind === 'ok') return null
+    return (
+      <div style={{ margin: '2px 0 8px 32px' }}>
+        <ErrorNotice message={rr.text} askAgent onDismiss={() => dismissRebaseResult(w.name)} testId={`rebase-error-${w.name}`} />
+      </div>
+    )
   }
 
   /* ─── Phase stepper (inline at main row) ─── */
@@ -1855,41 +1929,22 @@ export default function DevFleetPage() {
     }
     // error
     return (
-      <div style={{ gridColumn: '4 / -1', display: 'flex', alignItems: 'flex-start', gap: 8, minWidth: 0 } as CSSProperties}>
-        <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--danger)', whiteSpace: 'nowrap' }}>{i18nT('pages.devFleetPage.pull_build_failed')}</span>
-        {/* A gateway-composed diagnosis is rendered as PROSE -- body colour, not
-            monospace -- because it is the one line the user has to act on, and
-            the muted 11.5px log styling was burying the remedy in the noise it
-            exists to replace. It also wraps in full rather than ellipsizing: a
-            cause can end with the action to take, and `title`-only overflow puts
-            that action out of reach of keyboard and touch users.
-
-            The raw log tail gets the opposite treatment: it is clamped to two
-            lines, because an uncapped npm line would otherwise stretch this
-            header several lines tall for text whose full form already lives one
-            click away in the Log panel. */}
-        <span
-          style={{
-            ...(syncRun.lastIsCause
-              ? {
-                  color: 'var(--text)',
-                  fontSize: 12.5,
-                  whiteSpace: 'pre-wrap',
-                  overflowWrap: 'anywhere',
-                }
-              : {
-                  ...mono,
-                  display: '-webkit-box',
-                  WebkitLineClamp: 2,
-                  WebkitBoxOrient: 'vertical',
-                  overflow: 'hidden',
-                  overflowWrap: 'anywhere',
-                }),
-            minWidth: 0,
-            flex: 1,
-          } as CSSProperties}
-          title={syncRun.lastIsCause ? undefined : syncRun.last}
-        >{syncRun.last}</span>
+      <div style={{ gridColumn: '4 / -1', display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'flex-end', gap: 8, minWidth: 0 } as CSSProperties}>
+        {/* A gateway-composed diagnosis (lastIsCause) is the one line the user
+            has to act on, so it is the notice's message and wraps in full. When
+            the backend gave no diagnosis the message is the raw log tail — the
+            full log is one click away in the Log panel. Inputs are all in git,
+            so the hand-off loses nothing. The notice takes its own line
+            (`basis-full`) so the Log / dismiss pair below it stays a two-control
+            row (max-two-buttons-per-row). */}
+        <ErrorNotice
+          title={i18nT('pages.devFleetPage.pull_build_failed')}
+          message={syncRun.last}
+          variant="inline"
+          askAgent
+          className="basis-full min-w-0 flex-wrap select-text"
+          testId="sync-error"
+        />
         <Clickable aria-label={i18nT('pages.devFleetPage.toggle_log')} onClick={() => setSyncLogOpen((o) => !o)} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 11, padding: 2 } as CSSProperties}>{syncLogOpen ? i18nT('pages.devFleetPage.log') : i18nT('pages.devFleetPage.log_2')}</Clickable>
         <Clickable aria-label={i18nT('pages.devFleetPage.dismiss_sync_status')} onClick={() => dismissSync(syncRun?.rid)} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 14, padding: 2 } as CSSProperties}>{"\u00d7"}</Clickable>
       </div>
@@ -1906,12 +1961,22 @@ export default function DevFleetPage() {
       <Clickable aria-label={i18nT('pages.devFleetPage.toggle_provision_log')} onClick={() => toggleProvLog(w.name)} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 11, padding: 2 } as CSSProperties}>{open ? i18nT('pages.devFleetPage.log') : i18nT('pages.devFleetPage.log_2')}</Clickable>
     )
     if (pr.failed) {
+      // Failed action, inputs all on disk (the worktree) — hand-off on. The log
+      // tail is the message; the full log stays one click away via `logToggle`,
+      // which sits on its own line under the notice: the notice already carries
+      // two controls (hand-off + dismiss), the row's cap (max-two-buttons-per-row).
       return (
-        <div style={{ gridColumn: '4 / -1', display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 } as CSSProperties}>
-          <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--danger)', flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 4 }}><X size={12} className="lucide-inline" />{pr.exit != null ? i18nT('pages.devFleetPage.provision_failed_exit_code', { code: pr.exit }) : i18nT('pages.devFleetPage.provision_failed')}</span>
-          <span style={{ ...mono, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 } as CSSProperties} title={lastLine(pr.lines)}>{lastLine(pr.lines)}</span>
+        <div style={{ gridColumn: '4 / -1', display: 'flex', flexWrap: 'wrap', alignItems: 'center', justifyContent: 'flex-end', gap: 8, minWidth: 0 } as CSSProperties}>
+          <ErrorNotice
+            title={pr.exit != null ? i18nT('pages.devFleetPage.provision_failed_exit_code', { code: pr.exit }) : i18nT('pages.devFleetPage.provision_failed')}
+            message={lastLine(pr.lines) || i18nT('pages.devFleetPage.provision_failed')}
+            variant="inline"
+            askAgent
+            onDismiss={() => { void dismissProv(w.name) }}
+            className="basis-full min-w-0 flex-wrap"
+            testId={`provision-error-${w.name}`}
+          />
           {logToggle}
-          <Clickable aria-label={i18nT('pages.devFleetPage.dismiss_provision_status')} onClick={() => { void dismissProv(w.name) }} style={{ background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 14, padding: 2 } as CSSProperties}>{"\u00d7"}</Clickable>
         </div>
       )
     }
@@ -1994,6 +2059,7 @@ export default function DevFleetPage() {
             </>
           )}
         </div>
+        {renderRebaseFailure(w)}
         {w.is_main && syncRun && syncLogOpen ? (
           <pre style={{ margin: '2px 0 8px 32px', padding: '8px 10px', maxHeight: 180, overflow: 'auto', fontSize: 11, lineHeight: 1.45, background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, whiteSpace: 'pre-wrap', wordBreak: 'break-all', minWidth: 640 } as CSSProperties}>{filterStepMarkers(syncRun.lines || []).join('\n') || '(no output yet)'}</pre>
         ) : null}
@@ -2004,7 +2070,8 @@ export default function DevFleetPage() {
         {open && detail[w.name] ? (
           <div style={{ padding: '4px 0 14px 30px', fontSize: 12, minWidth: 640 }}>
             {detail[w.name].error
-              ? <span style={{ color: 'var(--danger)' }}>{detail[w.name].error}</span>
+              // Read failure of the row's detail fetch — nothing typed, hand-off on.
+              ? <ErrorNotice message={detail[w.name].error} askAgent testId={`worktree-detail-error-${w.name}`} />
               : <DetailPanel w={w} d={detail[w.name]} busy={busy} onRemove={() => removeWorktree(w.name, { ...w, ...detail[w.name] })} onLoadLogs={() => loadPodLogs(w.name)} logs={podLogs[w.name]} logsLoading={podLogsLoading[w.name]} />}
           </div>
         ) : null}
@@ -2030,9 +2097,12 @@ export default function DevFleetPage() {
       <p style={{ margin: '8px 0 0', fontFamily: 'ui-monospace, monospace', fontSize: 13, color: 'var(--text)', overflowWrap: 'anywhere' }}>{i18nT('pages.devFleetPage.no_checkout_found_env_example')}</p>
     </div>
   )
+  // Both branches are read failures of the fleet itself (a backend {error}
+  // body, or the request rejecting) — nothing on this page is typed, so the
+  // hand-off is on. `title` keeps the two failure modes distinguishable.
   else if (error) body = isDiscoveryError
-    ? <div role="alert" style={{ padding: 24, borderRadius: 8, border: '1px solid var(--danger)', background: 'var(--danger-subtle, rgba(239,68,68,0.08))' }}><p style={{ margin: 0, fontWeight: 600, color: 'var(--danger)' }}>{i18nT('pages.devFleetPage.discovery_error')}</p><p style={{ margin: '8px 0 0', color: 'var(--text)', fontSize: 14 }}>{error}</p></div>
-    : <EmptyState icon={<Server size={28} className="lucide-inline" />} title={i18nT('pages.devFleetPage.backend_unavailable')} subtitle={error} />
+    ? <ErrorNotice title={i18nT('pages.devFleetPage.discovery_error')} message={error} askAgent testId="fleet-discovery-error" />
+    : <ErrorNotice title={i18nT('pages.devFleetPage.backend_unavailable')} message={error} askAgent testId="fleet-backend-error" />
   else if (!wts.length) body = <EmptyState icon={<Server size={28} className="lucide-inline" />} title={i18nT('pages.devFleetPage.no_worktrees_found')} subtitle={i18nT('pages.devFleetPage.nothing_under_the_worktrees_root_yet')} />
   else body = <div>{columnHeader}{visible.map(renderRow)}{legacyToggle}</div>
 
@@ -2090,7 +2160,6 @@ export default function DevFleetPage() {
             <div style={{ marginBottom: 10 }}>
               <div style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--muted)', textTransform: 'uppercase', borderBottom: '1px solid var(--border)', paddingBottom: 3, marginBottom: 4 }}>{i18nT('pages.devFleetPage.remove')}</div>
               {pruneDialog.candidates.filter((c) => c.code !== 'closed').map((c) => (
-                // eslint-disable-next-line jsx-a11y/label-has-for -- deprecated rule; the control is nested in the label and carries an aria-label, so it is properly associated.
                 <label key={c.name} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0', cursor: 'pointer' }}>
                   <Checkbox checked={pruneSelected.has(c.name)} onChange={(e) => setPruneSelected((prev) => { const next = new Set(prev); if (e.target.checked) next.add(c.name); else next.delete(c.name); return next })} aria-label={i18nT('pages.devFleetPage.select', { name: c.name })} />
                   <span style={{ fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }}>{c.name}</span>
@@ -2109,7 +2178,6 @@ export default function DevFleetPage() {
               <div style={{ fontSize: 10, letterSpacing: '0.08em', color: 'var(--warn)', textTransform: 'uppercase', borderBottom: '1px solid var(--border)', paddingBottom: 3, marginBottom: 4 }}>{i18nT('pages.devFleetPage.remove_closed_pr')}</div>
               <p style={{ fontSize: 11, color: 'var(--muted)', margin: '0 0 6px' }}>{i18nT('pages.devFleetPage.closed_pr_not_on_main_hint')}</p>
               {pruneDialog.candidates.filter((c) => c.code === 'closed').map((c) => (
-                // eslint-disable-next-line jsx-a11y/label-has-for -- deprecated rule; the control is nested in the label and carries an aria-label, so it is properly associated.
                 <label key={c.name} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0', cursor: 'pointer' }}>
                   <Checkbox checked={pruneSelected.has(c.name)} onChange={(e) => setPruneSelected((prev) => { const next = new Set(prev); if (e.target.checked) next.add(c.name); else next.delete(c.name); return next })} aria-label={i18nT('pages.devFleetPage.select', { name: c.name })} />
                   <span style={{ fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: '1 1 auto', minWidth: 0 }}>{c.name}</span>
@@ -2143,7 +2211,6 @@ export default function DevFleetPage() {
                 const disabled = guarded || cannotForce
                 const checked = pruneForceSelected.has(k.name)
                 return (
-                  // eslint-disable-next-line jsx-a11y/label-has-for -- deprecated rule; the control is nested in the label and carries an aria-label, so it is properly associated.
                   <label key={k.name} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0', cursor: disabled ? 'default' : 'pointer', opacity: disabled ? 0.6 : 1 }}>
                     {guarded
                       ? <span style={{ width: 13, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}><ShieldAlert size={13} style={{ color: 'var(--muted)' }} /></span>
@@ -2210,7 +2277,8 @@ export default function DevFleetPage() {
                 <span style={{ fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flexShrink: 0, maxWidth: 200 }}>{nm}</span>
                 <span style={{ marginLeft: 'auto', display: 'inline-flex', alignItems: 'center', gap: 6, minWidth: 0, paddingLeft: 8 }}>
                   {it.status === 'failed' && it.error && (
-                    <span title={it.error} style={{ color: 'var(--danger)', fontSize: 11, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{it.error}</span>
+                    // Per-row failure of a server-side removal — nothing to lose, hand-off on.
+                    <ErrorNotice message={it.error} variant="inline" askAgent className="min-w-0" testId={`prune-item-error-${nm}`} />
                   )}
                   <Badge variant={meta.kind === 'done' ? 'ok' : meta.kind === 'failed' ? 'err' : 'muted'} className="text-[10.5px] px-1.5 py-0">{pruneStatusLabel(it.status)}</Badge>
                 </span>
@@ -2291,26 +2359,32 @@ export default function DevFleetPage() {
                 <code className="min-w-0 break-all rounded bg-bg-elevated px-1.5 py-0.5 text-text-strong select-text">{fleet.main_repo}</code>
               </div>
             )}
-            {gatewayError && (
-              <div
-                role="alert"
-                data-testid="gateway-restart-error"
-                className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger-subtle px-3 py-2.5 mt-3 text-[12.5px] leading-relaxed text-danger"
-              >
-                <AlertTriangle size={14} className="lucide-inline shrink-0 mt-0.5" />
-                {/* select-text + break-words: the message can be a pair of
-                    commands with absolute paths that the operator has to run. */}
-                <span className="min-w-0 flex-1 break-words select-text">{gatewayError}</span>
-                <Btn
-                  onClick={() => setGatewayError(null)}
-                  aria-label={i18nT('app.dismiss')}
-                  title={i18nT('app.dismiss')}
-                  className="shrink-0"
-                >
-                  <X size={13} className="lucide-inline" />
-                </Btn>
-              </div>
-            )}
+            {/* Restart / make-live failures. The message can be a pair of
+                commands with absolute paths the operator has to run, so it
+                stays selectable. Nothing typed on this page — hand-off on. */}
+            <ErrorNotice
+              message={gatewayError}
+              askAgent
+              onDismiss={() => setGatewayError(null)}
+              className="mt-3 select-text"
+              testId="gateway-restart-error"
+            />
+            {/* Latest failed row action (pod up/down, remove, rebase, prune,
+                restart…). Every such site reports through `notify(…, error)`,
+                which lands here instead of in the transient toast, so the
+                failure stays readable (and selectable) until dismissed. Inputs
+                are all server-side, so the hand-off is safe. The restart sites
+                both notify AND set gatewayError, so the same text is not shown
+                twice. */}
+            <div ref={actionErrorRef}>
+              <ErrorNotice
+                message={actionError && actionError !== gatewayError ? actionError : null}
+                askAgent
+                onDismiss={dismissActionError}
+                className="mt-3 select-text"
+                testId="devfleet-action-error"
+              />
+            </div>
             {servingReason && (
               <div
                 role="alert"
@@ -2356,8 +2430,21 @@ export default function DevFleetPage() {
               <StatCard label={i18nT('pages.devFleetPage.running_pods')} value={noFleet ? '—' : running} accent={!noFleet} />
               <StatCard label={i18nT('pages.devFleetPage.worktrees')} value={noFleet ? '—' : wts.length} />
               <StatCard label={i18nT('pages.devFleetPage.needs_provision')} value={noFleet ? '—' : needsProv} />
-              <StatCard label={i18nT('pages.devFleetPage.disk_worktrees')} value={noFleet ? '—' : diskGb} />
+              <StatCard label={i18nT('pages.devFleetPage.disk_worktrees')} value={noFleet || diskFailed ? '—' : diskGb} />
             </div>
+            {/* A failed /disk read shows "—" in the card (not the "…" that reads
+                as still measuring) and is named here. Read failure, nothing
+                typed — hand-off on. */}
+            {!noFleet && diskFailed && (
+              <ErrorNotice
+                title={i18nT('pages.devFleetPage.disk_usage_unavailable')}
+                message={diskError instanceof Error ? diskError.message : String(diskError)}
+                variant="inline"
+                askAgent
+                className="mb-3"
+                testId="disk-error"
+              />
+            )}
             <Card>
               {/* Same reasoning as the dashed stat cards: "(0)" is a count of a
                   fleet that was never read, so the title drops it entirely. */}

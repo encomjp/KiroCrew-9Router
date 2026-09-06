@@ -8,11 +8,18 @@ directly. This keeps the dispatch logic in one place and makes the
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 from kiro_crew.service import linux, macos
-from kiro_crew.service.common import Platform, current_platform, headless_auth_warning
+from kiro_crew.service.common import (
+    LAUNCHD_LABEL,
+    Platform,
+    current_platform,
+    headless_auth_warning,
+    restart_command_hint,
+)
 
 
 def _print_headless_auth_warning() -> None:
@@ -70,7 +77,7 @@ def installed_service_has_managed_marker() -> "bool | None":
         if plat == Platform.SYSTEMD:
             expected = 'Environment="KIROCREW_SERVICE_MANAGED=1"'
             lines = path.read_text(encoding="utf-8").splitlines()
-            return expected in {line.strip() for line in lines}
+            return any(line.strip() == expected for line in lines)
         if plat == Platform.LAUNCHD:
             # Reuse the launchd reader so malformed XML (which plistlib exposes
             # as an ExpatError) fails closed just like every other service
@@ -120,7 +127,7 @@ def install_service() -> int:
         # started — the directive only applies at service start. Deliberately
         # non-fatal: a failure warns and leaves the service running.
         if profile.message:
-            print(f"   {'⚠️ ' if not profile.ok else ''}{profile.message}")
+            print(f"   {'' if profile.ok else '⚠️ '}{profile.message}")
         _print_headless_auth_warning()
         print()
         print("   Status: kirocrew service status")
@@ -163,7 +170,7 @@ def uninstall_service() -> int:
             return 1
         print("✅ kirocrew service stopped and removed.")
         if profile.message:
-            print(f"   {'⚠️ ' if not profile.ok else ''}{profile.message}")
+            print(f"   {'' if profile.ok else '⚠️ '}{profile.message}")
         return 0
     if plat == Platform.LAUNCHD:
         macos.uninstall()
@@ -202,7 +209,7 @@ def install_launcher_profile(exec_path: str | None = None) -> int:
         return 0
     outcome = linux.install_launcher_profile(exec_path)
     if outcome.message:
-        print(f"{'⚠️  ' if not outcome.ok else '✅ '}{outcome.message}")
+        print(f"{'✅ ' if outcome.ok else '⚠️  '}{outcome.message}")
     return 0 if outcome.ok else 1
 
 
@@ -212,11 +219,10 @@ def remove_launcher_profile() -> int:
         print("ℹ️  Nothing to remove — the AppArmor sandbox profile is Linux-only.")
         return 0
     outcome = linux.remove_launcher_profile()
-    print(
-        f"{'⚠️  ' if not outcome.ok else '✅ '}{outcome.message}"
-        if outcome.message
-        else "✅ No AppArmor sandbox profile was installed."
-    )
+    if outcome.message:
+        print(f"{'✅ ' if outcome.ok else '⚠️  '}{outcome.message}")
+    else:
+        print("✅ No AppArmor sandbox profile was installed.")
     return 0 if outcome.ok else 1
 
 
@@ -280,3 +286,34 @@ def restart_service() -> bool:
             return macos.restart()
         return False
     return False
+
+
+def manual_restart_hint() -> str:
+    """Command an operator can run BY HAND to restart the installed service.
+
+    Printed when :func:`restart_service` was refused by the service manager —
+    a system-scope unit needs root/polkit privileges the calling process may
+    not have. Unlike :func:`kiro_crew.service.common.restart_command_hint`,
+    this must never answer ``kirocrew restart``: that is the command that just
+    failed, so a circular hint would send the operator straight back into the
+    same refusal.
+    """
+    plat = current_platform()
+    if plat == Platform.SYSTEMD:
+        # "sudo systemctl restart kirocrew" — shared with the update path and
+        # the Slack restart-failure hint so the string cannot drift.
+        return restart_command_hint()
+    if plat == Platform.LAUNCHD:
+        # NOT `launchctl kickstart` — that is the exact call macos.restart()
+        # just ran and got refused. Tearing the job down and bootstrapping it
+        # from the installed plist is the outside-process recovery; `;` rather
+        # than `&&` so a bootout refused because the job is not loaded still
+        # proceeds to the bootstrap.
+        uid = getattr(os, "getuid", lambda: -1)()
+        return (
+            f"launchctl bootout gui/{uid}/{LAUNCHD_LABEL}; "
+            f'launchctl bootstrap gui/{uid} "{macos.PLIST_PATH}"'
+        )
+    # No platform service manager exists here, so there is no service to have
+    # refused the restart; kept total for safety rather than reachability.
+    return "kirocrew gateway"

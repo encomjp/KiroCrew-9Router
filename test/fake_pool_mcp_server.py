@@ -20,6 +20,11 @@ advertised, so a recorder that stayed silent would observe nothing and read as a
 broken gateway. Without the argument the handshake is byte-for-byte what the
 launch-counting tests already assert against.
 
+An OPTIONAL third path argument records the per-CONNECTION ``nonce`` the same way,
+which is the separate question of whether each connection got its OWN namespace --
+the one that matters for a caller gatewayd cannot name, where there is no identity
+to tell co-tenants apart by (#5322). Either path alone turns advertising on.
+
 Stdlib only, and launched as ``sys.executable <this file> <log>`` -- never
 through a shell and never via ``-c`` -- so no quoting or backslash assumption
 travels onto Windows.
@@ -41,6 +46,13 @@ def main() -> int:
     # nothing and read as "injection is broken". Default off so the pooling tests
     # that only count launches keep the exact handshake they assert against.
     caller_log = sys.argv[2] if len(sys.argv) > 2 else ""
+    # Optional third argument: a path to record the per-CONNECTION nonce each
+    # tools/call arrived with, one line per call. Separate from ``caller_log`` so
+    # the tests that assert on identities keep their exact line format: the nonce
+    # is a namespace separator, present even when the identity is not, and the
+    # question it answers ("did gatewayd give each connection its own?") is a
+    # different one.
+    tenant_log = sys.argv[3] if len(sys.argv) > 3 else ""
 
     # One line per process launch. Opened in append mode and closed
     # immediately: a backend that lingers must not hold the handle that the
@@ -58,15 +70,20 @@ def main() -> int:
         except json.JSONDecodeError:
             continue
         method = msg.get("method")
-        if method == "tools/call" and caller_log:
+        if method == "tools/call" and (caller_log or tenant_log):
             params = msg.get("params") or {}
             meta = params.get("_meta") or {}
             block = meta.get("kirocrew.caller") or {}
+            tenant = meta.get("kirocrew.tenant") or {}
             # The empty string is a meaningful observation -- it is what a
             # backend sees when nothing injected -- so record it rather than
             # skipping the line.
-            with open(caller_log, "a", encoding="utf-8") as fh:
-                fh.write(f"{block.get('sessionKey', '')}\n")
+            if caller_log:
+                with open(caller_log, "a", encoding="utf-8") as fh:
+                    fh.write(f"{block.get('sessionKey', '')}\n")
+            if tenant_log:
+                with open(tenant_log, "a", encoding="utf-8") as fh:
+                    fh.write(f"{tenant.get('nonce', '')}\n")
             sys.stdout.write(
                 json.dumps({"jsonrpc": "2.0", "id": msg.get("id"), "result": {}}) + "\n"
             )
@@ -76,7 +93,7 @@ def main() -> int:
             continue
         params = msg.get("params") or {}
         capabilities: dict = {"tools": {}}
-        if caller_log:
+        if caller_log or tenant_log:
             capabilities["experimental"] = {"kirocrew.caller-identity": {"schemaVersion": 1}}
         reply = {
             "jsonrpc": "2.0",

@@ -50,9 +50,11 @@ from kiro_crew.artifacts import (
     ArtifactComment,
     ArtifactError,
     ArtifactNotFoundError,
+    ArtifactStillPublishedError,
     ArtifactValidationError,
     get_default_folder_store,
     get_default_store,
+    has_unthemed_hardcoded_colors,
     is_document_path,
     webapp_metadata_from_dict,
 )
@@ -602,11 +604,15 @@ def _strip_content(content: str) -> str:
 def _snippet_from(stripped: str) -> str:
     """Redacted, truncated display snippet from already-stripped text.
 
-    Redacts a generous prefix so patterns straddling the truncation boundary are
-    still caught (same controls the detail path applies to ``content``), then
-    trims to ``_SNIPPET_MAX_LEN``.
+    Redacts over the FULL text, then trims to ``_SNIPPET_MAX_LEN``. A bounded
+    pre-redaction window can cut a credential at its edge into fragments no
+    redaction regex matches, and redaction shrinking earlier text can slide
+    such a fragment into the final snippet. The full-text pass is expensive,
+    so list scans call this through :func:`_cached_snippet` (memoized per
+    artifact version) and always from the scan's executor thread, keeping it
+    off the event loop.
     """
-    head = _redact_text(stripped[: _SNIPPET_MAX_LEN * 3]).strip()
+    head = _redact_text(stripped).strip()
     return head[:_SNIPPET_MAX_LEN]
 
 
@@ -631,8 +637,13 @@ def _context_snippet(content: str, q_lower: str) -> str:
         # Match came from name/tags/description — no body line to center on.
         return _snippet_from(" ".join(lines))
     start = max(0, idx - 2)
-    window = [ln[:_CONTEXT_LINE_LEN] for ln in lines[start : idx + 3][:_CONTEXT_MAX_LINES]]
-    return _redact_text("\n".join(window))
+    window = lines[start : idx + 3][:_CONTEXT_MAX_LINES]
+    # Redact over the FULL window lines, then bound each line: cutting a line
+    # first can split a credential at the cut into fragments no redaction regex
+    # matches (same class as the prefix snippet above). Redaction tags carry no
+    # newlines, so the line structure survives the pass.
+    redacted = _redact_text("\n".join(window))
+    return "\n".join(ln[:_CONTEXT_LINE_LEN] for ln in redacted.splitlines())
 
 
 def _resolve_folder_ref(ref: Any, *, create_missing: bool) -> tuple[str, str | None]:
@@ -858,10 +869,31 @@ def _recorded_doc_identities(conversation_log: Any) -> set[tuple[int, int]]:
     return out
 
 
+def _collision_report(art: Any) -> str:
+    """Name the slug ``art``'s name derives to when the store had to suffix it.
+
+    Reads ``Artifact.slug_collided_with``, which ``ArtifactStore.create`` sets
+    from its uniquifier — the one place that knows a suffix happened. Nothing is
+    inferred here, so the caveats an inference needed no longer apply: a record
+    reused rather than created, or renamed by ``update()`` without recomputing
+    its slug, carries an empty field and cannot report a phantom collision.
+    """
+    return str(getattr(art, "slug_collided_with", "") or "")
+
+
 def _materialize_and_pin(
     path: str, conversation_log: Any, source: str = "chat", session_key: str = ""
-) -> Any:
+) -> tuple[Any, str]:
     """Create (or reuse) a file-backed artifact from ``path`` and mark it saved.
+
+    Returns ``(artifact, slug_collided_with)``, where the second element names
+    the slug the artifact's name derives to when the store had to append a
+    numeric suffix because that slug was taken, and is empty otherwise. It is
+    computed here, not by the caller, because only this function knows whether a
+    create happened: the reuse branch below collides with nothing, and
+    :meth:`ArtifactStore.update` can rename an artifact without recomputing its
+    slug, so a reused record's name may derive to a slug that differs from its
+    own with no collision ever having occurred.
 
     Idempotent: if an artifact already backs this path, just pin it. Otherwise
     the file is AUTHORIZED and READ through a single ``O_NOFOLLOW`` descriptor in
@@ -885,7 +917,7 @@ def _materialize_and_pin(
     canonical = os.path.realpath(expanded)
     existing = store.find_by_source_path(path) or store.find_by_source_path(canonical)
     if existing is not None:
-        return store.set_pinned(existing.slug, True)
+        return store.set_pinned(existing.slug, True), ""
     if not is_document_path(canonical):
         raise ArtifactValidationError("only document files can be saved this way")
     # Defense in depth: a resolved target under a sensitive dir is never a chat
@@ -918,7 +950,11 @@ def _materialize_and_pin(
         source_path=canonical,
         session_key=session_key,
     )
-    return store.set_pinned(art.slug, True)
+    # No slug parameter reaches this path, so the store always derives the slug
+    # from the name and silently appends a numeric suffix when that slug is taken;
+    # the shared report therefore needs no explicit-slug argument here. The reuse
+    # branch above returns before this point, so this only ever describes a create.
+    return store.set_pinned(art.slug, True), _collision_report(art)
 
 
 # ── List / Create ─────────────────────────────────────────────────────────────
@@ -938,6 +974,34 @@ _CONTENT_CACHE_MAX_TOTAL_BYTES = 32 * 1024 * 1024
 _content_cache: dict[str, tuple[tuple[int, str], str, str]] = {}
 _content_cache_bytes = 0
 _content_cache_lock = threading.Lock()
+
+#: Cache of the redacted prefix snippet, keyed by slug under the same
+#: (version, updated_at) key as the content cache. The snippet path redacts
+#: the FULL stripped body (see :func:`_snippet_from`), which is too expensive
+#: to repeat for every listed artifact on every debounced request — memoizing
+#: under the version key pays that pass once per artifact version. Entries are
+#: at most ``_SNIPPET_MAX_LEN`` chars, but slugs accumulate across
+#: create/delete cycles with no other pruning, so a fixed entry cap drops the
+#: whole cache when crossed (the same drop-all pressure valve the content
+#: cache uses); shares :data:`_content_cache_lock` (same executor-thread
+#: access pattern).
+_SNIPPET_CACHE_MAX_ENTRIES = 4096
+_snippet_cache: dict[str, tuple[tuple[int, str], str]] = {}
+
+
+def _cached_snippet(a: Any, stripped: str) -> str:
+    """The redacted prefix snippet for artifact *a*, memoized per version."""
+    key = (a.version, a.updated_at)
+    with _content_cache_lock:
+        hit = _snippet_cache.get(a.slug)
+        if hit and hit[0] == key:
+            return hit[1]
+    snippet = _snippet_from(stripped)
+    with _content_cache_lock:
+        if len(_snippet_cache) >= _SNIPPET_CACHE_MAX_ENTRIES:
+            _snippet_cache.clear()
+        _snippet_cache[a.slug] = (key, snippet)
+    return snippet
 
 
 def _cache_entry_bytes(raw: str, stripped: str) -> int:
@@ -1002,7 +1066,7 @@ def _scan_artifacts(
             d["snippet"] = (
                 _context_snippet(raw, q_lower)
                 if (do_content and q_lower)
-                else _snippet_from(stripped)
+                else _cached_snippet(a, stripped)
             )
         out.append(d)
     return out
@@ -1472,7 +1536,23 @@ async def api_artifacts_create(request: web.Request) -> web.Response:
     )
     # New library entries appear live in every open window.
     _notify_artifact_update(state, art.slug, art.version)
-    return _json_response(_serialize(art, include_content=True), status=201)
+    # Report a de-duplicated slug to the CLI and the MCP tool, both of which are
+    # HTTP clients and so cannot see the store's log line. Create-only: the value
+    # describes this call, and a GET or LIST would carry it empty forever.
+    payload = _serialize(art, include_content=True)
+    payload["slug_collided_with"] = _collision_report(art)
+    # Theme-contrast verdict for the clients, same relay pattern as
+    # ``slug_collided_with``: computed once here at the convergence point so
+    # EVERY authoring surface (MCP tool, CLI, dashboard) sees the same
+    # verdict -- the motivating incident traveled the CLI, which never runs
+    # the MCP-layer hint. Scans ``art.content`` (what was actually persisted),
+    # not the request body: a file-promoted save persists the server-read
+    # bytes, and the client's copy can be stale or redacted. Advisory only;
+    # the save has already succeeded.
+    payload["theme_contrast_warning"] = has_unthemed_hardcoded_colors(
+        art.kind, art.content or ""
+    )
+    return _json_response(payload, status=201)
 
 
 # ── Item: read / update / delete ──────────────────────────────────────────────
@@ -1799,7 +1879,18 @@ async def api_artifact_update(request: web.Request) -> web.Response:
                 await publish_sync.push_version_by_slug(art.slug)
             except Exception as exc:  # noqa: BLE001 - best-effort egress
                 logger.info("auto-sync push after snapshot failed for %s: %s", art.slug, exc)
-    return _json_response(_serialize(art, include_content=True))
+    payload = _serialize(art, include_content=True)
+    # Same relay as the save path's ``theme_contrast_warning``: a
+    # content-carrying update gets the verdict computed here at the
+    # convergence point, so the CLI's PATCH (the motivating incident's
+    # path) hears it too. Unlike save, PATCH never file-promotes, so the
+    # body IS the persisted content -- and scanning the body (not
+    # ``art.content``) keeps metadata-only updates (rename/retag) from
+    # warning about pre-existing content they didn't touch.
+    payload["theme_contrast_warning"] = has_unthemed_hardcoded_colors(
+        art.kind, body.get("content") or ""
+    )
+    return _json_response(payload)
 
 
 async def api_artifact_settle_blank(request: web.Request) -> web.Response:
@@ -1915,8 +2006,128 @@ async def api_artifact_delete(request: web.Request) -> web.Response:
         # reaches the delete() call below, which returns a clean 4xx (a bare
         # ArtifactNotFoundError catch here would leak ArtifactValidationError as a 500).
         _existing = None
+    # Withdraw the destination copy BEFORE the local delete, so the publication -- the
+    # only handle that can withdraw it -- still exists while the attempt is made. The
+    # reverse order was tried and reverted twice; this ordering is the one with the
+    # smaller crash residue. Die between the two steps here and the copy is withdrawn but
+    # the artifact remains, which the user simply deletes again. Die between them in the
+    # other order and the record is already gone while the content is still public, with
+    # nothing left to withdraw it by.
+    #
+    # The outcome decides whether the local delete may proceed, on ONE rule: the delete
+    # goes ahead only when there is nothing left to withdraw (never published, or the
+    # destination is CONFIRMED gone) or the destination confirmed the withdrawal. If the
+    # published copy was not withdrawn -- rejected (FAILED) or unreachable so the call was
+    # never made (UNREACHABLE) -- the delete is refused and says so.
+    #
+    # This deliberately refuses deletes that previously succeeded. Erasing the record was
+    # erasing the only handle that could ever withdraw a world-readable copy, and no later
+    # action could recover it, while a refused delete is recoverable by retrying once the
+    # destination answers again. Note what "recoverable" does NOT include: there is no
+    # action that accepts the exposure and clears the record, because `unpublish` keeps it
+    # too unless a removal or a confirmed absence says otherwise. Failing loudly is still
+    # the cheaper error, but the owner is genuinely stuck until the destination answers.
+    if _existing is not None and _existing.publication is not None:
+        withdrawal = await publish_sync.delete_for_artifact(_existing)
+        if withdrawal in (
+            publish_sync.DeleteWithdrawal.FAILED,
+            publish_sync.DeleteWithdrawal.UNREACHABLE,
+        ):
+            if withdrawal is publish_sync.DeleteWithdrawal.FAILED:
+                msg = (
+                    "The destination did not confirm removal of the published copy, so "
+                    "this artifact was not deleted. Try again once the destination stops "
+                    "erroring."
+                )
+            else:
+                msg = (
+                    "The published copy could not be withdrawn because its destination "
+                    "could not be reached, so this artifact was not deleted -- deleting "
+                    "it would leave a public copy with nothing able to take it down. "
+                    "Restore access to that destination and try again. Unpublishing "
+                    "first will not release it either: that refuses for the same reason, "
+                    "because it also keeps the record unless the copy is confirmed gone."
+                )
+            _audit(
+                tool="artifact_delete",
+                request=request,
+                outcome="error",
+                error=msg,
+                extra={"slug": slug},
+            )
+            return _err(msg, status=502)
+        # The withdrawal above is a network round trip, so the slug can be deleted AND
+        # RECREATED while it runs. `delete()` below removes by slug, so a delayed request
+        # would delete the REPLACEMENT -- an artifact the user never asked to delete and
+        # that nothing can restore. The ordering note above reasons that "a save landing
+        # in that window is included in the delete the user asked for", which holds for a
+        # save to the SAME artifact; a recreate is a DIFFERENT artifact wearing the same
+        # slug, which that argument does not cover. `created_at` is minted fresh on create
+        # at microsecond precision, so it identifies the generation rather than the name.
+        # A slug that is simply GONE is not an error here: `delete()` reports that itself.
+        # Off the loop: `store.get` returns the artifact WITH content, so on a large
+        # artifact it is a multi-megabyte synchronous read, and this handler is async.
+        # `_run_off_loop` is this module's helper for exactly that and propagates the
+        # exception unchanged, so the guard below still sees `ArtifactError`.
+        try:
+            _after = await _run_off_loop(lambda: get_default_store().get(slug))
+        except ArtifactError:
+            _after = None
+        if _after is not None and _after.created_at != _existing.created_at:
+            msg = (
+                "This artifact was deleted and a new one created under the same name "
+                "while its published copy was being withdrawn. The published copy was "
+                "withdrawn; the new artifact was left alone. Delete it again if you "
+                "meant to remove the replacement too."
+            )
+            _audit(
+                tool="artifact_delete",
+                request=request,
+                outcome="denied",
+                error=msg,
+                extra={"slug": slug},
+            )
+            return _err(msg, status=409)
+        # The copy is withdrawn, so DROP THE RECORD HERE rather than letting the
+        # directory removal below carry it away implicitly. That is not tidiness: it is
+        # what lets the removal be guarded. `delete(refuse_if_published=True)` re-reads
+        # the record inside the same lock that removes the artifact, so once this clear
+        # has run, a record found there again can only be a publication that landed
+        # AFTER the withdrawal -- a live public copy whose handle the removal would
+        # erase. Clearing first is therefore what converts "the record happens to still
+        # be here" into a usable signal. Without it the record is still present on the
+        # normal successful path and the guard could never fire.
+        #
+        # A vanished artifact is not an error: the removal below reports that itself,
+        # and the copy is already withdrawn either way.
+        try:
+            await _run_off_loop(lambda: get_default_store().clear_publication(slug))
+        except ArtifactNotFoundError:
+            pass
     try:
-        get_default_store().delete(slug)
+        # `refuse_if_published=True` is safe for an artifact that was never published
+        # (its record is None and nothing above touched it) and is the whole guard for
+        # one that was: see the clear directly above.
+        get_default_store().delete(slug, refuse_if_published=True)
+    except ArtifactStillPublishedError as exc:
+        # A publish landed between the withdrawal and the removal. Refusing is the same
+        # rule the withdrawal outcomes follow -- a refused delete is recoverable, an
+        # orphaned public copy is not -- so the NEW publication keeps its handle and the
+        # user is told what happened rather than silently losing the copy.
+        msg = (
+            "This artifact was published again while its earlier copy was being "
+            "withdrawn, so it was not deleted. The earlier copy was withdrawn; the new "
+            "one is still published and can still be taken down. Delete it again if you "
+            "meant to remove the new copy too."
+        )
+        _audit(
+            tool="artifact_delete",
+            request=request,
+            outcome="denied",
+            error=msg,
+            extra={"slug": slug, "detail": str(exc)},
+        )
+        return _err(msg, status=409)
     except ArtifactNotFoundError as exc:
         _audit(
             tool="artifact_delete",
@@ -2412,6 +2623,60 @@ async def api_artifact_refresh_sharing(request: web.Request) -> web.Response:
     return _json_response(_serialize(art, include_content=True))
 
 
+async def api_artifact_reprobe_notice(request: web.Request) -> web.Response:
+    """POST /api/artifacts/{slug}/publish/reprobe-notice — re-check the
+    destination's serving state and clear a stale publish notice.
+
+    A publish can record a "still rolling out" ``notice`` that later resolves on
+    its own, but nothing on the happy path revisits it, so the amber banner
+    would persist forever after the link works. This re-probes the provider and
+    reconciles ``notice`` / ``notice_code`` to the current truth (clears them
+    only when the condition has actually cleared). Gated like other mutations
+    since it can update meta.json.
+    """
+    state = request.app.get("state")
+    if state is None or _is_restricted_session(state, request):
+        _audit(
+            tool="artifact_reprobe_notice",
+            request=request,
+            outcome="denied",
+            error="restricted session" if state is not None else "missing dashboard state",
+            extra={"slug": request.match_info.get("slug", "")},
+        )
+        return _err("restricted session cannot reprobe artifact notice", status=403)
+    slug = request.match_info.get("slug", "")
+    try:
+        await publish_sync.reprobe_notice(slug)
+        art = await _run_off_loop(lambda: get_default_store().get(slug))
+    except ArtifactNotFoundError as exc:
+        _audit(
+            tool="artifact_reprobe_notice",
+            request=request,
+            outcome="error",
+            error=str(exc),
+            extra={"slug": slug},
+        )
+        return _err(str(exc), status=404)
+    except ArtifactValidationError as exc:
+        _audit(
+            tool="artifact_reprobe_notice",
+            request=request,
+            outcome="denied",
+            error=str(exc),
+            extra={"slug": slug},
+        )
+        return _err(str(exc))
+    except Exception as exc:  # pragma: no cover — reprobe is best-effort
+        return _sync_error_response("artifact_reprobe_notice", request, slug, exc)
+    _audit(
+        tool="artifact_reprobe_notice",
+        request=request,
+        outcome="success",
+        extra={"slug": slug},
+    )
+    return _json_response(_serialize(art, include_content=True))
+
+
 async def api_artifact_pull_latest(request: web.Request) -> web.Response:
     """POST /api/artifacts/{slug}/pull-latest — pull upstream into a fork."""
 
@@ -2781,10 +3046,24 @@ async def api_artifact_folders(request: web.Request) -> web.Response:
     return _json_response({"folders": out})
 
 
-def _spawn_artifact_folder_icon_task(request: web.Request, folder_id: str, name: str) -> None:
+def _spawn_artifact_folder_icon_task(
+    request: web.Request, folder_id: str, name: str, *, expected_epoch: int
+) -> None:
     """Fire-and-forget: derive a single-emoji icon for an artifact folder via
     the shared LLM helper (same mechanism as chat-sidebar folders) and store
-    it. Best-effort — any failure leaves the folder with the default glyph."""
+    it. Best-effort — any failure leaves the folder with the default glyph.
+
+    The write-back goes through ``set_icon_if_epoch``, which re-finds the
+    folder, checks the epoch and writes inside ONE critical section under the
+    store lock. So a folder deleted while generation was in flight is never
+    resurrected, and a manual icon set, an icon clear, or a rename that lands
+    while generation is pending wins over the stale generated result.
+    ``expected_epoch`` is the epoch this generation is pinned to, and each
+    caller obtains it without ever reading the epoch back: the rename path takes
+    the value :meth:`ArtifactFolderStore.rename` returns from inside its own
+    bump's critical section, and the create path pins 0, which a fresh folder's
+    epoch is by construction. A read-back would be a second lock acquisition and
+    could capture a competing mutation's epoch (issue #7991)."""
     state = request.app.get("state")
     if state is None:
         return
@@ -2795,8 +3074,10 @@ def _spawn_artifact_folder_icon_task(request: web.Request, folder_id: str, name:
             if not icon:
                 return
             fstore = get_default_folder_store()
-            if fstore.exists(folder_id):
-                await _run_off_loop(lambda: fstore.set_icon(folder_id, icon))
+            # No exists() pre-check: it was a TOCTOU gap (the folder could go
+            # away, or its icon change, between the check and the write) and
+            # set_icon_if_epoch subsumes it by re-finding under the lock.
+            await _run_off_loop(lambda: fstore.set_icon_if_epoch(folder_id, icon, expected_epoch))
         except Exception:  # noqa: BLE001 — best-effort background task
             logger.debug("artifact folder icon generation failed for %s", folder_id, exc_info=True)
 
@@ -2850,7 +3131,14 @@ async def api_artifact_folder_create(request: web.Request) -> web.Response:
         _audit(tool="artifact_folder_create", request=request, outcome="error", error=str(exc))
         return _err(str(exc), status=500)
     # Derive an emoji icon from the name in the background (chat-folder parity).
-    _spawn_artifact_folder_icon_task(request, folder["id"], name)
+    # A just-created folder's icon epoch is 0 by construction -- create() never
+    # touches the registry, and delete() pops its entry, so even a reused id
+    # reads 0. Passing the literal is deliberate rather than re-reading it: a
+    # read here would be a second lock acquisition, and any mutation landing in
+    # that window would raise the epoch, so the read would capture the
+    # COMPETING value and the generated icon would then clobber it. With 0
+    # pinned, any such mutation makes the write-back lose, which is correct.
+    _spawn_artifact_folder_icon_task(request, folder["id"], name, expected_epoch=0)
     _audit(
         tool="artifact_folder_create",
         request=request,
@@ -2886,6 +3174,12 @@ async def api_artifact_folder_update(request: web.Request) -> web.Response:
     if folder is None:  # exists() checked above; guards against a concurrent delete
         return _err("folder not found", status=404)
 
+    # Set by _apply_updates when it renames: the icon epoch the rename's own
+    # bump produced, read inside that same critical section. The handler must
+    # arm background generation with THIS value and never re-read the epoch
+    # afterwards -- see ArtifactFolderStore.rename for why a re-read is a race.
+    armed_icon_epoch: dict[str, int] = {}
+
     def _apply_updates() -> dict[str, Any]:
         # Each mutation persists via _save() (fsync/replace) — runs in the
         # executor, off the event loop.
@@ -2893,7 +3187,7 @@ async def api_artifact_folder_update(request: web.Request) -> web.Response:
         if f is None:
             raise ArtifactNotFoundError(f"folder not found: {fid}")
         if "name" in body:
-            f = fstore.rename(fid, str(body["name"]))
+            f, armed_icon_epoch["value"] = fstore.rename(fid, str(body["name"]))
         if "parent_id" in body:
             f = fstore.reparent(fid, str(body.get("parent_id") or ""))
         if "icon" in body:
@@ -2935,8 +3229,55 @@ async def api_artifact_folder_update(request: web.Request) -> web.Response:
     # A rename re-derives the emoji icon from the new name (chat-folder
     # parity) — unless this same request set an explicit icon, which wins.
     if "name" in body and "icon" not in body:
-        _spawn_artifact_folder_icon_task(request, fid, str(body["name"]))
+        # Arm with the epoch the rename itself produced, captured under the
+        # rename's own lock. Re-reading it here instead would pick up a manual
+        # icon set that landed in between and let the generated icon overwrite
+        # it. A missing value means the rename did not run, so nothing to arm.
+        epoch = armed_icon_epoch.get("value")
+        if epoch is not None:
+            _spawn_artifact_folder_icon_task(
+                request, fid, str(body["name"]), expected_epoch=epoch
+            )
     return _json_response(_serialize_folder(updated, path=fstore.breadcrumb(fid)))
+
+
+async def _withdraw_subtree_publications(folder_id: str, fstore: Any) -> str:
+    """Withdraw every published copy in a folder subtree BEFORE it is cascaded away.
+
+    Returns ``""`` when every copy is withdrawn (or there were none), otherwise the slug
+    of the FIRST artifact whose copy could not be withdrawn -- the caller then refuses the
+    whole cascade and destroys nothing.
+
+    Stops at the first failure rather than collecting them all: the question the caller is
+    asking is "may I destroy this subtree", and one un-withdrawable copy settles it. A copy
+    withdrawn before that point is genuinely gone, so its record is cleared -- it would
+    otherwise keep naming a destination that no longer holds it.
+    """
+    ids = await _run_off_loop(lambda: fstore.subtree_ids(folder_id))
+    if not ids:
+        return ""
+    store = get_default_store()
+    slugs = await _run_off_loop(
+        lambda: [a.slug for a in store.list() if (getattr(a, "folder_id", "") or "") in ids]
+    )
+    for slug in slugs:
+        try:
+            art = await _run_off_loop(lambda s=slug: store.get(s))
+        except ArtifactError:  # pragma: no cover -- listed, then vanished
+            continue
+        if art.publication is None:
+            continue
+        outcome = await publish_sync.delete_for_artifact(art)
+        if outcome in (
+            publish_sync.DeleteWithdrawal.FAILED,
+            publish_sync.DeleteWithdrawal.UNREACHABLE,
+        ):
+            return slug
+        # Withdrawn, or nothing was there: the destination no longer serves this copy, so
+        # the record must stop claiming it. The cascade deletes the artifact moments later;
+        # clearing here keeps the state honest if the cascade itself then fails.
+        await _run_off_loop(lambda s=slug: store.clear_publication(s))
+    return ""
 
 
 async def api_artifact_folder_delete(request: web.Request) -> web.Response:
@@ -2963,6 +3304,35 @@ async def api_artifact_folder_delete(request: web.Request) -> web.Response:
         return _err("folder not found", status=404)
     raw = (request.query.get("delete_contents") or "").strip().lower()
     delete_contents = raw in ("1", "true", "yes")
+    if delete_contents:
+        # The cascade destroys artifacts through `ArtifactStore.delete`, which knows
+        # nothing about publications -- so before this fix a cascade over a folder holding
+        # a published artifact erased the record while the public copy stayed served, with
+        # nothing left able to withdraw it. Exactly the single-delete defect, reached by a
+        # different door, and it has to obey the same rule.
+        #
+        # Withdraw first, destroy nothing until every published copy in the subtree is
+        # withdrawn. On the first copy that will NOT come down the whole cascade is
+        # refused: a folder that refuses to delete is recoverable, an orphaned public copy
+        # is not. A withdrawal that DID succeed has its record cleared so the artifact
+        # stops claiming a destination that no longer holds it.
+        blocked = await _withdraw_subtree_publications(fid, fstore)
+        if blocked:
+            msg = (
+                "This folder was not deleted: the published copy of "
+                f"{blocked} could not be withdrawn, and deleting it would leave a public "
+                "copy with nothing able to take it down. Restore access to its "
+                "destination and try again. Unpublishing it first will not release it "
+                "either -- that refuses for the same reason."
+            )
+            _audit(
+                tool="artifact_folder_delete",
+                request=request,
+                outcome="error",
+                error=msg,
+                extra={"folder_id": fid, "delete_contents": True, "blocked_slug": blocked},
+            )
+            return _err(msg, status=502)
     try:
         # delete() scans every artifact (O(N)) and, in cascade mode, recursively
         # removes directories — offload off the event loop.
@@ -2984,6 +3354,7 @@ async def api_artifact_folder_delete(request: web.Request) -> web.Response:
             extra={"folder_id": fid},
         )
         return _err(str(exc), status=500)
+    kept = list(summary.get("kept_published_artifact_slugs", []))
     _audit(
         tool="artifact_folder_delete",
         request=request,
@@ -2992,9 +3363,23 @@ async def api_artifact_folder_delete(request: web.Request) -> web.Response:
             "folder_id": fid,
             "delete_contents": delete_contents,
             "deleted_artifacts": len(summary.get("deleted_artifact_slugs", [])),
+            "kept_published_artifacts": len(kept),
         },
     )
-    return _json_response({"ok": True, **summary})
+    payload: dict[str, Any] = {"ok": True, **summary}
+    if kept:
+        # Filed into the subtree AFTER the withdrawal preflight ran, so their copies
+        # were never withdrawn and the cascade refused to destroy them. Say so: a
+        # silently surviving artifact is how someone concludes the delete worked.
+        payload["notice"] = (
+            "The folder was deleted, but "
+            + ", ".join(kept)
+            + (" is" if len(kept) == 1 else " are")
+            + " still published and so were kept rather than destroyed -- deleting "
+            "them would have left a public copy with nothing able to take it down. "
+            "They are now unfiled. Unpublish them first, then delete them."
+        )
+    return _json_response(payload)
 
 
 async def api_artifact_set_folder(request: web.Request) -> web.Response:
@@ -3247,7 +3632,7 @@ async def api_artifact_materialize(request: web.Request) -> web.Response:
         )
         return _err("conversation log unavailable", status=500)
     try:
-        art = await _run_off_loop(
+        art, collided_with = await _run_off_loop(
             lambda: _materialize_and_pin(
                 path,
                 clog,
@@ -3279,7 +3664,14 @@ async def api_artifact_materialize(request: web.Request) -> web.Response:
         outcome="success",
         extra={"path": audit_path, "slug": art.slug},
     )
-    return _json_response(_serialize(art, include_content=True))
+    # Report a de-duplicated slug so a client promoting a corrected document
+    # learns it landed at a suffixed slug while the canonical one keeps serving
+    # the older text. This response only: the value describes this call, so the
+    # artifact record would carry it empty on every GET and LIST, and would keep
+    # naming a collision after the artifact that caused it is deleted.
+    payload = _serialize(art, include_content=True)
+    payload["slug_collided_with"] = collided_with
+    return _json_response(payload)
 
 
 # ── Comments ──────────────────────────────────────────────────────────────────
@@ -3462,14 +3854,17 @@ async def api_artifact_post_comment(request: web.Request) -> web.Response:
         # Anchor strings are LLM/agent-influenced (esp. on the MCP path) and are
         # echoed back to the dashboard, so redact credentials/exfil-URLs and cap
         # length — same treatment as the comment body (backend-security-controls).
+        # Redaction runs over the FULL value (capping first can cut a credential
+        # into fragments no regex matches), and the values are request-sized, so
+        # the pass runs off-loop (no-blocking-call-on-event-loop).
         def _anchor_str(v: object) -> str | None:
             if not isinstance(v, str) or not v:
                 return None
-            return _redact_text(v[:2000])
+            return _redact_text(v)[:2000]
 
-        anchor_quote = _anchor_str(anchor_data.get("quote"))
-        anchor_prefix = _anchor_str(anchor_data.get("prefix"))
-        anchor_suffix = _anchor_str(anchor_data.get("suffix"))
+        anchor_quote = await asyncio.to_thread(_anchor_str, anchor_data.get("quote"))
+        anchor_prefix = await asyncio.to_thread(_anchor_str, anchor_data.get("prefix"))
+        anchor_suffix = await asyncio.to_thread(_anchor_str, anchor_data.get("suffix"))
         anchor_start = anchor_data.get("start_offset")
         anchor_end = anchor_data.get("end_offset")
         anchor_ver = anchor_data.get("version_number")
@@ -3485,7 +3880,7 @@ async def api_artifact_post_comment(request: web.Request) -> web.Response:
     # author (or the agent badge). getpass.getuser() is the alias on dev desks.
     # The author is LLM/agent-influenced on the MCP path and echoed to the
     # dashboard, so redact + cap it like the body (backend-security-controls).
-    author = _redact_text(str(body.get("author") or "")[:256])
+    author = (await asyncio.to_thread(_redact_text, str(body.get("author") or "")))[:256]
     if not author and not is_agent:
 
         try:
@@ -3624,7 +4019,7 @@ async def api_artifact_reply_comment(request: web.Request) -> web.Response:
     # who left them), mirroring the create handler. Agent replies keep their
     # explicit author. Without this, replies render as "Unknown". Redact + cap
     # the LLM/agent-influenced author before it is echoed to the dashboard.
-    author = _redact_text(str(body.get("author") or "")[:256])
+    author = (await asyncio.to_thread(_redact_text, str(body.get("author") or "")))[:256]
     if not author and not is_agent:
 
         try:
@@ -3899,7 +4294,7 @@ async def api_artifact_delete_comment(request: web.Request) -> web.Response:
     # artifact activity feed (dashboard), so redact credentials/exfil URLs before
     # it is persisted or echoed (backend-security-controls) — same treatment as
     # comment bodies / author / anchors.
-    reason = _redact_text(str(body.get("reason") or "").strip()[:500])
+    reason = (await asyncio.to_thread(_redact_text, str(body.get("reason") or "").strip()))[:500]
 
     store = get_default_store()
     try:
@@ -4139,6 +4534,10 @@ async def api_artifact_publish_providers(request: web.Request) -> web.Response:
                 # False + present in this list ⇒ installs on first publish; the
                 # FE may surface an "installs on first use" hint.
                 "available": avail,
+                # The remedy text for `available: false`. Without it the picker can only
+                # send the user somewhere generic, and a provider's own hint is the only
+                # thing that knows WHICH action makes it available.
+                "install_hint": str(getattr(p, "install_hint", "") or ""),
                 "sharing_model": _sharing_model_dict(sm),
                 "sync_model": {
                     "authority": sy.authority,

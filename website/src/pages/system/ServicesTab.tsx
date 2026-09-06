@@ -17,6 +17,7 @@ import { useProvider } from '../../providers'
 import { Card, CardTitle } from '../../components/ui'
 import InfoTip from '../../components/InfoTip'
 import McpGatewayCard from '../McpGatewayCard'
+import HostRuntimeCard from './HostRuntimeCard'
 import { fmtNumber, fmtPercent, fmtUnit } from '../../i18n/format'
 import { i18nT } from '../../i18n/t'
 import type { SystemData } from '../../types'
@@ -296,6 +297,9 @@ export default function ServicesTab() {
 
       {/* MCP Gateway — imported unchanged, self-hides when disabled */}
       <McpGatewayCard />
+
+      {/* Host runtime — self-hides outside the Windows desktop shell */}
+      <HostRuntimeCard />
     </>
   )
 }

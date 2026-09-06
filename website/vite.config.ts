@@ -20,6 +20,7 @@ import {
   TAILWIND_RUNTIME_SRC,
 } from './src/lib/vendorPaths'
 import { precompressPlugin } from './scripts/precompress.mjs'
+import { CONTEXT_SINGLETON_DEDUPE } from './vite.shared'
 import {
   parseBrandingConfig,
   applyBrandingToHtml,
@@ -165,6 +166,55 @@ function vendorRuntimePlugin(): Plugin {
  * `vite build` only (not dev server). The public/ directory is copied
  * verbatim by Vite so `define` replacements don't apply to it.
  */
+/**
+ * Self-host Excalidraw's canvas fonts. Without `window.EXCALIDRAW_ASSET_PATH`
+ * the library resolves its lazily-loaded text-tool fonts (Excalifont, Xiaolai,
+ * …) against a third-party CDN (esm.sh) — verified by a network probe against
+ * a live pod — which breaks air-gapped dashboards and violates the same
+ * no-network rule that `lib/excalidrawScene.ts` documents for the read-only
+ * renderer. SketchDialog sets the asset path to `/vendor/excalidraw/`; this
+ * plugin makes that path real: build emits every font file from the npm
+ * package into `dist/vendor/excalidraw/fonts/**`, and the dev server serves
+ * the same files straight from node_modules.
+ */
+function excalidrawFontsPlugin(): Plugin {
+  const FONTS_ROOT = path.resolve(__dirname, 'node_modules/@excalidraw/excalidraw/dist/prod/fonts')
+  const SERVE_PREFIX = '/vendor/excalidraw/fonts/'
+  const listFonts = (): string[] => {
+    const out: string[] = []
+    for (const family of readdirSync(FONTS_ROOT)) {
+      for (const file of readdirSync(path.join(FONTS_ROOT, family))) {
+        out.push(`${family}/${file}`)
+      }
+    }
+    return out
+  }
+  return {
+    name: 'kirocrew-excalidraw-fonts',
+    configureServer(server) {
+      server.middlewares.use((req, res, next) => {
+        const url = (req.url || '').split('?')[0]
+        if (!url.startsWith(SERVE_PREFIX)) return next()
+        const rel = decodeURIComponent(url.slice(SERVE_PREFIX.length))
+        // Path-traversal guard: the joined path must stay under FONTS_ROOT.
+        const abs = path.resolve(FONTS_ROOT, rel)
+        if (!abs.startsWith(FONTS_ROOT + path.sep) || !existsSync(abs)) return next()
+        res.setHeader('Content-Type', 'font/woff2')
+        res.end(readFileSync(abs))
+      })
+    },
+    generateBundle() {
+      for (const rel of listFonts()) {
+        this.emitFile({
+          type: 'asset',
+          fileName: `vendor/excalidraw/fonts/${rel}`,
+          source: readFileSync(path.join(FONTS_ROOT, rel)),
+        })
+      }
+    },
+  }
+}
+
 function swVersionPlugin(): Plugin {
   return {
     name: 'kirocrew-sw-version',
@@ -190,7 +240,18 @@ function swVersionPlugin(): Plugin {
         // Falls back to version alone if git is unavailable (CI edge case).
         let sha = ''
         try { sha = execSync('git rev-parse --short HEAD', { encoding: 'utf-8' }).trim() } catch {}
-        const buildHash = sha ? `${pkg.version}-${sha}` : pkg.version
+        // A dirty tree means HEAD does not describe these bytes: two builds
+        // from different uncommitted states would stamp the SAME version, so
+        // the service worker never byte-changes and clients keep the previous
+        // deploy's shell cache alive. Suffix a timestamp so every dirty build
+        // is its own cache generation; clean builds stay reproducible.
+        let dirty = ''
+        try {
+          if (execSync('git status --porcelain', { encoding: 'utf-8' }).trim()) {
+            dirty = `-dev${Date.now().toString(36)}`
+          }
+        } catch {}
+        const buildHash = (sha ? `${pkg.version}-${sha}` : pkg.version) + dirty
         content = content.replace('%%SW_BUILD_HASH%%', buildHash)
         writeFileSync(swPath, content)
       } catch (e: unknown) {
@@ -506,28 +567,12 @@ function appWindowUrls(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
+  plugins: [react(), tokenProxyPlugin(), appImportMapPlugin(), vendorRuntimePlugin(), excalidrawFontsPlugin(), swVersionPlugin(), editionExtensionPlugin(), bundleReportPlugin(), appWindowUrls(), precompressPlugin()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
     },
-    // Force a SINGLE instance of every CONTEXT-CARRYING singleton across the
-    // bundle. A KIROCREW_EDITION_DIR in a separate repo may resolve these from
-    // ITS OWN node_modules; a second copy binds an edition component's hooks to
-    // a DIFFERENT context instance than the core's providers — "Invalid hook
-    // call" (react), "No QueryClient set" / null router context / silently empty
-    // data (the rest) — only at runtime, only in the out-of-repo edition build.
-    // Dedupe the libraries the core's provider tree owns; harmless in the stock
-    // single-node_modules build. (See website/AGENTS.md — edition peer-dep rule.)
-    dedupe: [
-      'react',
-      'react-dom',
-      'react-redux',
-      'react-router',
-      'react-router-dom',
-      '@tanstack/react-query',
-      'framer-motion',
-    ],
+    dedupe: CONTEXT_SINGLETON_DEDUPE,
   },
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
@@ -662,6 +707,8 @@ export default defineConfig({
       exclude: [
         'src/test/**',
         'src/**/*.test.{ts,tsx}',
+        // Storybook fixtures: development-only, never in the served bundle.
+        'src/**/*.stories.{ts,tsx}',
         'src/**/*.d.ts',
         'src/vite-env.d.ts',
       ],
@@ -778,6 +825,22 @@ export default defineConfig({
           // remark/rehype/unified pipeline).
           if (/[\\/]node_modules[\\/](katex|highlight\.js|lowlight|refractor|react-markdown|remark-[^\\/]+|rehype-[^\\/]+|mdast-[^\\/]+|hast-[^\\/]+|micromark[^\\/]*|unified|unist-[^\\/]+)[\\/]/.test(id)) {
             return 'vendor-markdown'
+          }
+          // The YAML document parser, reached only by the skill editor's
+          // frontmatter round-trip (`SkillForm.tsx`). Bucketed like every other
+          // vendor library here because the App chunk is meant to hold FIRST-PARTY
+          // code -- its budget comment in scripts/check-bundle-size.mjs says as
+          // much -- and it is the ceiling that ordinary feature PRs trip. Measured
+          // 93.7 KB raw / 29 KB gzip, far under the gate's 500 KB default, so it
+          // needs no CHUNK_BUDGETS entry of its own. The leading separator keeps
+          // this off `js-yaml`, which is mermaid's and belongs in mermaid's chunk.
+          if (/[\\/]node_modules[\\/]yaml[\\/]/.test(id)) {
+            return 'vendor-yaml'
+          }
+          // Routed out because this change's sidebar growth pushed the App chunk past the
+          // ceiling the `yaml` note above names; eager at every use site, no lazy boundary to defeat.
+          if (/[\\/]node_modules[\\/]dompurify[\\/]/.test(id)) {
+            return 'vendor-dompurify'
           }
         },
       },

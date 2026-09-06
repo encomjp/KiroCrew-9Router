@@ -147,6 +147,11 @@ through `run_in_embed_pool` (the bounded `mc-embed` bulkhead) because
 `_consolidate` runs on the gateway event loop, and a slow or hung embed inline
 would stall heartbeats, Slack, and the dashboard.
 
+Structured `[Monitor wake]` turns never call `maybe_consolidate()`: their prompt
+and resulting action are automation evidence, not user-authored memory. Monitor
+admission also refuses restricted dashboard sessions, so a persisted loop cannot
+outlive the incognito or temporary boundary that prohibits derived memory.
+
 ### Lesson Extraction from Chat
 
 The history consolidation prompt includes a `"lessons"` key that extracts only implicit correction patterns — corrections the user made without explicitly saying "remember" (those are already saved immediately via `learn_add`). All lesson writes go through `write_lesson()` which provides substring dedup and topic-overlap dedup (>50% keyword overlap → newer replaces older). When vector memory is not active, falls back to `lessons.jsonl` via `LessonStore.save()`.
@@ -193,8 +198,8 @@ matter most:
   block (the latter re-acquires the lock itself, which is why reentrancy is
   required).
 - **Episodic search** (`_sqlite_vector_search`, the no-FAISS fallback): only the
-  row fetch is locked; the cosine/decay scoring loop then works on materialized
-  rows outside the lock.
+  row fetch — or the scoring-set build that replaces it — is locked; the
+  ranking then works on materialized data outside the lock.
 
 **The lock is never held across an embedding call.** An embed on a loaded model
 is serialized behind the embedder's own lock and costs tens of ms per short
@@ -230,12 +235,14 @@ Context injection: formatted as `key: value` pairs in `[Semantic Memory]` block.
 ### Episodic Memory
 
 SQLite table `episodic_memories` — conversation fragments with optional embeddings:
-- **Write**: text validation (10-2000 chars), **prompt-injection screening** (`_contains_injection`, same pattern set as the semantic-KV path), tag sanitization, importance clamping (0-1), FAISS dedup (cosine > 0.88). The dedup scan **skips tombstoned ("ghost") matches**: tombstone paths (merge, dashboard delete, cap eviction, stale retirement) set `is_deleted=1` but leave the vector in `_faiss_index`/`_faiss_id_map`, so a high-similarity hit may map to a deleted row. `_get_episodic()` filters `is_deleted=0` and returns `None` for those; the write loop `continue`s past a `None` match (mirroring `search_episodic`'s `if not mem or mem["is_deleted"]: continue`) instead of treating it as a conflict — otherwise a new memory matching a deleted one was silently rejected (data loss).
+- **Write**: text validation (10-2000 chars), **prompt-injection screening** (`_contains_injection`, same pattern set as the semantic-KV path), tag sanitization, importance clamping (0-1), FAISS dedup (cosine > `_DEFAULT_DEDUP_THRESHOLD` = 0.88, configurable via `memory.episodic_dedup_threshold` — the production stores (`slack/gateway.py`, `cli_server.py`, the dashboard's standalone fallback in `dashboard/handlers/memory.py`) pass it as `dedup_threshold`; deferred writers skip this check entirely so they have no threshold to honour, and `eval/bench/ingest.py` sweeps its own value). The dedup scan **skips tombstoned ("ghost") matches**: tombstone paths (merge, dashboard delete, cap eviction, stale retirement) set `is_deleted=1` but leave the vector in `_faiss_index`/`_faiss_id_map`, so a high-similarity hit may map to a deleted row. `_get_episodic()` filters `is_deleted=0` and returns `None` for those; the write loop `continue`s past a `None` match (mirroring `search_episodic`'s `if not mem or mem["is_deleted"]: continue`) instead of treating it as a conflict — otherwise a new memory matching a deleted one was silently rejected (data loss).
 - **Injection screening (XPIA defense-in-depth)**: episodic text is derived from conversation transcripts, so a poisoned turn could persist steering instructions that get re-injected into future contexts. `write_episodic()` runs `_contains_injection()` (before the embed call) and, on match, drops the entry and emits an auditable `injection_blocked` event with `memory_type='episodic'`. The stored audit snippet is scrubbed with `redact_exfiltration_urls()` + `redact_credentials()` first, since `/api/memory/events` surfaces it verbatim on the dashboard. This mirrors the semantic-KV screen at `validate_semantic()`. **Residual (accepted risk)**: this is a best-effort regex screen: a determined owner can still steer their own long-term memory with phrasing that evades the patterns; long-term memory poisoning is an accepted residual. The screen raises the bar against accidental/opportunistic XPIA persistence, not against a motivated self-owner.
 - **Search**: FAISS vector similarity with decay scoring: `cosine_sim × (0.7 + 0.3×importance) × exp(-rate×days_old)`, then MMR diversity reranking (Jaccard-based, `_MMR_LAMBDA` = 0.6). The decay rate is `_DEFAULT_DECAY_RATE` = 0.03/day, configurable per tag via `memory.decay_rates` (`_decay_rate_for`): keys are tags (case-insensitive, matching `_matches_tags`), the reserved `default` key replaces the built-in fallback, a multi-tag row uses the SLOWEST matching rate (smallest = maximum retention, so a broad tag can never age out a long-retention one), values are clamped to [0, 10] and non-numeric entries are dropped with a warning at store construction (`_sanitize_decay_rates`). Both vector rungs (FAISS and the stdlib fallback) resolve the rate through the same helper; the keyword rung does no decay scoring at all.
 - **MMR reranking**: Maximal Marginal Relevance balances relevance with diversity. Greedy iterative selection penalizes candidates similar to already-selected results. Prevents redundant episodic fragments from consuming the context budget. Configurable via `mmr=False` parameter to disable. The candidate pool is deliberately NOT truncated toward `limit` (that tail pick is the point of MMR); the only bound is the recall-safe `_MMR_MAX_POOL` = 1000 ceiling for pathological inputs.
 - **Relevance threshold**: `_EPISODIC_RELEVANCE_THRESHOLD` = 0.55 cosine required for context injection (empirically determined from a 100-query benchmark: 50 relevant + 50 irrelevant, F1=0.980), relaxed to `_EPISODIC_LONG_TEXT_THRESHOLD` = 0.42 for entries longer than `_EPISODIC_LONG_TEXT_CHARS` = 300 chars, because long texts dilute cosine scores. The threshold reads the RAW `cosine_sim`, not the decay-adjusted score, so age and importance affect ordering but never admission. Admission runs BEFORE the decay ranking, MMR, and the `limit` cut: `get_episodic_context()` calls `search_episodic(relevance_filter=True)`, which drops sub-threshold candidates first, so a highly relevant but old memory cannot be ordered past `limit` by a cluster of recent-but-irrelevant rows that the gate would then remove — a case that otherwise returned empty context while an exact match sat in the store. `search_episodic()` defaults to `relevance_filter=False` and returns the full ranked set for dashboard/API/CLI use. The keyword fallback is unaffected because those rows carry no `cosine_sim` key at all.
 - **Fallback ladder**: FAISS (needs faiss + numpy) → `_sqlite_vector_search`, stdlib cosine over the stored blobs → FTS5/LIKE keyword search (OR logic on text + tags) when there is no query embedding at all. The middle rung matters: faiss is an optional accelerator, not a declared dependency, so a stock install still gets vector recall from the stored vectors.
+- **Resident scoring set (the middle rung, with numpy)**: scoring reads only the embedding, `tags`, `importance`, `created_at` and the text LENGTH, and none of that changes between two searches with no write in between — so `_EpisodicScoringSet` holds those columns as numpy arrays and the search resolves row BODIES (`text`, `conversation_id`, `last_accessed_at`) for the ranked pool only, through the same `_get_episodic_batch` the FAISS path uses. Decay is a vectorized expression over the cached arrays, not a per-row Python dict build. Filtering still runs across the FULL population before `limit` — `tag_filter` and the relevance gate are masks over the cached arrays, never a top-k window, because a tag matching few rows would otherwise miss the pool entirely and return nothing where it returns hits today. The pool handed to MMR stays `_MMR_MAX_POOL`-bounded rather than `limit`, since the rerank reads each candidate's text.
+- **Scoring-set invalidation**: the validity token is `(in-process generation, PRAGMA data_version)`. `_invalidate_episodic_scoring()` bumps the generation and is called by **every** writer that changes which rows are scored or what they score as — `write_episodic`, `delete_episodic`, `_delete_episodic_row`, `_enforce_episodic_cap`, `_retire_stale_episodic`, `reconcile_embedding_space`, and `backfill_missing_embeddings`. Two of those are traps a naive append-only cache falls into: the backfill rebuilds the FAISS index only `if _HAS_FAISS`, which is False on exactly the install this rung serves, and a body lookup can never repair it (it drops ids that vanished but cannot surface ids that appeared, so recall degrades with no error); and `PRAGMA data_version` is the only in-band signal that a SECOND PROCESS committed to the same file, since the FAISS consistency gate compares two in-process structures. `_touch_last_accessed` is deliberately NOT a writer here — `last_accessed_at` is never scored and is re-read per search with the bodies. A ratchet test (`test_every_episodic_writer_invalidates_the_scoring_set`) fails on a new `episodic_memories` writer that skips the hook. The set is bounded by `_EPISODIC_SCORING_MAX_BYTES` (64 MiB, ~10 MiB for 2,600 rows at dim 1024) and is disabled outright on an sqlite with no `data_version` pragma; either way the rung falls back to reading the population per call.
 - **Cap**: `_DEFAULT_EPISODIC_MAX` = 10,000 active entries. `_enforce_episodic_cap()` tombstones `ORDER BY importance ASC, created_at ASC` (lowest-importance oldest first) on write once the count reaches the cap.
 
 Context injection: `_DEFAULT_EPISODIC_LIMIT` = 8 results in an `[Episodic Memory]` block, each fragment sliced to 1,500 chars, total bounded by `min(_EPISODIC_INJECT_CAP, caps.episodic)` where `_EPISODIC_INJECT_CAP` = 3,000. Injected on the first message of new sessions through the single `memory.get_context()` call in `build_session_context()`, which passes the user's message as the query; episodic is query-gated inside `get_context`, so callers without a message (eval runner) inject none, and follow-up turns never re-inject (ACP native history provides in-thread context).
@@ -267,7 +274,7 @@ not coordinate, so reason about them separately:
 
 ### In-Process Embedder (`embeddings.py`)
 
-Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kiro_crew/_vendor/llama_cpp`) — no external server, no HTTP hop, no runtime pip install. (The Ollama-era remote-URL path — and with it `_validate_url`/`_resolve_blocked_addr` SSRF hardening from commit `76640a75` — was removed together with the network client: there is no embedding URL to validate anymore.)
+Embeddings run in-process via the vendored llama-cpp-python 0.3.34 runtime (`kiro_crew/_vendor/llama_cpp`) — no external server, no HTTP hop, no runtime pip install. There is no remote embedding URL, so no URL validation or SSRF hardening is needed on this path; see `../post-launch-removals.md` for why a network embedding client must not come back.
 
 - `LlamaCppEmbedder.embed(text)` / `embed_batch(texts)` → returns 1024-dim vectors or `None` on any failure (graceful degradation)
 - **Non-blocking model load**: the GGUF load runs on a background daemon thread (`_kick_background_load()`, thread name `kc-embed-load`) — `embed()`/`embed_batch()` NEVER block on the load. When the model isn't in memory yet, the call kicks the background load and returns `None` immediately; memory degrades to keyword search until the load lands. The gateway/dashboard event loop is never stalled by embedding work. `wait_ready(timeout)` exists for sync contexts (tests, one-shot CLI flows) that legitimately want to block — never call it from an event-loop thread
@@ -393,6 +400,8 @@ Model: `Qwen/Qwen3-Embedding-0.6B` Q8_0 GGUF (610MB). Apache-2.0 licensed. Serve
 ### Keyword search over the markdown layer
 
 **Query escaping.** The query is treated as literal words, not FTS5 expression syntax. Tokens are quoted by `fts5_quote_tokens` in `_sqlite_compat.py`, the single escaping dialect shared with knowledge retrieval. Unquoted, `-` and `.` and a bare `AND` are FTS5 operators, so `PROJ-123` or `hooks.py` raises inside the driver and `MemoryStore.search`'s `except` turns it into `[]`, a silent "never written" for the likeliest queries. The join differs by surface on purpose: memory ANDs every token (a hand-typed query is deliberate), knowledge drops stopwords and ORs (natural-language recall).
+
+**CJK segmentation is a knowledge-only behaviour today.** `_sqlite_compat.py` also exports `fts5_segment_for_index` and `fts5_cjk_match_groups`, the pair that makes a word inside a spaceless CJK run addressable (see `knowledge.md` §4), plus the two primitives both search surfaces share: `is_cjk_char` (the character ranges) and `script_runs` (the same-script split). Those two live there because session search needs them as well, and the hand-maintained second copies had already drifted apart -- `history_search.py` now re-uses both rather than restating them. Three product FTS5 tables share the root cause and only `items_fts` is fixed. `memory_fts` does **not** use them: it is created `tokenize='porter unicode61'` and still matches through `fts5_quote_tokens`, so a spaceless CJK memory query is one token matched against one token and recalls only an exact whole-run hit. `preferences_fts` (`apps/builtins/personal_shopper/backend/store.py`) has the same gap and is likewise unfixed. The helpers live in the shared module rather than under `knowledge/` precisely so these surfaces can adopt them; each needs its own index rebuild and its own decision about AND-vs-OR semantics, which is why neither is done here.
 
 **Empty index is not absence.** `MemoryStore.index_row_count()` returns the FTS row count, or `None` when the index cannot be read, so a caller can separate three states that `search` collapses into one empty list: unreadable, empty, genuinely no match. An unbuilt or unreadable index is reported as such rather than as "no match".
 
@@ -537,21 +546,53 @@ falling back would resurrect lessons the user deleted and ignore the scope gate.
 whose `repo_scope` is present but unusable counts as neither.
 
 **Single write path** — all lesson writes go through `write_lesson()` which provides:
-- Substring dedup: "use dark mode" won't duplicate "always use dark mode"
+- Substring dedup, and it is ASYMMETRIC. A submitted rule contained in a stored one is
+  declined and nothing is mutated (`deduped` / `substring_covered`): "use dark mode"
+  won't duplicate "always use dark mode". A submitted rule that CONTAINS a stored one
+  deletes the stored row instead — "longer wins" — so teaching "when a release is in
+  progress, never force push to a shared branch" retires a stored "never force push to
+  a shared branch". Note the direction of that trade: attaching a condition to a rule
+  makes its text longer and its guidance NARROWER, so the row that survives can be the
+  one that applies in fewer cases.
 - Topic-overlap dedup: "use light mode" replaces "use dark mode" (>50% keyword overlap → newer wins)
 - Allowlist validation, injection scanning, audit logging
+
+Substring-delete and topic-overlap are not independent: verbatim containment at word
+boundaries makes the stored rule's keyword set a subset of the submitted rule's, so
+overlap scores 100% and the topic rule would delete the same row the substring rule
+did. Suppressing either one alone does not keep both lessons — which is why
+`write_lesson` REPORTS its deletions (below) rather than declining to make them, and
+why a caller that must never replace an existing lesson routes to
+`set_semantic_if_absent` instead (see `onboarding_import`, whose comment records that a
+foreign directive could otherwise delete a correction the user taught the agent).
 
 **What a write reports.** `write_lesson()` returns a `LessonWriteResult` naming WHICH
 outcome occurred: `inserted` / `enriched` / `unchanged` / `deduped` / `refused`, plus a
 short reason code (a `SemanticRejectCode` value for a refusal, the dedup rule's name for
 a dedup, `kept_stored_clause` for the one `unchanged` case that is not a byte-identical
-re-submit). The vocabulary is shared with `LessonStore.save_or_enrich()`, which already
-returned the first three words, so both stores describe the same events the same way.
+re-submit), plus `superseded` — the rules this call DELETED. The outcome vocabulary is
+shared with `LessonStore.save_or_enrich()`, which already returned the first three
+words, so both stores describe the same events the same way — but only the vocabulary is
+shared, not the dedup policy: the JSONL store matches on exact rule text plus scope and
+has no rule that supersedes, so it keeps both a general rule and the narrower rule
+containing it.
+
 The distinction matters because two outcomes mean "your lesson did not land"
 (`refused`, `deduped`) while two mean "your lesson is fine, there was nothing to do"
 (`unchanged`, and the kept-clause variant) — a caller reading only a bool cannot tell
 them apart, and the `learn add` CLI guessed wrong, writing a second `lessons.jsonl`
 record on every one of them.
+
+`superseded` exists because every other field describes what happened to the SUBMITTED
+lesson, so a write that tombstoned a stored rule reported a bare `inserted` with
+`reason=None` and the caller was told its lesson was saved with nothing naming the cost.
+The result is the only channel that can carry it: the deleted row is a tombstone, so by
+the time the caller looks it is absent from `get_lessons()`, from `learn_list` and from
+the injected lessons block. It is empty on every path that deleted nothing (including
+`enriched`, which is decided in pass 1 and skips the dedup scan), is forwarded by
+`/api/lessons` as a JSON array, and is rendered in full — not counted, not truncated —
+by the `learn add` CLI and the `learn_add` tool, because that text is the last readable
+copy of the removed rule.
 
 **The result's truth value is the old bool, deliberately.** `bool(result)` is `wrote`,
 byte-for-byte the predicate the previous `-> bool` return answered, so the three callers
@@ -564,7 +605,8 @@ bare assertion would keep passing while asserting nothing — a silent hazard my
 flag, since a bare `if` on any object is legal. `stored` is the separate property for
 "is my lesson in the store" (true for a no-op re-submit, which is NOT a write). Surfaces
 that report to a human or a model — the `learn add` CLI, the `POST /api/lessons` response
-(`ok` / `outcome` / `reason`), the `learn_add` tool result — read `outcome` and `reason`.
+(`ok` / `outcome` / `reason` / `superseded`), the `learn_add` tool result — read `outcome`
+and `reason`, and name the `superseded` rules when there are any.
 The dashboard Memory tab clears its draft and refreshes the list only for `inserted`
 or `enriched`; `unchanged` clears the draft but reports that it was already stored,
 while `deduped` and `refused` preserve the draft and surface the reason so it can be
@@ -601,7 +643,7 @@ lesson beat a contradicting preference in the same prompt.
 |----------|------------|-----------|
 | Lesson contradicts a preference | Lesson wins via the `[Learned corrections]` framing | `context.py` |
 | Two semantic writes to one key | `user_explicit` overrides all; else higher confidence; confidences within 0.1 count as equal so newer wins | `vector_memory._write_semantic()` |
-| Duplicate lessons | Substring dedup, then topic-overlap dedup (≥50% of the smaller keyword set → newer replaces older), then embedding dedup (cosine > 0.85 → longer text wins) | `vector_memory.write_lesson()` |
+| Duplicate lessons | Substring dedup (contained-in-stored declines; contains-a-stored-one DELETES it, "longer wins"), then topic-overlap dedup (≥50% of the smaller keyword set → newer replaces older), then embedding dedup (cosine > 0.85 → longer text wins). Every deletion is named in `LessonWriteResult.superseded` | `vector_memory.write_lesson()` |
 | Contradicting episodic fragments | No explicit resolution: time decay plus MMR surfaces the newer/more relevant fragment | `vector_memory.search_episodic()` |
 | A semantic value is superseded | `_retire_stale_episodic()` tombstones episodic rows that quote the old value | `vector_memory._write_semantic()` step 9 |
 
@@ -909,6 +951,35 @@ help a user enable and interpret it. It does not enable the feature or trigger
 generation, and holds no runtime-written frontmatter, since a builtin skill is
 re-synced by `rmtree` + `copytree` on upgrade.
 
+**`GET /api/skills` coalesces concurrent readers onto one scan, and stores nothing.**
+The catalog assembly is filesystem-heavy (`os.walk` plus per-file frontmatter reads, package
+path globs, per-skill resolve/read, agent annotation), and the defect this addresses is that
+N simultaneous skill-menu opens each paid for their own scan. `_assemble_skills_catalog` in
+`dashboard/handlers/prompts.py` fixes that with single-flight coalescing: the first reader
+assembles, readers queued alongside it take those rows instead of scanning again. Measured
+against a counting assembler, 8-way concurrency goes from 0% to 87.5% redundant-scan
+elimination — eight opens cost one scan.
+
+**There is no stored result and no TTL, and that is what makes the invariant cheap.** The
+leader's rows are offered only while another reader for the same key is still inside
+`_assemble_skills_catalog`; when the last one leaves, they are dropped. So a read that is not
+part of a concurrent burst always scans current on-disk state, the base's recorded default
+("No result cache: the endpoint always reflects current on-disk state, so freshly
+created/installed skills appear immediately") is preserved, and **no mutation path anywhere
+owes the catalog an invalidation**.
+
+**The mechanism is one assembly lock per key** (`LoopBoundLock` values in a registry, the shape
+#4800 established) — fast path, lock, re-check under it, where the re-check is the join. Per key
+rather than global, so readers of different projects still scan in parallel as the base did; the
+registry entry is dropped with the waiter count, and a test pins the parallelism.
+`_assemble_skills_catalog`'s docstring is authoritative for the contract — which readers can be
+served older rows, and the bound — so it stays next to the code it constrains and is spelled once.
+
+**The `?agent=` filter is deliberately NOT part of the key.** It is applied downstream as a
+comprehension over the assembled rows, and an end-to-end test drives two agents through the
+real endpoint in both orders to keep that true rather than merely currently-true — a join that
+ever shared the FILTERED result would fail whichever agent asked second.
+
 **Loading:**
 1. **Always-on**: skills with `always: true` have full content injected every new session
 2. **On-demand**: skill summaries (name + description + dir path) in session context; LLM can `cat` the file when relevant
@@ -1144,22 +1215,147 @@ enumeration, and a stat would initiate the outbound connection before confinemen
 Its size and content-digest cache token instead come from bytes admitted by the
 descriptor-pinned no-link reader.
 
-The dashboard's structured skill editor rebuilds the frontmatter block from its
-own fields, so it must carry every key it does not model. It re-emits those keys'
-**original source lines verbatim** rather than reserializing a parsed value: the
-form does not know a field's YAML type, so any value it invents can change the
-type (a list or nested map becomes a block scalar, a folded `>` becomes literal
-`|`). A field's block is defined as everything from its key line up to the next
-top-level key — the inverse of the key test, not a list of accepted continuation
-shapes, so indented lines, interior blank lines, indentless `- item` entries and
-comments are all covered without enumerating them. That verbatim rule applies to
-PRESERVATION only: the scalar view the form reads its own five fields from keeps
-the narrower "indented lines continue a value" rule, because a top-level comment
-after `always: true` is part of the block but not part of the value — folding it
-in made the flag read as unset and the form dropped the pin. A comment attached to
-one of the five modelled keys is not preserved, for the same reason their original
-spacing is not: the form owns those and re-emits them from its own state. The
-invariant to preserve when touching this code: editing a modelled field leaves
+The dashboard's structured skill editor owns five frontmatter fields (`name`,
+`description`, `always`, `triggers`, `tags`) and must leave every other byte of the
+block alone. It does that by parsing the block with a real YAML parser (the `yaml`
+package, `parseDocument`), replacing the **source range** of each field it owns, and
+copying every other byte through unchanged.
+
+Two properties of that design are load-bearing, and both were paid for:
+
+- **The parser decides structure, not a line matcher.** What counts as a key, as a
+  continuation of a value, or as a comment comes from the YAML grammar. `#1790`
+  spent four review rounds proving the alternative cannot be finished — each
+  accepted continuation shape revealed another valid one (indented lines → block
+  scalars → indented keys → blank lines → indentless `- item` entries) — and the
+  case it still left open (`#1825`) was a top-level line that is not a recognized
+  `key:` and follows a modelled key. A line-based walk can only attach such a line
+  to the preceding key, so re-emitting that key from form state destroyed it: a
+  `# comment`, a quoted `"my.key"`, or a dotted key silently vanished during an
+  unrelated edit. Source ranges have no such gap — those lines are not
+  inside any modelled key's range, so they are copied where they stand.
+- **Untouched bytes are COPIED, never re-serialized.** `Document.toString()`
+  normalizes: an indentless list comes back indented, a folded `>` scalar comes
+  back re-folded. Both are byte changes to a field the form does not own. Splicing
+  ranges is what makes the invariant exact rather than approximate. A field the
+  form DOES own is copied too when its value was not edited, so its original
+  quoting, block-scalar style and inline comment survive as well.
+
+A block the parser does not fully accept — a duplicate key, a tab used as
+indentation, an unclosed quote, a non-mapping or flow-mapping root — is **not
+spliced at all**, and neither is a block using **anchors or aliases**: a managed
+field can carry the anchor an unmodelled field aliases, so re-rendering it would
+drop the anchor and leave the alias dangling in a file that no longer parses. The
+same applies to any mapping layout whose **top-level keys are not at column 0** —
+an explicit key (`? name` then `: value`) puts a marker before the key that
+replacing the key's own range would leave behind, and a root-indented mapping would
+receive an appended field at a different indentation from its siblings, which is a
+YAML error rather than a cosmetic difference. One column check covers both.
+
+A block is also refused when any **managed field shares its line with a comment**.
+Four review rounds each found a different way that weaving a new value into such a
+line goes wrong (an inline comment lost on drop, a block-scalar header comment lost
+on replace and on drop, a trailing comment absorbed into the value once an edit made
+it multi-line), and the last of those fixes emitted `description: |- # note`, a form
+the BACKEND reader takes as literal text while discarding the content. Every
+arrangement of value and comment on one line is its own case, which is the same
+unfinishable enumeration this design exists to replace, so the splice declines and
+the block is edited raw. A comment on the line ABOVE a key is `commentBefore`, which
+the splice never touches, so it does not trigger the refusal.
+
+One refusal is detected in the SOURCE rather than the AST: a YAML document-end marker
+(`...` at column 0). The parser drops it, and anything after it belongs to a second
+document `parseDocument` never returns, so no AST rule can see it -- while an append,
+the path a MISSING managed field takes, would land after the marker where the reader
+never looks. Teaching the splice to insert before it would mean re-deriving a position
+from a construct the AST does not carry, which is the line arithmetic this design
+removes, so the block is edited raw instead.
+
+One more refusal comes from the FORM's own representation rather than from YAML:
+`triggers` and `tags` are a single-line input holding a comma-separated list, and YAML
+gives that field two legitimate shapes. The requirement is the same for both -- come back
+unchanged from what that input can carry -- but it lands differently on each. As a
+SCALAR (the `alpha, beta` form the editor itself writes) only a carriage return or
+newline is fatal: the input cannot hold one, so the browser strips it and a block-literal
+list merges into a single entry; commas there are the field's own separator and
+round-trip by design. As a SEQUENCE, read joins the items with `', '` and save splits on
+`,`, trims each piece and drops the empties, so an item must additionally be a non-empty
+string scalar, equal to its own trimmed text, and free of commas. Anything else is edited
+raw. The rule DEFAULTS TO DENY, which is its substance rather than a detail: five earlier
+versions were "allow unless a problem is recognised" and each shipped a hole where an
+unrecognised node kind fell through -- non-scalar items, empty items, multiline items,
+multiline scalars, then a mapping value. The kinds this field can represent are exactly
+three (absent, a single-line scalar, a sequence of single-line scalars), so those are
+named and everything else is refused, including node kinds a future YAML version adds.
+Note that a FOLDED value is fine either
+way: folding turns its breaks into spaces, so it is genuinely single-line.
+
+**The reader has the mirror of that rule.** Reading frontmatter with a real YAML parser
+is what lets the frontend and the backend DISAGREE about what a file already means:
+`description: "first\nsecond"` is one newline to the parser and the two characters
+backslash-n to `SKILL_LOADER`, which never unescapes. Main could not diverge this way,
+because it read with the same line dialect it wrote with. So a managed scalar whose
+backend reading differs from its YAML decoding is not spliceable at all -- adopting one
+reading and saving it would silently redefine the file for the code that loads skills.
+The comparison skips fields carrying a comment on their line (the comment rule's case,
+and the backend does not strip a trailing comment). Block scalars are NOT skipped, and
+the history of that decision is worth keeping: three attempts to decide agreement from
+the INDICATOR were each wrong -- the reader's six resolvable indicators, then the four
+that survive chomping, then the discovery that its fold ends in `.strip()`, which removes
+LEADING whitespace as well, something no YAML chomping mode does. So `always: |-` with a
+blank first line reads `true` on the backend and newline-then-true in the parser, and
+nothing about `|-` says so. Agreement depends on the CONTENT.
+
+The rule therefore SIMULATES rather than predicts. For a bare LITERAL indicator the
+reader's fold is short enough to reproduce faithfully (drop trailing blank lines, dedent
+by the first non-blank line's indent, join, strip), so the two readings are compared like
+any single-line value and the field stays editable when they match. A FOLDED (`>`) form or
+an explicit indicator is refused outright: the folding rules for `>` are intricate, and
+reproducing them to compare is the cross-language coupling this design exists to avoid.
+That refusal narrows what the structured editor accepts relative to the first version of
+this change, which could splice a folded value; the trade is a capability for a guarantee. This is the READ direction only: a boundary-quoted value TYPED into the
+form is still written, as a block literal, because there the author's intent is
+unambiguous.
+
+**The writer is bound by the reader's dialect, not by YAML.** `SKILL_LOADER` strips
+quote characters and resolves bare `|` / `>` block scalars, and does nothing else --
+no unescaping, no explicit indentation indicators. So a managed value is only ever
+emitted in a form that dialect decodes: a plain or quoted scalar with no backslash
+escape, or a bare block scalar. A value whose OWN TEXT begins or ends with a quote
+character also goes to a block scalar: the reader unquotes with `value.strip("\"'")`,
+which cannot tell a wrapping quote from one belonging to the text, so
+`description: Runs "build"` would read back as `Runs "build`. That rule tests the value,
+not the rendered line -- a correctly wrapper-quoted scalar begins and ends with a quote
+by construction, and routing those to a block scalar costs a value its leading
+whitespace for nothing. A value whose first line begins with whitespace would
+force YAML to emit `|2-`, which the reader would take as the literal value, so the
+leading whitespace is dropped instead -- the same bounded loss the previous
+line-based assembler had, preferred over losing the whole value.
+`parseSkillContent` returns such a block with `raw` set, which opens the raw editor
+with the real file text and surfaces the parser's own message where there is one;
+the structured form would otherwise have to guess where its fields live in bytes it
+could not parse, and a wrong guess rewrites the file. Reading is deliberately more
+tolerant than writing: `parseFrontmatter` renders whatever pairs it can from a
+malformed block, because a meta strip cannot corrupt anything.
+
+Two ordering rules inside the splice are load-bearing, and both were review
+findings rather than foresight:
+
+- **The unchanged check runs before the drop branch.** A managed field whose value
+  is legitimately empty in the file (`tags: []`, a bare `triggers:`,
+  `always: false`) renders as "absent", so consulting the writer first deleted a
+  line the user never edited. `always` also needs its own comparison, because the
+  form models it as a boolean: a file saying `false` and a file omitting the key
+  are the same form state, and comparing rendered text would read the former as an
+  edit.
+- **A block value's source range ends past its terminating newline**, unlike a
+  plain scalar's or a flow collection's. The end is normalized before use, or
+  rewriting a multiline field concatenates the following key onto the new value and
+  dropping one deletes the following line. Appending a field likewise inserts
+  before any trailing whitespace, so a blank line before the closing fence
+  survives.
+
+The invariant to preserve when touching this code: editing a modelled field leaves
 every unmodelled field byte-identical.
 
 The auto-skill (`auto/*`) write paths rebuild frontmatter from the generator's
@@ -1216,8 +1412,129 @@ set so repeat calls don't re-resolve.
 
 **CRUD operations** (via `SkillsLoader`):
 - `create_skill(name, content)` — creates `{name}/SKILL.md`, supports nested paths
-- `update_skill(name, content)` — overwrites existing SKILL.md
+- `update_skill(name, content)` — REPLACES the SKILL.md inode via `atomic_write()`
+  rather than writing through the existing one, so the document survives a write
+  that fails part-way. A hardlink to the old inode, or a handle already open on
+  it, therefore keeps seeing the pre-update bytes.
+  **What the replacement does NOT reproduce**, stated because an inode-replacing
+  write is where these get lost silently and the same limits apply to the steering
+  and `/api/file-write` update surfaces that adopted `atomic_write` first:
+  - **Ownership.** The fresh inode belongs to the gateway's own uid/gid. An
+    unprivileged writer cannot give a file away (`chown` to another user needs
+    `CAP_CHOWN`), so a *cross-owned* SKILL.md that the gateway can write changes
+    owner on save. Permission bits and the POSIX ACL are carried, so the effective
+    grant does not widen — the previous owner loses access rather than a new
+    principal gaining it — but the change is real and irreversible by this process.
+  - **A Windows DACL.** The carry is POSIX xattrs only
+    (`ACCESS_CONTROL_XATTRS_SUPPORTED` requires `os.listxattr`/`getxattr`/`setxattr`,
+    which Windows lacks), so on Windows the replacement lands on the DACL it
+    inherits from the containing directory rather than the one the replaced file
+    carried. A file the operator had tightened *below* its directory's inheritance
+    is therefore widened back to it. Closing this needs a `platform_compat`
+    primitive to READ a DACL — `restrict_to_owner` only writes one — and it belongs
+    to `atomic_write`, so it must land for all three surfaces at once rather than
+    by reverting one of them to an in-place write that a mid-write failure or a full
+    disk would turn into data loss.
 - `delete_skill(name)` — removes entire skill directory
+- All three address the leaf relative to a descriptor pinning the parent chain
+  (`pinned_fs`) where the platform has the descriptor-relative syscalls, so an
+  ancestor swapped for a link after resolution cannot redirect the write. Windows
+  keeps the by-name floor. `_DIR_FD_SUPPORTED` names exactly the extra
+  descriptor-relative calls these branches issue — `os.mkdir` (create, under the
+  parent descriptor `create_skill` already walked), `os.unlink` (update, via
+  `atomic_write`'s staging cleanup) and `os.stat` (delete, via `stat_at`) — on top of
+  `pinned_fs.supports_pinned_walk()`. `os.rmdir` is NOT probed: delete's removal is
+  a by-name `shutil.rmtree`, the residual noted below. `update_skill` additionally
+  requires `atomic_write.pinned_parent_replace_supported()` (the descriptor-relative
+  rename) and takes the by-name floor without it, because `atomic_write` refuses a
+  `parent_dir_fd` it cannot publish through rather than quietly writing by name.
+- Once the skill directory is pinned, `SKILL.md` is never addressed by name again —
+  including the metadata read. `_write_skill_md` passes the descriptor as
+  `open_access_control_source(skill_file, dir_fd=…)`, so the mode and the ACL come
+  from the inode inside the pinned directory. A by-name open there would let a
+  directory replaced at the skill's name supply both while the rename published
+  into the pinned original, handing the real skill back with permissions chosen by
+  whoever did the replacing.
+- `create_skill` resolves the parent chain **once** and addresses everything below it
+  through that one descriptor — the leaf directory (`os.mkdir(name, dir_fd=)`), its
+  `SKILL.md`, and the rollback that removes both. It deliberately does NOT route the
+  leaf through `pinned_fs.create_and_open_dir_pinned`: that helper resolves
+  `skill_dir.parent` with its own `realpath` and pins it again, which is a second
+  chance for an ancestor swapped since the first resolution to be followed, and which
+  would leave the create and the rollback addressing two different directories — the
+  skill landing outside the skills root while the rollback reports an identity mismatch
+  on an unrelated one. The helper's other two jobs are reproduced at the call site: a
+  name that already exists is refused because `os.mkdir` under the pinned parent raises
+  `FileExistsError` — the exclusivity is the syscall's, not a flag on a helper — and a
+  link or non-directory at the leaf becomes a refusal rather than a raw errno.
+- These paths use `open_dir_pinned`, not `pin_parent`, because `self._dir / name` is
+  a lexical join nothing canonicalized — so that walk's own `realpath` is the first
+  resolution of the chain, not a second one. `pin_parent` is for a caller that
+  already holds a `realpath`ed path (the steering and file-write update surfaces);
+  used here it would refuse the ordinary symlinks that legitimately sit above the
+  skills root, a symlinked `$HOME` being the common one.
+- `create_skill` lands `SKILL.md` at the **umask default on both branches**: the
+  pinned `O_CREAT` passes `0o666` precisely because that is what the by-name floor's
+  `write_text` produces, so the pin changes no permission default and the two
+  branches cannot diverge per platform. It is also the mode `prompts.py`'s own
+  pinned `O_EXCL` create of user content passes, through the same `pinned_fs` walk.
+  A tighter default for user-authored skill bodies is a policy change that has to
+  cover both branches and both platforms, so it does not ride this migration.
+  The skill DIRECTORY does land at `0o700` on the pinned branch against the floor's
+  umask default: the mode is passed at the call site, on `create_skill`'s own
+  `os.mkdir`, and it is the same `0o700` `pinned_fs.create_and_open_dir_pinned` gives
+  every caller, so the two cannot diverge if a later surface does borrow the helper.
+  It is strictly tighter than the floor. `update_skill` preserves the target's
+  existing bits either way.
+- `update_skill` / `delete_skill` return `False` for a REFUSED target as well as a
+  missing one — a parent that cannot be pinned, or an access-control source that
+  cannot be opened `O_NOFOLLOW` — which the dashboard reports as its existing 404.
+  Callers must not read `False` as "the name does not exist".
+- `create_skill`'s `exists()` guard is a by-name check with a window after it, and
+  **both branches refuse a rival that wins that window** rather than writing through
+  it — the pinned branch because `os.mkdir` under the pinned parent raises
+  `FileExistsError`, the by-name floor via `mkdir(parents=True, exist_ok=False)`.
+  Both refusals are `mkdir(2)`'s own, which cannot succeed on a name that already
+  exists; neither depends on a flag a helper happens to offer. Without the second, two
+  concurrent creates on a platform without `openat` would both `write_text` the same
+  `SKILL.md` and both report success, losing one submitted body and never producing
+  the documented 409.
+- `create_skill` is **all-or-nothing**: a failure mid-body (a short write, ENOSPC, an
+  interrupt) rolls back the `SKILL.md` *and* the directory the call created, both
+  through descriptors, and **both halves verify identity** because both address a NAME
+  under a descriptor: the leaf via `pinned_fs.unlink_verified`, which stats through the
+  directory's own fd and unlinks only if the inode is still the one the create made, and
+  the directory via `pinned_fs.remove_dir_verified`, which stages it aside under the
+  pinned parent and re-checks `(st_dev, st_ino)` before removing it. A rival that
+  replaced either name inside the failure window therefore keeps its own object, and the
+  rollback removes this object or nothing — a bare `unlink`/`rmdir` would delete whatever
+  answers to the name, turning a cleanup arm into a data loss.
+  Capturing those identities is itself a syscall that can fail (EIO/ESTALE on a network
+  filesystem), so **both `os.fstat` probes sit inside the guarded region**: a failure to
+  capture is rolled back like any other rather than escaping with a half-made skill that
+  answers every retry with 409. The leaf's identity is then asked for **once more through
+  the descriptor the call still holds**, because that descriptor is what the close at the
+  end of the guarded region takes away and an EIO on a network filesystem is usually
+  transient; the re-probe addresses a descriptor rather than a name, so it can never
+  answer with another object. **No unlink runs without an identity.** With both probes
+  failed the leaf name STAYS: removing it would be removing whatever answers to that
+  name, and that is a file this code has never read. The cost is bounded — the identity
+  probe precedes the first `os.write`, so a rollback with no identity is one where nothing
+  was written, and what is left is a skill with an EMPTY body rather than a truncated one.
+  It is listed, and both `update_skill` and `delete_skill` reach it, so the recovery is a
+  save rather than a shell. (`remove_dir_verified`'s `rmdir` refuses the now non-empty
+  directory and puts the name back, which is what keeps it findable.) Without the
+  rollback a half-made skill is permanent rather than untidy: the leftover directory
+  makes the `exists()` guard answer False forever, so every retry is a 409 over a
+  truncated body `list_skills()` still serves. A rollback that cannot finish is logged
+  (with the staging name when one was left) and never masks the original error.
+  One arm is deliberately outside that rule, and it is an `os.rmdir` rather than an
+  `unlink`: where the DIRECTORY's own `os.fstat` failed there is no identity to verify
+  and the `rmdir` under the pinned parent runs anyway. `rmdir(2)` cannot remove a file
+  and refuses a non-empty directory, so the most it can destroy is a rival's EMPTY
+  directory, while skipping it would strand this call's own directory behind a
+  permanent 409 — the harm the whole arm exists to prevent. That bound is what makes
+  it the one place a name is removed unverified.
 - Path traversal protection: `_safe_name()` rejects `..` and `\` (allows `/` for nesting)
 
 **Foreign-agent import:** only user-authored skills are eligible. Imported
@@ -1252,7 +1569,7 @@ and exfiltration URLs; clean assets are copied byte-for-byte, including leading
 and trailing whitespace. No per-asset preview truncation is used for either the
 security decision or the copied content.
 
-**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
+**Dashboard endpoints**: GET/POST `/api/skills`, GET/PUT/DELETE `/api/skills/{name:.+}`. POST sanitizes name to lowercase + hyphens + slashes. The two open-standard territories are read-only through this endpoint (`READONLY_SKILL_KEY_PREFIXES` in `handlers/prompts.py`): PUT or DELETE on a `kiro-user/` or `kiro-workspace/` key answers 405 with `Allow: GET` and `code: readonly_skill_prefix`, and a POST whose *sanitized* name lands in either territory answers 400 with `code: reserved_skill_prefix`. Those keys resolve per-machine / per-session on read (`_resolve_skill_root`) while `create/update/delete_skill` join the key onto the core skills root, so a write would edit a different file than the reader was shown; GET is unaffected. GET `/api/skills` discovery (kirocrew `list_skills()` os.walk + frontmatter, `list_kiro_skills`, and the skill→agent annotation) is fully offloaded to the dedicated `discovery_executor` pool (`executors.py`) via `collect_skills_blocking`, so it never stalls the event loop past the loop-stall watchdog on large catalogs. The annotation is O(agents) — `annotate_skills_with_agents` parses the agent JSONs and pre-expands each agent's `skill://` globs once, then matches every skill against that in-memory set. The discovery pool is deliberately separate from the reaper-critical `maintenance_executor` so browser-triggered scans can't starve the orphan sweep. When `?agent=<name>` names an agent whose `skill://` globs are non-empty (the filter is actually applied), the response is the envelope `{"skills": [...], "agent_scoped": true, "agent": <name>}` instead of the bare array; every unscoped path keeps the bare-array shape (#6028 — see the fuller rationale in learn-cron-dashboard.md's Skills CRUD entry).
 
 **LLM tool mechanisms:**
 - MCP tools (native): kiro-cli calls directly — **preferred for all LLM-facing operations**
@@ -1608,7 +1925,7 @@ Omitting a group **skips its sections** rather than capping them to zero — `Me
 
 A sub-agent that had a group withheld is told so by name (`[CONTEXT SCOPE]`, built by `_build_context_scope_section`), so it reports the gap instead of inventing what it cannot see. That is what makes an aggressive opt-out recoverable: a wrong `false` surfaces as a question rather than a fabrication.
 
-The flags resolve once at spawn and live on `SubagentInfo`. Every path that re-materializes a run from stored fields carries them — the stagger queue entry and `POST /api/spawn/{id}/retry` — so a queued or retried run sees the scope its caller chose. `spawn_continue` does not accept the flags but **inherits** them (`_inherited_context_groups`): a continuation rebuilds session context, because `get_or_create` returns `is_new=True` even when it restores the session via `session/load` (`resumed` is a separate flag and gates only thread history), so an un-inherited continuation would silently regain a withheld group. The live record wins; the run's persisted `context_groups` is the fallback, and a run predating the field records no scope at all — distinguishable from "all withheld" and defaulting to all-on. `GET /api/spawn` reports `context_withheld` only when something was withheld, and `_run_inner` logs the resolved set with the resulting context length.
+The flags resolve once at spawn and live on `SubagentInfo`. Every path that re-materializes a run from stored fields carries them — the stagger queue entry and `POST /api/spawn/{agent_id}/retry` — so a queued or retried run sees the scope its caller chose. `spawn_continue` does not accept the flags but **inherits** them (`_inherited_context_groups`): a continuation rebuilds session context, because `get_or_create` returns `is_new=True` even when it restores the session via `session/load` (`resumed` is a separate flag and gates only thread history), so an un-inherited continuation would silently regain a withheld group. The live record wins; the run's persisted `context_groups` is the fallback, and a run predating the field records no scope at all — distinguishable from "all withheld" and defaulting to all-on. `GET /api/spawn` reports `context_withheld` only when something was withheld, and `_run_inner` logs the resolved set with the resulting context length.
 
 ### Session Resume (`resumed=True`)
 

@@ -7,11 +7,13 @@ queue-drain path, but the primary user-typed turn (chat_handlers.py), the
 cron injection path (handlers/messaging.py), the Slack/dashboard nudge path
 (slack/gateway.py:_handle_nudge), and the cron-script delivery path
 (slack/gateway.py:_deliver_script_result) remained unwrapped — depending on
-the inner ACP _DEFAULT_PROMPT_TIMEOUT (7200s) instead.
+the inner ACP _DEFAULT_PROMPT_TIMEOUT (14400s) instead.
 
-This module verifies the cap value is correct AND that all eight dispatch
-sites in the source tree are wrapped with ``asyncio.wait_for(...,
-timeout=CHAT_TURN_TIMEOUT)``.
+This module verifies the cap value is correct AND that all helper-visible
+dispatch sites in the source tree are wrapped with ``asyncio.wait_for(...,
+timeout=CHAT_TURN_TIMEOUT)``. The structured dashboard monitor invokes
+``_run_chat`` inside an authorization coroutine that is itself passed to
+``spawn_guarded_turn``; its owning monitor tests pin that nested path.
 
 Why source-level checks (not behavioral): a behavioral test that mocks
 ``_run_chat`` and patches ``CHAT_TURN_TIMEOUT`` to a tiny value can prove
@@ -60,16 +62,22 @@ def test_cap_matches_inner_acp_prompt_timeout() -> None:
     )
 
 
-def test_cap_value_is_seven_thousand_two_hundred() -> None:
+def test_cap_value_is_four_hours() -> None:
     """Regression guard against silently changing the value back to 600s.
 
     The 600s value was sized for a recovery-path budget, not the master cap.
-    7200s aligns with the ACP layer underneath. If you intend to change this,
-    update docs/system-specs/modules/learn-cron-dashboard.md too.
+    14400s covers the longest single turn the shipped budgets produce (a
+    90-minute test command plus a fix and a re-run) and aligns with the ACP
+    layer underneath. If you intend to change this, update
+    docs/system-specs/modules/learn-cron-dashboard.md too, and keep the config
+    default (``AgentConfig.chat_turn_timeout_secs``) in step: a config-less
+    context must behave exactly like a default config.
     """
+    from kiro_crew.config.loader import AgentConfig
     from kiro_crew.constants import CHAT_TURN_TIMEOUT
 
-    assert CHAT_TURN_TIMEOUT == 7200.0
+    assert CHAT_TURN_TIMEOUT == 14400.0
+    assert AgentConfig().chat_turn_timeout_secs == CHAT_TURN_TIMEOUT
 
 
 def _find_create_task_dispatches(path: Path) -> list[tuple[int, str]]:
@@ -273,7 +281,7 @@ def _is_inline_wrapped_run_chat_dispatch(node: ast.AST) -> bool:
 
 
 def test_dispatch_site_count_matches_expectation() -> None:
-    """Pin the expected number of ``_run_chat`` dispatch sites at 8.
+    """Pin the expected number of helper-visible ``_run_chat`` sites at 7.
 
     If a new dispatch lands (or one is removed), this fails loudly so the
     contributor updates the PR description, the spec doc
@@ -292,8 +300,8 @@ def test_dispatch_site_count_matches_expectation() -> None:
             if "_run_chat(" in body:
                 total += 1
 
-    assert total == 8, (
-        f"Expected 8 _run_chat dispatch sites, found {total}.  "
+    assert total == 7, (
+        f"Expected 7 helper-visible _run_chat dispatch sites, found {total}.  "
         "If you added or removed one, update:\n"
         "  - the PR description\n"
         "  - docs/system-specs/modules/learn-cron-dashboard.md (Per-turn timeout section)\n"

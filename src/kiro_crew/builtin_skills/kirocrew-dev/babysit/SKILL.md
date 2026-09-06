@@ -25,10 +25,45 @@ Works from:
 | Discord DM | `discord:{agent}:direct:{user}` | fixed interval after each unattended turn |
 
 `autonudge_stop(reason?)` stops the loop bound to the current session from
-any of those surfaces. `monitor_update(message?, interval_secs?, max_cycles?)`
+any of those surfaces.
+`monitor_update(message?, interval_secs?, max_cycles?, max_runtime_secs?, banner?)`
 revises the loop already bound to this session in place, keeping its cycle
 count — use it when the instruction you armed has gone stale, or to raise the
-cap on a loop that is still doing useful work.
+cap on a loop that is still doing useful work. For a structured monitor it also
+takes `target?`, `objective?`, `max_agent_turns?`, `max_tokens?`,
+`max_provider_errors?` and `wake_instructions?`; every field is
+omit-to-leave-unchanged.
+
+Two `monitor_start` parameters are worth naming because their defaults are easy
+to inherit by accident:
+
+- `gate` (default true) holds a cycle back until the thing you are watching has
+  actually changed. Pass `gate=false` when the loop's duty is to act **while** the
+  subject is quiet — refresh a heartbeat file, chase a reviewer who has not
+  replied, keep a branch rebased on a moving base — because continued silence is
+  invisible to the observation. A gated loop is never starved: it is delivered
+  anyway after enough quiet intervals.
+- `banner` — a short line such as `watching PR #123 for CI` — changes only what is
+  stored and broadcast as a transcript row; the model still receives `message`
+  whole every cycle. Pass one whenever `message` is long, or a multi-KB
+  instruction is re-stored on every cycle. It is refused with a 400 on a
+  channel-bound loop (`slack:` / `discord:` / `webex:`); `monitor_update(banner="")`
+  clears one.
+
+### For a public GitHub pull request, prefer the structured monitor
+
+`monitor_watch(kind="github_pull_request", target=<PR URL>,
+objective="review_ready", interval_secs?, max_runtime_secs?, max_agent_turns?,
+max_tokens?, max_provider_errors?, wake_instructions?)` probes the pull request
+cheaply and wakes the owning session only when a new revision needs action —
+unchanged, pending, retry and terminal probes spend no agent turn, unlike a
+`monitor_start` cycle which spends a full turn every interval. Put the compact
+act-on-wake instruction in `wake_instructions`. Inspect it with `monitor_inspect`
+(no arguments — it resolves your own session) and end it with
+`monitor_stop(reason?)`, which retains the terminal outcome for inspection. One
+structured monitor per session, occupying the same slot as a `monitor_start`
+loop. Use `monitor_start` instead when you need to ACT most cycles, or when what
+you are watching is not a public GitHub PR.
 
 ### `interval_secs` counts between the loop's own cycles
 
@@ -183,10 +218,17 @@ not write it off as flakiness.
 - User is waiting and total time < 30 min → `wait` + poll, no loop.
 - "Babysit / monitor / keep checking" in THIS conversation, in a phase where
   you ACT most cycles (fixing findings, pushing revisions) → `monitor_start`.
-- **Pure-watch phase of a PR babysit** — waiting on CI or reviewers, nothing
-  to do until a signal → arm the **`pr_watch` script cron** (below). Zero
-  tokens per quiet cycle; it wakes THIS session with one agent turn only when
-  something unexpected happens.
+- **Pure-watch phase of a PR babysit** — waiting on CI or reviewers, nothing to
+  do until a signal → still `monitor_start`, and name the pull request in the
+  instruction **by full URL** — `https://github.com/<owner>/<repo>/pull/<N>`.
+  That form is the only one that selects a subject: a bare `PR #123`, or the
+  `owner/name#123` shorthand, deliberately refuses inference, so the loop stays
+  on the plain timer and every interval spends a turn. The user will usually say
+  "babysit PR #123"; you write the URL. A loop naming one public GitHub pull
+  request that way is gated by default:
+  quiet cycles cost no agent turn, and it wakes only on a real change. The
+  `pr_watch` script cron (below) is now only for what that cannot reach --
+  an enterprise host, or detection with no owning loop.
 - Reacting to review feedback or CI on a PR → `monitor_start` or in-turn
   `wait`+poll for the active-fix phase. **Never an agent (LLM) cron, never
   HEARTBEAT.md** (see below). The `pr_watch` script cron is fine: it is the
@@ -198,12 +240,26 @@ not write it off as flakiness.
   `script` cron at roughly a 5-minute interval.
 - External system will call back → `register_hook`.
 
-### Watch mode — zero-token PR polling with `pr_watch.py`
+### Watch mode — a manual cron for what the default gate cannot reach
 
-A babysit spends most of its life waiting: CI runs for ten minutes, reviewers
-take longer, and every `monitor_start` cycle that discovers "nothing changed"
-still pays a full agent turn on the session's whole context. Watch mode moves
-the *detection* to a script cron and keeps the *judgment* in this session:
+**Read this first: you probably do not need this section.** A `monitor_start`
+loop whose instruction names ONE public GitHub pull request is already gated --
+it observes that pull request each interval with one bounded `gh` call and
+re-injects your message only when it actually changed, so a cycle where nothing
+changed costs no agent turn. That is the default, on every arming surface, with
+no steps to take. Use it, and skip to the end of this section.
+
+Watch mode is the manual version, and only three situations still need it:
+
+- the pull request is on an **enterprise host** -- the gate pins public GitHub,
+  because choosing a host from data is not something a watch message may do;
+- there is **no owning loop** to gate: you want detection without a babysit
+  session, e.g. a fire-and-forget notification;
+- you need the cron's own knobs -- `known_reds` to suppress failures inherited
+  from the base branch, `note` to carry text into the wake, `wake_on_green`.
+
+If none of those apply, arming this cron gives you a second watcher on the same
+pull request, and the two will wake you separately for the same event.
 
 ```
 script cron (zero tokens, every ~5 min)
@@ -214,12 +270,11 @@ script cron (zero tokens, every ~5 min)
         · a comment or review someone else posted)
 ```
 
-**Why the interval can be small.** A `monitor_start` cycle costs a full agent
-turn on the session's whole context, which is what forces its interval up: at
-30 seconds it would burn the window on nothing. A tick of this cron costs one
-bounded `gh` call and no tokens at all, so the interval is limited by API
-politeness rather than by spend -- 60s is reasonable, and 300s is a default
-rather than a floor.
+**Why the interval can be small.** A tick of this cron costs one bounded `gh`
+call and no tokens at all, so the interval is limited by API politeness rather
+than by spend -- 60s is reasonable, and 300s is a default rather than a floor.
+An UNGATED `monitor_start` cycle, by contrast, costs a full agent turn on the
+session's whole context, which is what forces its interval up.
 
 Arm it **from the session that owns the babysit** — the cron captures that
 session as its wake target; armed anywhere else, the wake lands in the wrong
@@ -428,10 +483,17 @@ byte-for-byte instead of by eyeballing a diff of human text.
 
 Its `advisory` half is what you read when checking the exit conditions below:
 `unresolved_threads` (`null` there is the same "could not establish" as a `?`),
-`findings` per reviewer, and `stale_reviewers` / `blocking_reviewers`. Nothing
-else is emitted — ambient PR state (mergeable, merge state, review decision,
-check totals) stays in the prose above, which is where those conditions already
-read it, so there is no second copy to keep in sync.
+`findings` per reviewer, `stale_reviewers` / `blocking_reviewers`, and
+`elided_stamp_reviewers` — lanes whose freshness stamp MANGLED the head SHA
+(the workflows have the model retype it, so a lane can drop the middle and
+splice the head's prefix to its suffix). The gate verifies such a stamp against
+the current head and accepts it, which is why it is not a stale reviewer; the
+list exists so the emitter defect is still visible. Report it ONCE per head as
+a lane-quality note — it never blocks, and re-running that workflow usually
+produces a clean stamp. Nothing else is emitted — ambient PR state (mergeable,
+merge state, review decision, check totals) stays in the prose above, which is
+where those conditions already read it, so there is no second copy to keep in
+sync.
 
 Drive the cycle off the **exit code**, not off prose: `10` → report nothing and
 wait for the next cycle; `20` → drill in with `pr_findings.py` and act; `2` →
@@ -603,9 +665,13 @@ Two limits worth knowing before you trust it on an arbitrary PR:
 
 User: "babysit PR #247 until it's review-ready"
 
+Note what the message does with that: the user said `PR #247`, and the armed
+instruction names the pull request by FULL URL. That is what makes the loop
+observation-gated -- copy the user's bare number into the message and it is not.
+
 ```
 monitor_start(
-  message="Check PR #247. FIRST read
+  message="Check https://github.com/owner/repo/pull/247. FIRST read
            gh pr view 247 --json mergeable,mergeStateStatus,reviewDecision —
            rules 6 and 7 of the babysit skill govern what each value means.
            Then run
@@ -647,7 +713,10 @@ own "green is weaker than it looks" caveat.
 
 ## Rules & gotchas
 
-- **One loop per session** — a new `monitor_start` replaces the existing loop.
+- **One automation per session** — `monitor_start` is **create-only**: it refuses
+  while a loop (or a structured monitor) already occupies this session. To change
+  a running loop use `monitor_update`; to replace it, `autonudge_stop` first, then
+  arm again.
 - **Busy sessions skip a cycle** (never queue) — a long-running turn delays
   the next check to the following interval; skipped cycles don't count
   toward `max_cycles`.
@@ -659,6 +728,9 @@ own "green is weaker than it looks" caveat.
   dashboard/Slack for tool-heavy babysitting or run the gateway with
   `--approval yolo`/`auto`).
 - **Kill switches:** `autonudge_stop` (preferred), the dashboard 🎯 popover
-  (dashboard loops), `max_cycles`, or the per-loop STOP sentinel file.
+  (dashboard loops), `max_cycles`, or `max_runtime_secs`. A STOP sentinel file
+  only exists for a loop armed with an explicit `stop_sentinel_path` (the HTTP
+  `POST /api/autonudge` path accepts one); a loop armed through `monitor_start`
+  has none.
 - Loops fire `[auto-nudge cycle N]`-tagged messages — treat them as your own
   scheduled wake-ups, not user input.

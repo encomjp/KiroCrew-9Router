@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
+from body_stream_helpers import BodyStreamPayload
 
 from kiro_crew.dashboard.handlers import mcp as mcp_mod
 from kiro_crew.mcp_discovery import McpServerInfo
@@ -43,9 +44,19 @@ def _request(
     """Minimal aiohttp request double, matching the suite's existing style."""
     req = MagicMock(spec=web.Request)
     if isinstance(body, Exception):
+        # Malformed body: real undecodable bytes for the streaming (capped)
+        # path, a raising mock for the ``request.json()`` (uncapped) path.
+        raw = b"{not json"
         req.json = AsyncMock(side_effect=body)
     else:
+        raw = json.dumps(body).encode() if body is not None else b""
+        # Kept alive: ``api_mcp_server_detail`` reads uncapped
+        # (``max_bytes=None``) and consumes ``request.json()``.
         req.json = AsyncMock(return_value=body)
+    req.content = BodyStreamPayload(raw)
+    req.content_length = len(raw) if raw else None
+    req.charset = None
+    req.can_read_body = bool(raw)
     req.app = {"state": state if state is not None else _State()}
     req.query = query or {}
     req.match_info = match_info or {}
@@ -59,6 +70,21 @@ class _State:
 
     def __init__(self) -> None:
         self._background_tasks: set[asyncio.Task] = set()
+
+
+def _effective_stubs(section: dict[str, Any]) -> list[str]:
+    """The stub set IN EFFECT for a saved ``mcp_gateway`` section.
+
+    The toggle handler no longer rewrites ``stub_servers``: that key is the roster
+    a distribution ships and keeps growing, and a click is recorded as a decision
+    in ``stub_overrides`` over it. What the operator sees stubbed is the two
+    resolved together, so that -- not either key alone -- is what a test about
+    toggle behaviour should assert. Reads the production resolver so these tests
+    cannot drift from the runtime's own answer.
+    """
+    from kiro_crew.config.loader import _resolve_stub_servers
+
+    return _resolve_stub_servers(section)
 
 
 def _payload(resp: web.Response) -> Any:
@@ -521,6 +547,70 @@ class TestServerDetail:
         )
         assert resp.status == 400
         assert "server name is required" in _payload(resp)["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "name",
+        ["../../evil", "..", "a/../b", "a" * 129, "-leading-dash"],
+        ids=["traversal", "bare-dotdot", "embedded-dotdot", "overlong", "bad-leading-char"],
+    )
+    async def test_put_rejects_a_name_the_rest_of_the_tree_would_refuse(
+        self, sandbox: SimpleNamespace, name: str
+    ) -> None:
+        """PUT is the writer, so it must not plant a key nothing else can address.
+
+        ``_is_valid_mcp_name`` is the predicate the validation-dependent readers
+        in this tree enforce (several call sites in ``mcp.py`` itself, plus
+        ``mcp_custom.py``, ``mcp_discover.py`` and ``connections.py``). A name
+        carrying ``..`` or exceeding ``_MAX_MCP_NAME_LEN`` written through this
+        route is invisible to those, so the entry cannot be managed through them.
+        """
+        _write_global(sandbox, {})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request({"command": "node"}, match_info={"name": name}, method="PUT")
+        )
+        assert resp.status == 400
+        assert _payload(resp)["code"] == "invalid_server_name"
+        # The refusal must land before the write, not after it.
+        assert _read_global(sandbox) == {}
+
+    @pytest.mark.asyncio
+    async def test_delete_still_removes_a_malformed_junk_key(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """DELETE stays permissive on purpose, so a junk key remains clearable.
+
+        This mirrors the documented grant/revoke asymmetry in ``security.py``:
+        the writer validates, the remover does not, because guarding a remover
+        would strand exactly the entries the writer guard prevents. ``DELETE``
+        and ``api_mcp_remove`` are both such removers. Guarding this handler's
+        DELETE half is the specific regression this test forbids.
+        """
+        _write_global(sandbox, {"../../evil": {"command": "x"}})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request(None, match_info={"name": "../../evil"}, method="DELETE")
+        )
+        assert resp.status == 200
+        assert _payload(resp)["removed"] is True
+        assert _read_global(sandbox) == {}
+
+    @pytest.mark.asyncio
+    async def test_put_accepts_the_names_the_validator_allows(
+        self, sandbox: SimpleNamespace
+    ) -> None:
+        """The guard must not narrow the accepted set beyond the shared validator.
+
+        ``_VALID_MCP_NAME_RE`` deliberately admits ``@``, ``/``, ``.``, ``:`` and
+        ``_`` so scoped package ids (``@scope/pkg``) keep working.
+        """
+        _write_global(sandbox, {})
+        resp = await mcp_mod.api_mcp_server_detail(
+            _request(
+                {"command": "node"}, match_info={"name": "@scope/pkg.name_v2:1"}, method="PUT"
+            )
+        )
+        assert resp.status == 200
+        assert "@scope/pkg.name_v2:1" in _read_global(sandbox)
 
     @pytest.mark.asyncio
     async def test_delete_absent_is_404(self, sandbox: SimpleNamespace) -> None:
@@ -1130,7 +1220,12 @@ class TestLocalOverlayOwnsTheStubKeys:
         )
         assert resp.status == 200
         saved = json.loads(base.read_text(encoding="utf-8"))["mcp_gateway"]
-        assert saved["stub_servers"] == ["x-mcp", "y-mcp"]
+        assert _effective_stubs(saved) == ["x-mcp", "y-mcp"]
+        # The overlay's migrated roster is frozen into the base, and the click is a
+        # decision on top of it -- the allowlist is preserved either way, which is
+        # what this test is about.
+        assert saved["stub_servers"] == ["x-mcp"]
+        assert saved["stub_overrides"] == {"y-mcp": True}
 
     @pytest.mark.asyncio
     async def test_the_per_server_setter_refuses_a_shadowed_write(
@@ -1152,6 +1247,42 @@ class TestLocalOverlayOwnsTheStubKeys:
         )
         assert resp.status == 409
         assert _payload(resp)["code"] == "overlay_owns_stub_servers"
+
+    @pytest.mark.asyncio
+    async def test_an_overlay_owning_the_override_map_also_refuses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The guard must cover the key the toggle actually writes.
+
+        The decision lands in ``stub_overrides``, and the overlay wins the deep
+        merge per-key. Checking only ``stub_servers`` would let the click write base
+        ``config.json`` and answer 200 while the overlay kept the server on its own
+        value -- the silent never-takes-effect failure the guard exists to prevent,
+        reintroduced by relocating the write.
+        """
+        from kiro_crew.config.loader import config_local_path, config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        base = config_path()
+        base.parent.mkdir(parents=True, exist_ok=True)
+        base.write_text(
+            json.dumps({"mcp_gateway": {"stub_servers": ["a-mcp"]}}), encoding="utf-8"
+        )
+        config_local_path().write_text(
+            json.dumps({"mcp_gateway": {"stub_overrides": {"a-mcp": False}}}),
+            encoding="utf-8",
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "a-mcp", "stub": True}, state=SimpleNamespace())
+        )
+        assert resp.status == 409, (
+            "the toggle wrote a value the gateway would not read -- the overlay "
+            "shadows stub_overrides, so this had to be refused"
+        )
+        body = _payload(resp)
+        assert body["code"] == "overlay_owns_stub_servers"
+        assert "stub_overrides" in body["error"]
 
     @pytest.mark.asyncio
     async def test_a_corrupt_overlay_is_treated_as_absent(
@@ -1356,7 +1487,11 @@ class TestGatewayServers:
         body = _payload(resp)
         assert body["stubbed"] == ["a-mcp"]
         assert body["skipped"] == []
-        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == ["a-mcp"]
+        saved = json.loads(cfg_path.read_text())["mcp_gateway"]
+        assert _effective_stubs(saved) == ["a-mcp"]
+        # Recorded as a decision over the roster, which the write leaves alone.
+        assert saved["stub_servers"] == []
+        assert saved["stub_overrides"] == {"a-mcp": True}
 
         # Same request, same verdict, sharing now ON: the write must decline it and
         # say which name it declined, rather than co-tenanting on the weaker flag.
@@ -1439,7 +1574,7 @@ class TestGatewayServers:
             _request({"names": ["a-mcp"], "stub": False, "resolve_eligibility": True})
         )
         assert resp.status == 200
-        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == []
+        assert _effective_stubs(json.loads(cfg_path.read_text())["mcp_gateway"]) == []
 
     @pytest.mark.asyncio
     async def test_a_single_toggle_writes_exactly_the_name_it_was_given(
@@ -1474,7 +1609,7 @@ class TestGatewayServers:
             _request({"name": "a-mcp", "stub": True})
         )
         assert resp.status == 200
-        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == ["a-mcp"]
+        assert _effective_stubs(json.loads(cfg_path.read_text())["mcp_gateway"]) == ["a-mcp"]
 
     @pytest.mark.asyncio
     async def test_the_stub_write_goes_through_the_locked_config_primitive(
@@ -1520,7 +1655,7 @@ class TestGatewayServers:
         # regression: a direct ``write_config_atomically`` passes every behavioural
         # test in this file while reopening the cross-process window.
         assert seen == ["locked"]
-        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == ["a-mcp"]
+        assert _effective_stubs(json.loads(cfg_path.read_text())["mcp_gateway"]) == ["a-mcp"]
 
     @pytest.mark.asyncio
     async def test_a_cancelled_request_still_waits_for_the_write_to_finish(
@@ -1572,7 +1707,7 @@ class TestGatewayServers:
             "cancellation was observable before the offloaded write completed, so "
             "both locks were released while the worker was still writing"
         )
-        assert json.loads(cfg_path.read_text())["mcp_gateway"]["stub_servers"] == ["a-mcp"]
+        assert _effective_stubs(json.loads(cfg_path.read_text())["mcp_gateway"]) == ["a-mcp"]
 
     @pytest.mark.asyncio
     async def test_the_stub_write_also_holds_the_lock_agent_crud_writes_under(
@@ -1924,7 +2059,7 @@ class TestGatewaySetStub:
             "restart_required": True,
         }
         saved = json.loads(config_path().read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["ok-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["ok-mcp"]
 
     @pytest.mark.asyncio
     async def test_an_unwired_batch_that_wrote_nothing_claims_no_restart(
@@ -1981,7 +2116,10 @@ class TestGatewaySetStub:
         )
         assert resp.status == 200
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["x-mcp", "y-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["x-mcp", "y-mcp"]
+        # The migrated set is frozen into the roster, not merged with the click.
+        assert saved["mcp_gateway"]["stub_servers"] == ["x-mcp"]
+        assert saved["mcp_gateway"]["stub_overrides"] == {"y-mcp": True}
 
     @pytest.mark.asyncio
     async def test_a_disabled_legacy_config_is_not_seeded_by_the_write(
@@ -2003,7 +2141,9 @@ class TestGatewaySetStub:
         )
         assert resp.status == 200
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["y-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["y-mcp"]
+        # The inert allowlist stays unrevived: the roster froze empty.
+        assert saved["mcp_gateway"]["stub_servers"] == []
 
     @pytest.mark.asyncio
     async def test_removal_dedupes_and_drops_non_string_entries(
@@ -2025,7 +2165,93 @@ class TestGatewaySetStub:
         )
         assert resp.status == 200
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["b-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["b-mcp"]
+        # The write still normalizes the roster's FORM -- the duplicate and the
+        # non-string are gone -- while leaving its membership to the roster's owner.
+        # A surviving duplicate would make the dashboard's stub_count overcount.
+        assert saved["mcp_gateway"]["stub_servers"] == ["a-mcp", "b-mcp"]
+        assert saved["mcp_gateway"]["stub_overrides"] == {"a-mcp": False}
+
+    @pytest.mark.asyncio
+    async def test_toggling_back_to_agree_with_the_roster_drops_the_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Re-following the roster, not freezing its current value.
+
+        An override that agrees with the roster is identical in effect today and
+        differs tomorrow: stored, it would pin that server against the next roster
+        change. So an operator who toggles a server back to what the roster says is
+        asking to follow the roster again, and the entry must go.
+        """
+        from kiro_crew.config.loader import config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"mcp_gateway": {"stub_servers": ["a-mcp"]}}), encoding="utf-8"
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "a-mcp", "stub": False}, state=SimpleNamespace())
+        )
+        assert resp.status == 200
+        saved = json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
+        assert saved["stub_overrides"] == {"a-mcp": False}
+        assert _effective_stubs(saved) == []
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "a-mcp", "stub": True}, state=SimpleNamespace())
+        )
+        assert resp.status == 200
+        saved = json.loads(path.read_text(encoding="utf-8"))["mcp_gateway"]
+        assert "stub_overrides" not in saved, (
+            "the override survived a toggle back to the roster's own answer, so "
+            "this server is now pinned against any later roster change"
+        )
+        assert _effective_stubs(saved) == ["a-mcp"]
+
+    @pytest.mark.asyncio
+    async def test_a_deviation_does_not_shadow_a_later_roster_addition(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """End to end through the handler: the reason the two layers are separate.
+
+        The operator turns one shipped server off; the edition then ships another.
+        The new server must arrive, and the one they turned off must stay off.
+        """
+        from kiro_crew.config.loader import config_path
+
+        monkeypatch.setattr(mcp_mod, "sel", lambda: MagicMock())
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"mcp_gateway": {"stub_servers": ["a-mcp", "b-mcp"]}}),
+            encoding="utf-8",
+        )
+
+        resp = await mcp_mod.api_mcp_gateway_set_stub(
+            _request({"name": "b-mcp", "stub": False}, state=SimpleNamespace())
+        )
+        assert resp.status == 200
+
+        # Checked BEFORE the release is simulated: overwriting the roster below
+        # would otherwise hide a handler that had already taken it over, and the
+        # claim being made here is precisely that the click did not.
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["mcp_gateway"]["stub_servers"] == ["a-mcp", "b-mcp"], (
+            "the click rewrote the roster, so the edition no longer owns it"
+        )
+        assert saved["mcp_gateway"]["stub_overrides"] == {"b-mcp": False}
+
+        # The edition's next release grows the roster. Nothing else is touched.
+        saved["mcp_gateway"]["stub_servers"] = ["a-mcp", "b-mcp", "c-mcp"]
+        path.write_text(json.dumps(saved), encoding="utf-8")
+
+        assert _effective_stubs(saved["mcp_gateway"]) == ["a-mcp", "c-mcp"], (
+            "the roster addition did not arrive, or the operator's opt-out was "
+            "overwritten -- the click took ownership of the roster"
+        )
 
     @pytest.mark.asyncio
     async def test_apply_result_is_merged_into_the_response(
@@ -2063,7 +2289,7 @@ class TestGatewaySetStub:
         assert body["code"] == "mcp_apply_failed"
         # The config write happens BEFORE apply, so it survives the failure.
         saved = json.loads(config_path().read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["ok-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["ok-mcp"]
         outcomes = [c.kwargs.get("outcome") for c in sel.log_api_access.call_args_list]
         assert "error" in outcomes
 
@@ -2151,10 +2377,10 @@ class TestGatewaySetStubBatch:
             "restart_required": True,
         }
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == [
+        assert _effective_stubs(saved["mcp_gateway"]) == [
+            "kept-mcp",
             "a-mcp",
             "b-mcp",
-            "kept-mcp",
         ]
 
     @pytest.mark.asyncio
@@ -2181,7 +2407,7 @@ class TestGatewaySetStubBatch:
         )
         assert resp.status == 200
         saved = json.loads(path.read_text(encoding="utf-8"))
-        assert saved["mcp_gateway"]["stub_servers"] == ["kept-mcp"]
+        assert _effective_stubs(saved["mcp_gateway"]) == ["kept-mcp"]
 
     @pytest.mark.asyncio
     async def test_re_applies_the_pool_once_for_the_whole_batch(

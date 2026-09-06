@@ -39,6 +39,44 @@ pytestmark = pytest.mark.usefixtures("healthy_host_memory")
 # Subagent-registry isolation is provided globally by the autouse
 # ``_isolate_subagents_dir`` fixture in ``conftest.py``.
 
+# Two kinds of number live here and they must not be merged.
+#
+# POSITIVE WAITS (_START_TIMEOUT, _RESPAWN_TIMEOUT) bound how long the harness waits
+# for the event loop to schedule something. Every ordering guarantee around them is
+# asserted separately, and the fixed ``asyncio.sleep`` windows that prove a respawn
+# has NOT fired yet are deliberately left alone -- those are negative assertions,
+# where the duration IS the test. Raising a positive wait cannot weaken an assertion;
+# it only stops the harness giving up before the awaited thing was ever given a
+# chance to run. 5.0s was too tight on a loaded runner: shard 4 of the Windows
+# backend job runs ~950s wall with individual tests over 38s, and
+# ``test_cancel_recovery_waits_for_slow_teardown`` timed out there while the other
+# 17,258 tests in the same shard passed.
+#
+# _RESPAWN_TIMEOUT stays BELOW the production give-up it can outlive on the FAILURE
+# path (``subagent._RECOVERY_SLOT_WAIT_SECS`` = 60.0). A passing run never reaches
+# that give-up -- ``test_cancel_recovery_waits_for_free_slot`` frees the slot while
+# the poll is still young, and every other caller finds capacity already free, so
+# the bounded wait exits on its next tick. The bound is about what a FAILING run
+# reports: if the poll outlived 60.0s, the code would have already raised "no free
+# slot for recovery respawn", ``task2`` would never appear, and the failure would
+# read as "recovery never happened" rather than naming the real cause.
+#
+# Ceiling for both: ``setup.cfg`` sets a global ``--timeout=120``. The heaviest test
+# serializes two start waits plus one respawn poll, so the failure path must stay
+# under that or a real hang surfaces as an opaque pytest-timeout kill instead of the
+# named deadline that explains it.
+_START_TIMEOUT = 30.0  # the mocked stream reaching its first yield
+_RESPAWN_TIMEOUT = 20.0  # a cancelled run's replacement task appearing in _tasks
+
+# An UPPER BOUND, not a positive wait -- do not raise it with the two above.
+# ``test_cancel_recovery_failure_emits_done_and_delivers`` patches the production
+# give-up (``subagent._RECOVERY_SLOT_WAIT_SECS``, normally 60.0) down to 0.4s, and
+# this bound is what asserts the patch actually took effect: the recovery must fail
+# FAST. Widening it opens a band in which a refactor that stops reading that module
+# global -- inlining the literal, moving it onto the instance, renaming it -- leaves
+# every terminal assertion still passing, for the wrong reason.
+_GIVE_UP_BOUND = 10.0
+
 
 class _TransientError(Exception):
     """Duck-typed AcpError carrying the structured transient verdict."""
@@ -429,7 +467,7 @@ async def test_user_cancel_is_neutral_stopped_with_partial():
     with patch("kiro_crew.subagent.Stats") as stats, patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("long job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         cancelled = await mgr.cancel(info.id)
         await asyncio.gather(*mgr._tasks.values(), return_exceptions=True)
 
@@ -461,7 +499,7 @@ async def test_unexpected_cancel_auto_continues_once():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("interruptible job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         task1 = mgr._tasks[info.id]
         task1.cancel()  # UNEXPECTED cancel (not via mgr.cancel, not shutdown)
         await asyncio.gather(task1, return_exceptions=True)
@@ -474,7 +512,7 @@ async def test_unexpected_cancel_auto_continues_once():
         # teardown fully completes (explicit handshake, not a timed sleep).
         started.clear()
         task2 = None
-        deadline = asyncio.get_event_loop().time() + 5.0
+        deadline = asyncio.get_event_loop().time() + _RESPAWN_TIMEOUT
         while asyncio.get_event_loop().time() < deadline:
             task2 = mgr._tasks.get(info.id)
             if task2 is not None and task2 is not task1:
@@ -484,7 +522,7 @@ async def test_unexpected_cancel_auto_continues_once():
         assert task1.done()  # respawn never races the original teardown
 
         # Second unexpected cancel → terminal (budget spent).
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         task2.cancel()
         await asyncio.gather(task2, return_exceptions=True)
 
@@ -526,7 +564,7 @@ async def test_unexpected_cancel_after_tool_activity_finalizes_without_respawn()
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("side-effecting job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         assert info.tool_count > 0 and info.streaming_text == ""
         task1 = mgr._tasks[info.id]
         task1.cancel()  # UNEXPECTED cancel after tool ran
@@ -563,14 +601,14 @@ async def test_cancel_recovery_text_only_respawn_gets_resume_preamble():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("resumable job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         assert info.streaming_text and info.tool_count == 0
         task1 = mgr._tasks[info.id]
         task1.cancel()  # UNEXPECTED cancel after text, no tools
         await asyncio.gather(task1, return_exceptions=True)
 
         # Wait for the respawn's build_message call (second entry).
-        deadline = asyncio.get_event_loop().time() + 5.0
+        deadline = asyncio.get_event_loop().time() + _RESPAWN_TIMEOUT
         while len(build_msgs) < 2 and asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(0.05)
         assert len(build_msgs) >= 2
@@ -594,7 +632,7 @@ async def test_shutdown_cancel_does_not_auto_continue():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("job at shutdown")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         await mgr.cancel_all()
 
     assert mgr._shutting_down is True
@@ -621,6 +659,54 @@ async def test_orphan_injection_delegates_to_callback():
 async def test_orphan_injection_false_without_callback():
     mgr = SubagentManager(sessions=MagicMock(), ctx_builder=None)
     assert await mgr._try_inject_orphan_notification("dashboard:main", "msg") is False
+
+
+@pytest.mark.asyncio
+async def test_orphan_injection_callback_error_returns_false():
+    notify = AsyncMock(side_effect=RuntimeError("dashboard unavailable"))
+    mgr = SubagentManager(sessions=MagicMock(), ctx_builder=None, on_orphan_notify=notify)
+
+    assert await mgr._try_inject_orphan_notification("dashboard:main", "msg") is False
+    notify.assert_awaited_once_with("dashboard:main", "msg", None)
+
+
+@pytest.mark.asyncio
+async def test_delivered_orphan_survives_audit_and_tombstone_failures():
+    notify = AsyncMock(return_value=True)
+    audit = MagicMock()
+    audit.log_api_access.side_effect = RuntimeError("audit unavailable")
+    mgr = SubagentManager(sessions=MagicMock(), ctx_builder=None, on_orphan_notify=notify)
+    state = {
+        "id": "orphan-1",
+        "task": "recover work",
+        "parent_session": "dashboard:main",
+    }
+
+    with (
+        patch("kiro_crew.subagent.has_dashboard_surface", return_value=True),
+        patch("kiro_crew.subagent.sel", return_value=audit),
+        patch(
+            "kiro_crew.subagent.write_tombstone", side_effect=OSError("disk unavailable")
+        ) as write_tombstone,
+    ):
+        result = await mgr._notify_orphan("orphan-1", state, "notification_pending", False)
+
+    assert result is None
+    notify.assert_awaited_once()
+    audit.log_api_access.assert_called_once_with(
+        caller="dashboard:main",
+        operation="subagent.orphan_notification_injected",
+        outcome="ok",
+        source="subagent",
+    )
+    write_tombstone.assert_called_once_with(
+        "orphan-1",
+        cause="gateway_restart",
+        recovery_action="delivered",
+        pid=None,
+        turns=0,
+        last_tool="",
+    )
 
 
 @pytest.mark.asyncio
@@ -662,14 +748,14 @@ async def test_cancel_recovery_waits_for_slow_teardown():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("slow teardown job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         task1 = mgr._tasks[info.id]
         task1.cancel()
         await asyncio.gather(task1, return_exceptions=True)
 
         # Poll for the respawn; when it appears, teardown MUST already be done.
         task2 = None
-        deadline = asyncio.get_event_loop().time() + 5.0
+        deadline = asyncio.get_event_loop().time() + _RESPAWN_TIMEOUT
         while asyncio.get_event_loop().time() < deadline:
             task2 = mgr._tasks.get(info.id)
             if task2 is not None and task2 is not task1:
@@ -693,7 +779,7 @@ async def test_cancel_recovery_waits_for_free_slot():
     with patch("kiro_crew.subagent.Stats"), patch("kiro_crew.subagent.sel"):
         info = mgr.spawn("capacity job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         task1 = mgr._tasks[info.id]
 
         # Simulate the freed slot being immediately taken by a queued spawn.
@@ -715,7 +801,7 @@ async def test_cancel_recovery_waits_for_free_slot():
         # Free the slot — recovery proceeds and count never exceeds the cap.
         mgr._running_count = 0
         task2 = None
-        deadline = asyncio.get_event_loop().time() + 5.0
+        deadline = asyncio.get_event_loop().time() + _RESPAWN_TIMEOUT
         while asyncio.get_event_loop().time() < deadline:
             task2 = mgr._tasks.get(info.id)
             if task2 is not None and task2 is not task1:
@@ -753,7 +839,7 @@ async def test_cancel_recovery_failure_emits_done_and_delivers():
     ):
         info = mgr.spawn("doomed recovery job")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         task1 = mgr._tasks[info.id]
         task1.cancel()
         await asyncio.gather(task1, return_exceptions=True)
@@ -767,7 +853,7 @@ async def test_cancel_recovery_failure_emits_done_and_delivers():
         # failure path's subagent_done emit and on_done delivery run.
         rec = mgr._tasks.get(f"{info.id}:recovery")
         assert rec is not None, "pending recovery must be registered in _tasks"
-        await asyncio.wait_for(asyncio.gather(rec, return_exceptions=True), timeout=10)
+        await asyncio.wait_for(asyncio.gather(rec, return_exceptions=True), timeout=_GIVE_UP_BOUND)
 
     assert info.done is True
     assert info.error == "cancelled (recovery failed)"
@@ -796,7 +882,7 @@ async def test_cancel_all_reaches_pending_recovery_and_finalizes():
     ):
         info = mgr.spawn("job interrupted by shutdown")
         assert info is not None
-        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.wait_for(started.wait(), timeout=_START_TIMEOUT)
         task1 = mgr._tasks[info.id]
         task1.cancel()
         await asyncio.gather(task1, return_exceptions=True)
@@ -892,14 +978,17 @@ def test_no_raw_cancel_outside_chokepoint():
     pending cancel-recovery scheduler task — none of the latter two are managed
     runs, so the marker contract (and recovery) never applies to them."""
     import inspect
+    from pathlib import Path
 
     import kiro_crew.subagent as subagent_mod
 
-    source = inspect.getsource(subagent_mod)
-    lines = source.splitlines()
+    source_root = Path(subagent_mod.__file__).resolve().parent
+    source_paths = [Path(subagent_mod.__file__).resolve()]
+    source_paths.extend(sorted((source_root / "subagent_manager").glob("*.py")))
     raw_sites = [
-        (i + 1, line.strip())
-        for i, line in enumerate(lines)
+        (path.relative_to(source_root).as_posix(), i + 1, line.strip())
+        for path in source_paths
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines())
         if ".cancel()" in line
         and not line.strip().startswith("#")
         and "``" not in line  # docstring mentions, not call sites
@@ -921,19 +1010,19 @@ def test_no_raw_cancel_outside_chokepoint():
     )
     chokepoint_src = inspect.getsource(subagent_mod.SubagentManager._cancel_task_intentionally)
     assert "task.cancel()" in chokepoint_src
-    for lineno, line in raw_sites:
+    for rel, lineno, line in raw_sites:
         assert any(s in line for s in allowed_substrings), (
-            f"raw .cancel() at subagent.py:{lineno} ({line!r}) — route it "
+            f"raw .cancel() at {rel}:{lineno} ({line!r}) — route it "
             "through _cancel_task_intentionally with a terminal marker"
         )
     # The generic 'task.cancel()' form must appear ONLY inside the chokepoint.
     generic = [
-        (n, l)
-        for n, l in raw_sites
-        if "task.cancel()" in l
-        and "_reaper_task" not in l
-        and "recovery_task" not in l
-        and "report_task" not in l
+        (rel, n, line)
+        for rel, n, line in raw_sites
+        if "task.cancel()" in line
+        and "_reaper_task" not in line
+        and "recovery_task" not in line
+        and "report_task" not in line
     ]
     assert len(generic) == 1, (
         f"expected exactly one raw task.cancel() (the chokepoint body), " f"found: {generic}"

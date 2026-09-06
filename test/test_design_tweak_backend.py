@@ -14,12 +14,16 @@ import io
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+if sys.platform == "win32":  # pragma: no cover - platform-gated
+    import _winapi
 
 from conftest import requires_symlinks
 from kiro_crew.apps.builtins.design_tweak.backend import server
@@ -972,7 +976,8 @@ class TestProxyAuthDenialIsAudited:
         h = _H()
         assert server.Handler._authorized(h, "GET", b"") is False
         assert h.sent and h.sent[0][0] == 401
-        # Machine-readable code, per AGENTS.md's non-2xx body contract.
+        # Machine-readable code, per the non-2xx body contract in
+        # docs/system-specs/common/code-style.md.
         assert h.sent[0][1].get("code") == "invalid_proxy_signature"
 
         assert len(calls) == 1, "the 401 emitted no audit record"
@@ -1415,6 +1420,67 @@ class TestHtmlScanDoesNotFollowSymlinks:
         code, _ctype, body = server._static_response(str(root), "/", "/p/")
         assert code == 404
         assert b"private-notes" not in body
+
+    def test_a_junctioned_directory_is_not_enumerated(self, tmp_path, monkeypatch):
+        """A junction is the case that actually reaches a Windows user.
+
+        Every other test in this class is `@requires_symlinks` and therefore skipped
+        on Windows, because a symlink there needs a privilege. A junction needs none
+        — so the one link type a Windows user can plant was the one the guard did not
+        cover. `is_symlink()` does not report a junction and a junction IS a
+        directory, so the walk fell to the `is_dir()` arm and listed the linked tree.
+        """
+        secret = tmp_path / "protected"
+        secret.mkdir()
+        (secret / "private-notes.html").write_text("<h1>secret</h1>")
+        root = tmp_path / "site"
+        root.mkdir()
+        link = root / "docs"
+        link.mkdir()
+        (link / "private-notes.html").write_text("<h1>secret</h1>")
+        (root / "real.html").write_text("<h1>ok</h1>")
+
+        monkeypatch.setattr(server, "is_link_or_junction", lambda p: Path(p) == link)
+        found = server._scan_html(root)
+
+        assert "real.html" in found
+        assert not any("private-notes" in f for f in found), found
+
+    def test_the_scan_consults_the_shared_link_helper(self, tmp_path, monkeypatch):
+        """A junction is only refused if the walk ASKS the shared helper about it —
+        the seam, not the outcome, is what `is_symlink()` got wrong."""
+        root = tmp_path / "site"
+        (root / "public").mkdir(parents=True)
+        (root / "public" / "a.html").write_text("x")
+        seen = []
+
+        def _spy(p):
+            seen.append(Path(p).name)
+            return False
+
+        monkeypatch.setattr(server, "is_link_or_junction", _spy)
+        server._scan_html(root)
+
+        assert "public" in seen
+
+    @pytest.mark.skipif(
+        sys.platform != "win32", reason="junctions are a Windows reparse point"
+    )
+    def test_a_real_windows_junction_is_not_enumerated(self, tmp_path):
+        """No stub and no elevation: the real reparse point, so the stubbed tests
+        above stand in for something rather than for nothing."""
+        secret = tmp_path / "protected"
+        secret.mkdir()
+        (secret / "private-notes.html").write_text("<h1>secret</h1>")
+        root = tmp_path / "site"
+        root.mkdir()
+        (root / "real.html").write_text("<h1>ok</h1>")
+        _winapi.CreateJunction(str(secret), str(root / "docs"))
+
+        found = server._scan_html(root)
+
+        assert "real.html" in found
+        assert not any("private-notes" in f for f in found), found
 
     def test_ordinary_nested_html_is_still_found(self, tmp_path):
         """The refusal must not break the diagnostic page it feeds."""
@@ -3108,6 +3174,59 @@ class TestDevProxyBodyCaps:
         assert b"hi" in out
         # HTML still gets the overlay injected — the cap did not break the rewrite.
         assert server._OVERLAY_PATH.encode() in out
+
+
+class TestDevProxyContentTypeIsAllowlisted:
+    """A proxied reply carries one of OUR literals, never the upstream's value.
+
+    `_PROXY_CTYPES` and `_safe_upstream_ctype` exist because the dev server is the
+    project's own process but still an unaudited one whose headers land in our
+    response. The selector was written, tested in isolation, and never called:
+    `_relay_http` forwarded every upstream header through `_header_value` alone, so
+    the media type and its charset reached the browser as sent. `_header_value`
+    still stopped response splitting, which is why this survived -- what was lost
+    is the mapping to a closed set.
+    """
+
+    def _relay(self, monkeypatch, upstream_ctype, path="/"):
+        class _Conn:
+            def __init__(self, *a, **k):
+                pass
+
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                return _FakeUpstreamResponse(b"body", upstream_ctype)
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(server.http.client, "HTTPConnection", _Conn)
+        probe = _RelayProbe.__new__(_RelayProbe)
+        _RelayProbe.__init__(probe, path=path)
+        probe._relay_http()
+        assert not probe.errors
+        return {k.lower(): v for k, v in probe.sent_headers}
+
+    def test_upstream_charset_is_normalised(self, monkeypatch):
+        """The one case a verbatim forward actually changed browser behaviour."""
+        sent = self._relay(monkeypatch, "text/html; charset=iso-8859-1")
+        assert sent["content-type"] == "text/html; charset=utf-8"
+
+    def test_unrecognised_media_type_falls_back_to_the_request_path(self, monkeypatch):
+        sent = self._relay(monkeypatch, "bogus/thing", path="/app.css")
+        assert sent["content-type"] == _safe_ctype_for_css()
+
+    def test_a_header_smuggled_into_the_media_type_cannot_survive(self, monkeypatch):
+        sent = self._relay(monkeypatch, "evil/x\r\nSet-Cookie: a=b", path="/x.css")
+        assert sent["content-type"] == _safe_ctype_for_css()
+        assert "set-cookie" not in sent
+
+
+def _safe_ctype_for_css() -> str:
+    """The literal the selector maps an unknown media type on a `.css` path to."""
+    return server._safe_upstream_ctype("bogus/thing", "/x.css")
 
 
 class TestDevProcCrossPlatform:

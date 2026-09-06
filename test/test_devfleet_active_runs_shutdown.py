@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import kiro_crew.apps.builtins.dev_fleet.server as mod
+from kiro_crew.apps.builtins.dev_fleet import runtime, worktree_ops
 
 # ---------------------------------------------------------------------------
 # Fixture: reset all module-level state that these tests touch
@@ -36,14 +37,14 @@ import kiro_crew.apps.builtins.dev_fleet.server as mod
 @pytest.fixture(autouse=True)
 def _reset_module_state(monkeypatch):
     """Isolate each test from shared module state."""
-    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {})
-    monkeypatch.setattr(mod, "_RUNS", {})
-    monkeypatch.setattr(mod, "_SHUTDOWN_IN_PROGRESS", False)
+    monkeypatch.setattr(runtime, "_ACTIVE_RUNS", {})
+    monkeypatch.setattr(runtime, "_RUNS", {})
+    monkeypatch.setattr(runtime, "_SHUTDOWN_IN_PROGRESS", False)
     # Give each test a fresh lock so prior acquisitions do not bleed over.
-    monkeypatch.setattr(mod, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
-    monkeypatch.setattr(mod, "_RUNS_LOCK", asyncio.Lock())
+    monkeypatch.setattr(runtime, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
+    monkeypatch.setattr(runtime, "_RUNS_LOCK", asyncio.Lock())
     # Disable background tasks so startup/cleanup don't spawn real subtasks.
-    monkeypatch.setenv(mod._DISABLE_BACKGROUND_ENV, "1")
+    monkeypatch.setenv(worktree_ops._DISABLE_BACKGROUND_ENV, "1")
     yield
 
 
@@ -67,8 +68,8 @@ def _make_fake_proc(*, running: bool = True):
 async def _noop_run(label, cmd, *, cwd=None, env=None, cleanup_paths=None):
     """Replacement _start_run that registers immediately without spawning."""
     rid = uuid.uuid4().hex[:12]
-    async with mod._RUNS_LOCK:
-        mod._RUNS[rid] = {
+    async with runtime._RUNS_LOCK:
+        runtime._RUNS[rid] = {
             "status": "running",
             "exit_code": None,
             "label": label,
@@ -76,12 +77,12 @@ async def _noop_run(label, cmd, *, cwd=None, env=None, cleanup_paths=None):
             "started": 0.0,
         }
     task = asyncio.create_task(asyncio.sleep(10))  # long-lived stand-in
-    async with mod._SHUTDOWN_ADMISSION_LOCK:
-        if mod._SHUTDOWN_IN_PROGRESS:
+    async with runtime._SHUTDOWN_ADMISSION_LOCK:
+        if runtime._SHUTDOWN_IN_PROGRESS:
             task.cancel()
             raise RuntimeError("dev-fleet shutdown in progress: run refused")
-        mod._ACTIVE_RUNS[rid] = (task, None)
-    task.add_done_callback(lambda _t: mod._ACTIVE_RUNS.pop(rid, None))
+        runtime._ACTIVE_RUNS[rid] = (task, None)
+    task.add_done_callback(lambda _t: runtime._ACTIVE_RUNS.pop(rid, None))
     return rid
 
 
@@ -97,7 +98,7 @@ async def test_run_before_cleanup_is_captured_and_cancelled():
     fake_proc = _make_fake_proc(running=True)
     task = asyncio.create_task(asyncio.sleep(10))
     rid = "before_run"
-    mod._ACTIVE_RUNS[rid] = (task, fake_proc)
+    runtime._ACTIVE_RUNS[rid] = (task, fake_proc)
 
     killed_pids = []
 
@@ -105,10 +106,10 @@ async def test_run_before_cleanup_is_captured_and_cancelled():
         killed_pids.append(pid)
 
     with (
-        patch.object(mod, "_kill_tree", side_effect=fake_kill_tree),
-        patch.object(mod, "_refresher_task", None),
-        patch.object(mod, "_warm_task", None),
-        patch.object(mod, "_reaper_task", None),
+        patch.object(runtime, "_kill_tree", side_effect=fake_kill_tree),
+        patch.object(worktree_ops, "_refresher_task", None),
+        patch.object(worktree_ops, "_warm_task", None),
+        patch.object(worktree_ops, "_reaper_task", None),
     ):
         await mod.dev_fleet_cleanup(app=None)
 
@@ -118,9 +119,9 @@ async def test_run_before_cleanup_is_captured_and_cancelled():
     await asyncio.sleep(0)
     assert task.cancelled()
     # The entry was popped from _ACTIVE_RUNS.
-    assert rid not in mod._ACTIVE_RUNS
+    assert rid not in runtime._ACTIVE_RUNS
     # Shutdown flag is set and stays set.
-    assert mod._SHUTDOWN_IN_PROGRESS is True
+    assert runtime._SHUTDOWN_IN_PROGRESS is True
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +144,9 @@ async def test_run_after_snapshot_is_refused():
     async def instrumented_cleanup(app):
         """Cleanup that signals after the critical section, then waits."""
         global _cleanup_inner_called  # noqa: F821
-        async with mod._SHUTDOWN_ADMISSION_LOCK:
-            mod._SHUTDOWN_IN_PROGRESS = True
-            _snapshot = list(mod._ACTIVE_RUNS.items())
+        async with runtime._SHUTDOWN_ADMISSION_LOCK:
+            runtime._SHUTDOWN_IN_PROGRESS = True
+            _snapshot = list(runtime._ACTIVE_RUNS.items())
         # Signal: the admission window is now closed.
         snapshot_taken.set()
         # Wait for the test to attempt a registration before we continue.
@@ -153,19 +154,19 @@ async def test_run_after_snapshot_is_refused():
         # Now do the (empty) cleanup loop.
         for rid, (task, proc) in _snapshot:
             if proc is not None and proc.returncode is None:
-                await mod._kill_tree(proc.pid)
+                await runtime._kill_tree(proc.pid)
             if not task.done():
                 task.cancel()
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-            mod._ACTIVE_RUNS.pop(rid, None)
+            runtime._ACTIVE_RUNS.pop(rid, None)
 
     with (
-        patch.object(mod, "_refresher_task", None),
-        patch.object(mod, "_warm_task", None),
-        patch.object(mod, "_reaper_task", None),
+        patch.object(worktree_ops, "_refresher_task", None),
+        patch.object(worktree_ops, "_warm_task", None),
+        patch.object(worktree_ops, "_reaper_task", None),
     ):
 
         # Start cleanup in the background.
@@ -182,11 +183,11 @@ async def test_run_after_snapshot_is_refused():
             return fake_proc
 
         with patch(
-            "kiro_crew.apps.builtins.dev_fleet.server.create_subprocess_limited",
+            "kiro_crew.apps.builtins.dev_fleet.runtime.create_subprocess_limited",
             side_effect=fake_create_subprocess,
         ):
             with pytest.raises(RuntimeError, match="shutdown in progress"):
-                await mod._start_run(
+                await runtime._start_run(
                     "test_label",
                     ["/bin/echo", "hi"],
                     cwd=None,
@@ -194,7 +195,7 @@ async def test_run_after_snapshot_is_refused():
                 )
 
         # The failed run must NOT have been registered.
-        assert len(mod._ACTIVE_RUNS) == 0
+        assert len(runtime._ACTIVE_RUNS) == 0
 
         # Let cleanup finish.
         cleanup_may_proceed.set()
@@ -224,13 +225,13 @@ async def test_admission_lock_released_before_slow_work():
     fake_proc = _make_fake_proc(running=True)
     task = asyncio.create_task(asyncio.sleep(100))
     rid = "slow_run"
-    mod._ACTIVE_RUNS[rid] = (task, fake_proc)
+    runtime._ACTIVE_RUNS[rid] = (task, fake_proc)
 
     with (
-        patch.object(mod, "_kill_tree", side_effect=slow_kill_tree),
-        patch.object(mod, "_refresher_task", None),
-        patch.object(mod, "_warm_task", None),
-        patch.object(mod, "_reaper_task", None),
+        patch.object(runtime, "_kill_tree", side_effect=slow_kill_tree),
+        patch.object(worktree_ops, "_refresher_task", None),
+        patch.object(worktree_ops, "_warm_task", None),
+        patch.object(worktree_ops, "_reaper_task", None),
     ):
 
         cleanup_task = asyncio.create_task(mod.dev_fleet_cleanup(app=None))
@@ -241,7 +242,7 @@ async def test_admission_lock_released_before_slow_work():
         # The admission lock must be FREE — acquire and release immediately.
         acquired = False
         try:
-            acquired = mod._SHUTDOWN_ADMISSION_LOCK.locked()
+            acquired = runtime._SHUTDOWN_ADMISSION_LOCK.locked()
         except Exception:
             pass
         assert not acquired, "Admission lock should be released before the slow kill phase"
@@ -260,13 +261,13 @@ async def test_admission_lock_released_before_slow_work():
 async def test_start_run_refused_after_cleanup():
     """After a full dev_fleet_cleanup cycle, _start_run raises on any new call."""
     with (
-        patch.object(mod, "_refresher_task", None),
-        patch.object(mod, "_warm_task", None),
-        patch.object(mod, "_reaper_task", None),
+        patch.object(worktree_ops, "_refresher_task", None),
+        patch.object(worktree_ops, "_warm_task", None),
+        patch.object(worktree_ops, "_reaper_task", None),
     ):
         await mod.dev_fleet_cleanup(app=None)
 
-    assert mod._SHUTDOWN_IN_PROGRESS is True
+    assert runtime._SHUTDOWN_IN_PROGRESS is True
 
     # Now try to start a run — it must be refused.
     fake_proc = _make_fake_proc()
@@ -275,13 +276,13 @@ async def test_start_run_refused_after_cleanup():
         return fake_proc
 
     with patch(
-        "kiro_crew.apps.builtins.dev_fleet.server.create_subprocess_limited",
+        "kiro_crew.apps.builtins.dev_fleet.runtime.create_subprocess_limited",
         side_effect=fake_create,
     ):
         with pytest.raises(RuntimeError, match="shutdown in progress"):
-            await mod._start_run("after_shutdown", ["/bin/echo"])
+            await runtime._start_run("after_shutdown", ["/bin/echo"])
 
-    assert len(mod._ACTIVE_RUNS) == 0
+    assert len(runtime._ACTIVE_RUNS) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +304,7 @@ async def test_old_code_without_admission_guard_escapes_cleanup():
 
     async def old_cleanup():
         """Old cleanup: snapshot without closing the admission window first."""
-        _snapshot = list(mod._ACTIVE_RUNS.items())  # bare snapshot, no flag
+        _snapshot = list(runtime._ACTIVE_RUNS.items())  # bare snapshot, no flag
         snapshot_taken.set()
         await cleanup_may_proceed.wait()
         for rid, (task, proc) in _snapshot:
@@ -313,7 +314,7 @@ async def test_old_code_without_admission_guard_escapes_cleanup():
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-            mod._ACTIVE_RUNS.pop(rid, None)
+            runtime._ACTIVE_RUNS.pop(rid, None)
 
     cleanup_coro = asyncio.create_task(old_cleanup())
 
@@ -322,20 +323,20 @@ async def test_old_code_without_admission_guard_escapes_cleanup():
 
     # With old code, _SHUTDOWN_IN_PROGRESS is never set — so _start_run
     # succeeds and escapes the cleanup snapshot.
-    assert not mod._SHUTDOWN_IN_PROGRESS  # old code never set this
+    assert not runtime._SHUTDOWN_IN_PROGRESS  # old code never set this
 
     # Manually simulate what _start_run would do without the guard.
     rid_escaped = "escaped_run"
     task_escaped = asyncio.create_task(asyncio.sleep(100))
     # No admission check → registers successfully.
-    mod._ACTIVE_RUNS[rid_escaped] = (task_escaped, None)
+    runtime._ACTIVE_RUNS[rid_escaped] = (task_escaped, None)
 
     cleanup_may_proceed.set()
     await cleanup_coro
 
     # OLD CODE BUG: the escaped run is still in _ACTIVE_RUNS — cleanup missed it.
     assert (
-        rid_escaped in mod._ACTIVE_RUNS
+        rid_escaped in runtime._ACTIVE_RUNS
     ), "Expected old code to leave the escaped run in _ACTIVE_RUNS (the bug)"
     # Cleanup: cancel the dangling task.
     task_escaped.cancel()

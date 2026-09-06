@@ -17,10 +17,12 @@ They never raise — on failure they return an empty string and log a warning.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import zipfile
 import zlib
 from pathlib import Path
+from typing import IO
 
 # Optional so a stale install (git pull without `pip install -e .`) degrades
 # to "docx/pptx parsing unavailable" instead of killing every CLI entry at
@@ -33,7 +35,12 @@ except ModuleNotFoundError:  # pragma: no cover — exercised via monkeypatch
 
 from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
-from kiro_crew.zip_vet import ZipInventoryRejected, vet_zip_inventory
+from kiro_crew.zip_vet import (
+    TAIL_WINDOW,
+    ZipInventoryRejected,
+    vet_zip_inventory,
+    vet_zip_inventory_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +79,33 @@ def is_parseable_document(mimetype: str = "", filename: str = "") -> bool:
     return ext in DOC_EXTENSIONS
 
 
-def extract_text(path: str, mimetype: str = "", filename: str = "") -> str:
+def extract_text(
+    path: str,
+    mimetype: str = "",
+    filename: str = "",
+    max_chars: int | None = None,
+    fileobj: IO[bytes] | None = None,
+) -> str:
     """Extract readable text from a document file.
 
     Detects format from *mimetype* first, then falls back to file extension.
     Returns empty string on any failure.
+
+    *max_chars*, when given, bounds the AGGREGATE extracted text: parsing
+    stops as soon as at least that many characters have been collected (the
+    result may slightly overshoot, callers truncate to their exact cap).
+    Without it a multi-part container (e.g. a .pptx with thousands of
+    slides, each under the per-entry decompression cap) could accumulate
+    unbounded text in memory. Callers that only need a preview should pass
+    their cap + 1 so truncation stays detectable.
+
+    *fileobj*, when given, is an ALREADY-OPEN binary file the .docx/.pptx
+    ZIP is read from instead of re-opening *path* — callers that stat-gate
+    the file first pass the same handle so the bytes parsed are exactly the
+    bytes measured (no stat→open TOCTOU window). *path* is still used for
+    sensitive-path screening, format detection and logging. PDF extraction
+    is byte-scan based and still reads *path*; no current fileobj caller
+    requests PDFs.
     """
     if is_sensitive_path(path):
         logger.warning("Refusing to read sensitive path: %s", path)
@@ -104,9 +133,9 @@ def extract_text(path: str, mimetype: str = "", filename: str = "") -> str:
         return ""
     try:
         if fmt == "docx":
-            return _extract_docx(path)
+            return _extract_docx(path, max_chars=max_chars, fileobj=fileobj)
         if fmt == "pptx":
-            return _extract_pptx(path)
+            return _extract_pptx(path, max_chars=max_chars, fileobj=fileobj)
         if fmt == "pdf":
             return _extract_pdf(path)
     except Exception:
@@ -128,19 +157,49 @@ def _safe_decompress(data: bytes, max_size: int | None = None) -> bytes:
     return result
 
 
-def _vet_archive_inventory(path: str) -> bool:
+def _vet_archive_inventory(path: str, fileobj: IO[bytes] | None = None) -> bool:
     """Preflight an OOXML container's declared inventory before opening it.
 
     Returns True when the archive is within bounds. Fails closed: a rejected or
     unreadable tail returns False, and the caller degrades to "" like every
     other unreadable-document path in this module.
+
+    When *fileobj* is given the tail is read from THAT handle, not from *path*:
+    the handle is what ``zipfile`` will parse, so vetting the path instead
+    would bound a different archive than the one opened -- a swapped path
+    between the two reads would let an over-cap inventory reach the allocation
+    this vet exists to prevent. The position is restored so the caller's
+    ``ZipFile`` still sees the whole file.
     """
     try:
-        vet_zip_inventory(path, max_members=_MAX_ARCHIVE_MEMBERS)
+        if fileobj is not None:
+            tail = _read_tail_from(fileobj)
+            vet_zip_inventory_bytes(tail, max_members=_MAX_ARCHIVE_MEMBERS)
+        else:
+            vet_zip_inventory(path, max_members=_MAX_ARCHIVE_MEMBERS)
     except ZipInventoryRejected as exc:
         logger.warning("archive inventory rejected (%s)", exc.reason)
         return False
+    except OSError as exc:
+        # An unseekable or unreadable handle is an unvettable archive, and this
+        # guard fails closed like the path branch does.
+        logger.warning("cannot read archive tail from handle: %s", exc)
+        return False
     return True
+
+
+def _read_tail_from(fileobj: IO[bytes]) -> bytes:
+    """Read the EOCD search window from an already-open archive handle.
+
+    Mirrors :func:`kiro_crew.zip_vet._read_tail` for the fd-based caller, then
+    rewinds so the handle is still at byte 0 for ``zipfile.ZipFile``.
+    """
+    try:
+        size = fileobj.seek(0, os.SEEK_END)
+        fileobj.seek(max(0, size - TAIL_WINDOW))
+        return fileobj.read(TAIL_WINDOW)
+    finally:
+        fileobj.seek(0)
 
 
 def _read_zip_entry(
@@ -166,7 +225,9 @@ def _read_zip_entry(
 _W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
-def _extract_docx(path: str) -> str:
+def _extract_docx(
+    path: str, max_chars: int | None = None, fileobj: IO[bytes] | None = None,
+) -> str:
     """Extract text from a .docx file (ZIP containing word/document.xml).
 
     Must only be called from extract_text() which enforces is_sensitive_path().
@@ -174,10 +235,11 @@ def _extract_docx(path: str) -> str:
     assert _xml_fromstring is not None  # extract_text() gates the None case
     if is_sensitive_path(path):
         return ""
-    if not _vet_archive_inventory(path):
+    if not _vet_archive_inventory(path, fileobj):
         return ""
     paragraphs: list[str] = []
-    with zipfile.ZipFile(path, "r") as zf:
+    collected = 0
+    with zipfile.ZipFile(fileobj if fileobj is not None else path, "r") as zf:
         if "word/document.xml" not in zf.namelist():
             return ""
         data = _read_zip_entry(zf, "word/document.xml")
@@ -190,7 +252,19 @@ def _extract_docx(path: str) -> str:
                 if t_elem.text:
                     texts.append(t_elem.text)
             if texts:
-                paragraphs.append("".join(texts))
+                joined = "".join(texts)
+                if paragraphs:
+                    # Count the "\n" separator only BETWEEN paragraphs, so
+                    # `collected` tracks len("\n".join(paragraphs)) exactly.
+                    # Charging the first paragraph a separator too let a
+                    # cap-sized opening paragraph stop extraction while the
+                    # caller's length check read the result as un-truncated,
+                    # silently dropping the rest of the document.
+                    collected += 1
+                paragraphs.append(joined)
+                collected += len(joined)
+                if max_chars is not None and collected >= max_chars:
+                    break
     return "\n".join(paragraphs)
 
 
@@ -200,18 +274,25 @@ _A_NS = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 _SLIDE_RE = re.compile(r"^ppt/slides/slide(\d+)\.xml$")
 
 
-def _extract_pptx(path: str) -> str:
+def _extract_pptx(
+    path: str, max_chars: int | None = None, fileobj: IO[bytes] | None = None,
+) -> str:
     """Extract text from a .pptx file (ZIP containing ppt/slides/*.xml).
 
     Must only be called from extract_text() which enforces is_sensitive_path().
+
+    With *max_chars* set, slide iteration stops as soon as the collected
+    text meets the budget — later slides are never decompressed or parsed,
+    so a deck with thousands of slides cannot accumulate unbounded text.
     """
     assert _xml_fromstring is not None  # extract_text() gates the None case
     if is_sensitive_path(path):
         return ""
-    if not _vet_archive_inventory(path):
+    if not _vet_archive_inventory(path, fileobj):
         return ""
     slides: list[tuple[int, str]] = []
-    with zipfile.ZipFile(path, "r") as zf:
+    collected = 0
+    with zipfile.ZipFile(fileobj if fileobj is not None else path, "r") as zf:
         slide_names = sorted(
             (n for n in zf.namelist() if _SLIDE_RE.match(n)),
             key=lambda n: int(_SLIDE_RE.match(n).group(1)),  # type: ignore[union-attr]
@@ -227,7 +308,11 @@ def _extract_pptx(path: str) -> str:
                 if t_elem.text:
                     texts.append(t_elem.text)
             if texts:
-                slides.append((num, "\n".join(texts)))
+                slide_text = "\n".join(texts)
+                slides.append((num, slide_text))
+                collected += len(slide_text)
+                if max_chars is not None and collected >= max_chars:
+                    break
     parts: list[str] = []
     for num, text in slides:
         parts.append(f"--- Slide {num} ---\n{text}")

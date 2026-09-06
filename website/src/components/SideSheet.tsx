@@ -46,7 +46,7 @@ function Sheet({ onClose, label, header, headerActions, footer, width, paused, c
 
   // The ref stays stable across pausing; only the key handling is switched off,
   // so focus is neither restored nor re-grabbed when the nested dialog opens.
-  useDialogFocusTrap(dialogRef, onClose, !paused)
+  useDialogFocusTrap(dialogRef, onClose, { enabled: !paused })
 
   return (
     <div className="fixed inset-0 z-[90] flex justify-end">

@@ -13,7 +13,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 
 import { api } from '../api/client'
-import chatReducer, { OLDER_PAGE_LIMIT, loadOlderMessages, switchSlot } from '../store/chatSlice'
+import chatReducer, { OLDER_PAGE_LIMIT, OLDER_WALK_PAGE_LIMIT, loadOlderMessages, switchSlot } from '../store/chatSlice'
 
 vi.mock('../api/client')
 
@@ -67,7 +67,7 @@ describe('switchSlot initial load bound', () => {
     mockDetail({ messages: [], has_more: false, next_before: 0, total: 251 })
     await store.dispatch(loadOlderMessages() as never)
     expect(api.chatSlotDetail).toHaveBeenLastCalledWith(
-      'slot-a', OLDER_PAGE_LIMIT, 250, expect.anything(),
+      'slot-a', OLDER_WALK_PAGE_LIMIT, 250, expect.anything(),
     )
   })
 
@@ -113,17 +113,25 @@ describe('switchSlot initial load bound', () => {
     expect(st.slotOldestIndex).toBe(0)
   })
 
-  // Same guard as warmSlotCache and ChatPane's hydrate: the server's limit
-  // slices RAW rows, and a streaming response is many chunk rows that only
-  // collapse afterwards — bounding it would keep just the tail.
-  it('switches to a streaming slot unbounded', async () => {
+  // A slot mid-turn is bounded like any other. The exemption it used to have
+  // rested on the pre-purchase argument this file's subject retires -- unseen
+  // growth pushing a window clear of a small cache is a COVERAGE question,
+  // verified after the response for a streaming payload exactly as for a settled
+  // one. Leaving it in place applied the unbounded shape to the commonest switch
+  // there is, since a slot mid-turn is the one a reader most often steps away
+  // from: measured on a phone as one switch turning 303 loaded messages into
+  // 6,265, taking the reader's saved position with it.
+  it('switches to a streaming slot bounded to the cache, like any other', async () => {
     mockDetail({ running: true })
-    const store = makeStore({ slotRun: { 'slot-a': { state: 'streaming' } } })
+    const store = makeStore({
+      slotRun: { 'slot-a': { state: 'streaming' } },
+      slotMessages: { 'slot-a': Array.from({ length: 303 }, (_, i) => ({ role: 'user', content: `m${i}`, ts: `2026-01-01T00:00:00Z` })) },
+    })
     await store.dispatch(switchSlot('slot-a') as never)
-    expect(api.chatSlotDetail).toHaveBeenCalledWith('slot-a')
+    expect(api.chatSlotDetail).toHaveBeenCalledWith('slot-a', 303)
   })
 
-  it('switches to an idle slot bounded', async () => {
+  it('switches to a fresh idle slot bounded to one page', async () => {
     mockDetail({})
     const store = makeStore({ slotRun: { 'slot-a': { state: 'idle' } } })
     await store.dispatch(switchSlot('slot-a') as never)

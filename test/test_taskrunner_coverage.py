@@ -681,14 +681,18 @@ class TestCleanupRunSessions:
 
 
 class TestRunTrust:
-    def test_grant_and_revoke_keep_flag_and_scope_in_sync(self, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_grant_and_revoke_keep_flag_and_scope_in_sync(self, tmp_path: Path) -> None:
+        # Awaited: both halves are offloaded with `asyncio.to_thread`, because each
+        # writes a SEL event and arming also reads the `approval_modes` policy —
+        # filesystem work that must not run on the gateway's event loop.
         runner = _runner(tmp_path)
         run = _seed_run(runner, tmp_path, task_id="trust_sync")
         scope = _auto_approve_scope("trust_sync")
-        runner._grant_run_trust(run, True)
+        await runner._grant_run_trust(run, True)
         assert run.auto_approve is True
         assert safety_override().is_scope_active(scope) is True
-        runner._grant_run_trust(run, False)
+        await runner._grant_run_trust(run, False)
         assert run.auto_approve is False
         assert safety_override().is_scope_active(scope) is False
 
@@ -696,7 +700,7 @@ class TestRunTrust:
     async def test_release_runtime_revokes_scope(self, tmp_path: Path) -> None:
         runner = _runner(tmp_path)
         run = _seed_run(runner, tmp_path, task_id="trust_release")
-        runner._grant_run_trust(run, True)
+        await runner._grant_run_trust(run, True)
         await runner._release_run_runtime(run)
         assert safety_override().is_scope_active(_auto_approve_scope("trust_release")) is False
 
@@ -1175,27 +1179,6 @@ class TestWatchdogLoop:
         # second tick sees the id already recorded and does not reset again
         assert runner._sessions.reset.await_count == 1
         assert any("stalled task" in call.args[0] for call in notify.await_args_list)
-
-
-# ── Tests hook ──
-
-
-class TestRunTests:
-    @pytest.mark.asyncio
-    async def test_no_command_configured(self, tmp_path: Path) -> None:
-        ok, out = await _runner(tmp_path)._run_tests()
-        assert (ok, out) == (True, "no test command configured")
-
-    @pytest.mark.asyncio
-    async def test_delegates_to_run_tests(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        runner = _runner(tmp_path)
-        runner._test_cmd = ["pytest", "-q"]
-        fake = AsyncMock(return_value=(False, "1 failed"))
-        monkeypatch.setattr(tr, "run_tests", fake)
-        assert await runner._run_tests() == (False, "1 failed")
-        assert fake.await_args.args == (["pytest", "-q"], Path(tmp_path))
 
 
 # ── Registry persistence ──

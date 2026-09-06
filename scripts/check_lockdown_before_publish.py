@@ -47,8 +47,9 @@ Deliberately NOT violations (continued):
   is mandatory, and there are three legitimate kinds: a load-time re-assert; a
   file that holds no data; or a call site where a REVIEWED decision says the
   helper must not be used here at all -- ``workflows/store.py::save`` runs on
-  the event loop and ``restrict_to_owner`` spawns ``icacls``, so #5228 settled
-  it on POSIX ``chmod`` with a ``_redact``-ed payload.
+  the event loop, where ``restrict_to_owner``'s Windows DACL write costs an
+  unbounded SMB round-trip on a network-homed data home, so #5228 settled it on
+  POSIX ``chmod`` with a ``_redact``-ed payload.
 
   The marker and ``KNOWN_UNCONVERTED`` are not interchangeable, and picking the
   wrong one misreports the site. ``KNOWN_UNCONVERTED`` means "this SHOULD be
@@ -184,7 +185,7 @@ SUPPRESS_RE = re.compile(r"#\s*lockdown-ok\s*:\s*(?P<reason>\S.*)$")
 KNOWN_UNCONVERTED: dict[str, tuple[str, str]] = {
     # Empty: #5493 converted denied_commands; this PR converts write_pod_config
     # and snapshot._do_merge, and annotates sel._append_lines_locked lockdown-ok
-    # (same event-loop / icacls reason as #5228). Shrink-only: do not re-add a
+    # (same event-loop reason as #5228). Shrink-only: do not re-add a
     # converted site.
 }
 

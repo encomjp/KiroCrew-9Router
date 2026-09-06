@@ -307,6 +307,102 @@ async def test_two_stubs_on_one_backend_are_told_apart(tmp_path: Path, short_soc
 
 
 @pytest.mark.asyncio
+async def test_two_UNNAMED_stubs_on_one_backend_get_distinct_namespaces(
+    tmp_path: Path, short_sock_dir
+) -> None:
+    """#5322: co-tenants gatewayd cannot NAME must still be separable.
+
+    The sibling test above proves a named co-tenant arrives carrying its own
+    identity. This is the case that has no identity to arrive with: a stub whose
+    session gatewayd cannot resolve forwards ``caller=None``, so nothing in the
+    frame distinguishes two such stubs. The backend then falls back to its own
+    process for a namespace -- correct in the 1:1 shim topology, and worthless on a
+    POOLED backend where that process is shared, which is how two unnamed
+    co-tenants came to share one ``unresolved:<pid>`` snapshot namespace and could
+    resolve element indices against each other's trees.
+
+    So this drives two identity-less stubs onto one pooled backend and reads back
+    the per-connection nonce each call carried. Distinct, non-empty values are the
+    whole fix: they are what the backend keys per-tenant state on when there is no
+    identity.
+
+    The nonce is asserted, not the (absent) identity: on a host where the peer
+    walk happens to find a pidfile for the test process's ancestry a stub could
+    legitimately be named, and that would not weaken this claim -- the nonce is
+    injected for every connection either way.
+    """
+    endpoint_root = short_sock_dir
+    sock = endpoint_root / "gw.sock"
+    work_dir = tmp_path / "ws"
+    work_dir.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    launch_log = tmp_path / "launches.txt"
+    caller_log = tmp_path / "callers.txt"
+    tenant_log = tmp_path / "tenants.txt"
+
+    def _resolver(_key: object) -> tuple[str, list[str], dict[str, str], str]:
+        return (
+            sys.executable,
+            [str(_FAKE_SERVER), str(launch_log), str(caller_log), str(tenant_log)],
+            {},
+            str(work_dir),
+        )
+
+    stop = asyncio.Event()
+    daemon = asyncio.create_task(
+        gw.run_gatewayd(
+            socket_path=sock,
+            max_backends=8,
+            idle_timeout_secs=300,
+            stop_event=stop,
+            target_resolver=_resolver,
+            prewarm_count=0,
+        )
+    )
+    procs: list[asyncio.subprocess.Process] = []
+    try:
+        for _ in range(100):
+            if transport.endpoint_exists(sock):
+                break
+            await asyncio.sleep(0.05)
+        assert transport.endpoint_exists(sock), "gatewayd never bound its endpoint"
+
+        for i in range(2):
+            proc = await _spawn_stub(
+                socket_path=sock, server="fake", agent="probe",
+                work_dir=work_dir, home=home, session_key="",
+            )
+            procs.append(proc)
+            reply = await _drive_initialize(proc, req_id=i + 1)
+            assert "result" in reply, f"unnamed stub {i} got no initialize result: {reply}"
+            reply = await _drive_tool_call(proc, req_id=100 + i)
+            assert "result" in reply, f"unnamed stub {i} got no tools/call result: {reply}"
+
+        assert _launch_count(launch_log) == 1, (
+            "the two stubs did not share a backend, so this run says nothing "
+            "about separating unnamed co-tenants"
+        )
+
+        nonces = _observed_callers(tenant_log)
+        assert len(nonces) == 2, f"expected one nonce per call, got {nonces!r}"
+        assert all(nonces), (
+            f"a call reached the shared backend with no nonce: {nonces!r}. With no "
+            "identity and no nonce the backend has nothing left but its own pid, "
+            "which is the SHARED process -- both co-tenants land in one namespace."
+        )
+        assert nonces[0] != nonces[1], (
+            f"both unnamed co-tenants got the same nonce {nonces[0]!r}. One "
+            "namespace for two sessions is exactly #5322: each one's own "
+            "fingerprint check still passes, so a wrong-target action is silent."
+        )
+    finally:
+        await _reap(procs)
+        stop.set()
+        await asyncio.wait_for(daemon, timeout=30)
+
+
+@pytest.mark.asyncio
 async def test_real_stubs_sharing_a_key_share_one_backend(tmp_path: Path, short_sock_dir) -> None:
     """THE pooling assertion: 3 real stub processes -> exactly 1 MCP server.
 

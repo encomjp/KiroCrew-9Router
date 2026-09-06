@@ -118,9 +118,15 @@ export function BlockEditor({
           // Tab nests a list item, Shift+Tab lifts it out. On anything that is
           // not a list item Tab keeps its native job of moving focus, so the
           // keyboard can still leave the editor.
+          //
+          // Claim BEFORE the rewrite: IMEs use Tab to cycle the candidate list,
+          // and on WebKit the keydown that commits a candidate arrives after
+          // `compositionend` with `isComposing` already false — so an unclaimed
+          // Tab would re-indent the block and replace the composing text.
           const ta = e.currentTarget
           const next = shiftListItem(text, ta.selectionStart, e.shiftKey)
           if (!next) return
+          if (!ime.claimKey(e)) return
           e.preventDefault()
           rewrite(ta, next.text, next.pos)
         } else if (e.key === 'Enter' && !e.shiftKey && onSplit) {

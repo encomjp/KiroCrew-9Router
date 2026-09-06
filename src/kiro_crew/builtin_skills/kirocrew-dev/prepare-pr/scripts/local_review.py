@@ -492,26 +492,50 @@ def extract_base_rule_specs(workflow_text: str) -> list[FileSpec]:
     return specs
 
 
+#: The directory the shared review-prompt blocks live in. The extractor selects
+#: on this rather than on position in the file: a workflow may materialize SEVERAL
+#: unrelated things from ``$BASE_SHA``, and "the first such loop" is not a
+#: description of the prompt loader. `codex-review.yml` now also base-materializes
+#: `.github/review-cli/{package.json,package-lock.json}` -- and it does so ABOVE
+#: the prompt loader, so a positional match silently produced prompt specs named
+#: `package.json`.
+_PROMPT_DIR = ".github/review-prompts/"
+
+_PROMPT_TMPL_RE = re.compile(
+    r"git show \"\$BASE_SHA:(?P<src>[^\"]*"
+    + re.escape(_PROMPT_DIR)
+    + r"[^\"]*\$\{?\w+\}?[^\"]*)\"\s*>\s*\"(?P<dest>[^\"]+)\"",
+)
+_LOOP_RE = re.compile(r"for\s+(?P<var>\w+)\s+in\s+(?P<names>[A-Za-z0-9_.\- ]+);\s*do")
+
+
 def extract_prompt_file_specs(workflow_text: str) -> list[FileSpec]:
     """Base-ref review-prompt files, expanded from the workflow's own for-loop.
 
     Returns [] when the workflow keeps no prompt files.
     """
-    loop = re.search(r"for\s+(?P<var>\w+)\s+in\s+(?P<names>[A-Za-z0-9_.\- ]+);\s*do", workflow_text)
-    tmpl = re.search(
-        r"git show \"\$BASE_SHA:(?P<src>[^\"]*\$\{?\w+\}?[^\"]*)\"\s*>\s*\"(?P<dest>[^\"]+)\"",
-        workflow_text,
-    )
-    if loop is None or tmpl is None:
+    tmpl = _PROMPT_TMPL_RE.search(workflow_text)
+    if tmpl is None:
         return []
+    # The governing loop is the LAST one opened before the prompt template, not
+    # the first one in the file. Anything materialized earlier (the review CLI's
+    # own manifest, for instance) has its own loop and is not a prompt block.
+    loops = [m for m in _LOOP_RE.finditer(workflow_text) if m.start() < tmpl.start()]
+    if not loops:
+        return []
+    loop = loops[-1]
     var = loop.group("var")
     # codex-review.yml's loader carries a `cp` bootstrap: when a shared prompt
     # is absent on the base (the PR that introduces it), CI warns and uses the
     # checked-out copy. Mirror that exactly; without the cp, a missing prompt
-    # stays fatal like CI's Opus lanes.
+    # stays fatal like CI's Opus lanes. Scoped to the prompt directory for the
+    # same reason as the template above -- and searched from the loop onward, so
+    # an unrelated `cp` earlier in the file cannot be mistaken for the bootstrap.
     cp_tmpl = re.search(
-        r"cp\s+\"(?P<src>[^\"]*\$\{?\w+\}?[^\"]*)\"\s+\"(?P<dest>[^\"]+)\"",
-        workflow_text,
+        r"cp\s+\"(?P<src>[^\"]*"
+        + re.escape(_PROMPT_DIR)
+        + r"[^\"]*\$\{?\w+\}?[^\"]*)\"\s+\"(?P<dest>[^\"]+)\"",
+        workflow_text[loop.start() :],
     )
     specs: list[FileSpec] = []
     for name in loop.group("names").split():
@@ -771,11 +795,23 @@ def build_spliced_lane(
     prompt = substitute_sed_placeholders(prompt, workflow_text, values)
     prompt = remap_staged_paths(substitute_expressions(prompt, values), stage_dir)
 
-    pass_block = _run_block_with(scalars, "DISCOVERY PASS", contract)
-    literals = prompt_segments(pass_block, stage_dir)
-    discovery = literals_between(literals, "DISCOVERY PASS", "DISCOVERY PASS", "discovery-pass")
+    # Each pass needs its own Bedrock session, so a lane may run them as two
+    # separate steps -- locate each instruction in the `run:` block that carries
+    # it rather than assuming both share one. Both lookups resolve to the same
+    # block for a lane that still drives both passes from a single step.
+    discovery_block = _run_block_with(scalars, "DISCOVERY PASS", contract, stage_dir)
+    discovery = literals_between(
+        prompt_segments(discovery_block, stage_dir),
+        "DISCOVERY PASS",
+        "DISCOVERY PASS",
+        "discovery-pass",
+    )
+    pass_block = _run_block_with(scalars, "FALSIFICATION PASS", contract, stage_dir)
     falsification = literals_between(
-        literals, "FALSIFICATION PASS", "UNTRUSTED EVIDENCE", "falsification-pass"
+        prompt_segments(pass_block, stage_dir),
+        "FALSIFICATION PASS",
+        "UNTRUSTED EVIDENCE",
+        "falsification-pass",
     )
     markers = re.findall(r"\"([A-Z0-9_]+)::\$\{?[a-z_]+\}?\"", pass_block)
     notes: list[str] = []
@@ -808,7 +844,7 @@ def build_spliced_lane(
             "no `BUDGET: at most N BLOCKING` or `BUDGET: report ALL` line found in "
             "the extracted prompt."
         )
-    ci_model = _extract_ci_model(workflow_text, scalars)
+    ci_model = _extract_ci_model(workflow_text, scalars, prefer="cli")
     notes.extend(_model_note(ci_model, local_model))
     return Lane(
         name=name,
@@ -907,37 +943,77 @@ def _assembly_block(scalars: list[BlockScalar], target: str, contract: str) -> s
     )
 
 
-def _run_block_with(scalars: list[BlockScalar], needle: str, contract: str) -> str:
+def _run_block_with(
+    scalars: list[BlockScalar], needle: str, contract: str, stage_dir: str
+) -> str:
+    """The `run:` block whose MODEL-FACING instructions carry ``needle``.
+
+    Matches ``needle`` in the block's own text first, then in the ``cat``-spliced
+    prompt files it pulls in, so an instruction the workflow keeps in a shared
+    prompt file is found in the step that splices it rather than only where it
+    appears inline. A block whose splices cannot be resolved is skipped, not
+    fatal: an unresolvable splice elsewhere in the job is not evidence about the
+    block being looked for.
+    """
     for scalar in scalars:
-        if scalar.key == "run" and needle in scalar.text:
+        if scalar.key != "run":
+            continue
+        if needle in scalar.text:
+            return scalar.text
+        try:
+            segments = prompt_segments(scalar.text, stage_dir)
+        except ParityError:
+            continue
+        if any(needle in segment for segment in segments):
             return scalar.text
     raise ParityError(
-        "no `run:` block in {} contains {!r} - the workflow was restructured.".format(
-            contract, needle
-        )
+        "no `run:` block in {} carries the instruction {!r}, in its own text or in "
+        "a prompt file it splices - the workflow was restructured.".format(contract, needle)
     )
 
 
-def _extract_ci_model(workflow_text: str, scalars: list[BlockScalar]) -> str:
-    """The model id CI actually pins.
+def _extract_ci_model(
+    workflow_text: str, scalars: list[BlockScalar], prefer: str = "action"
+) -> str:
+    """The model id CI pins for THIS lane's reviewer.
 
     Scoped to the blocks where a pin is CONFIG - the action's ``claude_args`` and
     the CLI config heredoc written by a ``run`` block - never the whole file: the
     workflows discuss ``--model`` in prose comments too, and a comment match
     would report a word ("below") as the model id.
+
+    A lane may carry BOTH shapes, so which one wins is not incidental. The GPT
+    lanes drive the codex CLI for the review itself and additionally embed a
+    claude-code-action for the Opus adjudication of their blocking verdict - a
+    different model, on a stage that judges the verdict rather than producing it.
+    Reading that pin as the reviewer's would make the brief claim the GPT lane
+    runs on Opus and report drift on every run. ``prefer`` names the reviewer's
+    own shape: ``"cli"`` for a lane that drives the CLI, ``"action"`` for a lane
+    whose reviewer IS the action.
     """
-    for scalar in scalars:
-        if scalar.key != "claude_args":
-            continue
-        match = re.search(r"--model\s+(\S+)", scalar.text)
-        if match is not None:
-            return match.group(1)
-    for scalar in scalars:
-        if scalar.key != "run":
-            continue
-        match = re.search(r"^\s*model\s*=\s*\"([^\"]+)\"", scalar.text, re.MULTILINE)
-        if match is not None:
-            return match.group(1)
+    def from_action() -> Optional[str]:
+        for scalar in scalars:
+            if scalar.key != "claude_args":
+                continue
+            match = re.search(r"--model\s+(\S+)", scalar.text)
+            if match is not None:
+                return match.group(1)
+        return None
+
+    def from_cli() -> Optional[str]:
+        for scalar in scalars:
+            if scalar.key != "run":
+                continue
+            match = re.search(r"^\s*model\s*=\s*\"([^\"]+)\"", scalar.text, re.MULTILINE)
+            if match is not None:
+                return match.group(1)
+        return None
+
+    order = (from_cli, from_action) if prefer == "cli" else (from_action, from_cli)
+    for source in order:
+        found = source()
+        if found is not None:
+            return found
     raise ParityError(
         "no model pin (`--model X` in claude_args, or `model = \"X\"` in a run "
         "block) found in the workflow; the local brief cannot claim model parity."

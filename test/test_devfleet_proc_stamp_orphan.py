@@ -41,16 +41,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import kiro_crew.apps.builtins.dev_fleet.server as mod
+from kiro_crew.apps.builtins.dev_fleet import runtime, worktree_ops
 
 
 @pytest.fixture(autouse=True)
 def _reset_module_state(monkeypatch):
-    monkeypatch.setattr(mod, "_ACTIVE_RUNS", {})
-    monkeypatch.setattr(mod, "_RUNS", {})
-    monkeypatch.setattr(mod, "_SHUTDOWN_IN_PROGRESS", False)
-    monkeypatch.setattr(mod, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
-    monkeypatch.setattr(mod, "_RUNS_LOCK", asyncio.Lock())
-    monkeypatch.setenv(mod._DISABLE_BACKGROUND_ENV, "1")
+    monkeypatch.setattr(runtime, "_ACTIVE_RUNS", {})
+    monkeypatch.setattr(runtime, "_RUNS", {})
+    monkeypatch.setattr(runtime, "_SHUTDOWN_IN_PROGRESS", False)
+    monkeypatch.setattr(runtime, "_SHUTDOWN_ADMISSION_LOCK", asyncio.Lock())
+    monkeypatch.setattr(runtime, "_RUNS_LOCK", asyncio.Lock())
+    monkeypatch.setenv(worktree_ops._DISABLE_BACKGROUND_ENV, "1")
     yield
 
 
@@ -91,12 +92,16 @@ async def test_proc_spawned_during_shutdown_is_not_orphaned():
         killed_pids.append(pid)
 
     with (
-        patch.object(mod, "create_subprocess_limited", side_effect=blocking_create_subprocess),
-        patch.object(mod, "_kill_tree", side_effect=fake_kill_tree),
-        patch.object(mod, "platform_compat") as pc,
-        patch.object(mod, "_refresher_task", None),
-        patch.object(mod, "_warm_task", None),
-        patch.object(mod, "_reaper_task", None),
+        patch.object(
+            runtime,
+            "create_subprocess_limited",
+            side_effect=blocking_create_subprocess,
+        ),
+        patch.object(runtime, "_kill_tree", side_effect=fake_kill_tree),
+        patch.object(runtime, "platform_compat") as pc,
+        patch.object(worktree_ops, "_refresher_task", None),
+        patch.object(worktree_ops, "_warm_task", None),
+        patch.object(worktree_ops, "_reaper_task", None),
     ):
         pc.IS_POSIX = True
         pc.IS_WINDOWS = False
@@ -105,13 +110,13 @@ async def test_proc_spawned_during_shutdown_is_not_orphaned():
         # 1. Start the run. It registers (task, None) and the worker begins;
         #    the worker parks inside blocking_create_subprocess (child spawned,
         #    proc not yet stamped).
-        rid = await mod._start_run("build", ["/bin/echo", "hi"], cwd=None, env={})
+        rid = await runtime._start_run("build", ["/bin/echo", "hi"], cwd=None, env={})
         await spawn_entered.wait()
 
         # Precondition: the run is registered but with proc STILL None — this
         # is the window under test.
-        assert rid in mod._ACTIVE_RUNS
-        assert mod._ACTIVE_RUNS[rid][1] is None
+        assert rid in runtime._ACTIVE_RUNS
+        assert runtime._ACTIVE_RUNS[rid][1] is None
 
         # 2. Shutdown fires now, while the child is live but unstamped.
         cleanup = asyncio.create_task(mod.dev_fleet_cleanup(app=None))
@@ -160,20 +165,24 @@ async def test_repeat_cancellation_during_drain_still_reaps():
         killed_pids.append(pid)
 
     with (
-        patch.object(mod, "create_subprocess_limited", side_effect=blocking_create_subprocess),
-        patch.object(mod, "_kill_tree", side_effect=fake_kill_tree),
-        patch.object(mod, "platform_compat") as pc,
-        patch.object(mod, "_refresher_task", None),
-        patch.object(mod, "_warm_task", None),
-        patch.object(mod, "_reaper_task", None),
+        patch.object(
+            runtime,
+            "create_subprocess_limited",
+            side_effect=blocking_create_subprocess,
+        ),
+        patch.object(runtime, "_kill_tree", side_effect=fake_kill_tree),
+        patch.object(runtime, "platform_compat") as pc,
+        patch.object(worktree_ops, "_refresher_task", None),
+        patch.object(worktree_ops, "_warm_task", None),
+        patch.object(worktree_ops, "_reaper_task", None),
     ):
         pc.IS_POSIX = True
         pc.IS_WINDOWS = False
         pc.kill_and_reap = AsyncMock()
 
-        rid = await mod._start_run("build", ["/bin/echo", "hi"], cwd=None, env={})
+        rid = await runtime._start_run("build", ["/bin/echo", "hi"], cwd=None, env={})
         await spawn_entered.wait()
-        worker_task = mod._ACTIVE_RUNS[rid][0]
+        worker_task = runtime._ACTIVE_RUNS[rid][0]
 
         # First cancellation: worker enters the CancelledError handler and
         # begins draining spawn_task (still parked).

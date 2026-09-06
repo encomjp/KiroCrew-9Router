@@ -26,13 +26,31 @@ concurrency:
 
 jobs:
   design-review:
-    name: Design Review
+    # BRANCH-PROTECTION NAME COLLISION -- keep this conditional. Two workflows
+    # publish the protected check name "Design Review": this same-repo lane and the
+    # privileged Stage-2 fork-design-review.yml. GitHub resolves a required status
+    # check to the NEWEST check-run carrying that name, so on a fork PR -- where
+    # this lane reviews nothing -- any `pull_request` event firing AFTER the fork
+    # lane published its verdict (a reopen, and for codex-review an `edited`
+    # title/body) would make THIS lane the newest run under the protected name
+    # and satisfy the gate on a review that never ran. Naming this job
+    # differently on a fork PR leaves exactly ONE publisher of the protected
+    # name per PR type: this lane for same-repo PRs, the Stage-2 lane for forks.
+    # `pr-readiness.yml` is unaffected -- it already collapses every check-run of
+    # the name for forks and treats a name with no completed run as pending,
+    # never as passed.
+    #
+    # The fork guard sits on EVERY step rather than on the job, and that
+    # placement is what makes the name above render. GitHub never evaluates a
+    # skipped job's `name:` expression, so while the guard was a job-level `if:`
+    # every fork PR published the raw expression source as its check name.
+    # Letting the job start with all steps gated costs seconds of runner time and
+    # reports the intended name instead. `test_ai_review_workflows.py` asserts
+    # the guard is on every step, so a step added later cannot quietly run
+    # against fork content.
+    name: "${{ github.event.pull_request.head.repo.full_name == github.repository && 'Design Review' || 'Design Review (same-repo lane, not applicable to forks)' }}"
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # Same-repo PRs only (not forks): fork PRs have no OIDC/secrets access, and
-    # this keeps budget abuse / prompt-injection / secret-exfil out — mirrors
-    # the fork guard in codex-review.yml.
-    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       # persist-credentials:false stops actions/checkout from writing the
       # GITHUB_TOKEN into .git/config, where the agentic reviewer — which reads
@@ -40,11 +58,13 @@ jobs:
       # still works (history is fetched via depth 0); the posting step uses its
       # own scoped GH_TOKEN. Mirrors codex-review.yml.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event.pull_request.head.repo.full_name == github.repository
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Resolve human override
+        if: github.event.pull_request.head.repo.full_name == github.repository
         id: human_override
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -54,11 +74,37 @@ jobs:
         run: |
           exact="<!-- ai-review-human-override target=design head=$HEAD "
           all="<!-- ai-review-human-override target=all head=$HEAD "
-          record="$(gh api "repos/$REPO/issues/$PR/comments" --paginate 2>/dev/null \
+          # A comments feed this step could not READ is not a PR with no
+          # override recorded. `2>/dev/null || true` discarded both the error
+          # text and the exit status, so a transient API failure collapsed
+          # onto the same empty string as "no override recorded" and the lane
+          # re-gated a verdict a human had already cleared with
+          # /ai-review override. The common case is transient, so absorb it
+          # here: up to three attempts with a short backoff. A read that never
+          # succeeds fails this run CLOSED while naming the read as the cause;
+          # a PR genuinely carrying no override still reads successfully and
+          # resolves to inactive, as before.
+          comments=""
+          read_ok=""
+          for attempt in 1 2 3; do
+            if comments="$(gh api "repos/$REPO/issues/$PR/comments" --paginate)"; then
+              read_ok=1
+              break
+            fi
+            echo "Reading the PR comments failed on attempt $attempt."
+            if [ "$attempt" -lt 3 ]; then
+              sleep "$attempt"
+            fi
+          done
+          if [ -z "$read_ok" ]; then
+            echo "::error::Could not read this PR's comments after 3 attempts, so this lane cannot tell whether a human override is recorded for $HEAD. Failing closed rather than re-gating a verdict a human may have cleared -- re-run this job."
+            exit 1
+          fi
+          record="$(printf '%s' "$comments" \
             | jq -sr --arg exact "$exact" --arg all "$all" \
               'add // [] | [.[] | select(.user.login == "github-actions[bot]")
               | select((.body | startswith($exact)) or (.body | startswith($all)))]
-              | (last.body // "")' 2>/dev/null || true)"
+              | (last.body // "")')"
           actor="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\1/p')"
           source="$(printf '%s\n' "$record" | sed -nE '1s/^.* actor=([^ ]+) source=([0-9]+) -->$/\2/p')"
           if [ -n "$actor" ] && [ -n "$source" ]; then
@@ -77,7 +123,11 @@ jobs:
       # PR content. Also skip when a human override is recorded, so an OIDC
       # failure can never keep the override from clearing the lane.
       - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
-        if: github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository
+          && (
+          github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
+          )
         with:
           role-to-assume: ${{ secrets.AWS_BEDROCK_ROLE_ARN }}
           aws-region: us-west-2
@@ -92,7 +142,11 @@ jobs:
         # required checks; merge is gated by human review), so a red result is
         # override-able. The always()-run steps below still post a leak-safe
         # comment and log the outcome regardless.
-        if: github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository
+          && (
+          github.actor != 'dependabot[bot]' && steps.human_override.outputs.active != 'true'
+          )
         uses: anthropics/claude-code-action@24dcd50c0568f0fc9e9211213a4fd2d9eb15c4e0 # v1
         with:
           # Inference via Amazon Bedrock (region from the AWS creds step above).
@@ -185,6 +239,8 @@ jobs:
             speculative surface.
 
             CLAUDE.md and AGENTS.md (root and website/) hold the conventions.
+            AGENTS.md is a router, so open the doc its routing table names for
+            the area under review.
 
             THIS IS A DESIGN REVIEW, NOT A LINE-LEVEL REVIEW. Two OTHER automated
             reviewers already cover line-level correctness, security, style,
@@ -337,7 +393,11 @@ jobs:
       # + per-page jq lookup, mirroring claude-review.yml.
       - name: Post design review summary
         id: post
-        if: always()
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository
+          && (
+          always()
+          )
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -421,7 +481,7 @@ jobs:
               echo "_Design-level review of \`$HEAD\` — updated in place on each push. **A BLOCK verdict blocks PR readiness**; PASS/CONCERNS are advisory._"
               echo
               printf '%s\n' "$summary"
-            } > /tmp/design-comment.md
+            } > "${RUNNER_TEMP:-/tmp}/design-comment.md"
           else
             # No parseable verdict → the review errored or emitted no header. Do
             # NOT post the raw model/error text: it can carry internal detail
@@ -444,7 +504,7 @@ jobs:
               echo "## Design Review (Fable 5) — ⚠️ could not complete"
               echo
               echo "_The design review did not produce a verdict for \`$HEAD\` ($why). See the Design Review job logs. Advisory — does not block merge._"
-            } > /tmp/design-comment.md
+            } > "${RUNNER_TEMP:-/tmp}/design-comment.md"
           fi
           # Defense-in-depth: scrub credential shapes AND AWS account ids / ARNs
           # from whatever we post (a valid-verdict body may quote an ARN from the
@@ -452,22 +512,116 @@ jobs:
           # above, this keeps internal detail out of the public PR comment. The
           # SYSTEM RULES prompt also forbids emitting secrets; this is the
           # mechanical backstop. Mirrors codex-review.yml's redaction step.
-          perl -i -pe 's/\b(?:AKIA|ASIA)[A-Z2-7]{16}\b/[REDACTED-AWS-KEY-ID]/g; s{arn:aws\S*}{[REDACTED-ARN]}g; s/\b[0-9]{12}\b/[REDACTED-ACCT]/g; s/(?i)(aws_secret_access_key|aws_session_token|x-amz-security-token)\s*[:=]\s*\S+/$1=[REDACTED]/g' /tmp/design-comment.md
-          # Author filter: only a github-actions[bot] comment may match, so a PR
-          # commenter can't plant the marker and have us PATCH their comment.
-          # Per-page --jq under --paginate emits only matching ids; head -n1 takes
-          # the first across pages (no malformed multi-line id).
-          existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\"))) | .id" 2>/dev/null \
-            | head -n1 || true)"
-          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
-            gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
-              --field body="$(cat /tmp/design-comment.md)" >/dev/null || true
-            echo "Updated existing design-review comment #$existing"
-          else
-            gh pr comment "$PR" --body-file /tmp/design-comment.md || true
-            echo "Created new design-review comment"
-          fi
+          perl -i -pe 's/\b(?:AKIA|ASIA)[A-Z2-7]{16}\b/[REDACTED-AWS-KEY-ID]/g; s{arn:aws\S*}{[REDACTED-ARN]}g; s/\b[0-9]{12}\b/[REDACTED-ACCT]/g; s/(?i)(aws_secret_access_key|aws_session_token|x-amz-security-token)\s*[:=]\s*\S+/$1=[REDACTED]/g' "${RUNNER_TEMP:-/tmp}/design-comment.md"
+          # Guarded upsert (#8292, #8344): the shared function below is defined
+          # byte-identically in every review lane; test_ai_review_workflows.py
+          # pins all copies to one canonical body so the invariant cannot
+          # drift lane by lane.
+          guarded_comment_upsert() {
+            local marker="$1" stamp="$2" lane="$3" out_file="$4"
+            local matches existing lookup_ok pr_head="" attempt withhold=""
+            # Find the bot's existing marker comment (first match wins) and
+            # capture its id. Author filter: only a github-actions[bot]
+            # comment can match, so a PR commenter cannot plant the marker and
+            # have this step PATCH their comment with the write-scoped token.
+            # Only the id is read: no decision below inspects the current
+            # body, so this function has no read-modify-write window on it.
+            # Capture the paginated query's FULL output first and select the
+            # first id off the captured value -- a `... | head -n1` inside the
+            # pipeline lets head's early exit SIGPIPE the api call and misread
+            # a successful lookup as a failure under pipefail (#8350).
+            # Retry a transient failure: whether a comment exists is a gating
+            # input here, and one blip is not evidence that none does.
+            lookup_ok=0
+            for attempt in 1 2 3; do
+              if matches="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" 2>/dev/null)"; then
+                lookup_ok=1
+                break
+              fi
+              matches=""
+              echo "Reading this PR's comments failed on attempt $attempt."
+              if [ "$attempt" -lt 3 ]; then
+                sleep "$attempt"
+              fi
+            done
+            existing="$(printf '%s\n' "$matches" | awk 'NR == 1')"
+            # This lane's marker comment is ONE slot shared by every run on the
+            # PR, and the REST comments API has no If-Match, so a write to it
+            # is last-writer-wins with no way to detect the loss afterwards --
+            # it exposes no edit history either (#8292). Exactly one kind of
+            # run may therefore claim the slot: a COMPLETED verdict for the
+            # PR's CURRENT head. Every other case leaves an existing comment
+            # untouched, because each of them can lose a live verdict.
+            if ! grep -Fq "$stamp $HEAD" "$out_file"; then
+              # No "<stamp> $HEAD" proof marker: this is a review FAILURE
+              # notice, and PATCHing one over a completed verdict buries that
+              # verdict -- blocking findings included -- where no reader or
+              # tool looks. Note that PRESERVING the verdict and prepending a
+              # staleness notice is not a safe alternative: it reads the body
+              # and writes a merge of it back, so a verdict published between
+              # the read and the write is restored away.
+              withhold="run for $HEAD produced no completed verdict"
+            else
+              # A completed verdict for a SUPERSEDED head is the same loss
+              # arriving late: an older run can finish after a newer one has
+              # already published, and the fork lanes' concurrency group is
+              # keyed per head so they are not cancelled -- while a cancelled
+              # same-repo run still executes this if:always() step. So confirm
+              # this run is still the PR's head before claiming the slot.
+              # Retry a transient read the way this lane's other gating reads
+              # do, then treat an unreadable head as NOT confirmed: writing is
+              # the destructive half, so it must not proceed on an unknown.
+              for attempt in 1 2 3; do
+                if pr_head="$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')" \
+                  && [ -n "$pr_head" ]; then
+                  break
+                fi
+                pr_head=""
+                echo "Reading this PR's head sha failed on attempt $attempt."
+                if [ "$attempt" -lt 3 ]; then
+                  sleep "$attempt"
+                fi
+              done
+              if [ -z "$pr_head" ]; then
+                withhold="this PR's head was unreadable after 3 attempts, so $HEAD cannot be confirmed current"
+              elif [ "$pr_head" != "$HEAD" ]; then
+                withhold="$HEAD is no longer this PR's head ($pr_head)"
+              fi
+            fi
+            if [ -n "$withhold" ]; then
+              # A lookup that ERRORED is not "no comment exists": taking the
+              # create path there plants a second marker comment over a
+              # possibly-live verdict, which no later run undoes.
+              if [ "$lookup_ok" -eq 0 ]; then
+                echo "Withholding $lane comment for $HEAD ($withhold); the comment lookup also failed, so nothing was posted"
+                return 0
+              fi
+              if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+                echo "Withholding $lane comment for $HEAD ($withhold); left existing comment #$existing untouched"
+                return 0
+              fi
+              # The lookup SUCCEEDED and found nothing, so there is no verdict
+              # to lose: posting the body as a NEW comment buries nothing.
+              gh pr comment "$PR" --body-file "$out_file" || true
+              echo "Created new $lane comment"
+              return 0
+            fi
+            if [ "$lookup_ok" -eq 1 ] && [ -n "$existing" ] && [ "$existing" != "null" ]; then
+              gh api --method PATCH "repos/$REPO/issues/comments/$existing" \
+                --field body="$(cat "$out_file")" >/dev/null || true
+              echo "Updated existing $lane comment #$existing"
+            else
+              # No existing comment -- or a lookup that could not confirm one
+              # -- falls through to CREATE either way: a completed verdict for
+              # the confirmed current head must never be dropped because the
+              # comment lookup failed, since a duplicate comment is
+              # recoverable and an unposted verdict is not (#8350).
+              gh pr comment "$PR" --body-file "$out_file" || true
+              echo "Created new $lane comment"
+            fi
+          }
+          guarded_comment_upsert "$MARKER" "[DESIGN-REVIEWED]" "Design Review" "${RUNNER_TEMP:-/tmp}/design-comment.md"
 
       # This step converts the design verdict into the "Design Review" check
       # status. A real BLOCK verdict now FAILS the check (emits ::error:: and
@@ -484,7 +638,11 @@ jobs:
       # infrastructure noise can never block a merge. Do NOT widen the failing
       # branch beyond BLOCK.
       - name: Design review status (gates on BLOCK)
-        if: always()
+        if: >-
+          github.event.pull_request.head.repo.full_name == github.repository
+          && (
+          always()
+          )
         env:
           HEAD: ${{ github.event.pull_request.head.sha }}
           ACTOR: ${{ github.actor }}

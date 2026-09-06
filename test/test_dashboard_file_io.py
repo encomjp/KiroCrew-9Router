@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import stat
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -304,6 +307,131 @@ class TestFileWrite:
             )
             assert resp.status == 400
 
+    @pytest.mark.asyncio
+    async def test_write_routes_acl_preservation_through_atomic_write(
+        self, tmp_file, mock_sel, home_patch, monkeypatch
+    ):
+        """api_file_write must carry the source inode's ACL, not just its bits.
+
+        The old mkstemp+copymode path carried permission BITS only, dropping a
+        named POSIX ACL on every save. Assert the handler now
+        routes through atomic_write with an OPEN source descriptor via
+        preserve_access_control_from and the existing file mode; a revert to
+        copymode fails here.
+        """
+        import os as _os
+
+        import kiro_crew.atomic_write as aw
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        captured: dict[str, object] = {}
+        original = files_mod.atomic_write
+
+        def recording(target, content, **kwargs):
+            captured["kwargs"] = dict(kwargs)
+            captured["thread"] = threading.current_thread().ident
+            src_fd = kwargs.get("preserve_access_control_from")
+            if isinstance(src_fd, int):
+                captured["source_bytes"] = _os.read(src_fd, 4096)
+            original(target, content, **kwargs)
+
+        monkeypatch.setattr(files_mod, "atomic_write", recording)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(
+                "/api/file-write", json={"path": str(tmp_file), "content": "updated"}
+            )
+            assert resp.status == 200
+
+        kwargs = captured["kwargs"]
+        # See the steering twin: the handler's gate is PIN-FIRST, not
+        # xattr-first. When the parent pins, open_access_control_source hands
+        # back a descriptor even where the xattr syscalls are absent — the MODE
+        # carry needs it so the bits come off the pinned inode (macOS: openat
+        # and no listxattr). Only on the unpinned floor does the xattr flag
+        # decide, and None there (Windows) is what keeps os.replace working
+        # while any other handle is open. The kwarg itself must always be passed.
+        handler_pins = (
+            files_mod.pinned_fs.supports_pinned_walk()
+            and aw.pinned_parent_replace_supported()
+        )
+        assert "preserve_access_control_from" in kwargs
+        if handler_pins or aw.ACCESS_CONTROL_XATTRS_SUPPORTED:
+            assert isinstance(kwargs["preserve_access_control_from"], int)
+            assert captured["source_bytes"] == b"hello world"
+        else:  # pragma: no cover - exercised on Windows CI only
+            assert kwargs["preserve_access_control_from"] is None
+        assert kwargs["mode"] == stat.S_IMODE(tmp_file.stat().st_mode)
+        assert tmp_file.read_text(encoding="utf-8") == "updated"
+        # Off the event loop (no-blocking-call-on-event-loop): every call in the
+        # transaction is a blocking filesystem call, so a network-backed path
+        # would otherwise freeze chat and the heartbeat -- and atomic_write's
+        # Windows rename retry degrades to a single attempt on a loop thread.
+        assert captured["thread"] != threading.current_thread().ident
+
+    @pytest.mark.asyncio
+    async def test_write_refuses_a_final_component_swapped_to_a_link(
+        self, tmp_path, mock_sel, home_patch, monkeypatch
+    ):
+        """A TOCTOU swap of the final component into a link is a 4xx, not a 500.
+
+        ``_validate_dashboard_path`` canonicalizes through ``realpath``, so the
+        path reaching the handler is symlink-free by construction and a leaf link
+        is followed to its target exactly as it was before this change. The
+        ``O_NOFOLLOW`` in ``open_access_control_source`` therefore only closes
+        the window where that component is swapped for a link AFTER the check.
+        When it fires, that is a rejected target rather than a server fault: the
+        handler returns 404 (matching the steering peer's ``notfound``) and
+        ``atomic_write`` is never reached.
+        """
+        from kiro_crew.dashboard.handlers import files as files_mod
+
+        target = tmp_path / "real.md"
+        target.write_text("protected", encoding="utf-8")
+
+        def swapped_under_us(*args, **kwargs):
+            raise OSError(errno.ELOOP, "symbolic link loop")
+
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("atomic_write must not run once the open is refused")
+
+        monkeypatch.setattr(files_mod, "open_access_control_source", swapped_under_us)
+        monkeypatch.setattr(files_mod, "atomic_write", fail_if_called)
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post(
+                "/api/file-write", json={"path": str(target), "content": "attacker"}
+            )
+            assert resp.status == 404
+            assert (await resp.json())["code"] == "not_found"
+        assert target.read_text(encoding="utf-8") == "protected"
+        mock_sel.log_tool_invocation.assert_called_with(
+            session_key="dashboard",
+            tool_name="file_write",
+            outcome="not_found",
+            resources=str(target),
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(os.name == "nt", reason="creating a symlink on Windows needs elevation")
+    async def test_write_follows_a_leaf_symlink_to_its_canonical_target(
+        self, tmp_path, mock_sel, home_patch
+    ):
+        """Writing a leaf symlink lands on its target, as it did before.
+
+        Stated as a test because the ACL carry added an ``os.open`` on the write
+        path, and it must not change which inode a save reaches: ``realpath``
+        resolution happens in the path guard, upstream of everything here.
+        """
+        real = tmp_path / "real.md"
+        real.write_text("old", encoding="utf-8")
+        link = tmp_path / "link.md"
+        link.symlink_to(real)
+
+        async with TestClient(TestServer(_make_app())) as client:
+            resp = await client.post("/api/file-write", json={"path": str(link), "content": "new"})
+            assert resp.status == 200
+        assert real.read_text(encoding="utf-8") == "new"
+        assert link.is_symlink()
+
 
 def _make_send_app(state) -> web.Application:
     app = web.Application()
@@ -490,7 +618,7 @@ class TestSendMessage:
         with patch(
             "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock
         ) as mock_run, patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -535,7 +663,7 @@ class TestSendMessage:
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
         with patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -597,7 +725,7 @@ class TestSendMessage:
         with patch(
             "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock
         ) as mock_run, patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history",
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async",
             return_value=mock_slot,
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
@@ -623,6 +751,52 @@ class TestSendMessage:
                 state.notify.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_send_message_session_origin_rehydrate_reads_off_the_loop(self):
+        """The cold-slot rehydration must not parse the transcript on the loop.
+
+        Issue #7408: this handler called the SYNCHRONOUS rehydrate, which read and
+        JSON-parsed the whole transcript inline -- 100-300 ms on a large store,
+        stalling every other request. Asserted by thread identity rather than by
+        the name of the function called, so the guarantee survives a rename.
+        """
+        from kiro_crew.dashboard import chat_persistence
+
+        state = _mock_state()
+        state.get_slot = MagicMock(return_value=None)
+        state.conversation_log = MagicMock()
+        state._slots = {}
+        mock_job = MagicMock()
+        mock_job.id = "abc12345"
+        mock_job.name = "test-cron"
+        mock_job.session_key = "dashboard:chat-1-1712793600"
+        state.crons.list_jobs = MagicMock(return_value=[mock_job])
+        app = _make_send_app(state)
+        seen: list[int] = []
+
+        def _prefetch(*_a, **_kw):
+            seen.append(threading.get_ident())
+            # messages=None means "nothing persisted", so the handler falls back to
+            # the notification path -- keeping this test about the read's location.
+            return ({}, True, None, {}, None)
+
+        with patch.object(chat_persistence, "_prefetch_rehydrate_inputs", _prefetch):
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.post(
+                    "/api/send-message",
+                    json={"text": "update", "session": "origin", "caller_session": "cron:abc12345"},
+                )
+                assert resp.status == 200
+
+        assert seen, (
+            "the off-loop prefetch never ran: either the read is happening inline "
+            "on the loop again (the #7408 defect) or this seam moved"
+        )
+        assert threading.get_ident() not in seen, (
+            "the transcript was read on the event-loop thread; the handler must "
+            "await rehydrate_slot_from_history_async"
+        )
+
+    @pytest.mark.asyncio
     async def test_send_message_session_origin_rehydrate_returns_none_falls_back(self):
         """When get_slot returns None AND rehydrate returns None (no persisted
         session on disk), fall back to normal delivery (notification + optional
@@ -637,7 +811,7 @@ class TestSendMessage:
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
         with patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history", return_value=None
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async", return_value=None
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -692,7 +866,7 @@ class TestSendMessage:
         app = _make_send_app(state)
         with patch(
             "kiro_crew.dashboard.chat_runner._run_chat", new_callable=AsyncMock
-        ) as mock_run, patch("kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"):
+        ) as mock_run, patch("kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"):
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
                     "/api/send-message",
@@ -715,7 +889,7 @@ class TestSendMessage:
         state.get_slot = MagicMock()
         app = _make_send_app(state)
         with patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(
@@ -753,7 +927,7 @@ class TestSendMessage:
         state.crons.list_jobs = MagicMock(return_value=[mock_job])
         app = _make_send_app(state)
         with patch(
-            "kiro_crew.dashboard.handlers.messaging._rehydrate_slot_from_history"
+            "kiro_crew.dashboard.handlers.messaging.rehydrate_slot_from_history_async"
         ) as mock_rehydrate:
             async with TestClient(TestServer(app)) as client:
                 resp = await client.post(

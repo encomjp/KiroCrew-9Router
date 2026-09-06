@@ -108,7 +108,17 @@ async def api_kiro_hooks(request: web.Request) -> web.Response:
     # escaped as an unhandled 500 — and degrades the same way: no user hooks.
     # Off-loop: the reader stats + reads up to the size cap, and this handler
     # runs on the gateway event loop (review-adopted, no-blocking-call rule).
-    raw = await asyncio.to_thread(_read_agent_spec, agent_cfg)
+    # The labels are passed explicitly: they name the SEL denial event's
+    # operation and interface channel, and without them a refusal here is
+    # recorded under the reader's ``list_agents`` defaults -- attributing a
+    # hooks request's denial to an agent-listing cache warm, the exact
+    # misattribution the labels exist to prevent.
+    raw = await asyncio.to_thread(
+        _read_agent_spec,
+        agent_cfg,
+        operation="api_kiro_hooks",
+        source="dashboard",
+    )
     # The reader guarantees the TOP level is an object, not the "hooks" value:
     # a user-writable {"hooks": []} would reach hooks.items() below and escape
     # as a 500. Same degrade-as-absent rule as every other unusable shape.

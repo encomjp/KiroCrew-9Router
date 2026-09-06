@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pod-e2e.sh <worktree-name> [--keep] [--no-stop] [--api-only] [--fe-only] [--video]
+# pod-e2e.sh <worktree-name> [--keep] [--no-stop] [--api-only] [--fe-only] [--video] [--no-suppress-first-run]
 #
 # Run the full e2e flow for ONE worktree against an ISOLATED pod instance,
 # never touching the live gateway:
@@ -21,6 +21,7 @@ set -uo pipefail
 
 # ---------------------------------------------------------------- args ----
 NAME="" ; KEEP=0 ; NO_STOP=0 ; RUN_API=1 ; RUN_FE=1 ; VIDEO=0
+NO_SUPPRESS_FIRST_RUN=0
 for a in "$@"; do
   case "$a" in
     --keep)     KEEP=1 ;;
@@ -28,11 +29,14 @@ for a in "$@"; do
     --api-only) RUN_FE=0 ;;
     --fe-only)  RUN_API=0 ;;
     --video)    VIDEO=1 ;;
+    # Documented in SKILL.md and accepted by pod-playwright.py; without this
+    # arm the catch-all below rejects the documented spelling with exit 64.
+    --no-suppress-first-run) NO_SUPPRESS_FIRST_RUN=1 ;;
     -*)         echo "unknown flag: $a" >&2; exit 64 ;;
     *)          NAME="$a" ;;
   esac
 done
-[ -n "$NAME" ] || { echo "usage: pod-e2e.sh <worktree-name> [--keep] [--no-stop] [--api-only] [--fe-only] [--video]" >&2; exit 64; }
+[ -n "$NAME" ] || { echo "usage: pod-e2e.sh <worktree-name> [--keep] [--no-stop] [--api-only] [--fe-only] [--video] [--no-suppress-first-run]" >&2; exit 64; }
 # Pod names are [a-zA-Z0-9._-] without leading dots — reject anything that
 # could traverse paths (slashes, '..') before NAME is used in any path.
 case "$NAME" in
@@ -281,18 +285,68 @@ if [ "$PORT" = "5476" ] || [ "$PORT" = "7777" ]; then
 fi
 
 # ---------------------------------------------------------------- health --
-log "waiting for health on $BASE_URL ..."
+# Identity-gated, deliberately NOT a bare probe of base_url. A pod's port is
+# derived from its name across 199 slots and can be pinned by hand, so it is
+# routinely held by another pod or by the live gateway -- and every Kiro Crew
+# gateway answers /api/health with the same body, so a 200 from that port proves
+# only that SOMETHING is there. `pod status --json` reports the pod's OWN health:
+# the HTTP code when the process a 127.0.0.1 connect reaches is this pod's own
+# gateway, 0 when nothing answers, and -2 when the responder is provably somebody
+# else's. Curling base_url here would accept a stranger's 200 and hand every
+# later phase -- auth, API tests, Playwright, the artifacts -- a pod this run
+# never booted.
+log "waiting for health on $NAME ($BASE_URL) ..."
 HEALTHY=0
-for i in $(seq 1 45); do
-  CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE_URL/api/health" 2>/dev/null || echo "000")
-  if [ "$CODE" = "200" ] || [ "$CODE" = "401" ] || [ "$CODE" = "403" ]; then
-    HEALTHY=1; break
-  fi
+FOREIGN=0
+# Overridable so a slow host can wait longer, and so the phase is drivable in a
+# test without sitting out the real deadline. Validated as 1-6 plain decimal
+# digits BEFORE any arithmetic, and read with an explicit 10# base, because a
+# plain typo in this env var otherwise breaks the run three different ways:
+#   abc    -> inside $(( )) bash reads it as a variable NAME; under `set -u`
+#             that is "abc: unbound variable" and the run dies (exit 127).
+#   08     -> a leading zero means octal, and 08 is not valid octal:
+#             "value too great for base", the run dies (exit 1).
+#   1e24   -> no error at all: the deadline lands centuries out and the poll
+#             never gives up. For an unattended harness a silent hang is worse
+#             than a crash, which is what the 6-digit cap (~11 days) closes.
+# All three die or hang BEFORE any verdict or the summary is printed, so the
+# value is normalized here rather than trusted at the point of use.
+HEALTH_TIMEOUT="${POD_E2E_HEALTH_TIMEOUT:-60}"
+case "$HEALTH_TIMEOUT" in
+  ''|*[!0-9]*) HEALTH_TIMEOUT="" ;;
+esac
+if [ -z "$HEALTH_TIMEOUT" ] || [ "${#HEALTH_TIMEOUT}" -gt 6 ]; then
+  echo "pod-e2e: ignoring POD_E2E_HEALTH_TIMEOUT='${POD_E2E_HEALTH_TIMEOUT:-}' (want 1-6 decimal digits of seconds); using 60" >&2
+  HEALTH_TIMEOUT=60
+fi
+HEALTH_DEADLINE=$(( $(date +%s) + 10#$HEALTH_TIMEOUT ))
+# Probe FIRST, test the deadline after -- a do-while, not a while. `date +%s` has
+# whole-second resolution, so a pre-test loop reads a clock that may already have
+# ticked past the deadline computed one fork earlier, and skips its body. The body
+# is the only place HEALTHY is set, so that zero-probe run reports "never became
+# healthy" about a pod nobody ever asked. The window is one fork wide, which is
+# invisible at the 60s default and near-certain to bite at the 1s a test uses.
+while :; do
+  CODE=$("$KIROCREW_CLI" pod status "$NAME" --json 2>/dev/null \
+    | python3 -c 'import sys,json;print(json.load(sys.stdin).get("health",0))' 2>/dev/null \
+    || echo 0)
+  case "$CODE" in
+    200|401|403) HEALTHY=1; break ;;
+    # Keep polling: a predecessor may still be releasing the port. Remembered so
+    # the timeout names the conflict instead of blaming the worktree build.
+    -2)          FOREIGN=1 ;;
+  esac
+  # Deadline reached: stop without burning a final pointless sleep.
+  [ "$(date +%s)" -lt "$HEALTH_DEADLINE" ] || break
   sleep 1
 done
 if [ "$HEALTHY" -eq 0 ]; then
   "$KIROCREW_CLI" pod logs "$NAME" -n 50 > "$ARTIFACT_DIR/boot-fail.log" 2>&1 || true
-  fail "health — pod never became healthy (45s timeout, see boot-fail.log)"
+  if [ "$FOREIGN" -eq 1 ]; then
+    fail "health — :$PORT is held by another process, not this pod's gateway; pin a free PORT= for $NAME (see boot-fail.log)"
+  else
+    fail "health — pod never became healthy (${HEALTH_TIMEOUT}s timeout, see boot-fail.log)"
+  fi
 fi
 
 # ---------------------------------------------------------------- auth ----
@@ -355,6 +409,7 @@ if [ "$RUN_FE" -eq 1 ] && [ "$HEALTHY" -eq 1 ]; then
     PW_ARGS=("$PW_RUNNER" --base-url "$BASE_URL" --artifact-dir "$ARTIFACT_DIR" --checkout "$CHECKOUT")
     PW_ARGS+=(--teardown-timeout "${POD_E2E_TEARDOWN_TIMEOUT:-30}")
     [ "$VIDEO" -eq 1 ] && PW_ARGS+=(--video)
+    [ "$NO_SUPPRESS_FIRST_RUN" -eq 1 ] && PW_ARGS+=(--no-suppress-first-run)
     # Declarative manifest parse: extract ONLY the PLAYWRIGHT_SPEC value.
     # The manifest is branch-controlled — never source/eval it on the host.
     PLAYWRIGHT_SPEC=""

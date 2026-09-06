@@ -6,6 +6,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { OverflowMenu, breadcrumbSegments } from '../components/MarkdownPanel'
 import { api } from '../api/client'
+import { i18nT } from '../i18n/t'
 
 vi.mock('../api/client', () => ({
   api: {
@@ -14,6 +15,27 @@ vi.mock('../api/client', () => ({
     createArtifact: vi.fn(),
     revealPath: vi.fn(),
   },
+  // revealOrOpen branches its failure wording on `err instanceof ApiError`, so
+  // the mock must export a real class — a bare object would make `instanceof`
+  // throw before the alert fires.
+  ApiError: class ApiError extends Error {
+    status: number
+    authRequired: boolean
+    constructor(status: number, message: string, _body = '', authRequired = false) {
+      super(message)
+      this.name = 'ApiError'
+      this.status = status
+      this.authRequired = authRequired
+    }
+  },
+}))
+
+// The overflow's Open/Reveal entries gate on directLocal (a remote session
+// cannot usefully drive Finder on the gateway). Default to a local session so
+// the inventory/label assertions see them; the remote case is its own test.
+const brandingEnv = vi.hoisted(() => ({ directLocal: true }))
+vi.mock('../hooks/useBranding', () => ({
+  useBranding: () => ({ botName: 'Test', avatar: '', directLocal: brandingEnv.directLocal }),
 }))
 
 const writeText = vi.fn()
@@ -26,6 +48,7 @@ const wrapper = ({ children }: { children: React.ReactNode }) => (
 
 beforeEach(() => {
   writeText.mockReset()
+  brandingEnv.directLocal = true
   queryClient.clear()
   // happy-dom's navigator.clipboard is getter-only; defineProperty replaces it.
   Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
@@ -35,10 +58,15 @@ beforeEach(() => {
   // Desktop present by default: the backend acted, nothing to copy back.
   vi.mocked(api).revealPath = vi.fn().mockResolvedValue({ ok: true })
   vi.spyOn(window, 'alert').mockImplementation(() => {})
+  overflowError.mockReset()
 })
 
+/** Where a standalone OverflowMenu reports a failed row action (the panel
+ *  renders it through ErrorNotice in production). */
+const overflowError = vi.fn()
+
 function openMenu() {
-  render(<OverflowMenu filePath="/tmp/hello.txt" content={'line one\nline two\n'} />, { wrapper })
+  render(<OverflowMenu onError={overflowError} filePath="/tmp/hello.txt" content={'line one\nline two\n'} />, { wrapper })
   fireEvent.click(screen.getAllByRole('button')[0])
 }
 
@@ -69,7 +97,7 @@ describe('MarkdownPanel OverflowMenu', () => {
   })
 
   it('Copy content copies an empty string for an empty file without throwing', () => {
-    render(<OverflowMenu filePath="/tmp/empty.txt" content="" />, { wrapper })
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/empty.txt" content="" />, { wrapper })
     fireEvent.click(screen.getAllByRole('button')[0])
     fireEvent.click(screen.getByText('Copy content'))
     expect(writeText).toHaveBeenCalledExactlyOnceWith('')
@@ -104,6 +132,19 @@ describe('MarkdownPanel OverflowMenu', () => {
     expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
   })
 
+  // A remote/tunneled session cannot usefully open Finder on the gateway, so
+  // the two desktop hand-off entries are gated on directLocal — matching the
+  // shared FilePathMenu, which self-gates on the same flag. The clipboard and
+  // download fallbacks stay.
+  it('hides both desktop hand-off entries on a remote session (directLocal false)', () => {
+    brandingEnv.directLocal = false
+    openMenu()
+    expect(screen.queryByText('Open with default app')).not.toBeInTheDocument()
+    expect(screen.queryByText('Show in file manager')).not.toBeInTheDocument()
+    expect(screen.getByText('Copy path')).toBeInTheDocument()
+    expect(screen.getByText('Copy content')).toBeInTheDocument()
+  })
+
   /**
    * The reveal entry names the GATEWAY's file manager: `/api/reveal` shells out
    * there, so a dashboard opened from a Mac against a Linux gateway must not say
@@ -130,20 +171,28 @@ describe('MarkdownPanel OverflowMenu', () => {
     expect(screen.queryByText('Open in File Explorer')).not.toBeInTheDocument()
   })
 
-  it('tells the user the path was copied when the host has no desktop', async () => {
+  // The copy-fallback confirmation is centralized in api.revealPath itself
+  // (client.ts), right next to its copyToClipboard call, so every call site —
+  // including this panel — is covered without a local alert. Asserting no
+  // local alert here guards against double-notifying once the panel resolves
+  // through the (mocked) real client.
+  it('does not alert locally when the mocked backend resolves with a copy fallback', async () => {
     vi.mocked(api).revealPath = vi.fn().mockResolvedValue({ ok: true, copy: '/tmp/hello.txt' })
     openMenu()
     fireEvent.click(screen.getByText('Show in file manager'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith(
-      'Path copied to clipboard (no desktop available)',
-    ))
+    await waitFor(() => expect(api.revealPath).toHaveBeenCalled())
+    expect(window.alert).not.toHaveBeenCalled()
   })
 
-  it('surfaces the server message when the reveal is refused', async () => {
+  it('shows the shared i18n failure message when the reveal is refused', async () => {
+    // The overflow funnels reveal failures through the shared FilePathMenu path,
+    // which shows a neutral catalog string rather than leaking the raw server
+    // message (which could name an internal path or reason).
     vi.mocked(api).revealPath = vi.fn().mockRejectedValue(new Error('access denied'))
     openMenu()
     fireEvent.click(screen.getByText('Open with default app'))
-    await waitFor(() => expect(window.alert).toHaveBeenCalledWith('access denied'))
+    await waitFor(() => expect(overflowError).toHaveBeenCalledWith(i18nT('components.filePathMenu.reveal_failed')))
+    expect(window.alert).not.toHaveBeenCalled()
   })
 })
 
@@ -185,7 +234,7 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
 
   it('renders exactly six entries with no optional props and no library match', async () => {
     stubKnowledge({ enabled: false, alreadyAdded: false })
-    render(<OverflowMenu filePath="/tmp/hello.bin" content="x" />, { wrapper })
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/hello.bin" content="x" />, { wrapper })
     fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
     await waitFor(() => expect(screen.getByText('Add to artifacts')).toBeInTheDocument())
     expect(itemsInOrder()).toEqual([
@@ -203,7 +252,7 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
     vi.mocked(api).artifacts = vi.fn().mockResolvedValue({ artifacts: [{ slug: 'notes-md', name: 'notes.md' }] })
     vi.mocked(api).artifact = vi.fn().mockResolvedValue({ live_dirty: false, pinned: false })
     render(
-      <OverflowMenu
+      <OverflowMenu onError={overflowError}
         filePath="/tmp/notes.md"
         content="x"
         onRefresh={vi.fn()}
@@ -231,7 +280,7 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
   it('swaps Full screen for Exit full screen without changing the rest of the list', async () => {
     stubKnowledge({ enabled: false, alreadyAdded: false })
     render(
-      <OverflowMenu filePath="/tmp/hello.bin" content="x" onFullscreen={vi.fn()} fullscreen />,
+      <OverflowMenu onError={overflowError} filePath="/tmp/hello.bin" content="x" onFullscreen={vi.fn()} fullscreen />,
       { wrapper },
     )
     fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
@@ -261,7 +310,7 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
       headers: new Headers({ 'X-Truncated': 'true' }),
       text: () => Promise.resolve('the first 512 KB only'),
     }) as never
-    render(<OverflowMenu filePath="/tmp/huge.txt" content={'prefix'} />, { wrapper })
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/huge.txt" content={'prefix'} />, { wrapper })
     fireEvent.click(screen.getAllByRole('button')[0])
     fireEvent.click(await screen.findByText('Add to artifacts'))
 
@@ -275,7 +324,7 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
       headers: new Headers(),
       text: () => Promise.resolve('the whole file'),
     }) as never
-    render(<OverflowMenu filePath="/tmp/small.txt" content={'the whole file'} />, { wrapper })
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/small.txt" content={'the whole file'} />, { wrapper })
     fireEvent.click(screen.getAllByRole('button')[0])
     fireEvent.click(await screen.findByText('Add to artifacts'))
 
@@ -287,7 +336,7 @@ describe('OverflowMenu inventory (regression guard for #1083)', () => {
 
   it('renders the already-in-library row as a non-actionable status, not a menu item', async () => {
     stubKnowledge({ enabled: true, alreadyAdded: true })
-    render(<OverflowMenu filePath="/tmp/notes.md" content="x" />, { wrapper })
+    render(<OverflowMenu onError={overflowError} filePath="/tmp/notes.md" content="x" />, { wrapper })
     fireEvent.click(screen.getByTestId('markdown-panel-more-options'))
     await waitFor(() => expect(screen.getByText('In Library')).toBeInTheDocument())
     // It is a <span>: nothing happens when it is activated, so exposing it to
@@ -314,7 +363,7 @@ describe('OverflowMenu roving-focus tint', () => {
 
   it('focuses the first row on open and tints rows only under :focus-visible', async () => {
     render(
-      <OverflowMenu filePath="/tmp/notes.md" content="x" onRefresh={vi.fn()} onFullscreen={vi.fn()} />,
+      <OverflowMenu onError={overflowError} filePath="/tmp/notes.md" content="x" onRefresh={vi.fn()} onFullscreen={vi.fn()} />,
       { wrapper },
     )
     fireEvent.click(screen.getByTestId('markdown-panel-more-options'))

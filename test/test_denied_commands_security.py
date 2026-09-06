@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from kiro_crew import security
 from kiro_crew.security import (
     _GIT_PUBLISH_RULE_PATTERNS,
     BUILTIN_DENIED_RULES,
@@ -32,13 +33,15 @@ _GOLDEN = Path(__file__).parent / "fixtures" / "denied_commands_golden.json"
 
 
 class TestCatalog:
-    def test_catalog_has_137_unique_ids(self):
+    def test_catalog_ids_are_unique(self):
         # 130 patterns ported byte-exact from the retired agent-config
         # deniedCommands list + 7 legacy security.py globs (secret-fetch tool
-        # names + boto3 underscore destructive forms) restored as regexes.
-        assert len(BUILTIN_DENIED_RULES) == 140
+        # names + boto3 underscore destructive forms) restored as regexes,
+        # plus later additions (e.g. the dev-mode out-of-install confirmation
+        # flag, #6907).
+        assert len(BUILTIN_DENIED_RULES) == 149
         ids = [r.id for r in BUILTIN_DENIED_RULES]
-        assert len(set(ids)) == 140
+        assert len(set(ids)) == 149
 
     def test_token_mint_is_blocked_in_both_the_cli_and_module_forms(self):
         """`kirocrew token` mints a signed dashboard token that authenticates to EVERY gateway
@@ -177,7 +180,7 @@ class TestCatalog:
     def test_patterns_match_manifest_verbatim(self):
         golden = json.loads(_GOLDEN.read_text(encoding="utf-8"))
         golden_by_id = {g["id"]: g for g in golden}
-        assert len(golden_by_id) == 140
+        assert len(golden_by_id) == 149
         for rule in BUILTIN_DENIED_RULES:
             g = golden_by_id[rule.id]
             assert rule.pattern == g["pattern"]
@@ -191,7 +194,7 @@ class TestCatalog:
 
     def test_builtin_denied_rules_accessor_returns_dicts(self):
         rules = builtin_denied_rules()
-        assert len(rules) == 140
+        assert len(rules) == 149
         first = rules[0]
         assert set(first.keys()) == {"id", "pattern", "category", "description"}
         assert isinstance(first["id"], str)
@@ -228,6 +231,12 @@ class TestSelfProtectionFlagInterposition:
         # tempered-greedy pattern, so it needs no widening/floor from this PR -- it
         # is listed here only to satisfy the category-completeness invariant.
         "self-protection-cron-adopt": "kirocrew {flags} cron adopt",
+        # Keys on the flag LITERAL itself (plain substring), so interposed
+        # flags anywhere in the command cannot separate the anchor from the
+        # token the rule matches — the flag IS the token.
+        "self-protection-dev-mode-out-of-root-confirm": (
+            "kirocrew {flags} app dev my-app --confirm-out-of-install-root"
+        ),
         # The kill rules key on the kill TARGET, not a CLI subcommand; their gap
         # is between the kill verb and the product name.
         "self-protection-kill": "pkill {flags} kirocrew",
@@ -450,25 +459,39 @@ class TestSelfProtectionFlagInterposition:
         rule joining the floor cannot silently skip all three walks. The kill
         rules key on a kill target, not a CLI subcommand, and the credential
         mint rule is outside the self-protection category -- neither has a
-        ``kirocrew ...`` template, so the derivation excludes them.
+        ``kirocrew ...`` template, so the derivation excludes them. The
+        dev-mode confirm rule's template does start with ``kirocrew``, but its
+        floor keys on the FLAG literal, not the subcommand words -- the
+        subcommand walks would quote ``app dev`` alone, which must stay
+        allowed without the flag -- so it is carved out explicitly and gets
+        its own quoting cross in
+        ``test_dev_mode_confirm_flag_denied_under_quote_splitting``.
         """
         from kiro_crew import security
 
+        flag_keyed_floor_ids = {"self-protection-dev-mode-out-of-root-confirm"}
         floor_subcommand_ids = {
             rule_id
             for rule_id in security._SELF_PROTECTION_FLOOR_RULE_IDS
             if self._TEMPLATES.get(rule_id, "").startswith("kirocrew ")
+            and rule_id not in flag_keyed_floor_ids
         }
         assert set(self._SUBCOMMANDS) == floor_subcommand_ids, (
             "every floor-listed kirocrew-subcommand rule must register its "
             "words in _SUBCOMMANDS (and every _SUBCOMMANDS entry must be "
             "floor-listed), or the shell-dressing walks silently skip it"
         )
+        # every flag-keyed carve-out must still be floor-listed -- the carve-out
+        # exempts a rule from the SUBCOMMAND walks, never from the floor itself
+        assert flag_keyed_floor_ids <= set(security._SELF_PROTECTION_FLOOR_RULE_IDS)
         # the predicate for each is wired and fires on a de-escaped argv
         assert security._is_self_restart("kirocrew -\\v restart")
         assert security._is_self_update("kirocrew \\update")
         assert security._is_self_gateway_restart("kirocrew -\\v gateway restart")
         assert security._is_self_cloud_destructive("kirocrew -\\v cloud destroy")
+        assert security._is_dev_mode_out_of_root_confirm(
+            "kirocrew app dev x --confirm-out-of-install-'root'"
+        )
 
     def test_self_protection_denied_under_interposed_redirection(self):
         """A redirection is removed from argv by the shell and can sit anywhere in
@@ -693,10 +716,21 @@ class TestIsDeniedDualMatching:
     def test_malformed_regex_alone_allows(self):
         assert is_denied("some benign thing", denied_regexes=["(unclosed"]) is None
 
-    def test_git_publish_still_blocks_with_empty_denied_regexes(self):
-        # Git-publish floor runs before the tiers and is independent of the
-        # disableable regex tier.
-        assert is_denied("git push origin main", denied_regexes=[]) is not None
+    def test_git_publish_floor_honours_the_per_rule_opt_out(self):
+        # The floor runs before the tiers, but each of its GATED branches is now
+        # consulted against the effective set, so an operator who disabled every
+        # built-in has disabled these too. That is the point of the gating: a
+        # toggle the UI offers must not be a silent no-op in either direction.
+        assert is_denied("git push origin main", denied_regexes=[]) is None
+        # ``None`` fails closed to all built-ins enabled, so the default path
+        # still denies.
+        assert is_denied("git push origin main") is not None
+
+    def test_git_publish_unverifiable_glue_is_never_opt_out_able(self):
+        # Substitution glue fuses text into the push target, so the destination
+        # cannot be determined at all. This branch carries no per-rule gate — it
+        # is what keeps the gated branches non-bypassable.
+        assert is_denied("git push origin ma$(echo)in", denied_regexes=[]) is not None
 
 
 class TestLazyPossessiveGapSplit:
@@ -848,25 +882,39 @@ class TestUserPatternExactSemantics:
         assert m._disabled is False
         assert m._bounded is False  # built-in → fast fragment path
 
-    def test_documented_bound_user_only_builtins_full_input(self):
-        # DOCUMENTED TRADE-OFF (see security.md / _DenyMatcher.match): a USER
-        # custom regex is matched only over the first _DENY_FALLBACK_SCAN_MAX_CHARS
-        # chars (exact semantics + ReDoS-safety, at the cost of full-input —
-        # Python's re can't give all three). The built-in SECURITY FLOOR is NOT
-        # bounded: a destructive built-in after a long prefix in one segment is
-        # still caught at full length.
-        from kiro_crew.security import _DENY_FALLBACK_SCAN_MAX_CHARS
+    def test_documented_bound_applies_only_where_the_bounded_engine_is_needed(self):
+        # The residual cap is NARROWER than "any user regex". A pattern that splits
+        # into ONE fragment (no top-level ``.*``) is matched full-input whoever
+        # authored it: one fragment means no gap the forward-only matcher could
+        # fail to backtrack across, so its single ``re.search`` already has exact
+        # ``re.search`` semantics and the cap buys nothing. Padding past the cap
+        # therefore no longer defeats a plain user or edition rule — that was a
+        # bypass of a rule the panel advertises as enforcing, not a trade-off worth
+        # keeping. What still needs the bounded engine, and so still truncates: a
+        # pattern whose fragments can over-consume across a ``.*`` gap, where the
+        # linear matcher would UNDER-match and let a denied command through.
+        from kiro_crew.security import _DENY_FALLBACK_SCAN_MAX_CHARS, _DenyMatcher
 
         # Built-in floor: full-input (no truncation) — a >cap prefix in the SAME
         # segment does not hide a destructive built-in.
         long_prefix = "export X=" + ("a" * (_DENY_FALLBACK_SCAN_MAX_CHARS + 500)) + " ; rm -rf /"
         assert is_denied(long_prefix) is not None
-        # User custom rule: bounded — the documented residual. A benign pad past
-        # the cap before the user's own needle escapes the user's own rule.
+
+        # Single-fragment user rule: now FULL-INPUT. A pad past the cap no longer
+        # escapes the user's own rule.
         pat = r"my-custom-danger"
         pad = "x" * (_DENY_FALLBACK_SCAN_MAX_CHARS + 100)
-        assert is_denied(f"{pad}{pat}", denied_regexes=[pat]) is None  # documented gap
-        assert is_denied(pat, denied_regexes=[pat]) is not None  # normal-length: enforced
+        assert _DenyMatcher(pat)._bounded is False
+        assert is_denied(f"{pad}{pat}", denied_regexes=[pat]) is not None
+        assert is_denied(pat, denied_regexes=[pat]) is not None
+
+        # Still bounded, and still truncating: a non-final fragment ending in a
+        # greedy variable-width quantifier can over-consume across the gap, so this
+        # one keeps the exact-but-capped engine.
+        greedy = r"needle \S+ .* tail"
+        assert _DenyMatcher(greedy)._bounded is True
+        assert is_denied(f"{pad}needle zzz qqq tail", denied_regexes=[greedy]) is None
+        assert is_denied("needle zzz qqq tail", denied_regexes=[greedy]) is not None
 
 
 class TestIsDeniedReDoSResistance:
@@ -1039,7 +1087,7 @@ class TestIsDeniedReDoSResistance:
 
           1. ROUTING — the chain rules take the full-input fragment path (never the bounded
              whole-regex fallback, whose truncation cap is pinned separately by
-             ``test_documented_bound_user_only_builtins_full_input``), and every fragment they
+             ``test_documented_bound_applies_only_where_the_bounded_engine_is_needed``), and every fragment they
              split into is a plain literal, so each is one forward ``re.search`` scan with no
              variable-width backtracking;
           2. INVOCATIONS — doubling the adversarial input leaves the engine-invocation trace
@@ -3247,6 +3295,24 @@ class TestCredentialMintSegmentScoping:
     @pytest.mark.parametrize(
         "cmd",
         [
+            f"bash -c'{_NAME} {_TOK}'",  # glued single-quoted
+            f'bash -c"{_NAME} {_TOK}"',  # glued double-quoted
+            f"sh -ec'{_NAME} {_TOK}'",  # letters before the c in the cluster
+            f"bash -lc'{_NAME} {_TOK}'",
+            f"sh -c'{_NAME} >/tmp/o {_TOK}'",  # redirect form needs the descent
+        ],
+    )
+    def test_glued_shell_flag_payload_still_blocked(self, cmd):
+        # With NO space after the `-c`, the payload rides INSIDE the flag token
+        # once shlex strips the quotes (`-c'<mint>'` -> one token).  The bare-flag
+        # pattern rejects a token carrying the payload's own characters, so the
+        # glued spelling was examined by NO consumer of the shared extractor --
+        # this floor included (#8197).
+        assert _denied_by(cmd) == _RULE_MINT
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
             f"{_NAME}>/tmp/out {_TOK}",
             f"{_NAME}>>/tmp/out {_TOK}",
             f"{_NAME} {_TOK}>/tmp/out",
@@ -3559,6 +3625,150 @@ class TestSelfFloorShortCircuit:
         assert security._is_credential_mint(cmd)
 
 
+class TestSelfKillArgvWindowIsQuoteAware:
+    """The bare-``kill`` argv window survives a QUOTED close-paren decoy (#8633).
+
+    ``_substitution_depth_delta`` counts parens on tokens the tokenizer already
+    stripped the quotes from, so ``kill $(printf ')' ; pgrep -f <name>)`` scored
+    the quoted paren as a real closer, ended the window at the ``;``, and
+    dropped the ``pgrep`` clause that names the target -- while bash, whose
+    substitution scan is quote-aware, runs that ``pgrep`` (measured).  The fix
+    re-derives the window's substitution bodies from the RAW text through the
+    same quote-aware span scan the extractor uses, as a UNION with the token
+    walk, so no previously-detected spelling is dropped.
+    """
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # the decoy class from the issue: a quoted ')' inside the body
+            "kill $(printf ')' ; pgrep -f {n})",
+            # same decoy through the backtick spelling of the substitution
+            "kill `printf ')' ; pgrep -f {n}`",
+            # the kill matched at any argv position, as the token walk does
+            "sudo kill $(printf ')' ; pgrep -f {n})",
+            # the decoy inside a nested shell payload is the same command
+            'sh -c \'kill $(printf ")" ; pgrep -f {n})\'',
+            # a quoted separator is DATA: bash hands kill the substitution too
+            "kill 123 ';' $(pgrep -f {n})",
+            # ``&>`` is a redirect of the SAME command, not a separator: bash
+            # runs ``kill <substitution output>`` (pre-push review, measured)
+            "kill &>/dev/null $(printf ')' ; pgrep -f {n})",
+            # ``>|`` (noclobber override) is the last separator-charactered
+            # member of the redirect grammar -- same rule, measured
+            # (server-side GPT review round 4)
+            "kill >|/dev/null $(printf ')' ; pgrep -f {n})",
+            # an escaped backtick is DATA inside a backtick body, so it must
+            # not be taken as the closer (pre-push review, measured)
+            "kill `printf '\\`' ; pgrep -f {n}`",
+            # a proven substitution INSIDE double quotes must not swallow the
+            # rest of the line: the ``;`` after it is a real separator and the
+            # kill segment after it is still scanned (pre-push review, measured)
+            'echo "$(date)" ; kill $(printf \')\' ; pgrep -f {n})',
+            # the decoy fully inside double quotes: bash parses the body in a
+            # fresh quote context, so the interior ')' stays data
+            "kill \"$(printf ')' ; pgrep -f {n})\"",
+            # quote-SPLICED kill: bash passes the word ``kill``, so the spliced
+            # spelling with the decoy must not slip both union halves
+            # (server-side GPT review, measured)
+            "k''ill $(printf ')' ; pgrep -f {n})",
+            "k'i'll $(printf ')' ; pgrep -f {n})",
+            '"ki"ll $(printf \')\' ; pgrep -f {n})',
+            # an EMPTY substitution expands to nothing, so ``kill$()`` is the
+            # word ``kill`` -- the glue exclusion must not eat the anchor
+            # (server-side GPT review round 2, measured)
+            "kill$() $(printf ')' ; pgrep -f {n})",
+            "kill$( ) $(pgrep -f {n})",
+            # a NON-empty body can still expand to nothing at runtime
+            # (``$(:)``, ``$(true)``), which no static scan decides -- a FIRST
+            # word whose pre-glue prefix is ``kill`` keeps its anchor
+            # (server-side GPT review round 3, measured)
+            "kill$(:) $(pgrep -f {n})",
+            "kill$(:) $(printf ')' ; pgrep -f {n})",
+            "kill$(true) `pgrep -f {n}`",
+            # a variable an EARLIER command assigned the verb to reaches the
+            # raw walk spelled ``$k`` while the token walk sees it resolved --
+            # so the decoyed alias slipped both union halves (server-side GPT
+            # review round 5, measured)
+            "k=kill; $k $(printf ')' ; pgrep -f {n})",
+            "k=kill; ${{k}} $(printf ')' ; pgrep -f {n})",
+            "x=/usr/bin/kill; $x $(printf ')' ; pgrep -f {n})",
+            # a command-position substitution whose OUTPUT is the verb: the
+            # undecoyed spelling is already token-detected, so only the
+            # decoyed combination needed the raw anchor (server-side GPT
+            # review round 6, measured)
+            "`printf kill` $(printf ')' ; pgrep -f {n})",
+            "$(echo kill) $(printf ')' ; pgrep -f {n})",
+        ],
+    )
+    def test_quoted_paren_decoy_is_still_a_self_kill(self, cmd):
+        assert _denied_by(cmd.format(n=_NAME)) == _RULE_KILL
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # the undecorated control the issue names
+            "kill $(pgrep -f {n})",
+            # an unbalanced span is UNPROVEN: fail closed, scan the remainder
+            "kill $(pgrep -f {n}",
+            # decoyed AND unbalanced: only the raw pass sees this one, so it is
+            # what discriminates its fail-closed remainder from an empty body
+            "kill $(printf ')' ; pgrep -f {n}",
+        ],
+    )
+    def test_control_spellings_remain_detected(self, cmd):
+        assert _denied_by(cmd.format(n=_NAME)) == _RULE_KILL
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # the issue's documented intentional non-detections: the name is an
+            # operand of a DIFFERENT command, so the fix must not widen the
+            # window into denying them
+            "kill 8123 && cp /tmp/{n}.json ~/",
+            "kill 123; echo $(cat /tmp/{n})",
+            # a comment is prose, not a command: bash never runs the pgrep
+            "kill 123 # $(pgrep -f {n})",
+            # single quotes make the whole thing data for echo
+            "echo 'kill $(pgrep -f {n})'",
+            # a substitution BEFORE the kill word is an environment word's
+            # value, not the kill's operand -- the exact false positive the
+            # token walk's own scoping replaced (pre-push review)
+            "LOG=$(ls /tmp/{n}.log) kill 4242",
+            "nice -n $(cat /opt/{n}/etc/nice) kill -TERM 4242",
+            # ``kill...`` glued to a substitution is an ARGUMENT of echo, not
+            # a program: bash runs only the echo (pre-push review)
+            "echo kill$(printf {n})",
+            # same glue, with a LATER substitution naming the product: the
+            # glued word must not anchor the forward window either
+            "echo kill$(printf x) $(pgrep -f {n})",
+            # a proven double-quoted substitution must not absorb the rest of
+            # the line into the kill's window (pre-push review)
+            'kill "$(printf 123)"; echo {n}',
+            'kill "$(printf 123)" && cp /tmp/{n}.json ~/',
+        ],
+    )
+    def test_scoped_non_detections_stay_allowed(self, cmd):
+        assert _denied_by(cmd.format(n=_NAME)) is None
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # a REAL pipe or or-list still separates -- only the redirect
+            # spellings (``2>&1``, ``&>``, ``>|``) ride inside a word.
+            # Predicate-level: the raw regex TIER matches these across the
+            # pipe on main too (its ``[^;&#>]`` class admits ``|``), so the
+            # public-gate verdict is owned by that tier, not this walk.
+            "kill 123 | grep $(cat /tmp/{n})",
+            "kill 123 || echo $(cat /tmp/{n})",
+        ],
+    )
+    def test_pipe_still_separates_the_argv_window(self, cmd):
+        from kiro_crew import security
+
+        assert security._is_self_kill(cmd.format(n=_NAME).lower()) is False
+
+
 class TestStdinProgramTextScoping:
     """A stdin-reading interpreter is judged on its PROGRAM, not on its neighbours.
 
@@ -3779,3 +3989,2569 @@ class TestStdinProgramTextScoping:
             f"echo {rule.pattern!r} >> notes.txt",
         ):
             assert security.is_denied(cmd) is None, f"rule fires on its own text: {cmd!r}"
+
+
+class TestDevModeConfirmFlagIsAgentInaccessible:
+    """`--confirm-out-of-install-root` must be unreachable from an agent shell.
+
+    The flag is the operator's explicit attestation for granting app dev mode
+    on a UI root OUTSIDE the app's install directory (#6907), and the grant
+    relaxes the unauthenticated UI route's root containment. Without this rule
+    an auto-approved Bash tool could pass the flag itself and convert shell
+    access into a self-granted serving grant on an arbitrary host directory —
+    the exact self-grant path the confirmation gate exists to close. Two tiers
+    enforce it: the catalog rule matches the flag's literal text (direct form,
+    nested shell payloads, quoted interpreter argv), and the paired argv floor
+    (``_is_dev_mode_out_of_root_confirm``) re-checks the DE-ESCAPED text and
+    tokenized argv, because quote-splitting inside the token
+    (``--confirm-out-of-install-'root'``) reaches argparse as the accepted
+    flag while the raw text never carries the literal.
+    """
+
+    def test_the_flag_is_denied_in_direct_and_nested_forms(self):
+        from kiro_crew import security
+
+        for cmd in (
+            "kirocrew app dev my-app --confirm-out-of-install-root",
+            'bash -c "kirocrew app dev my-app --confirm-out-of-install-root"',
+            "python3 -c \"import subprocess; subprocess.run("
+            "['kirocrew','app','dev','x','--confirm-out-of-install-root'])\"",
+        ):
+            assert security.is_denied(cmd) is not None, f"not denied: {cmd!r}"
+
+    def test_dev_mode_confirm_flag_denied_under_quote_splitting(self):
+        """Quoting splits the flag in RAW text but the shell strips it, so the
+        de-quoted argv still carries the accepted flag -- the argv floor must
+        deny every spelling the raw-text regex cannot see."""
+        from kiro_crew import security
+
+        for cmd in (
+            "kirocrew app dev my-app --confirm-out-of-install-'root'",
+            'kirocrew app dev my-app --confirm-out-of-install-"root"',
+            'kirocrew app dev my-app "--confirm-out-of-install-root"',
+            "kirocrew app dev my-app '--confirm-out-of-install-root'",
+            'kirocrew app dev my-app --confirm-out-of-install-ro""ot',
+            "kirocrew app dev my-app --confirm\\-out-of-install-root",
+            "kirocrew app dev my-app --'confirm'-out-of-install-root",
+            "bash -c \"kirocrew app dev my-app --confirm-out-of-install-'root'\"",
+        ):
+            assert security.is_denied(cmd) is not None, f"not denied: {cmd!r}"
+
+    def test_ordinary_dev_toggles_stay_allowed(self):
+        """The rule targets the attestation flag, not the dev-mode verb —
+        in-install dev-mode toggles remain an ordinary agent operation."""
+        from kiro_crew import security
+
+        assert security.is_denied("kirocrew app dev my-app") is None
+        assert security.is_denied("kirocrew app dev my-app --off") is None
+
+
+class TestSelfModuleIndexIsLinear:
+    """The self-protection floor's module-flag scan must stay LINEAR in token count.
+
+    ``_self_module_name_index`` walked forward from an interpreter token to the first
+    module flag, normalizing every token it passed.  ``_self_program_index`` called it
+    for every python-looking token and ``_matches_self_subcommand`` looped that over all
+    tokens, so a command of interpreter words with no module flag among them re-walked
+    and re-normalized the whole tail once per word: quadratic, on a floor that runs for
+    every command.
+
+    Reaching it needs only one product word anywhere in the text, which is what opens
+    the floor's cheap keyword gate (``_self_floor_can_fire``).  Padding alone does NOT
+    reproduce it -- ``python ... restart`` leaves that gate shut and the path is linear,
+    which is why the shape below carries ``kirocrew``.  Measured on base:
+    0.035 s / 0.125 s / 0.490 s / 1.937 s / 7.704 s at 250/500/1000/2000/4000 tokens,
+    4x per doubling, against 0.0027 s -> 0.0414 s after -- 186x at 4 000 tokens, and
+    the negative-verdict spelling pays the same cost to decide nothing.
+
+    The scan and the normalized forms are now computed once per token list.  Both the
+    verdicts and the complexity are pinned, since a rewrite that changed which token the
+    scan stops at would silently change what the floor denies.
+    """
+
+    # Every branch of the scan, with the index it must return for the interpreter at 0.
+    SHAPES: "list[tuple[list[str], object]]" = [
+        (["python", "-m", "kiro_crew", "restart"], 2),
+        (["python", "-mkiro_crew", "restart"], 1),
+        # A -m<something-else> is an ordinary interpreter flag: the scan must CONTINUE
+        # past it rather than stop, or the real module flag after it is never seen.
+        (["python", "-mjson", "-m", "kiro_crew"], 3),
+        (["python", "-msomething", "-mkiro_crew"], 2),
+        (["python", "-u", "-O", "-m", "kiro_crew"], 4),
+        # -m present but the module is not ours, and -m as the final token.
+        (["python", "-m", "json"], None),
+        (["python", "-m"], None),
+        (["python"], None),
+        (["python", "-mjson"], None),
+        # Quoting and dotted submodules the normalizer resolves.
+        (["python", "-m", "'kiro_crew'"], 2),
+        (["python", "-m", "kiro_crew.cli"], 2),
+    ]
+
+    def test_the_returned_index_is_unchanged(self):
+        from kiro_crew import security
+
+        for tokens, expected in self.SHAPES:
+            scan = security._self_module_flag_scan(list(tokens))
+            assert security._self_module_name_index(list(tokens), 0, scan) == expected, tokens
+
+    def test_a_shared_scan_answers_as_a_fresh_one_does(self):
+        """The scan is built once per frame and reused for every token in it, so a
+        stale or mismatched table would answer differently from one built for the call.
+        Pinned at every interpreter position, since that reuse is the whole optimization.
+        """
+        from kiro_crew import security
+
+        for tokens, expected in self.SHAPES:
+            shared = security._self_module_flag_scan(list(tokens))
+            for i in range(len(tokens)):
+                fresh = security._self_module_flag_scan(list(tokens))
+                assert security._self_module_name_index(
+                    list(tokens), i, shared
+                ) == security._self_module_name_index(list(tokens), i, fresh), (tokens, i)
+            assert security._self_module_name_index(list(tokens), 0, shared) == expected
+
+    def test_the_scan_is_a_required_argument(self):
+        """Not optional-with-a-fallback: this is called once per token by a loop over
+        those tokens, so a caller able to omit the scan could silently reintroduce the
+        quadratic. A type error is the point."""
+        import inspect
+
+        from kiro_crew import security
+
+        for fn in (security._self_module_name_index, security._self_program_index):
+            param = inspect.signature(fn).parameters["scan"]
+            assert param.default is inspect.Parameter.empty, fn.__name__
+
+    def test_the_floor_verdicts_are_unchanged(self):
+        from kiro_crew import security
+
+        for text in (
+            "kirocrew restart",
+            "python -m kiro_crew restart",
+            "python -mkiro_crew restart",
+            "python -mjson -m kiro_crew restart",
+            "python -msomething -m kiro_crew restart",
+            "python -u -O -m kiro_crew restart",
+            "python -m 'kiro_crew' restart",
+            "python -m kiro_crew -v restart",
+            "python python -m kiro_crew restart",
+        ):
+            assert security._is_self_restart(text), text
+
+        for text in (
+            "kirocrew doctor",
+            "python -m kiro_crew",
+            "python restart",
+            "python -m pytest test/test_restart.py",
+            "echo kirocrew restart",
+        ):
+            assert not security._is_self_restart(text), text
+
+    def test_the_stop_predicate_matches_the_handling(self):
+        from kiro_crew import security
+
+        for token in ("-m", "-mkiro_crew", "-mkiro_crew.cli"):
+            assert security._is_self_module_flag(token), token
+        # Not a stop: the scan has to keep going past these.
+        for token in ("-mjson", "-msomething", "python", "-u", "", "kiro_crew"):
+            assert not security._is_self_module_flag(token), token
+
+    def test_the_scan_is_linear_not_quadratic(self, monkeypatch):
+        """What makes the scan linear is asserted DETERMINISTICALLY, not by timing.
+
+        A timed doubling ratio cannot separate this property from the runner: on a
+        starved shared CI host, scheduler noise, GC pauses, and frequency scaling
+        inflate the ratio past any bound tight enough to catch the quadratic (a run
+        was observed failing the 3x ratio while the absolute budget below passed
+        with 2.1x headroom -- the red measured the runner, not the code), so the
+        ratio form false-reds PRs whose diff never touches this scan. The linearity
+        is structural, so it is asserted structurally, the same two-layer strategy
+        as ``test_mid_dotstar_chain_spam_stays_linear``. A regression has to break
+        one of these to reintroduce the quadratic:
+
+          1. PRECOMPUTE ONCE PER FRAME -- ``_self_module_flag_scan`` (the single
+             pair of linear passes that replaced the per-interpreter-token re-walk)
+             runs exactly once for the frame, however many interpreter tokens the
+             frame holds;
+          2. WORK PER TOKEN IS CONSTANT -- the ``_normalize_operand`` AND
+             ``_is_self_module_flag`` call counts each grow as an exact arithmetic
+             progression in the token count (equal size steps produce equal call
+             increments). The quadratic this test pins against re-normalized the
+             remaining tail once per interpreter token, which makes the increments
+             themselves grow with the size and breaks the progression. The flag
+             predicate is counted SEPARATELY because a cheaper regression shape
+             exists that never re-normalizes: a per-token forward walk over the
+             already-precomputed ``scan.norm`` (losing the ``stops`` O(1) jump)
+             keeps the normalize count linear, but it must consult the stop
+             predicate once per walked token, so that count goes quadratic and
+             breaks its progression.
+
+        The absolute budget stays as the machine-independent catastrophic-blowup
+        backstop: the pre-fix quadratic spent 1.94s where the bound is 0.5s, and it
+        also catches cost added outside the instrumented calls, where the counts
+        cannot see it.
+        """
+        import time
+
+        from kiro_crew import security
+
+        def build(n: int) -> str:
+            return " ".join(["python"] * n + ["kirocrew", "restart"])
+
+        # Backstop budget, measured BEFORE instrumenting (the counting wrappers
+        # below would bill their own overhead against it). The input is built
+        # OUTSIDE the timed window, and one untimed small-size call warms the
+        # path first, so first-call cost is not billed against the budget when
+        # this test runs alone.
+        security._is_self_restart(build(250))
+        text = build(2000)
+        start = time.perf_counter()
+        assert security._is_self_restart(text) is True
+        large = time.perf_counter() - start
+        # Base spent 1.94 s here; a quadratic scan cannot come near this ceiling.
+        assert large < 0.5, f"2k tokens took {large:.3f}s"
+
+        real_scan = security._self_module_flag_scan
+        real_norm = security._normalize_operand
+        real_flag = security._is_self_module_flag
+        counts = {"scan": 0, "norm": 0, "flag": 0}
+
+        def counting_scan(tokens: "list[str]") -> "security._SelfModuleScan":
+            counts["scan"] += 1
+            return real_scan(tokens)
+
+        def counting_norm(token: str) -> str:
+            counts["norm"] += 1
+            return real_norm(token)
+
+        def counting_flag(tok: str) -> bool:
+            counts["flag"] += 1
+            return real_flag(tok)
+
+        monkeypatch.setattr(security, "_self_module_flag_scan", counting_scan)
+        monkeypatch.setattr(security, "_normalize_operand", counting_norm)
+        monkeypatch.setattr(security, "_is_self_module_flag", counting_flag)
+
+        def measured(n: int) -> "tuple[int, int, int]":
+            counts["scan"] = counts["norm"] = counts["flag"] = 0
+            # The verdict must still be reached THROUGH the instrumented path, or
+            # the counts below are counting nothing.
+            assert security._is_self_restart(build(n)) is True
+            return counts["scan"], counts["norm"], counts["flag"]
+
+        results = [measured(n) for n in (500, 1000, 1500)]
+
+        # (1) The precompute runs once per frame, independent of the token count.
+        for scans, _, _ in results:
+            assert scans == 1, (
+                f"_self_module_flag_scan ran {scans} times for one frame -- a "
+                "per-token caller is the quadratic re-walk the precompute removed"
+            )
+
+        # (2) Per-token work is constant: equal size steps, equal call increments,
+        # for BOTH instrumented costs (see the docstring for why each has teeth).
+        for name, series in (
+            ("normalize", [norm for _, norm, _ in results]),
+            ("module-flag-predicate", [flag for _, _, flag in results]),
+        ):
+            assert series[0] > 500, (
+                f"the instrument is not observing the path under test -- fewer "
+                f"{name} calls than tokens means the scan never saw the frame"
+            )
+            assert series[1] - series[0] == series[2] - series[1], (
+                f"{name} counts {series} are not an arithmetic progression -- the "
+                "per-token cost grows with the input, which is the super-linear "
+                "re-walk this precompute exists to prevent"
+            )
+
+    def test_the_padded_shape_that_does_not_open_the_gate_stays_cheap(self):
+        """Pins the reason the reported reproduction did not reproduce: without a
+        product word the floor's keyword gate stays shut and nothing is scanned."""
+        from kiro_crew import security
+
+        assert not security._self_floor_can_fire("python restart")
+        assert security._self_floor_can_fire("python kirocrew")
+
+
+class TestPythonStdinDetectorStepsOverOutputRedirects:
+    """An OUTPUT redirect must not be mistaken for the interpreter's script path.
+
+    ``_python_reads_stdin`` decides whether a ``python`` invocation takes its PROGRAM
+    from stdin, and the credential-mint floor uses that to know whether to scan the
+    stdin carriers (here-string, heredoc, redirect, pipe producer) for a payload that
+    imports our CLI.  It read the raw token for ``<`` and for heredocs but had no branch
+    for the ``>`` family at all, so those tokens fell through to "a positional that is
+    not ``-`` is a script path" and the answer became False.
+
+    The unnumbered glued form survived by accident: ``_normalize_operand`` reduces
+    ``>out.txt`` to the empty string and the loop skips empties.  ``2>&1`` reduces to
+    ``2`` -- a perfectly good file name -- so the interpreter looked like it was running
+    a script called ``2``, and the program on its stdin went unscanned.  Eight spellings
+    reached the floor that way, verified against bash to actually run the here-string:
+
+        python 2>&1 <<< '<program>'          python 2>> log <<< '<program>'
+        python 1>&2 <<< '<program>'          python >& out <<< '<program>'
+        python 2> /dev/null <<< '<program>'  python 3>&1 <<< '<program>'
+        python > out.txt <<< '<program>'     python <<< '<program>' 2>&1
+
+    The last one is worth its own note: the here-string is consumed correctly there, and
+    a redirect AFTER it still flipped the verdict, because the walk continues past the
+    carrier and met the leftover ``2``.  So this was not only about redirects preceding
+    the payload.
+    """
+
+    # Program-on-stdin shapes: True. Bash was measured for each -- every one runs the
+    # here-string program.
+    READS_STDIN: "list[list[str]]" = [
+        ["2>&1", "<<<", "prog"],
+        ["1>&2", "<<<", "prog"],
+        ["2>", "/dev/null", "<<<", "prog"],
+        [">", "out.txt", "<<<", "prog"],
+        [">out.txt", "<<<", "prog"],
+        ["2>>", "log", "<<<", "prog"],
+        [">&", "out", "<<<", "prog"],
+        ["3>&1", "<<<", "prog"],
+        ["&>/dev/null", "<<<", "prog"],
+        ["&>>", "log", "<<<", "prog"],
+        ["12>&1", "<<<", "prog"],
+        ["2>&-", "<<<", "prog"],
+        ["2>&1-", "<<<", "prog"],
+        # The noclobber override and the {name} automatic descriptor (bash 4.1+), both
+        # raised in review. Measured in bash 5.2: every one runs the here-string.
+        ["2>|", "/dev/null", "<<<", "prog"],
+        ["2>|/dev/null", "<<<", "prog"],
+        [">|", "f", "<<<", "prog"],
+        ["{fd}>", "f", "<<<", "prog"],
+        ["{fd}>f", "<<<", "prog"],
+        ["{fd}>&1", "<<<", "prog"],
+        ["{fd}>>", "f", "<<<", "prog"],
+        ["{fd}>|", "f", "<<<", "prog"],
+        # A following operator glued into the SAME word starts a new redirect, so the
+        # target must stop there. Taking all of `/dev/null<<EOF` as the target swallows
+        # the heredoc marker and loses the program on stdin. Measured in bash: both run.
+        ["2>/dev/null<<EOF", "prog", "EOF"],
+        [">out<<EOF", "prog", "EOF"],
+        ["2>&1<<<prog"],
+        ["2>/dev/null<<<prog"],
+        ["2>>log<<<prog"],
+        ["&>/dev/null<<<prog"],
+        ["{fd}>f<<<prog"],
+        ["2>a>b<<<prog"],
+        # A redirect INSIDE a substitution belongs to that inner command and is not a
+        # boundary of this word: after the shell runs it, `2>$(printf /dev/null)` is just
+        # `2>/dev/null`. Measured in bash: all of these run the here-string.
+        ["2>$(echo>/dev/null;printf", "/dev/null)", "<<<", "prog"],
+        ["2>`echo>/dev/null;printf", "/dev/null`", "<<<", "prog"],
+        [">$(echo>x;printf", "out)", "<<<", "prog"],
+        ["2>${x:-/dev/null}", "<<<", "prog"],
+        ["2>$(printf", "/dev/null)", "<<<", "prog"],
+        # A subshell or brace group NESTED in the substitution closes with its own `)`
+        # or `}`. Depth must count those too, and the word must reach the scan with its
+        # delimiters intact -- the tokenizer splits on the space, so this arrives as the
+        # word `2>$(`, and `_SHELL_WRAPPER_CHARS` would otherwise strip the opener off.
+        ["2>$(", "(true);", "printf", "/dev/null)", "<<<", "prog"],
+        ["2>$(", "(true)", ";", "printf", "/dev/null", ")", "<<<", "prog"],
+        ["2>$(", "{", "true;", "printf", "/dev/null;", "}", ")", "<<<", "prog"],
+        # PowerShell's all-streams redirect. Included on the floor's fail-closed rule:
+        # under PowerShell `*>` is the operator and the program arrives on stdin, while
+        # under bash `*` is a glob whose first match becomes the script. Answering True
+        # over-triggers under bash and under-triggers under neither.
+        ["*>", "token.txt", "<<<", "prog"],
+        ["*>>", "token.txt", "<<<", "prog"],
+        ["*>token.txt", "<<<", "prog"],
+        # zsh's `!` noclobber override, the third modifier in the set. Measured with real
+        # zsh: `python >! out <<< '<program>'` runs the here-string.
+        [">!", "out", "<<<", "prog"],
+        [">>!", "out", "<<<", "prog"],
+        ["2>!", "out", "<<<", "prog"],
+        ["&>!", "out", "<<<", "prog"],
+        ["2>>!", "out", "<<<", "prog"],
+        [">!out", "<<<", "prog"],
+        # A redirect needs no whitespace in front of it, so it can ride on the back of a
+        # FLAG. Measured in bash: `python -u> out <<< '<program>'` runs the here-string.
+        ["-u>", "/dev/null", "<<<", "prog"],
+        ["-u>/dev/null", "<<<", "prog"],
+        ["-B>", "out", "<<<", "prog"],
+        ["-u2>", "err", "<<<", "prog"],
+        ["-u>>", "out", "<<<", "prog"],
+        ["-u>!", "out", "<<<", "prog"],
+        ["2>&1", "1>&2", "<<<", "prog"],
+        ["<<<", "prog", "2>&1"],
+        ["-u", "2>&1", "<<<", "prog"],
+        ["2>&1", "-u", "<<<", "prog"],
+        # No carrier at all: a bare interpreter still reads its program from stdin.
+        ["2>&1"],
+        ["2>&1", "-"],
+        # The redirect TARGET must be consumed, not run: `python 2> script.py`
+        # redirects into that file and still reads its program from stdin.
+        ["2>", "script.py"],
+        [">", "script.py"],
+        ["2>script.py"],
+    ]
+
+    # The program comes from somewhere else: False, redirect or no redirect.
+    SUPPLIES_PROGRAM_ELSEWHERE: "list[list[str]]" = [
+        ["2>&1", "script.py"],
+        ["script.py", "2>&1"],
+        ["2>", "/dev/null", "script.py"],
+        [">", "out.txt", "script.py"],
+        ["2>&1", "-c", "code"],
+        ["-c", "code", "2>&1"],
+        ["2>&1", "-m", "mod"],
+        ["-m", "mod", "2>&1"],
+        # Measured in bash: after these redirects a real script still supplies the
+        # program, so stepping over the redirect must not mean ignoring what follows.
+        ["2>|", "f", "script.py"],
+        ["{fd}>&1", "script.py"],
+        ["{fd}>", "f", "script.py"],
+        # A redirect glued to a POSITIONAL: the script still supplies the program, so the
+        # word must be split and its prefix classified rather than skipped. Measured in
+        # bash: `python script.py> out <<< '<program>'` runs the script.
+        ["script.py>", "out"],
+        ["script.py>out"],
+        ["-c>", "out", "code"],
+    ]
+
+    def test_the_glue_point_is_only_a_trailing_redirect(self):
+        """None when the word has no `>`, or already starts with one -- a leading file
+        descriptor belongs to the redirect, and the shell reads digits as an fd only when
+        they are the whole prefix (`2>err` is fd 2; `x2>err` is the word `x2`)."""
+        from kiro_crew import security
+
+        assert security._redirect_glue_point("-u>") == 2
+        assert security._redirect_glue_point("-u>/dev/null") == 2
+        assert security._redirect_glue_point("-u2>err") == 3
+        assert security._redirect_glue_point("script.py>out") == 9
+        for token in (">out", "2>err", "&>f", "*>f", "{fd}>f", "-u", "script.py", ""):
+            assert security._redirect_glue_point(token) is None, token
+
+    def test_a_brace_expansion_is_not_read_as_a_descriptor(self):
+        """``{fd}>`` is an automatic descriptor; ``{a,b}`` is a brace EXPANSION the shell
+        resolves before redirect parsing. Only an identifier may sit in the braces, or an
+        ordinary argument could be swallowed as a redirect."""
+        from kiro_crew import security
+
+        assert security._output_redirect_scan("{fd}>&1") == ("1", 7)
+        assert security._output_redirect_scan("{fd}>") == ("", 5)
+        for token in ("{a,b}>x", "{1..3}>x", "{}>x", "{a b}>x"):
+            assert security._output_redirect_scan(token) is None, token
+
+    def test_a_program_on_stdin_is_detected_through_an_output_redirect(self):
+        from kiro_crew import security
+
+        for tokens in self.READS_STDIN:
+            assert security._python_reads_stdin(list(tokens)) is True, tokens
+
+    def test_a_script_or_inline_program_still_wins(self):
+        from kiro_crew import security
+
+        for tokens in self.SUPPLIES_PROGRAM_ELSEWHERE:
+            assert security._python_reads_stdin(list(tokens)) is False, tokens
+
+    def test_the_redirect_helper_reports_target_and_end_position(self):
+        """Three distinct answers. A glued target ends at the word's end; an empty target
+        at the word's end means the target is the NEXT token; an end short of the word
+        means another operator followed and must be re-examined, not eaten."""
+        from kiro_crew import security
+
+        assert security._output_redirect_scan("2>&1") == ("1", 4)
+        assert security._output_redirect_scan(">out.txt") == ("out.txt", 8)
+        assert security._output_redirect_scan("&>/dev/null") == ("/dev/null", 11)
+        assert security._output_redirect_scan("2>") == ("", 2)
+        assert security._output_redirect_scan(">&") == ("", 2)
+        assert security._output_redirect_scan("2>>") == ("", 3)
+        # An end short of len() is where the glued-heredoc bypass lived.
+        assert security._output_redirect_scan("2>/dev/null<<EOF") == ("/dev/null", 11)
+        assert security._output_redirect_scan("2>&1<f") == ("1", 4)
+        assert security._output_redirect_scan(">a>b") == ("a", 2)
+        assert security._output_redirect_scan("2></dev/null") == ("", 2)
+        # Scanning from an offset is how a chain is walked in one pass.
+        assert security._output_redirect_scan(">a>b", 2) == ("b", 4)
+        # A redirect is a boundary only at substitution depth ZERO. Inside `$(...)`,
+        # `${...}` or backticks it belongs to the inner command, and cutting there left
+        # the tail of the substitution to be read as a script path.
+        assert security._output_redirect_scan("2>$(echo>/dev/null;printf") == (
+            "$(echo>/dev/null;printf",
+            25,
+        )
+        assert security._output_redirect_scan("2>`echo>x`") == ("`echo>x`", 10)
+        assert security._output_redirect_scan("2>${x:->}") == ("${x:->}", 9)
+        # Depth counts EVERY opener, not just a `$`-prefixed one: a nested subshell
+        # closes with its own `)`, and ignoring it drops the depth to zero early.
+        assert security._output_redirect_scan("2>$( (x)>y )") == ("$( (x)>y )", 12)
+        assert security._output_redirect_scan("2>$(") == ("$(", 4)
+        # PowerShell's all-streams descriptor, and the glob spellings it must NOT eat.
+        assert security._output_redirect_scan("*>") == ("", 2)
+        assert security._output_redirect_scan("*>>") == ("", 3)
+        assert security._output_redirect_scan("*>token.txt") == ("token.txt", 11)
+        for token in ("*", "*.py", "*.txt"):
+            assert security._output_redirect_scan(token) is None, token
+
+    def test_the_descriptor_and_modifier_sets_are_the_enumerated_ones(self):
+        """The two sets are enumerated from the shells' grammars, not grown one spelling
+        per review round. Asserted here so the boundary is a test rather than a comment:
+        descriptors are digits, ``&``, ``{name}`` and ``*``; modifiers are ``&``, ``|``
+        and ``!``."""
+        from kiro_crew import security
+
+        for descriptor in ("", "2", "12", "&", "*", "{fd}"):
+            for operator in (">", ">>"):
+                for modifier in ("", "&", "|", "!"):
+                    token = f"{descriptor}{operator}{modifier}"
+                    assert security._output_redirect_scan(token) is not None, token
+        # A modifier outside the set is part of the TARGET, not the operator.
+        assert security._output_redirect_scan(">?x") == ("?x", 3)
+        assert security._output_redirect_scan(">^x") == ("^x", 3)
+        # ...and the boundary still applies once the substitution has closed.
+        assert security._output_redirect_scan("2>$(printf x)>b") == ("$(printf x)", 13)
+        # Not output redirects, and must not be swallowed as such.
+        for token in ("script.py", "-u", "-", "<<<", "<<PY", "<f", "2", "", "-c"):
+            assert security._output_redirect_scan(token) is None, token
+
+    def test_a_chain_of_glued_redirects_is_linear(self, monkeypatch):
+        """One word may hold many operators (``>a>a>a...``). Re-slicing the word per
+        operator was quadratic in its length -- on a floor that runs for every command,
+        and in a module that pins linearity elsewhere, so it is pinned here too.
+
+        Asserted DETERMINISTICALLY, not by timing: a doubling ratio false-reds on a
+        starved shared runner whose scheduler noise exceeds the ratio's slack (see
+        ``test_the_scan_is_linear_not_quadratic`` for the observed case), so what
+        makes the walk linear is asserted structurally instead. The fix's contract is
+        that a chain word is walked ONCE, IN PLACE: ``_output_redirect_scan`` returns
+        an index precisely so the caller can advance through the same string rather
+        than re-slice it. A regression has to break one of these:
+
+          1. ONE SCAN PER OPERATOR -- the ``_output_redirect_scan`` invocation
+             count grows as an exact arithmetic progression in the chain length
+             (equal size steps produce equal call increments; per-operator
+             re-injection or retry work makes the increments themselves grow);
+          2. THE FULL WORD EVERY TIME -- every invocation receives a string of the
+             chain word's full length. Re-slicing the remainder per operator (the
+             quadratic) hands the scan progressively shorter COPIES, each of which
+             costs the slice that made it;
+          3. THE START INDEX ADVANCES -- strictly increasing within the word, never
+             reset to 0, so each character is visited once.
+
+        The absolute budget stays as the machine-independent catastrophic-blowup
+        backstop for cost added outside the scan, where the trace cannot see it.
+        """
+        import time
+
+        from kiro_crew import security
+
+        # Backstop budget, measured BEFORE instrumenting (the tracing wrapper below
+        # would bill its own overhead against it). The input is built OUTSIDE the
+        # timed window, and one untimed small-size call warms the path first, so
+        # first-call cost is not billed against the budget when this test runs
+        # alone.
+        security._python_reads_stdin([">a" * 200, "<<<", "prog"])
+        tokens = [">a" * 1600, "<<<", "prog"]
+        start = time.perf_counter()
+        assert security._python_reads_stdin(tokens) is True
+        large = time.perf_counter() - start
+        assert large < 0.2, f"1600 glued redirects took {large:.4f}s"
+
+        real_scan = security._output_redirect_scan
+        trace: "list[tuple[int, int]]" = []  # (len(raw), start)
+
+        def tracing_scan(raw: str, start: int = 0) -> "tuple[str, int] | None":
+            trace.append((len(raw), start))
+            return real_scan(raw, start)
+
+        monkeypatch.setattr(security, "_output_redirect_scan", tracing_scan)
+
+        def walked(k: int) -> "list[tuple[int, int]]":
+            trace.clear()
+            word = ">a" * k
+            assert security._python_reads_stdin([word, "<<<", "prog"]) is True
+            return list(trace)
+
+        sizes = (400, 800, 1200)
+        walks = [walked(k) for k in sizes]
+
+        # (1) One scan per operator: equal size steps, equal call increments.
+        # The progression form (rather than exact doubling) is deliberately
+        # immune to a constant per-word offset, so a benign refactor that adds
+        # one trailing probe call does not false-red this test.
+        calls = [len(w) for w in walks]
+        assert calls[0] >= sizes[0], (
+            "the instrument is not observing the path under test -- fewer scans "
+            "than operators means the chain was never walked"
+        )
+        assert calls[1] - calls[0] == calls[2] - calls[1], (
+            f"scan counts {calls} for chain sizes {sizes} are not an arithmetic "
+            "progression -- per-operator work that scales with the chain is the "
+            "re-slicing quadratic the in-place walk exists to prevent"
+        )
+
+        # (2) + (3) The walk is in place: every scan sees the FULL word and the
+        # start index only ever advances.
+        for walk, k in zip(walks, sizes):
+            word_len = len(">a" * k)
+            assert {length for length, _ in walk} == {word_len}, (
+                "a scan received a string shorter than the chain word -- the "
+                "remainder is being re-sliced per operator, which is quadratic "
+                "in the word's length"
+            )
+            starts = [position for _, position in walk]
+            assert all(a < b for a, b in zip(starts, starts[1:])), (
+                "the scan's start index went backwards or repeated -- the walk "
+                "restarted inside the word instead of advancing through it once"
+            )
+
+    def test_the_floor_denies_the_stdin_program_behind_a_redirect(self):
+        """The end-to-end property: these are credential-mint attempts whose program
+        rides in on stdin, and each was ALLOWED before this change."""
+        from kiro_crew import security
+
+        payload = "from kiro_crew.cli import main; main()"
+        for cmd in (
+            f"python 2>&1 <<< '{payload}'",
+            f"python 1>&2 <<< '{payload}'",
+            f"python 2> /dev/null <<< '{payload}'",
+            f"python > out.txt <<< '{payload}'",
+            f"python 2>> log <<< '{payload}'",
+            f"python >& out <<< '{payload}'",
+            f"python 3>&1 <<< '{payload}'",
+            f"python 2>&1 1>&2 <<< '{payload}'",
+            f"python <<< '{payload}' 2>&1",
+            f"echo '{payload}' | python 2>&1",
+            f"python 2>&1 << 'PY'\n{payload}\nPY",
+            # Raised in review, measured in bash 5.2.
+            f"python 2>| /dev/null <<< '{payload}'",
+            f"python >| out <<< '{payload}'",
+            f"python {{fd}}>&1 <<< '{payload}'",
+            f"python {{fd}}> out <<< '{payload}'",
+            # Glued mixed operators, measured in bash.
+            f"python 2>/dev/null<<EOF\n{payload}\nEOF",
+            f"python >out<<EOF\n{payload}\nEOF",
+            f"python 2>&1<<<'{payload}'",
+            # A redirect nested in a substitution, measured in bash.
+            f"python 2>$(echo>/dev/null;printf /dev/null) <<< '{payload}'",
+            f"python 2>`echo>/dev/null;printf /dev/null` <<< '{payload}'",
+            f"python 2>$( (true); printf /dev/null) <<< '{payload}'",
+            f"python 2>$( {{ true; printf /dev/null; }} ) <<< '{payload}'",
+            # PowerShell's all-streams redirect with the program on a pipe.
+            f"echo '{payload}' | python *> token.txt",
+            f"echo '{payload}' | python *>> token.txt",
+            # A redirect glued to a flag, measured in bash.
+            f"python -u> /dev/null <<< '{payload}'",
+            f"python -B> out <<< '{payload}'",
+        ):
+            assert security._is_credential_mint(cmd.lower()), cmd
+
+    def test_the_floor_still_allows_the_ordinary_shapes(self):
+        from kiro_crew import security
+
+        payload = "from kiro_crew.cli import main; main()"
+        for cmd in (
+            "python script.py",
+            f"python script.py <<< '{payload}'",
+            "python -m json.tool",
+            "python 2>&1 script.py",
+            "ls -la 2>&1",
+            "pytest test/test_x.py 2>&1 | tail -5",
+            # Reading `*>` as a redirect must not start denying ordinary commands: with
+            # no payload-bearing carrier there is nothing for the floor to fire on.
+            "python *> out",
+            "python *.py > out",
+            "pytest tests/ *> out",
+        ):
+            assert not security._is_credential_mint(cmd.lower()), cmd
+
+
+class TestOutputRedirectScanQuoting:
+    """A bare opener in a redirect target is not grammar (issue #8634).
+
+    ``_output_redirect_scan``'s span walk counted every ``(``/``{`` as a depth
+    opener. The tokenizer that feeds it resolves quoting, so a QUOTED ``(`` --
+    one filename character to bash -- arrived bare, opened a span that never
+    closed, and the target ran past the ``<<<``/``<<`` that should have ended
+    it; a bare ``{`` needs no quoting at all. The stdin program then went
+    unscanned -- the same consequence the scan's own docstring describes for a
+    glued heredoc marker. Third site of the #8150 class. The rule that closes
+    it: at depth zero only a ``$``-prefixed opener starts a substitution span.
+    Quote characters that reach the scan are DATA (the tokenizer already
+    resolved quoting), so the walk must not read them as grammar either --
+    the review-found inverse defect.
+    """
+
+    def test_the_quoted_paren_bypass_is_denied_end_to_end(self):
+        """The public consequence, through the production tokenizer (which strips
+        the quotes; the scan sees ``2>a)(b<<<``). Measured in bash: each spelling
+        runs the here-string program. On the uncorrected walk ``is_denied``
+        returned None for all three."""
+        from kiro_crew import security
+
+        prog = "'from kiro_crew.cli import main; main()'"
+        assert security.is_denied(f"python3 2>'a)(b'<<< {prog}") is not None
+        assert security.is_denied(f"python3 2>a{{b<<<{prog}") is not None
+        assert security.is_denied(f'python3 > "a{{b" <<< {prog}') is not None
+        # The balanced spelling was already denied and must stay denied.
+        assert security.is_denied(f"python3 > ab <<< {prog}") is not None
+
+    def test_a_bare_opener_in_a_dequoted_target_is_not_a_delimiter(self):
+        """The walk's own boundary, on the de-quoted form the production path
+        hands it. An unquoted bare ``(`` cannot reach execution (bash syntax
+        error), and a bare ``{`` is an ordinary filename character (measured:
+        ``python 2>a{b<<<'<program>'`` runs the program), so neither may hold
+        the span open past the operator."""
+        from kiro_crew import security
+
+        assert security._output_redirect_scan("2>a)(b<<<") == ("a)(b", 6)
+        assert security._output_redirect_scan("2>a{b<<<x") == ("a{b", 5)
+        # `$((arith))` still spans: the opener is `$`-prefixed.
+        assert security._output_redirect_scan("2>$((1+2))<<<x") == ("$((1+2))", 10)
+
+    def test_a_quoted_opener_does_not_swallow_the_stdin_operator(self):
+        """Positive controls on quote-bearing text -- the quote characters are
+        DATA the walk steps over, and the parens inside them are bare, so the
+        depth-zero rule ends the target at the operator. Each boundary here
+        reached past the operator on the unfixed walk. Measured in bash:
+        ``python3 > 'a(b' <<< '<program>'`` creates the file ``a(b`` and RUNS
+        the here-string program (and the glued ``2>'a)(b'<<<'<program>'``
+        likewise), so the target must end before the operator, where bash ends
+        it."""
+        from kiro_crew import security
+
+        # The issue's measured case: end was 19 (past the `<<<`), now 8.
+        assert security._output_redirect_scan("> 'a(b' <<< payload") == (" 'a(b' ", 8)
+        assert security._output_redirect_scan('> "a{b" <<< payload') == (' "a{b" ', 8)
+        # Glued heredoc after a quoted opener: end was 12 (marker absorbed), now 7.
+        assert security._output_redirect_scan("2>'a(b'<<EOF") == ("'a(b'", 7)
+        assert security._output_redirect_scan('2>"a{b"<<EOF') == ('"a{b"', 7)
+        # An ESCAPED delimiter is one filename character too (`a\(b` is `a(b`).
+        assert security._output_redirect_scan("2>a\\(b<<<x") == ("a\\(b", 6)
+        # A quoted `)` at depth zero plus a quoted `(`: the unquoted walk opened a
+        # span that never closed and ran the target to the end of the text.
+        assert security._output_redirect_scan("2>'a)(b'<<<x") == ("'a)(b'", 8)
+        # ANSI-C: `$'` is not `$(`/`${`, so nothing opens and the paren is data.
+        assert security._output_redirect_scan("2>$'a(b'<<<x") == ("$'a(b'", 8)
+        assert security._output_redirect_scan("2>$'a\\')'<<<x") == ("$'a\\')'", 9)
+
+    def test_a_data_quote_is_not_read_as_grammar(self):
+        """The inverse direction, found in review (First Principles lane): the
+        tokenizer resolves quoting, so a quote character that SURVIVES it is
+        literal filename text (``2>"a'b"`` tokenizes to ``2>a'b``). A quoting
+        state opened on that data quote consumed the ``<<<`` to the end of the
+        text and hid the operator -- measured in bash, the spelling runs the
+        program, so the boundary must stay at the operator. The same rule keeps
+        the PID-parameter spelling (``$$'`` is not ANSI-C) and a quote inside
+        backticks (bash tolerates it unterminated there) at their pre-fix
+        boundaries."""
+        from kiro_crew import security
+
+        assert security._output_redirect_scan("2>a'b<<<x") == ("a'b", 5)
+        assert security._python_reads_stdin(["2>a'b<<<", "'prog'"]) is True
+        assert security._output_redirect_scan("2>$$'\\'<<<X") == ("$$'\\'", 7)
+        assert security._output_redirect_scan("2>`'`a<<<X") == ("`'`a", 6)
+
+    def test_the_unmoved_boundaries_do_not_move(self):
+        """Inverse controls, byte-identical before and after the fix: a real
+        substitution span still holds the walk open, a real backtick region
+        still toggles, and an unterminated quote or trailing backslash is
+        ordinary data to the end of the text."""
+        from kiro_crew import security
+
+        assert security._output_redirect_scan("2>$( (x)>y )") == ("$( (x)>y )", 12)
+        assert security._output_redirect_scan("2>`echo>x`") == ("`echo>x`", 10)
+        assert security._output_redirect_scan("2>${x:->}") == ("${x:->}", 9)
+        assert security._output_redirect_scan("2>'a(b") == ("'a(b", 6)
+        assert security._output_redirect_scan("2>\\") == ("\\", 3)
+
+    def test_the_stdin_program_is_detected_through_a_quoted_target(self):
+        """The detector-level consequence, on quote-bearing tokens and on the
+        de-quoted tokens the production frame actually carries: with the target
+        absorbing the glued ``<<<``, ``_python_reads_stdin`` answered False and
+        the program on stdin went unscanned."""
+        from kiro_crew import security
+
+        assert security._python_reads_stdin(["2>'a)(b'<<<", "'prog'"]) is True
+        assert security._python_reads_stdin(["2>'a(b'<<<", "'prog'"]) is True
+        assert security._python_reads_stdin(['2>"a{b"<<<', "'prog'"]) is True
+        # De-quoted, as `_self_token_frames` hands them over.
+        assert security._python_reads_stdin(["2>a)(b<<<", "prog"]) is True
+        assert security._python_reads_stdin(["2>a{b<<<", "prog"]) is True
+
+
+class TestNestedPayloadExtractionIsLinear:
+    """``_nested_shell_payloads`` must stay LINEAR in token count.
+
+    It runs inside the synchronous PreToolUse gate, on every command, through the
+    self-protection floor (``_self_token_frames``) and the deny tiers.  Both of its
+    scans used to walk forward per program token looking for the first command flag,
+    so a command padded with interpreter tokens -- none of which is a flag -- made
+    every one of them re-walk the whole tail: quadratic, and measured at 13.2 s for
+    16 000 tokens, growing ~4x per doubling.  At that size the gateway's own loop
+    watchdog fires and the process exits, so this is a denial of service reachable
+    from any agent- or injection-authored command.
+
+    The fix precomputes each scan's first-stop index in one backward pass.  The
+    payload list is unchanged by construction -- the loops' only exits were that
+    first stop token or the end of the list -- and both properties are pinned here:
+    the SET, so the transformation cannot silently drop or invent a payload, and the
+    COMPLEXITY, so a future edit cannot reintroduce a per-program walk.
+    """
+
+    # Every shape the extractor recognises, with the payloads it must produce.
+    SHAPES: "list[tuple[list[str], list[str]]]" = [
+        (["bash"] * 8 + ["-c", "x"], ["x"] * 8),
+        (["bash", "-c", "--", "--", "x"], ["x"]),
+        # A ``--`` run that reaches the end of the list yields NOTHING: there is no
+        # script token after it.  Worth pinning because the scan still has to traverse
+        # the run, so this is the shape whose cost buys no payload at all.
+        (["$0"] * 3 + ["-c"] + ["--"] * 3, []),
+        (["$0"] * 3 + ["-c"] + ["--"] * 3 + ["x"], ["x"] * 3),
+        (["bash", "-c", "--", "x", "--", "y"], ["x"]),
+        (["bash", "--", "-c", "x"], ["x"]),
+        (["bash", "<<<", "x"], ["x"]),
+        (["bash", "<<<x"], ["x"]),
+        (["bash<<<x"], ["x"]),
+        (["env", "-Sx"], ["x"]),
+        (["env", "--split-string=x"], ["x"]),
+        (["env", "--split-string", "x"], ["x"]),
+        (["eval", "x"], ["x"]),
+        (["$SHELL", "-c", "x"], ["x"]),
+        (["bash", "-c"], []),
+        (["bash", "-c", "--"], []),
+        (["a=(rm -rf)", "${a[@]}"], ["rm -rf"]),
+        ([], []),
+    ]
+
+    def test_the_payload_set_is_unchanged(self):
+        from kiro_crew import security
+
+        for tokens, expected in self.SHAPES:
+            assert security._nested_shell_payloads(list(tokens)) == expected, tokens
+
+    def test_the_scan_is_linear_not_quadratic(self, monkeypatch):
+        """What makes the scan linear is asserted DETERMINISTICALLY, not by timing.
+
+        A timed doubling ratio measures the runner, not the code: on a starved
+        shared Windows runner, scheduler noise alone produced a 3.1x ratio against
+        the 3x bound and false-redded a PR whose diff never touched this scan --
+        the same failure mode already evicted from
+        ``TestSelfModuleIndexIsLinear::test_the_scan_is_linear_not_quadratic`` and
+        ``test_a_chain_of_glued_redirects_is_linear``, whose structural strategy is
+        reused here.  A regression has to break one of these to reintroduce the
+        quadratic:
+
+          1. PRECOMPUTE ONCE PER CALL -- ``_next_stop_indexes`` runs exactly
+             TWICE per call (the env-split stop table and the past-the-dashes
+             run-skip table), however many tokens the command holds;
+          2. WORK PER TOKEN IS CONSTANT -- the ``_program_basename`` call count
+             grows as an exact arithmetic progression in the token count (equal
+             size steps produce equal call increments).  The quadratic this test
+             pins against re-walked the whole tail once per shell token, which
+             makes the increments themselves grow with the size and breaks the
+             progression;
+          3. NO PER-SHELL-TOKEN RE-WALK -- the ``_is_shell_command_flag`` and
+             ``_is_not_double_dash`` call counts each hold to an exact arithmetic
+             progression too.  These are the predicates a per-shell-token forward
+             re-walk has to re-consult once per walked token, so a regression to
+             the quadratic breaks their progressions even where the basename
+             count above stays linear.
+
+        One stated residual: a re-walk that INLINES the comparisons instead of
+        calling the named predicates is not observed by these counts.  The named
+        predicates are the contract that keeps the comparisons callable -- the
+        stop-table design exists precisely so every consult goes through them --
+        and the timing form this replaces could not reliably catch that shape
+        either (the ratio measured the runner, not the code).
+
+        No absolute wall-clock cap: coverage tracing on the backend jobs prices
+        line events, not algorithmic cost (#8630 precedent), and the counts see
+        every cost shape this function can otherwise regress to.
+        """
+        from kiro_crew import security
+
+        real_stop_tables = security._next_stop_indexes
+        real_basename = security._program_basename
+        real_flag = security._is_shell_command_flag
+        real_dash = security._is_not_double_dash
+        counts = {"tables": 0, "basename": 0, "flag": 0, "dash": 0}
+
+        def counting_stop_tables(tokens: "list[str]", is_stop: object) -> "list[int]":
+            counts["tables"] += 1
+            return real_stop_tables(tokens, is_stop)  # type: ignore[arg-type]
+
+        def counting_basename(token: str) -> str:
+            counts["basename"] += 1
+            return real_basename(token)
+
+        def counting_flag(token: str) -> bool:
+            counts["flag"] += 1
+            return real_flag(token)
+
+        def counting_dash(token: str) -> bool:
+            counts["dash"] += 1
+            return real_dash(token)
+
+        monkeypatch.setattr(security, "_next_stop_indexes", counting_stop_tables)
+        monkeypatch.setattr(security, "_program_basename", counting_basename)
+        monkeypatch.setattr(security, "_is_shell_command_flag", counting_flag)
+        monkeypatch.setattr(security, "_is_not_double_dash", counting_dash)
+
+        def measured(n: int) -> "tuple[int, int, int, int]":
+            counts["tables"] = counts["basename"] = 0
+            counts["flag"] = counts["dash"] = 0
+            # The verdict must still be reached THROUGH the instrumented path, or
+            # the counts below are counting nothing.  The padding token is
+            # dash-prefixed so the flag predicate is genuinely consulted (a
+            # dash-free padding never reaches it and its progression would hold
+            # vacuously), but ``-x`` is not a command flag, herestring, or glued
+            # carrier, so the shape still yields no payload -- all cost, no
+            # output, the padding shape from the report.
+            assert security._nested_shell_payloads(["bash", "-x"] * (n // 2)) == []
+            return (
+                counts["tables"],
+                counts["basename"],
+                counts["flag"],
+                counts["dash"],
+            )
+
+        sizes = (2000, 4000, 6000)
+        results = [measured(n) for n in sizes]
+
+        # (1) The stop tables are built once per call, independent of size.
+        for tables, _, _, _ in results:
+            assert tables == 2, (
+                f"_next_stop_indexes ran {tables} times for one call -- the env "
+                "stop table and the past-the-dashes table are each built exactly "
+                "once; a per-token builder is the re-walk the precompute removed"
+            )
+
+        # (2) + (3) Per-token work is constant: equal size steps, equal call
+        # increments, for every instrumented cost (see the docstring for why each
+        # has teeth).  The progression form (rather than exact doubling) is
+        # deliberately immune to a constant per-call offset, so a benign refactor
+        # that adds one probe call does not false-red this test.
+        for name, floor, series in (
+            ("program-basename", sizes[0], [b for _, b, _, _ in results]),
+            ("command-flag-predicate", sizes[0] // 2, [f for _, _, f, _ in results]),
+            ("double-dash-predicate", sizes[0], [d for _, _, _, d in results]),
+        ):
+            assert series[0] >= floor, (
+                f"the instrument is not observing the path under test -- fewer "
+                f"{name} calls than expected means the scan never saw the tokens"
+            )
+            assert series[1] - series[0] == series[2] - series[1], (
+                f"{name} counts {series} are not an arithmetic progression -- the "
+                "per-token cost grows with the input, which is the super-linear "
+                "re-walk this precompute exists to prevent"
+            )
+
+    def test_a_long_double_dash_run_is_also_linear(self, monkeypatch):
+        """The ``--`` skip after a command flag was a THIRD forward walk, and fixing
+        the two scans did not fix it: every program token found the same flag and
+        then re-walked the whole run, so ``$0 ... -c -- -- ...`` stayed quadratic
+        (measured 4x per doubling) even with the scans linear.
+
+        Asserted DETERMINISTICALLY, not by timing (see
+        ``test_the_scan_is_linear_not_quadratic`` for the observed false-red).
+        The fixed code prices the ``--`` run ONCE, while it builds the
+        past-the-dashes table; the payload lookups after that are O(1) reads of
+        it.  A regression has to break one of these:
+
+          1. ``_next_stop_indexes`` runs exactly TWICE per call, however long
+             the run -- a rebuilt or per-program table breaks the constant;
+          2. the ``_is_not_double_dash`` call count grows as an exact arithmetic
+             progression in n -- the predicate is consulted once per token while
+             the table is built, but the third forward walk consulted it once
+             per run token PER program token, which makes the increments grow
+             with n and breaks the progression.
+
+        One stated residual, shared with ``test_the_scan_is_linear_not_quadratic``:
+        a re-walk that inlines the ``--`` comparison instead of calling the named
+        predicate is not observed by the count; the named predicate is the
+        contract that keeps the comparison callable.
+
+        No absolute wall-clock cap: coverage tracing on the backend jobs prices
+        line events, not algorithmic cost (#8630 precedent); the counts are the
+        guard.
+        """
+        from kiro_crew import security
+
+        real_stop_tables = security._next_stop_indexes
+        real_dash = security._is_not_double_dash
+        counts = {"tables": 0, "dash": 0}
+
+        def counting_stop_tables(tokens: "list[str]", is_stop: object) -> "list[int]":
+            counts["tables"] += 1
+            return real_stop_tables(tokens, is_stop)  # type: ignore[arg-type]
+
+        def counting_dash(token: str) -> bool:
+            counts["dash"] += 1
+            return real_dash(token)
+
+        monkeypatch.setattr(security, "_next_stop_indexes", counting_stop_tables)
+        monkeypatch.setattr(security, "_is_not_double_dash", counting_dash)
+
+        def measured(n: int) -> "tuple[int, int]":
+            counts["tables"] = counts["dash"] = 0
+            # A ``--`` run that reaches the end of the list yields NOTHING
+            # (pinned in SHAPES): the whole traversal buys no payload, which is
+            # exactly the shape whose cost must not scale per program token.
+            tokens = ["$0"] * n + ["-c"] + ["--"] * n
+            assert security._nested_shell_payloads(tokens) == []
+            return counts["tables"], counts["dash"]
+
+        sizes = (2000, 4000, 6000)
+        results = [measured(n) for n in sizes]
+
+        for tables, _ in results:
+            assert tables == 2, (
+                f"_next_stop_indexes ran {tables} times for one call -- the "
+                "past-the-dashes table must be built exactly once, not rebuilt "
+                "per program token"
+            )
+
+        dashes = [d for _, d in results]
+        assert dashes[0] >= sizes[0], (
+            "the instrument is not observing the path under test -- fewer "
+            "double-dash-predicate calls than tokens means the table build "
+            "never consulted it"
+        )
+        assert dashes[1] - dashes[0] == dashes[2] - dashes[1], (
+            f"_is_not_double_dash counts {dashes} are not an arithmetic "
+            "progression -- the run is being re-walked per program token, which "
+            "is the third-forward-walk quadratic the precompute removed"
+        )
+
+    def test_the_stop_predicates_match_the_handling(self):
+        """The precomputed index and the branch taken at that index are two places
+        that must agree.  Each predicate is therefore asserted to hold exactly on the
+        tokens its handler knows how to process."""
+        from kiro_crew import security
+
+        for token in ("-c", "-lc", "--command"):
+            assert security._is_shell_command_flag(token), token
+        # `-Cc` is deliberately NOT a flag stop: widening the class made it eat
+        # the stop through which a later `--command`'s payload was found.  The
+        # uppercase-clustered spellings belong to the every-carrier sweep
+        # (spaced) and the glued pattern (glued) instead.
+        for token in ("x", "--", "bash", "", "<<<", "-Cc"):
+            assert not security._is_shell_command_flag(token), token
+
+        for token in ("<<<", "<<<glued"):
+            assert security._is_herestring_token(token), token
+        for token in ("x", "--", "bash", "", "-c"):
+            assert not security._is_herestring_token(token), token
+
+        for token in ("-cx.sh", "-ecrg . /root", "-Ccrg . /root"):
+            assert security._is_glued_shell_command_token(token), token
+        for token in ("-c", "-lc", "-Cc", "x", "--", "bash", "", "<<<x"):
+            assert not security._is_glued_shell_command_token(token), token
+
+        # The sweep's loose carrier recognition covers what neither table does.
+        assert security._shell_c_carrier_glued("-Cc") == ""
+        assert security._shell_c_carrier_glued("-1c") == ""
+        assert security._shell_c_carrier_glued("-1cx.sh") == "x.sh"
+        assert security._shell_c_carrier_glued("--command") is None
+
+        for token in ("-s", "--split-string", "-Sx", "--split-string=x"):
+            assert security._is_env_split_flag(token), token
+        for token in ("x", "-c", "--", ""):
+            assert not security._is_env_split_flag(token), token
+
+        assert not security._is_not_double_dash("--")
+        for token in ("x", "-c", "", "---"):
+            assert security._is_not_double_dash(token), token
+
+    def test_the_index_table_reads_as_no_such_token_past_the_end(self):
+        from kiro_crew import security
+
+        table = security._next_stop_indexes(["a", "-c", "b"], lambda t: t == "-c")
+        assert table == [1, 1, 3, 3], table
+        assert security._next_stop_indexes([], lambda t: True) == [0]
+
+
+class TestDenyMatchingIsQuoteNormalized:
+    """A rule authored as a command SHAPE must survive re-spelling of a token.
+
+    Both deny tiers match TEXT, and a shell strips quoting, de-escapes, collapses
+    empty-string splices and collapses whitespace runs before the program sees
+    its argv -- so ``rm -rf "/"`` runs exactly what ``rm -rf /`` runs while
+    containing none of that rule's own text.  Of the ~140 built-in rules only the
+    six self-protection rules and git-publish had an argv-structural floor
+    closing this; every other rule was spelling-dependent.
+    ``_deny_segment_views`` adds a quote/escape-normalized re-join of each
+    segment as a SECOND view, additively.
+    """
+
+    # One rule (``rm -rf /.*``), every spelling a shell reduces to ``rm -rf /``.
+    # Deliberately no ``$HOME`` / ``~`` spelling here: the view does not expand,
+    # so those belong to the path-identity layer, not to this one.
+    RESPELLINGS = (
+        'rm -rf "/"',
+        "rm -rf '/'",
+        '"rm" -rf /',
+        "'rm' -rf /",
+        'rm "-rf" /',
+        "rm '-rf' /",
+        "r''m -rf /",
+        'r""m -rf /',
+        "rm -r''f /",
+        "rm  -rf  /",  # whitespace run, not quoting
+        "rm\t-rf /",  # tab
+        "rm -rf \\/",  # backslash escape
+    )
+
+    def test_every_respelling_of_one_rule_is_denied(self):
+        for cmd in self.RESPELLINGS:
+            reason = is_denied(cmd)
+            assert reason is not None, f"quoted respelling escaped the rule: {cmd!r}"
+
+    def test_the_respellings_are_a_real_bypass_without_the_normalized_view(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The additive-proof twin: with the extra view removed, every cell above
+        is ALLOWED.
+
+        This is what makes the assertion above a security property rather than an
+        incidental match -- if a later change makes the raw text match these on
+        its own, this test fails loudly and the cross above stops proving
+        anything.
+        """
+        from kiro_crew import security
+
+        monkeypatch.setattr(
+            security, "_deny_segment_views", lambda segment, emit_self=True: (segment.lower(),)
+        )
+        for cmd in self.RESPELLINGS:
+            assert security.is_denied(cmd) is None, (
+                f"raw text now matches {cmd!r} on its own -- the cross above no longer "
+                "isolates the normalized view"
+            )
+        # ...while the canonical spelling never needed the view.
+        assert security.is_denied("rm -rf /") is not None
+
+    def test_other_rule_families_are_covered_too(self):
+        """Not an ``rm``-specific patch: any command-shape rule gains the view."""
+        for cmd in (
+            'dd "if=/dev/zero" of=/dev/sda',
+            "dd if''=/dev/zero of=/dev/sda",
+            'chmod "777" /tmp/x',
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_respelling_inside_a_compound_command_is_denied(self):
+        """The evasion in its own segment after a separator still lands."""
+        for cmd in (
+            'ls -la && "rm" -rf /',
+            'echo start; rm -rf "/"',
+            'true | r""m -rf /',
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_nested_shell_payloads_are_viewed_in_their_own_right(self):
+        """A shell's ``-c`` argument is a COMMAND, and ``shlex`` strips only the
+        OUTER quoting level -- so the payload's own inner quoting survives the
+        parent's re-join and the rule still misses it.  Found by the GPT 5.6
+        review lane on this change.  Every literal payload spelling
+        ``_nested_shell_payloads`` recognises must therefore be viewed too.
+        """
+        for cmd in (
+            'bash -c \'dd "if=/dev/zero" of=/dev/sda\'',
+            "sh -c 'rm -rf \"/\"'",
+            "sh -c \"rm -rf '/'\"",
+            "bash -c -- 'rm -rf \"/\"'",  # ``--`` ends option parsing
+            "eval 'rm -rf \"/\"'",
+            "bash <<< 'rm -rf \"/\"'",  # herestring feeds the script on stdin
+            "env -S 'rm -rf \"/\"'",
+            'bash -c \'sh -c "rm -rf \\"/\\""\'',  # two levels of nesting
+        ):
+            assert is_denied(cmd) is not None, f"nested payload escaped the rule: {cmd!r}"
+
+    def test_a_nested_payload_is_split_before_it_is_viewed(self):
+        """The payload is a command LINE, so the separator rule applies inside it
+        too -- otherwise the walk fabricates a command one level down."""
+        for cmd in (
+            "bash -c 'echo rm; -rf /'",
+            "bash -c 'echo hello'",
+            "sh -c 'ls -la'",
+        ):
+            assert is_denied(cmd) is None, f"fabricated a command inside a payload: {cmd!r}"
+
+    def test_a_data_consumer_mention_is_not_walked(self):
+        """``echo bash -c '<script>'`` PRINTS the script, so descending into it
+        would refuse a command that runs nothing (advisory from the GPT 5.6
+        lane).  The repo's own ``_data_consumer_exempt`` decides this."""
+        for cmd in (
+            "echo bash -c 'rm -rf \"/\"'",
+            "cat bash -c 'rm -rf \"/\"'",
+        ):
+            assert is_denied(cmd) is None, f"mention over-blocked: {cmd!r}"
+
+    def test_the_exemption_does_not_weaken_the_raw_tier(self):
+        """The unquoted mention was already refused BEFORE this change, because
+        the raw text contains the rule's own text.  The exemption must not walk
+        that back -- it only decides whether to DESCEND into a payload."""
+        for cmd in (
+            "echo rm -rf /",
+            "echo bash -c 'rm -rf /'",
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_executor_wrappers_are_still_walked(self):
+        """Guard against narrowing the descent to "launcher in command position",
+        the remedy suggested alongside the advisory: in every command below the
+        launcher is NOT in command position, and every one of them really
+        executes the payload.  A position rule would trade one false positive for
+        six bypasses."""
+        for cmd in (
+            "sudo bash -c 'rm -rf \"/\"'",
+            "timeout 5 bash -c 'rm -rf \"/\"'",
+            "nohup bash -c 'rm -rf \"/\"'",
+            "ssh host bash -c 'rm -rf \"/\"'",
+            "xargs bash -c 'rm -rf \"/\"'",
+            "env FOO=1 bash -c 'rm -rf \"/\"'",
+        ):
+            assert is_denied(cmd) is not None, f"executor wrapper escaped the rule: {cmd!r}"
+
+    def test_a_normalized_match_records_the_raw_spelling_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Forensics needs both halves.  The view names the command that WOULD
+        have run; only the raw spelling shows the evasion.  The full input is
+        already in ``operation``, so what the extra field adds is WHICH segment
+        normalized into the match (Design Review suggestion).
+        """
+        from kiro_crew import security
+
+        events: list[dict] = []
+        monkeypatch.setattr(
+            security,
+            "_emit_deny_event",
+            lambda tool, pattern, segment, raw_segment="": events.append(
+                {"pattern": pattern, "segment": segment, "raw_segment": raw_segment}
+            ),
+        )
+        assert security.is_denied("ls -la && r''m -rf /") is not None
+        assert events, "no deny event was emitted"
+        last = events[-1]
+        assert last["segment"] == "rm -rf /", last
+        assert last["raw_segment"] == "r''m -rf /", last
+
+        # A raw match is caught by the WHOLE-STRING pass 1, which has no segment
+        # to normalize, so the extra field stays absent and an ordinary denial's
+        # event does not grow.
+        events.clear()
+        assert security.is_denied("ls -la && rm -rf /") is not None
+        assert events[-1]["segment"] == "ls -la && rm -rf /"
+        assert events[-1]["raw_segment"] == ""
+
+    def test_the_synthesized_target_keeps_model_authored_quoting(self):
+        """DOCUMENTED GAP, pinned rather than claimed.
+
+        The PR that added this view asserted that
+        ``is_denied_synthesized_target`` needs no normalized view because its
+        input is gate-constructed rather than shell text.  Pinning that
+        assumption (Design Review suggestion) DISPROVED it: the ``path`` VALUE is
+        model-authored, and ``_normalize_search_path`` resolves home variables and
+        dot segments but not quoting, so a quote character survives into the
+        synthesized target and a path-keyed operator rule can miss it the same way
+        the shell tiers used to.
+
+        That is a second surface with its own semantics (a synthesized grammar,
+        not a command line) and its own review surface, so it is NOT fixed here --
+        it is recorded as a residual in ``docs/system-specs/modules/security.md``
+        and pinned here so the gap is findable instead of implied.  When it is
+        closed, this test is the one that must flip.
+        """
+        from kiro_crew import hooks
+
+        target = hooks._search_deny_target(
+            {
+                "operation": "search_codebase_map",
+                "path": '"$HOME"/notes',
+                "max_depth": 3,
+            }
+        )
+        assert target, "the synthesizer produced no target for a recursive operation"
+        assert '"' in target, (
+            "quoting no longer survives into the synthesized target -- the gap this "
+            "pins is closed, so update the residual in the security spec and flip "
+            "this assertion"
+        )
+
+    def test_a_payload_glued_inside_one_token_is_handled(self):
+        """A payload is not always a TOKEN.  ``_nested_shell_payloads`` also returns
+        SYNTHESIZED text -- a ``sed`` ``e``-flag replacement, a glued herestring
+        tail, a glued ``env -S`` argument, an ``alias`` assignment -- so recovering
+        a position with ``list.index`` raised ``ValueError`` straight out of the
+        permission gate.  Found independently as BLOCKING by the GPT 5.6 and Opus
+        4.8 lanes; ``sed 's/x/y/e' notes.txt`` is Opus's reproducer and is
+        legitimate input.
+        """
+        for cmd in (
+            "bash<<<'rm -rf \"/\"'",  # glued herestring
+            "alias x='rm -rf \"/\"'",  # alias assignment
+            'sed \'s#x#rm -rf "/"#e\' file',  # sed e-flag script executes
+        ):
+            assert is_denied(cmd) is not None, f"glued payload escaped the rule: {cmd!r}"
+        for cmd in (
+            "sed 's/x/y/e' notes.txt",  # Opus's reproducer -- must not crash, must allow
+            "bash<<<'echo hello'",
+            "env -S'echo hello'",
+        ):
+            assert is_denied(cmd) is None, f"benign glued payload over-blocked: {cmd!r}"
+
+    def test_the_exemption_is_decided_per_occurrence_and_fails_closed(self):
+        """A payload with no token position cannot be proven inert, so it is
+        descended into rather than skipped -- deciding from one recovered index
+        would not be sound, because a short synthesized payload can also be a
+        coincidental substring of an unrelated token."""
+        from kiro_crew import security
+
+        # Synthesized payload, no token position: the destructive one is still
+        # denied rather than exempted away.
+        assert "rm -rf /" in security._deny_segment_views("bash<<<'rm -rf \"/\"'")
+        # Exact-token payload under a data consumer: exempt, so no payload view.
+        views = security._deny_segment_views("echo bash -c 'rm -rf \"/\"'")
+        assert "rm -rf /" not in views, views
+
+    def test_view_construction_never_raises(self, monkeypatch: pytest.MonkeyPatch):
+        """The gate must get a security DECISION, never an exception.
+
+        ``_deny_segment_views`` runs inside the PreToolUse gate, so a raising
+        helper would be a crash rather than a deny.  Every window is built inside a
+        guard, and the raw view is already present before any of them runs -- so a
+        failure costs the extra match and nothing else.
+        """
+        from kiro_crew import security
+
+        def _boom(*_a: object, **_k: object) -> object:
+            raise RuntimeError("payload walk exploded")
+
+        for target in (
+            "_nested_shell_payloads",
+            "_argv_programs",
+            "_shell_tokens",
+            "_decode_shell_quoted_literals",
+        ):
+            monkeypatch.setattr(security, target, _boom)
+            assert security._deny_segment_views("rm -rf /") == ("rm -rf /",)
+            # ...and the raw tier still decides, so the deny stands.
+            assert security.is_denied("rm -rf /") is not None
+            assert security.is_denied("ls -la && rm -rf /") is not None
+            monkeypatch.undo()
+
+    def test_ansi_c_and_locale_quoting_are_resolved(self):
+        """``$'…'`` and ``$"…"`` are QUOTING forms: bash computes the value before
+        the program sees it, so ``rm -rf $'/'`` runs exactly what ``rm -rf /`` runs.
+        A matcher that has not resolved them is reading a spelling the shell never
+        hands over.  BLOCKING from the GPT 5.6 lane; the escape form matters too,
+        since ``$'\\x2d\\x72\\x66'`` is ``-rf``.
+        """
+        for cmd in (
+            "rm -rf $'/'",
+            "dd $'if=/dev/zero' of=/dev/sda",
+            "$'rm' -rf /",
+            "rm $'\\x2d\\x72\\x66' /",  # the flag spelled in hex
+            'bash -c $\'rm -rf "/"\'',  # ANSI-C wrapping a nested payload
+            'rm -rf $"/"',  # locale quoting
+        ):
+            assert is_denied(cmd) is not None, f"dollar-quoted spelling escaped: {cmd!r}"
+        for cmd in (
+            "echo $'hello world'",
+            "grep $'needle' src/",
+        ):
+            assert is_denied(cmd) is None, f"benign dollar-quoted command over-blocked: {cmd!r}"
+
+    def test_decoding_dollar_quotes_does_not_eat_variable_references(self):
+        """The decode runs on the RAW text and REQUIRES the quote character, which
+        is what makes it safe.  After ``shlex`` the quotes are gone and ``$'/'``
+        reads as ``$/`` -- indistinguishable from ``$HOME`` -- so a post-shlex
+        ``$``-strip would eat real variables and break the path normalizer's own
+        ``$HOME`` expansion.
+        """
+        import os
+
+        from kiro_crew import security
+
+        home = os.path.expanduser("~")
+        assert security.normalize_shell_command("cat $HOME/x") == ["cat", f"{home}/x"]
+        assert security.normalize_shell_command("cat ${HOME}/x") == ["cat", f"{home}/x"]
+        assert security._shell_tokens("echo $FOO") == ["echo", "$FOO"]
+        assert security._shell_tokens("echo $(date)") == ["echo", "$(date)"]
+        # A decoded value containing whitespace stays ONE token.
+        assert security._shell_tokens("echo $'a b'") == ["echo", "a b"]
+
+    def test_unicode_escapes_in_dollar_quotes_are_decoded(self):
+        """``$'\\u002d\\u0072\\u0066'`` is ``-rf``, the same word the ``\\x``-spelled
+        form already decoded to.  BLOCKING from the GPT 5.6 lane.  The gap was in
+        the SHARED escape decoder rather than in this view, so it also closes a
+        live bypass of the credential-mint floor -- see the sibling test below.
+        """
+        from kiro_crew import security
+
+        assert security._decode_printf_escapes(r"\u002d\u0072\u0066") == "-rf"
+        assert security._decode_printf_escapes(r"\U0000002d\U00000072") == "-r"
+        for cmd in (
+            r"rm $'\u002d\u0072\u0066' /",
+            r"rm -rf $'\u002f'",
+            r"rm $'\U0000002d\U00000072\U00000066' /",
+        ):
+            assert is_denied(cmd) is not None, f"unicode-escaped spelling escaped: {cmd!r}"
+
+    def test_the_unicode_widths_are_exact_and_case_sensitive(self):
+        """Bash consumes AT MOST 4 hex digits after ``\\u`` and 8 after ``\\U``, so
+        ``$'\\u0072f'`` is ``r`` followed by a literal ``f`` -- not a 5-digit code
+        point.  Reading more digits than the spelling allows is a bypass: the wrong
+        character replaces the two the shell passes, and ``rm -$'\\u0072f' /``
+        escaped the rule that way (BLOCKING from the GPT 5.6 lane).
+        """
+        from kiro_crew import security
+
+        assert security._decode_printf_escapes(r"\u0072f") == "rf"
+        assert security._decode_printf_escapes(r"\u002d1234") == "-1234"
+        assert security._decode_printf_escapes(r"\U0000002d") == "-"
+        assert security._decode_printf_escapes(r"\u2d") == "-"
+        assert is_denied(r"rm -$'\u0072f' /") is not None
+
+    def test_case_is_preserved_until_after_the_escapes_are_decoded(self):
+        """The widths above are case-sensitive, and ``is_denied`` lowercases its
+        input -- so the decode has to happen BEFORE that fold.  Segments are
+        therefore split from the original-case text, which is safe because no case
+        mapping produces a separator, and the ordinary case-insensitive matching
+        must still work.
+        """
+        from kiro_crew import security
+
+        # Splitting commutes with lowercasing.
+        mixed = "LS -la && RM -RF / ; Echo Done"
+        assert [s.strip().lower() for s in security._split_segments(mixed)] == [
+            s.strip() for s in security._split_segments(mixed.lower())
+        ]
+        # Every view is lowercased regardless of the input's case...
+        views = security._deny_segment_views("RM -RF $'/'")
+        assert all(v == v.lower() for v in views), views
+        assert views[0] == "rm -rf $'/'"
+        # ...and an uppercase destructive command is still denied.
+        assert is_denied("RM -RF /") is not None
+        assert is_denied(r"RM -RF $'\u002F'") is not None
+
+    def test_the_decoder_gap_also_bypassed_the_credential_mint_floor(self):
+        """Scope note, pinned: the missing ``\\u`` decoding was NOT introduced by the
+        normalized view -- it sat in ``_decode_printf_escapes``, which the
+        argv-structural self-protection floors already used.  So the same spelling
+        walked past an un-disableable rule while its ``\\x`` twin was refused.  Both
+        spellings must read as the same word.
+        """
+        from kiro_crew import security
+
+        for spelling in (
+            "kirocrew $'\\u0074\\u006f\\u006b\\u0065\\u006e'",
+            "kirocrew $'\\x74\\x6f\\x6b\\x65\\x6e'",
+            "kirocrew token",
+        ):
+            assert security._is_credential_mint(spelling.lower()), spelling
+            assert security.is_denied(spelling) is not None, spelling
+
+    def test_a_lone_surrogate_escape_stays_inert(self):
+        """A decoded lone surrogate is not a character bash can pass either, and it
+        would travel into the SEL audit record whose JSON encoder raises on it --
+        turning a denial into a crash.  Left encoded, like NUL."""
+        from kiro_crew import security
+
+        assert security._decode_printf_escapes(r"\ud800") == r"\ud800"
+        assert security._decode_printf_escapes(r"\u0000") == r"\u0000"
+        # ...and a command carrying one still returns a decision rather than raising.
+        assert is_denied(r"echo $'\ud800'") is None
+
+    def test_line_continuations_fold_exactly_where_bash_folds_them(self):
+        """The rule is MEASURED, not assumed.  ``printf %q`` on the resulting argv
+        gives, for ``<spelling> BB``:
+
+            A\\<nl>A BB      -> <AA><BB>            folded
+            "A\\<nl>A" BB    -> <AA><BB>            folded
+            'A\\<nl>A' BB    -> <A\\<nl>A><BB>       NOT folded
+            $'A\\<nl>A' BB   -> <A\\<nl>A><BB>       NOT folded
+
+        So the fold applies unquoted and inside double quotes, and preserves
+        single-quoted and ANSI-C spans.  ``$"..."`` follows the double-quote rule.
+        """
+        from kiro_crew import security
+
+        fold = security._fold_line_continuations
+        assert fold("A\\\nA BB") == "AA BB"
+        assert fold('"A\\\nA" BB') == '"AA" BB'
+        assert fold("'A\\\nA' BB") == "'A\\\nA' BB"
+        assert fold("$'A\\\nA' BB") == "$'A\\\nA' BB"
+        assert fold('$"A\\\nA" BB') == '$"AA" BB'
+        # CRLF input folds the same way.
+        assert fold("A\\\r\nA BB") == "AA BB"
+        # A backslash escaping something else is untouched, and cannot open a quote.
+        assert fold("a\\'b\\\nc") == "a\\'bc"
+
+    def test_folded_continuation_spellings_are_denied(self):
+        """``_split_segments`` cuts on the newline, so without folding first the
+        continuation is severed and neither piece carries the command bash runs.
+        BLOCKING from the GPT 5.6 lane; these are the spellings its probe proved
+        bash folds.
+        """
+        for cmd in (
+            '"r\\\nm" -rf /',
+            'rm "-r\\\nf" /',
+            'rm -rf "\\\n/"',
+            "r\\\nm -rf /",
+            "rm -rf \\\n/",
+        ):
+            assert is_denied(cmd) is not None, f"continuation spelling escaped: {cmd!r}"
+
+    def test_the_preserving_contexts_are_not_over_blocked(self):
+        """In these the continuation is LITERAL, so the command is not the
+        destructive one and must not be refused -- which is why the fold had to be
+        quote-aware rather than a bare regex."""
+        for cmd in (
+            "'r\\\nm' -rf /",  # bash argv: <r\<nl>m> -- a different program name
+            "echo 'r\\\nm -rf /'",  # printed literally
+            "$'r\\\nm' -rf /",
+        ):
+            assert is_denied(cmd) is None, f"literal continuation over-blocked: {cmd!r}"
+
+    def test_the_blunt_floor_helper_is_why_the_fold_is_quote_aware(self):
+        """Kept as the record of a rejected reuse.
+
+        ``_shell_join_continuations`` already existed and looks like the answer, but
+        it is a bare regex that folds inside SINGLE quotes too -- which bash does
+        not -- and its own comment scopes it deliberately to the self-protection
+        floor's tokenizer input, "NOT a catalog-wide rewrite of the matched text".
+        These assertions document what reusing it here would have done, so the
+        one-line shortcut is not reached for again.
+        """
+        from kiro_crew import security
+
+        blunt = security._shell_join_continuations
+        assert blunt('"r\\\nm" -rf /') == '"rm" -rf /'  # agrees with bash here...
+        assert blunt("'r\\\nm' -rf /") == "'rm' -rf /"  # ...but not here
+        assert blunt("echo 'r\\\nm -rf /'") == "echo 'rm -rf /'"  # would over-block
+        # The quote-aware fold disagrees with it in exactly the preserving cases.
+        assert security._fold_line_continuations("'r\\\nm' -rf /") == "'r\\\nm' -rf /"
+
+    def test_ansi_c_escaped_quotes_are_decoded(self):
+        """Inside ``$'…'`` bash resolves ``\\"`` and ``\\'`` to the plain quote, so
+        ``bash -c $'rm -rf \\"/\\"'`` hands the inner shell the script ``rm -rf "/"``
+        and it runs the destructive command.  Leaving the backslashes in meant the
+        nested view missed the rule (BLOCKING from the GPT 5.6 lane).
+        """
+        for cmd in (
+            'bash -c $\'rm -rf \\"/\\"\'',
+            "bash -c $'rm -rf \\'/\\''",
+        ):
+            assert is_denied(cmd) is not None, f"escaped-quote payload escaped: {cmd!r}"
+        # ...but the same escapes NOT feeding a shell are a literal operand, and
+        # must not be over-blocked: bash argv for ``rm -rf $'\\"/\\"'`` is
+        # ``<rm><-rf><\\"/\\">`` -- a file named `"/"`, not the root (printf %q).
+        assert is_denied('rm -rf $\'\\"/\\"\'') is None
+
+    def test_the_ansi_c_decoder_is_a_single_pass(self):
+        """Sequential replaces let one substitution's OUTPUT be re-read as another's
+        input.  ``$'\\\\n'`` is an escaped backslash then the letter ``n`` -- two
+        characters -- but resolving ``\\\\`` first and then looking for ``\\n``
+        collapses it to whitespace and invents a separator bash never passed.  One
+        left-to-right pass makes that impossible.
+        """
+        from kiro_crew import security
+
+        decode = security._decode_ansi_c_body
+        assert decode(r"\\n") == "\\n"  # backslash + n, NOT whitespace
+        assert decode(r"\"") == '"'
+        assert decode(r"\'") == "'"
+        assert decode(r"\?") == "?"
+        assert decode(r"\x2d") == "-"
+        assert decode(r"\u0072f") == "rf"  # exact width, then a literal f
+        assert decode(r"\q") == "\\q"  # unrecognised: both characters kept
+        assert decode(r"\n") == " "  # this family has always normalized to a space
+
+    def test_a_nested_payloads_own_continuations_are_folded(self):
+        """A payload is a command LINE, so the shell that runs it folds ITS
+        continuations before lexing.  Two things were needed: fold the payload
+        before splitting it, AND walk the WHOLE command for payloads -- because
+        ``_split_segments`` is deliberately quote-unaware, so the newline inside the
+        quoted payload severs the command before the ``-c`` script can be extracted
+        from it.  BLOCKING from the GPT 5.6 lane.
+        """
+        for cmd in (
+            "bash -c 'r\\\nm -rf /'",
+            "bash -c 'rm -r\\\nf /'",
+            "bash -c 'rm -rf \\\n/'",
+            "eval 'r\\\nm -rf /'",
+        ):
+            assert is_denied(cmd) is not None, f"nested continuation escaped: {cmd!r}"
+
+    def test_the_whole_command_walk_emits_no_view_of_itself(self):
+        """``emit_self=False`` is what keeps the whole-command walk from fabricating
+        a command across separators -- it contributes payload views only."""
+        from kiro_crew import security
+
+        cmd = "echo one\ntrue && bash -c 'rm -rf \"/\"'"
+        views = security._deny_segment_views(cmd, False)
+        assert all("echo one" not in v for v in views), views
+        assert "rm -rf /" in views, views
+        # With emit_self on, the source's own re-join IS the first view.
+        assert security._deny_segment_views("ls -la")[0] == "ls -la"
+
+    def test_locale_quoting_uses_double_quote_semantics_not_ansi_c(self):
+        """``$"…"`` is locale TRANSLATION, not ANSI-C -- measured, because treating
+        the two alike was a bypass (BLOCKING from the GPT 5.6 lane).
+
+        bash gives ``$"\\r\\mAA"`` the word ``\\r\\mAA``, byte-identical to plain
+        ``"\\r\\mAA"``: inside double quotes a backslash escapes only ``$``, a
+        backtick, ``"``, ``\\`` and a newline, so ``\\r`` is a literal backslash-r
+        and NOT a carriage return.  Decoding it as ANSI-C turned that ``\\r`` into
+        whitespace and the command vanished from the view -- while the inner shell of
+        ``bash -c $"\\r\\m -rf /"`` resolves the backslashes in its own lexing pass
+        and runs the destructive command (measured: ``bash -c $"\\r\\mAA"`` executes
+        ``rmAA``).
+        """
+        from kiro_crew import security
+
+        decode = security._decode_shell_quoted_literals
+        # Locale: the $ goes, the double-quoted text is left for shlex.
+        assert decode('$"\\r\\mAA"') == '"\\r\\mAA"'
+        # ANSI-C: the body IS decoded, so the two forms are not interchangeable.
+        assert decode("$'\\r\\mAA'") == "' \\mAA'"
+
+        assert is_denied('bash -c $"\\r\\m -rf /"') is not None
+        assert is_denied('bash -c $"rm -rf /"') is not None
+        # ...and the operand form stays denied, because bash's operand there is `/`.
+        assert is_denied('rm -rf $"/"') is not None
+        # A benign locale-quoted string is untouched.
+        assert is_denied('echo $"hello world"') is None
+
+    def test_ansi_c_control_escapes_are_decoded(self):
+        """``\\cX`` is a control character and ``\\cI`` is a TAB, so
+        ``bash -c $'rm\\cI-rf /'`` hands the inner shell a tab-separated
+        ``rm -rf /`` and it runs -- measured, the inner shell does split on it
+        (BLOCKING from the GPT 5.6 lane).
+
+        The mapping is MEASURED, not derived: bash gives ``ord(upper(X)) & 0x1F``
+        with ``?`` special-cased to 0x7F.  An XOR-0x40 guess gets ``\\c0`` wrong --
+        bash yields 0x10, not the letter ``p``.
+        """
+        from kiro_crew import security
+
+        decode = security._decode_ansi_c_body
+        # Every control result takes the same normalization to a space as the named
+        # family, which is what puts a token boundary where the shell puts one.
+        assert decode(r"a\cIb") == "a b"  # 0x09 tab
+        assert decode(r"a\cJb") == "a b"  # 0x0a newline
+        assert decode(r"a\cMb") == "a b"  # 0x0d carriage return
+        assert decode(r"a\c0b") == "a b"  # 0x10 -- not 'p'
+        assert decode(r"a\c?b") == "a b"  # 0x7f
+        assert decode(r"a\c[b") == "a b"  # 0x1b escape
+        # ...and a NUL TRUNCATES the word, which is what bash does with one --
+        # measured: `$'AA\\c@junk'` yields `AA`.
+        assert decode(r"a\c@b") == "a"
+
+        for cmd in (
+            r"bash -c $'rm\cI-rf /'",
+            r"bash -c $'rm\cJ-rf /'",
+            r"bash -c $'rm\cM-rf /'",
+            r"bash -c $'dd\cIif=/dev/zero of=/dev/sda'",
+        ):
+            assert is_denied(cmd) is not None, f"control-escape payload escaped: {cmd!r}"
+
+    def test_the_quoting_regex_is_not_redos_prone(self):
+        """The negated classes must EXCLUDE the backslash.
+
+        With ``[^']`` a backslash can match either alternative -- ``\\\\.`` (two
+        characters) or the class (one) -- the textbook ambiguous quoted-string
+        pattern, so an unterminated ``$'`` followed by a run of backslashes forces
+        the engine through ~1.618**n tilings.  This regex runs inside the
+        PreToolUse gate on the full, uncapped command, so that is a hang rather
+        than a slowdown (BLOCKING from the Opus 4.8 lane; measured at 9 ms for 24
+        backslashes, growing ~1.6x per character added).
+
+        Asserted two ways: structurally, that neither class admits a backslash, and
+        with a budget a Fibonacci-time scan could not possibly meet.
+        """
+        import time
+
+        from kiro_crew import security
+
+        pattern = security._ANSI_C_QUOTE_RE.pattern
+        assert "[^'\\\\]" in pattern and '[^\\"\\\\]' in pattern, pattern
+
+        payload = "AA $'" + ("\\" * 2000)
+        start = time.perf_counter()
+        security._decode_shell_quoted_literals(payload)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"decode took {elapsed:.3f}s -- the ambiguity is back"
+
+    def test_the_audit_fields_redact_before_truncating(self):
+        """``redact_and_truncate``, never a bare slice.
+
+        A credential straddling the 200-char boundary would be cut in half, and the
+        fragment no longer matches the credential pattern -- so SEL's own write-path
+        redaction cannot catch it and the partial secret persists in a
+        dashboard-readable log.  BLOCKING from the GPT 5.6 lane on the new
+        ``raw_segment`` field; the older ``segment`` field carried the same hazard.
+        """
+        from kiro_crew import security
+
+        captured: list[object] = []
+
+        class _Recorder:
+            def log(self, event: object) -> None:
+                captured.append(event)
+
+        original = security.SecurityEventLog
+        security.SecurityEventLog = _Recorder  # type: ignore[assignment]
+        try:
+            secret = "AKIA" + "Q" * 16
+            padded = "x" * 190 + secret + " rm -rf /"
+            security._emit_deny_event("probe", "rm -rf /.*", padded, raw_segment=padded)
+        finally:
+            security.SecurityEventLog = original  # type: ignore[assignment]
+
+        assert captured, "no event recorded"
+        meta = captured[-1].metadata  # type: ignore[attr-defined]
+        for field in ("segment", "raw_segment"):
+            value = meta.get(field, "")
+            assert secret not in value, f"{field} leaked the credential: {value!r}"
+            assert secret[:12] not in value, f"{field} leaked a fragment: {value!r}"
+
+    def test_octal_escapes_are_masked_to_one_byte_like_bash(self):
+        """MEASURED: ``$'\\555'`` is ``m`` (0o555 & 0xFF == 0x6D), ``$'\\777'`` is
+        0xFF, ``$'\\400'`` is a NUL bash cannot place in an argv, and ``$'r\\555'``
+        is ``rm``.  Converting the full octal value instead produced ``ŭ`` where
+        bash passes ``m``, so ``$'r\\555' -rf /`` ran while the view matched nothing
+        (BLOCKING from the GPT 5.6 lane).
+        """
+        from kiro_crew import security
+
+        decode = security._decode_ansi_c_body
+        assert decode(r"\555") == "m"
+        assert decode(r"\155") == "m"
+        assert decode(r"\777") == "\xff"
+        assert decode(r"\101") == "A"
+        # A masked value of zero is a NUL, and bash TRUNCATES the word there --
+        # measured: `$'AA\\400junk'` yields `AA`, `$'\\400'` the empty word.
+        assert decode(r"\400") == ""
+        assert is_denied(r"$'r\555' -rf /") is not None
+
+    def test_ansi_c_octal_consumes_three_digits_total_like_bash(self):
+        """MEASURED: in ``$'...'`` a leading zero is one of the (at most) three
+        octal digits -- ``$'\\06777'`` is ``\\067`` ('7') then the literal ``77``,
+        so bash passes ``777``; ``$'\\0677'`` passes ``77``.  The ``\\0nnn``
+        four-digit form belongs to ``echo -e``/``printf %b`` only.  Sharing that
+        pattern here consumed a fourth digit, so ``chmod $'\\06777' /tmp/x``
+        normalized to a one-byte argument instead of ``chmod 777 /tmp/x`` and a
+        rule on the decoded spelling missed (BLOCKING from the GPT 5.6 lane).
+        """
+        from kiro_crew import security
+
+        decode = security._decode_ansi_c_body
+        assert decode(r"\06777") == "777"
+        assert decode(r"\0677") == "77"
+        assert decode(r"\067") == "7"
+        # The printf/echo -e decoder keeps the four-digit form: '\0677' there is
+        # ONE escape (0o677 & 0xFF == 0xBF), measured against `echo -e`.
+        assert security._decode_printf_escapes(r"\0677") == "\xbf"
+
+    def test_a_non_ascii_control_target_does_not_crash_the_gate(self):
+        """``str.upper()`` is not length-preserving outside ASCII -- ``"ß".upper()``
+        is ``"SS"`` -- so ``ord`` of it raised ``TypeError`` straight out of the
+        permission gate on ``echo $'\\cß'`` (BLOCKING from the GPT 5.6 lane).  A
+        non-ASCII target keeps both characters, as bash does for an undefined
+        spelling.
+        """
+        from kiro_crew import security
+
+        assert security._decode_ansi_c_body("\\c\u00df") == "\\c\u00df"
+        assert is_denied("echo $'\\c\u00df'") is None
+        # ...and a non-ASCII operand still yields a DECISION rather than an
+        # exception. This one is denied on purpose: the rule blocks a recursive
+        # force-delete rooted at the filesystem root, and `/<non-ascii>` is rooted
+        # there -- what matters here is that the gate answers at all.
+        assert is_denied("rm -rf $'/\u00df'") is not None
+        assert is_denied(r"bash -c $'rm\cI-rf /'") is not None
+
+    def test_a_nul_escape_truncates_the_word_like_bash(self):
+        """MEASURED on every spelling that can reach zero: ``$'AA\\0junk'``,
+        ``$'AA\\400junk'``, ``$'AA\\x00junk'``, ``$'AA\\u0000j'`` and
+        ``$'AA\\c@junk'`` all yield ``AA``, and ``$'\\0AA'`` yields the empty word --
+        bash cannot place a NUL in an argv, and what it does instead is STOP there.
+
+        Leaving the escape encoded was a bypass:
+        ``$'dd\\0junk' if=/dev/zero of=/dev/sda`` ran while the view held
+        ``dd\\0junk if=`` and matched nothing (BLOCKING from the GPT 5.6 lane).
+        """
+        from kiro_crew import security
+
+        decode = security._decode_ansi_c_body
+        for body in (r"AA\0junk", r"AA\400junk", r"AA\x00junk", r"AA\u0000j", r"AA\c@junk"):
+            assert decode(body) == "AA", body
+        assert decode(r"\0AA") == ""
+        # The OTHER inert codes keep the escape rather than truncating, because bash
+        # does not produce them at all.
+        assert decode(r"AA\ud800junk") == r"AA\ud800junk"
+
+        assert is_denied(r"$'dd\0junk' if=/dev/zero of=/dev/sda") is not None
+        assert is_denied(r"$'mkfs\0junk' /dev/sda") is not None
+
+    def test_flag_interposition_is_a_catalog_gap_not_a_view_gap(self):
+        """DOCUMENTED GAP, with the evidence that places it outside this change.
+
+        ``$'rm\\0junk' -rf --no-preserve-root /`` normalizes to exactly the command
+        bash runs -- the view is correct -- but the rule ``rm -rf /.*`` requires its
+        text contiguous and does not tolerate an interposed flag, so nothing matches.
+        The PLAIN spelling is allowed too, on base and here alike, which is what
+        shows this is the built-in rule's authoring rather than anything
+        normalization can reach: no view can make a non-matching pattern match.
+
+        Closing it means editing a shipped rule's regex, which changes matching for
+        the whole catalog and is a separate decision.  Pinned so the gap is findable;
+        when it is closed, the first assertion flips.
+        """
+        from kiro_crew import security
+
+        # The catalog cannot see the flag-interposed form in ANY spelling...
+        assert is_denied("rm -rf --no-preserve-root /") is None
+        # ...while the contiguous shape the rule is authored for is refused.
+        assert is_denied("rm -rf /") is not None
+        # ...and the view for the escaped spelling IS the command bash runs.
+        views = security._deny_segment_views(r"$'rm\0junk' -rf --no-preserve-root /")
+        assert "rm -rf --no-preserve-root /" in views, views
+
+    def test_two_accepted_over_blocks_are_pinned_not_implied(self):
+        """ACCEPTED residuals from the GPT 5.6 lane's advisory findings.
+
+        Both are FALSE POSITIVES, not bypasses, and both were measured:
+
+        * ``$'…'`` is INERT inside double quotes -- bash's word for
+          ``"$'r\\155 -rf /'"`` is the literal ``$'r\\155 -rf /'`` and ``echo``
+          prints it verbatim -- but the decode is applied without tracking the
+          outer quote context, so a view can hold the decoded text.
+        * ``$'r\\155 -rf /'`` is ONE word (``rm -rf /`` with spaces inside it), and
+          running it gives "No such file or directory" because no program has that
+          name; re-joining tokens with spaces turns those intra-word spaces into
+          argv boundaries.
+
+        Accepted rather than fixed, on the asymmetry this file already documents
+        for its data-consumer denylist: a false positive is "annoying, visible, and
+        safe", while the inverse is a silent bypass -- and ``is_denied``'s own
+        docstring states over-blocking is the safer direction for this pass.  Both
+        suggested remedies push toward LESS denial, and the second one would have to
+        mask intra-token whitespace, which is the mechanism that makes a re-spelled
+        command's argv read as the command in the first place.  Pinned so the
+        behaviour is findable and deliberate; if either is closed, its assertion
+        flips.
+        """
+        assert is_denied("echo \"$'r\\155 -rf /'\"") is not None
+        assert is_denied("echo $'r\\155 -rf /'") is not None
+
+    def test_a_single_segment_command_is_not_walked_twice(self):
+        """The whole-command payload walk exists for the case where the split
+        SEVERED a quoted payload.  With one segment the whole command IS that
+        segment, so walking it twice doubles the payload scan -- which is quadratic
+        in token count inside ``_nested_shell_payloads`` -- for no additional view.
+        Raised as a stall risk by the GPT 5.6 lane; measured, skipping the duplicate
+        halves the cost on a command padded with interpreter tokens.
+        """
+        from kiro_crew import security
+
+        calls: list[tuple[str, bool]] = []
+        real = security._deny_segment_views
+
+        def _spy(segment: str, emit_self: bool = True) -> tuple[str, ...]:
+            calls.append((segment, emit_self))
+            return real(segment, emit_self)
+
+        security._deny_segment_views = _spy  # type: ignore[assignment]
+        try:
+            security.is_denied("ls -la")
+            single = list(calls)
+            calls.clear()
+            security.is_denied("ls -la && echo hi")
+            compound = list(calls)
+        finally:
+            security._deny_segment_views = real  # type: ignore[assignment]
+
+        # One segment: exactly one walk, and it is the emitting one.
+        assert single == [("ls -la", True)], single
+        # Two segments: the whole-command walk is needed, and emits nothing itself.
+        assert compound[0] == ("ls -la && echo hi", False), compound
+        assert [c[0] for c in compound[1:]] == ["ls -la", "echo hi"], compound
+        # ...and the payload reach it exists for is intact.
+        assert is_denied("bash -c 'r\\\nm -rf /'") is not None
+
+    def test_unbalanced_quote_still_normalizes_through_the_fallback(self):
+        """An unterminated quote makes ``shlex`` raise; the degraded fallback
+        (whitespace split + quote strip) must still produce the view, so a
+        hostile unparseable spelling is not a bypass."""
+        assert is_denied('rm -rf "/') is not None
+        assert is_denied("rm -rf '/") is not None
+
+    def test_normalization_failure_cannot_flip_a_deny_to_an_allow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Fail-closed: the raw view is matched FIRST and independently, so a
+        tokenizer that raises loses only the extra match."""
+        from kiro_crew import security
+
+        def _boom(cmd: str) -> list[str]:
+            raise RuntimeError("tokenizer exploded")
+
+        monkeypatch.setattr(security, "_shell_tokens", _boom)
+        assert security._deny_segment_views("rm -rf /") == ("rm -rf /",)
+        assert security.is_denied("rm -rf /") is not None
+        assert security.is_denied("ls -la && rm -rf /") is not None
+
+    def test_the_view_never_crosses_a_separator(self):
+        """Re-joining tokens erases command boundaries, so the view is built per
+        SEGMENT.  A whole-input re-join would fabricate a command that was never
+        run -- these two inputs are each two commands, neither of which is
+        destructive."""
+        for cmd in (
+            "echo rm\n-rf /",
+            "echo rm; -rf /",
+            "echo rm && -rf /",
+        ):
+            assert is_denied(cmd) is None, f"fabricated a command across a separator: {cmd!r}"
+
+    def test_benign_commands_stay_allowed(self):
+        """Including quoted ones -- the view only removes quoting, it does not
+        invent tokens."""
+        for cmd in (
+            "ls -la",
+            "echo hello",
+            'grep -rn "needle" src/',
+            "git commit -m 'fix the thing'",
+            'python -c "print(1)"',
+            "aws s3 ls",
+            "git push origin my-feature",
+        ):
+            assert is_denied(cmd) is None, cmd
+
+    def test_views_are_deduplicated_when_normalization_changes_nothing(self):
+        """A command with no quoting/escaping/padding must not pay a second
+        140-rule pass."""
+        from kiro_crew import security
+
+        assert security._deny_segment_views("ls -la") == ("ls -la",)
+        assert security._deny_segment_views('rm -rf "/"') == ('rm -rf "/"', "rm -rf /")
+        # A nested payload adds its own view after the parent's, and the walk
+        # takes no numeric depth cap -- it terminates because each payload is
+        # strictly shorter than its parent's source text.
+        assert security._deny_segment_views("sh -c 'rm -rf \"/\"'") == (
+            "sh -c 'rm -rf \"/\"'",
+            'sh -c rm -rf "/"',
+            "rm -rf /",
+        )
+
+    def test_shared_tokenizer_left_the_path_normalizer_expanding(self):
+        """``_shell_tokens`` was factored OUT of ``normalize_shell_command``; the
+        expansion that makes the latter the PATH normalizer must still run, or
+        the sensitive-path normalizer pass silently stops resolving spellings."""
+        import os
+
+        from kiro_crew import security
+
+        home = os.path.expanduser("~")
+        assert security.normalize_shell_command('cat "$HOME"/.ssh/id_rsa') == [
+            "cat",
+            f"{home}/.ssh/id_rsa",
+        ]
+        assert security.normalize_shell_command("cat ~/.ssh/id_rsa") == [
+            "cat",
+            f"{home}/.ssh/id_rsa",
+        ]
+        # ...and the tokenizer itself deliberately does NOT expand.
+        assert security._shell_tokens('cat "$HOME"/.ssh/id_rsa') == ["cat", "$HOME/.ssh/id_rsa"]
+        assert security._shell_tokens("") == []
+
+
+class TestEmptyArgvElementDoesNotBreakTheDenyView:
+    """An empty-quoted word must not walk a command past the deny catalog.
+
+    ``rm -rf "" /home/x`` runs exactly what ``rm -rf /home/x`` runs -- the empty
+    operand is a real argv element the shell hands over, and ``rm`` simply
+    reports it and deletes the rest.  But the deny VIEW is a single-space join of
+    argv, so a zero-width element rendered as a spurious extra separator
+    (``rm -rf  /home/x``) and every rule authored as a command SHAPE with single
+    separators stopped matching its own target (issue #7500).
+
+    The escape was pattern-DEPENDENT, which is what places the repair in the
+    render rather than in individual rules: ``chmod "" 777 /etc/passwd`` stayed
+    denied only because the rule that catches it tolerates the extra separator.
+
+    The empty-elided render is ADDED as a third view, never substituted for the
+    plain join -- ``test_the_elided_view_is_added_and_never_substituted`` carries
+    the measured reason.
+    """
+
+    # One rule (``rm -rf /.*``), every spelling of an empty word a shell accepts,
+    # at every position where it changes the join.
+    EMPTY_WORD_SPELLINGS = (
+        'rm -rf "" /home/x',
+        "rm -rf '' /home/x",
+        "rm -rf $'' /home/x",  # ANSI-C quoting, empty body
+        'rm -rf $"" /home/x',  # locale quoting, empty body
+        "rm -rf \"\"'' /home/x",  # concatenation of two empty words
+        "rm -rf ''\"\" /home/x",
+        'rm -rf """" /home/x',
+        'rm -rf "" "" /home/x',  # two separate empty operands
+        'rm "" -rf /home/x',  # between the program and its flag
+    )
+
+    def test_every_empty_word_spelling_is_denied(self):
+        for cmd in self.EMPTY_WORD_SPELLINGS:
+            assert is_denied(cmd) is not None, f"empty word escaped the rule: {cmd!r}"
+
+    def test_the_empty_word_is_a_real_bypass_without_the_elision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The additive-proof twin, in the shape this file already uses: with the
+        normalized view removed, every cell above is ALLOWED -- so the assertion
+        above is a property of the view's render and not an incidental raw match.
+        """
+        from kiro_crew import security
+
+        monkeypatch.setattr(
+            security, "_deny_segment_views", lambda segment, emit_self=True: (segment.lower(),)
+        )
+        for cmd in self.EMPTY_WORD_SPELLINGS:
+            assert security.is_denied(cmd) is None, (
+                f"raw text now matches {cmd!r} on its own -- the cross above no "
+                "longer isolates the view's render"
+            )
+        assert security.is_denied("rm -rf /home/x") is not None
+
+    def test_other_rule_families_escaped_the_same_way(self):
+        """Not an ``rm``-specific patch: any rule whose shape uses single
+        separators was defeated by the same word."""
+        for cmd in (
+            'dd "" if=/dev/zero of=/dev/sda',
+            "dd '' if=/dev/zero of=/dev/sda",
+            "dd $'' if=/dev/zero of=/dev/sda",
+        ):
+            assert is_denied(cmd) is not None, f"empty word escaped the rule: {cmd!r}"
+
+    def test_the_tolerant_rule_family_does_not_regress(self):
+        """``chmod`` was denied BEFORE this change, by a rule that tolerates the
+        extra separator, so it is the control that proves the fix did not trade
+        one family for another."""
+        for cmd in (
+            "chmod 777 /etc/passwd",
+            'chmod "" 777 /etc/passwd',
+            "mkfs.ext4 /dev/sda1",
+            'mkfs.ext4 "" /dev/sda1',
+        ):
+            assert is_denied(cmd) is not None, cmd
+
+    def test_a_nested_payload_carrying_the_word_is_denied(self):
+        """The word is available at both levels: in the wrapper's own argv and
+        inside the ``-c`` script, whose payload gets its own view."""
+        for cmd in (
+            "bash \"\" -c 'dd \"if=/dev/zero\" of=/dev/sda'",
+            "bash -c 'dd \"\" if=/dev/zero of=/dev/sda'",
+            "bash \"\" -c 'dd \"\" if=/dev/zero of=/dev/sda'",
+        ):
+            assert is_denied(cmd) is not None, f"nested empty word escaped: {cmd!r}"
+
+    def test_the_tokenizer_still_reports_the_element(self):
+        """The fix is in the RECOGNIZER, not the lexer.  ``_shell_tokens`` is
+        documented as argv the way a POSIX shell hands it over, and an
+        empty-quoted word really is an element of that argv -- so it stays, and
+        the ~19 path-normalizer consumers see unchanged tokens.  Only the view
+        gains a render without it.
+        """
+        from kiro_crew import security
+
+        assert security._shell_tokens('rm -rf "" /home/x') == ["rm", "-rf", "", "/home/x"]
+        assert security.normalize_shell_command('rm -rf "" /home/x') == [
+            "rm",
+            "-rf",
+            "",
+            "/home/x",
+        ]
+        # Three views: raw, the plain join (unchanged, double-spaced), and the
+        # empty-elided join APPENDED beside it -- never instead of it.
+        assert security._deny_segment_views('rm -rf "" /home/x') == (
+            'rm -rf "" /home/x',
+            "rm -rf  /home/x",
+            "rm -rf /home/x",
+        )
+
+    def test_the_elided_view_is_added_and_never_substituted(self):
+        """A rule that REQUIRES an intervening token matched the double-spaced
+        view, so replacing that view instead of adding beside it REMOVED an
+        existing denial.
+
+        Found by the GPT 5.6 review lane and reproduced against the merge-base:
+        with a custom rule ``rm -rf .* ./data``, the spelling
+        ``r""m -rf "" ./data`` was refused before this change and became allowed
+        when the plain join was dropped -- the rule matches neither the elided
+        view nor the command's canonical spelling ``rm -rf ./data``, which that
+        rule never covered.  The ``r""m`` spelling is what isolates it: the
+        simpler ``rm -rf "" ./data`` keeps a raw-view match, because ``.*``
+        happily spans the quote characters.
+
+        This is the concrete reason ``_deny_segment_views`` only ever ADDS views.
+        """
+        custom = ["rm -rf .* ./data"]
+        for cmd in (
+            "rm -rf -v ./data",  # the shape the rule is authored for
+            'rm -rf "" ./data',
+            'r""m -rf "" ./data',  # the isolating spelling
+            "rm -rf '' ./data",
+        ):
+            assert is_denied(cmd, denied_regexes=custom) is not None, (
+                f"an existing denial was lost: {cmd!r}"
+            )
+        # The canonical spelling was never covered by that rule, before or after,
+        # which is what makes the rows above denials to PRESERVE rather than a
+        # coverage claim this change should be making.
+        assert is_denied("rm -rf ./data", denied_regexes=custom) is None
+
+    def test_benign_commands_with_an_empty_word_stay_allowed(self):
+        """Eliding a zero-width element renders what the command does; it must not
+        invent a match for a command that does nothing destructive."""
+        for cmd in (
+            'echo "" hello',
+            "printf '%s' ''",
+            'git "" status',
+            'grep "" notes.txt',
+            'test "" = ""',
+            'ls "" -la',
+        ):
+            assert is_denied(cmd) is None, f"benign empty word over-blocked: {cmd!r}"
+
+    EMPTY_WORDS = ('""', "''", "$''", '$""', "\"\"''", '""""')
+
+    # Single-segment commands, one per rule shape.  ``git push origin main`` is
+    # here for the VIEW property; its deny property is enforced by the argv
+    # floor rather than the tiers -- see
+    # ``test_the_git_publish_detector_skips_an_empty_word``.
+    PROPERTY_BASES = (
+        "rm -rf /home/x",
+        "dd if=/dev/zero of=/dev/sda",
+        "chmod 777 /etc/passwd",
+        "git push origin main",
+        "ls -la",
+        "cat /etc/passwd",
+    )
+
+    def _empty_word_variants(self, base: str):
+        """*base* with each empty-word spelling inserted at every argument boundary."""
+        words = base.split(" ")
+        for word in self.EMPTY_WORDS:
+            for at in range(len(words) + 1):
+                yield at, word, " ".join(words[:at] + [word] + words[at:])
+
+    def test_inserting_an_empty_word_at_any_boundary_changes_no_view(self):
+        """The mechanical catch the issue's pattern harvest asked for, expressed
+        against the VIEW instead of rule by rule.
+
+        The harvest proposed asserting that inserting ``""`` at each argument
+        boundary of every catalog command still denies.  Stated against the view
+        the property is stronger and rule-INDEPENDENT: if the normalized view of
+        the command with an empty word inserted is IDENTICAL to the view without
+        it, then no rule matched against that view -- including one a per-family
+        list would omit, and one added later -- can decide the two differently.  A
+        per-rule sweep would also need a command synthesized from each of the ~140
+        rule regexes, which is not mechanical; this is.
+        """
+        from kiro_crew import security
+
+        for base in self.PROPERTY_BASES:
+            expected = security._deny_segment_views(base)[-1]
+            for at, word, variant in self._empty_word_variants(base):
+                views = security._deny_segment_views(variant)
+                assert views[-1] == expected, (
+                    f"{word} at position {at} of {base!r} changed the view: "
+                    f"{views[-1]!r} != {expected!r}"
+                )
+
+    def test_the_deny_decision_follows_the_view_for_every_boundary(self):
+        """The view property above, carried through to the decision the gate
+        actually returns.  The non-git bases are decided by the deny TIERS;
+        the git base is enforced by the argv floor, swept here since issue
+        #8115 closed its empty-word gap (an interposed word now denies at
+        every boundary -- via the protected-branch rule where the parse holds,
+        via the ungated anti-obfuscation branch where it does not)."""
+        from kiro_crew import security
+
+        for base in self.PROPERTY_BASES:
+            expected_denied = security.is_denied(base) is not None
+            for _at, _word, variant in self._empty_word_variants(base):
+                assert (security.is_denied(variant) is not None) == expected_denied, (
+                    f"{variant!r} decided differently from {base!r}"
+                )
+
+    def test_the_git_publish_detector_skips_an_empty_word(self):
+        """GAP CLOSED by issue #8115 -- this is the flipped form of the
+        ``test_the_git_publish_detector_is_a_separate_pre_existing_gap`` pin
+        that #8114 left, and it now pins the closure.
+
+        Every git-publish rule is stripped from the regex tier and enforced
+        solely by an argv floor (``_git_publish_floor_tags``).  Its entry
+        detector's raw-text pass still requires the program and subcommand
+        adjacent, but the normalizer second pass
+        (``_is_git_push_via_normalizer``) now skips empty and whitespace-only
+        argv words when seeking the subcommand, so an interposed empty word no
+        longer hides the push from the floor.  The widening is deliberate
+        fail-closed OVER-detection: git does not ignore a zero-width word (it
+        takes it as its command name and exits), so a spelling this newly
+        reaches either fails to run a push at all or was already reached in
+        its adjacent spelling -- no runnable push gains an escape.  For the
+        newly-reached spellings the floor's ``_git_push_args`` parse fails on
+        the interposed word, so the deny comes from the UNGATED
+        anti-obfuscation branch (``_GIT_PUBLISH_UNGATED``), not from
+        ``_is_push_to_protected_branch`` -- the right treatment for a spelling
+        git itself cannot run.
+        """
+        from kiro_crew import security
+
+        assert is_denied("git push origin main") is not None, (
+            "the protected-branch floor no longer fires on the plain spelling -- this "
+            "pin is measuring nothing"
+        )
+        # Every empty-word spelling the view property enumerates, interposed
+        # at the exact boundary the entry detector used to bail on, plus the
+        # whitespace-only shapes from issue #8115.
+        base = "git push origin main".split(" ")
+        for word in self.EMPTY_WORDS + ('" "', "$'\\t'"):
+            cmd = " ".join([base[0], word] + base[1:])
+            assert is_denied(cmd) is not None, (
+                f"an interposed word escaped the git-publish floor: {cmd!r}"
+            )
+        # The DISCRIMINATING pin for the seek-loop closure is the predicate
+        # itself: the end-to-end deny above can also arrive via the ungated
+        # parse-failure branch, and the flag spellings below already match the
+        # pass-1 raw regex, so only a direct call proves the normalizer seek
+        # now steps over the empty word (and, for the flag rows, that a global
+        # flag still consumes its empty argument without drifting off the
+        # subcommand position).
+        for cmd in (
+            'git "" push origin main',
+            "git '' -c x=y push origin main",
+            "git -c '' push origin main",
+        ):
+            assert security._is_git_push_via_normalizer(cmd) is True, (
+                f"the normalizer seek did not resolve the subcommand: {cmd!r}"
+            )
+        # ...and the end-to-end deny for the flag spellings holds too.
+        for cmd in (
+            "git -c '' push origin main",
+            "git -C '' push origin main",
+            "git '' -c x=y push origin main",
+        ):
+            assert is_denied(cmd) is not None, cmd
+        # A post-subcommand empty word was always tolerated (argv parsing has
+        # begun by then) and stays unchanged.
+        assert is_denied('git push "" origin main') is not None
+        # The subcommand-position requirement is intact: ``stash push`` with an
+        # interposed empty word is still not a publish.
+        assert is_denied('git "" stash push') is None
+
+    def test_a_whitespace_only_word_is_a_documented_residual(self):
+        """DOCUMENTED GAP, pinned rather than claimed.
+
+        A quoted WHITESPACE-ONLY word (``rm -rf " " /home/x``) renders the same
+        extra separator and still escapes the rule.  It is NOT fixed here.  A
+        render that dropped it would be additive like the empty-elided one and so
+        could not lose a denial, but it is not the same claim: an empty element
+        carries no characters, so a view without it is still the argv the shell
+        hands over, while a whitespace-only element is a real operand naming a
+        file that can exist, so a view without it is an argv ONE OPERAND SHORT of
+        the one that runs.  ``is_denied``'s exception machinery is matched against
+        views, so the direction that widening opens is ALLOW.
+
+        The naive alternative is unsound and must not be chosen either:
+        whitespace-collapsing the joined line would merge a two-word filename
+        into two operands and match a rule against a command that was never run --
+        the second assertion below is what keeps that on the record.
+
+        Tracked by issue #8124; when it lands, this test is the one that must
+        flip.
+        """
+        from kiro_crew import security
+
+        for cmd in ('rm -rf " " /home/x', "rm -rf $'\\t' /home/x"):
+            assert is_denied(cmd) is None, (
+                f"{cmd!r} is now denied -- the residual this pins is closed, so update "
+                "the security spec and flip this assertion"
+            )
+        # ...and the two-word filename that makes a whitespace collapse unsound.
+        assert security._deny_segment_views('rm -rf "a b"')[-1] == "rm -rf a b"
+
+    def test_the_self_protection_floor_was_never_fooled(self):
+        """The argv-structural floor matches token frames, not a rendered line, so
+        the empty word never reached it -- pinned so a later refactor cannot move
+        those rules onto the rendered view and inherit this class of escape."""
+        prog = "kiro" + "crew"
+        for cmd in (f"{prog} restart", f'{prog} "" restart', f'{prog} -v "" restart'):
+            assert is_denied(cmd) is not None, cmd
+
+
+class TestPolynomialBacktrackingStaysBounded:
+    """The unbounded full-input path must not accept polynomial-backtracking regexes.
+
+    An earlier round of #7705 gave single-fragment patterns full-input matching so
+    an edition rule could not be silently capped at 2000 chars (padding bypass).
+    That reasoning was about correctness and missed cost: the length cap was also
+    what made POLYNOMIAL backtracking harmless. `a+a+$` is not the exponential
+    shape `_redos_prone` screens, so it publishes fine, and unbounded it measures
+    ~3.5s against 2,000 characters — a stall of the synchronous PreToolUse gate.
+    GPT 5.6 flagged it, then flagged the grouped spelling `(a+)(a+)$` that the
+    first screen still let through. Both were right.
+    """
+
+    def test_the_exponential_screen_does_not_catch_the_polynomial_family(self):
+        # Why a second predicate is needed at all: the publication screen passes
+        # this pattern, so nothing else stands between it and the gate.
+        assert security.is_safe_user_regex("a+a+$") is True
+        assert security.is_safe_user_regex("(a+)+$") is False
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "a+a+$",
+            r"\w+\d+$",
+            ".*.*!",
+            "[a-z]*[a-z]+;",
+            "a{2,}b{2,}",
+            # Grouped spellings: parentheses do not change the backtracking, so
+            # treating a group as opaque let these through (GPT 5.6, #7705).
+            "(a+)(a+)$",
+            "(a+)a+$",
+            "a+(a+)$",
+            "(?:a+)(?:a+)$",
+            "(ab)+(cd)+$",
+            "((a+))(a+)$",
+        ],
+    )
+    def test_polynomial_shapes_are_flagged(self, pattern):
+        assert security._polynomial_backtracking_prone(pattern) is True
+
+    @pytest.mark.parametrize("pattern", ["(a+)(a+)$", "(a+)a+$", "(?:a+)(?:a+)$"])
+    def test_grouped_spellings_keep_the_bounded_engine(self, pattern):
+        # The whole point: each of these measured multiple SECONDS unbounded.
+        assert security._DenyMatcher(pattern)._bounded is True
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            r"rm\s+-rf\s+/",
+            r"ada[^;&#>|\n]*credentials",
+            r"curl.*169\.254\.169\.254",
+            "a+b",
+            r"(?:sudo\s+)?shutdown",
+        ],
+    )
+    def test_ordinary_rules_are_not_flagged(self, pattern):
+        # A literal between the quantified units is the common shape; flagging it
+        # would cost the fast path for nearly every real rule.
+        assert security._polynomial_backtracking_prone(pattern) is False
+
+    def test_a_flagged_pattern_keeps_the_bounded_engine(self):
+        matcher = security._DenyMatcher("a+a+$")
+        assert matcher._bounded is True, "must not take the unbounded full-input path"
+
+    def test_the_flagged_pattern_evaluates_fast_on_a_long_input(self):
+        # The actual property under test is wall-clock: on the bounded engine a
+        # 20k-character command must not stall the gate. Unbounded, this input
+        # would take minutes.
+        matcher = security._DenyMatcher("a+a+$")
+        subject = "a" * 20000 + "!"
+        start = time.perf_counter()
+        matcher.match(subject)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 1.0, f"deny evaluation took {elapsed:.1f}s — gate would stall"
+
+
+class TestDataConsumerGuardIsChargedPerCommandNotPerPayload:
+    """#8595 -- the deny walk was quadratic in nested payload COUNT.
+
+    ``_data_consumer_exempt`` is called once per extracted payload, and three of
+    its guards read only ``tokens`` -- a value the caller binds once, outside the
+    payload loop.  One of those guards sweeps the whole argv with
+    ``_SCRIPT_EXECUTES_RE``, so re-asking per payload cost N x len(tokens):
+    18,000 payloads took ~209s measured, against ~2.5s once the answer is
+    charged once.
+
+    These assertions are STRUCTURAL on purpose.  A wall-clock bound would claim
+    a performance budget for every other pass in the gate and would flake on a
+    slower runner, so what is pinned is the bounded QUANTITY -- how many times
+    the command-level answer is computed -- which is the property the fix
+    actually establishes.
+    """
+
+    @staticmethod
+    def _spaced(n: int) -> str:
+        """The issue's repro shape: ``bash -c a0pay -c a1pay ...``."""
+        return "bash" + "".join(f" -c a{i}pay" for i in range(n))
+
+    @staticmethod
+    def _count_guard_calls(monkeypatch, cmd: str) -> int:
+        calls = {"n": 0}
+        real = security._data_consumer_command_disqualified
+
+        def counting(tokens):
+            calls["n"] += 1
+            return real(tokens)
+
+        monkeypatch.setattr(security, "_data_consumer_command_disqualified", counting)
+        security.is_denied(cmd)
+        return calls["n"]
+
+    @staticmethod
+    def _count_argv_sweeps(monkeypatch, cmd: str) -> int:
+        calls = {"n": 0}
+        real = security._SCRIPT_EXECUTES_RE
+
+        class Counting:
+            def search(self, s):
+                calls["n"] += 1
+                return real.search(s)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        monkeypatch.setattr(security, "_SCRIPT_EXECUTES_RE", Counting())
+        security.is_denied(cmd)
+        return calls["n"]
+
+    def test_guard_is_charged_once_however_many_payloads(self, monkeypatch):
+        # The count must not scale with the payload count.  Measured: 1 at every
+        # size here; before the fix the guard's work was re-done per payload.
+        counts = {n: self._count_guard_calls(monkeypatch, self._spaced(n)) for n in (30, 60, 120)}
+        assert counts[30] == counts[60] == counts[120], (
+            f"command-level guard is charged per payload, not per command: {counts}"
+        )
+        # Belt as well as braces: a future change making it 2*N would still keep
+        # the three counts EQUAL to each other only by accident, so bound it
+        # against the payload count directly.
+        assert counts[120] < 30, f"guard charged {counts[120]} times for 120 payloads"
+
+    @pytest.mark.parametrize("n", [30, 60, 120])
+    def test_argv_sweep_is_linear_in_the_argv_not_quadratic_in_payloads(self, monkeypatch, n):
+        # ``_SCRIPT_EXECUTES_RE`` sweeps every token.  Charged once per command
+        # that is O(len(tokens)); charged once per payload it was
+        # O(len(tokens) x payloads).  Measured before the fix: 1830 / 7260 /
+        # 28920 sweeps at n = 30 / 60 / 120 (ratio ~3.98, quadratic).  After:
+        # 61 / 121 / 241 (ratio ~1.99, linear).  The bound below is ~3x the argv
+        # length, which the linear form clears with room and the quadratic form
+        # misses by a factor of forty at n=120.
+        cmd = self._spaced(n)
+        argv_len = len(security.normalize_shell_command(cmd))
+        sweeps = self._count_argv_sweeps(monkeypatch, cmd)
+        assert sweeps <= 3 * argv_len, (
+            f"argv sweep is quadratic in payload count: {sweeps} sweeps for an "
+            f"argv of {argv_len} tokens ({n} payloads)"
+        )
+
+    @staticmethod
+    def _count_argv_elements(monkeypatch, cmd: str) -> "tuple[int, int]":
+        """(argv elements consumed, argv length) for one ``is_denied`` call.
+
+        The argv is handed out as a list subclass whose iterator counts the
+        elements taken from it, which is what separates ONE hoisted pass over
+        the argv from one pass PER PAYLOAD.
+        """
+        counted = {"n": 0}
+
+        class CountingList(list):
+            def __iter__(self):
+                for item in list.__iter__(self):
+                    counted["n"] += 1
+                    yield item
+
+        real = security._shell_tokens
+
+        def wrapped(*args, **kwargs):
+            return CountingList(real(*args, **kwargs))
+
+        monkeypatch.setattr(security, "_shell_tokens", wrapped)
+        security.is_denied(cmd)
+        return counted["n"], len(real(cmd))
+
+    @pytest.mark.parametrize("n", [30, 60, 120, 240])
+    def test_argv_is_walked_per_command_not_per_payload(self, monkeypatch, n):
+        # The second half of #8595: recovering a payload's token positions with
+        # ``[i for i, tok in enumerate(tokens) if tok == payload]`` walks the
+        # whole argv once per payload.  Hoisting the guard alone leaves the walk
+        # quadratic -- measured 1.37s / 4.30s / 15.56s at 4k / 8k / 16k payloads,
+        # ratios 3.15 and 3.62 -- so this half is load-bearing, not tidying.
+        #
+        # Measured argv elements consumed, 30 / 60 / 120 / 240 payloads:
+        #   both hoists      1154 /  2294 /  4574 /   9134   (ratio ~2.00, linear)
+        #   position reverted 2984 /  9554 / 33494 / 124574   (ratio ~3.72, quadratic)
+        # The bound below sits at 40x the argv length: the linear form uses ~19x
+        # and the quadratic form ~259x at n=240.
+        cmd = self._spaced(n)
+        elements, argv_len = self._count_argv_elements(monkeypatch, cmd)
+        assert elements <= 40 * argv_len, (
+            f"argv walked per payload: {elements} elements consumed for an argv of "
+            f"{argv_len} tokens ({n} payloads) -- expected O(argv), not O(argv x payloads)"
+        )
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            # pipes into an evaluator -- the printed text IS the command
+            f"echo {_NAME} {_TOK} | sh",
+            f"echo '{_PK} -f {_NAME}' | bash",
+            # substitution occupies program position -- its OUTPUT runs
+            f"$(printf echo) {_NAME} {_TOK}",
+            f"`printf echo` {_PK} -f {_NAME}",
+            # the script text can EXECUTE rather than print
+            f'awk \'system("{_PK} -f {_NAME}")\'',
+            f"awk 'BEGIN{{print | \"{_PK} -f {_NAME}\"}}'",
+            # a control operator inside the token starts a command that runs
+            f"echo foo;{_PK} -f {_NAME}",
+        ],
+    )
+    def test_every_way_the_exemption_is_refused_still_refuses(self, cmd):
+        # Hoisting must not widen the exemption.  A faster deny gate that misses
+        # one case is strictly worse than a slow one, so each documented refusal
+        # route is pinned here alongside the cost assertions above.
+        assert _denied_by(cmd) is not None
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"echo {_NAME} {_TOK}",
+            f"printf '{_NAME} {_TOK}'",
+            "awk '{print $1}' file",
+            "sed 's/a/b/' file",
+        ],
+    )
+    def test_the_ordinary_data_consumer_is_still_exempt(self, cmd):
+        # The other direction: hoisting must not NARROW the exemption either, or
+        # the change trades a latency fix for a false positive.
+        assert _denied_by(cmd) is None
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"echo {_NAME} {_TOK}",
+            f"echo {_NAME} {_TOK} | sh",
+            f'awk \'system("{_PK} -f {_NAME}")\'',
+            "awk '{print $1}' file",
+            f"$(printf echo) {_NAME} {_TOK}",
+        ],
+    )
+    def test_precomputed_and_self_computed_guards_agree(self, cmd):
+        # The three call sites this change does not touch pass no precomputed
+        # value, so they take the ``None`` branch.  That branch must give the
+        # same answer as the hoisted one, or those callers silently change
+        # behaviour.
+        tokens = security.normalize_shell_command(cmd)
+        programs = security._argv_programs(tokens)
+        hoisted = security._data_consumer_command_disqualified(tokens)
+        for i, token in enumerate(tokens):
+            self_computed = security._data_consumer_exempt(i, token, programs, tokens)
+            passed_in = security._data_consumer_exempt(
+                i, token, programs, tokens, command_disqualified=hoisted
+            )
+            assert self_computed == passed_in, (
+                f"token {i} ({token!r}) disagrees: self-computed={self_computed} "
+                f"passed-in={passed_in}"
+            )

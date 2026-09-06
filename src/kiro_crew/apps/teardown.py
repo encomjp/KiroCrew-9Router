@@ -534,3 +534,36 @@ async def notify_slot_closed(app: str, slot_key: str) -> bool:
         )
         return False
     return True
+
+
+def forget_app_hooks(app: str) -> None:
+    """Drop every in-process hook *app* registered. For UNINSTALL, not disable.
+
+    The three registries above are process memory keyed by app name, and nothing
+    dropped an entry: ``unregister_app_disable_hook``,
+    ``unregister_slot_close_hook`` and ``unregister_slot_close_undo_hook`` existed
+    with no caller. Uninstall already drops the app's other per-app process state
+    (notification channels, the app-secret cache) and deletes its workspace, so a
+    surviving hook is a closure over a store whose files are gone.
+
+    That is not merely untidy, because :func:`notify_slot_closed` reports failure
+    rather than swallowing it and ``api_chat_slot_delete`` REFUSES the dismissal on
+    a false return. A slot belonging to an uninstalled app therefore becomes
+    undismissable: the stale hook raises, the close is refused with
+    ``app_close_hook_failed``, and the user is left with a tab they cannot get rid
+    of for an app that no longer exists. Dropping the entry restores the
+    no-hook-registered path, which returns True and lets the close proceed.
+
+    DISABLE deliberately does not call this, and the asymmetry with the
+    notification channels next to it is the reason rather than an oversight:
+    those ARE unregistered on both paths, because the gateway's own enable
+    pipeline puts them back. These registries are not gateway-owned. They are
+    repopulated only from each app's own watchdog -- ``register_app_disable_hook``
+    says so -- so clearing them on disable would leave a window after a re-enable,
+    before that watchdog next runs, in which a dismissal quietly fails to reach a
+    worker that is live again. Uninstall has no such window: nothing re-registers
+    behind it.
+    """
+    unregister_app_disable_hook(app)
+    unregister_slot_close_hook(app)
+    unregister_slot_close_undo_hook(app)

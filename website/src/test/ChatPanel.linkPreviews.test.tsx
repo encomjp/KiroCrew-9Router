@@ -71,13 +71,16 @@ describe('ChatPanel settings – Link Previews toggle', () => {
     await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'true'))
   })
 
-  it('persists the change through updateDashboardConfig, preserving sibling fields', async () => {
+  it('persists the change through updateDashboardConfig, sending only that key', async () => {
     wrap(<ChatPanel />)
     const toggle = await screen.findByRole('switch', { name: 'Link Previews' })
     await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'false'))
     fireEvent.click(toggle)
+    // Sibling fields are preserved by the HANDLER, which applies only the keys
+    // present in the body. Sending them from here instead would write each one
+    // back at this tab's cached value and clobber a setting changed elsewhere.
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, link_previews: true }),
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ link_previews: true }),
     )
   })
 
@@ -88,7 +91,7 @@ describe('ChatPanel settings – Link Previews toggle', () => {
     await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'true'))
     fireEvent.click(toggle)
     await waitFor(() =>
-      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ ...BASE_DASH, link_previews: false }),
+      expect(updateDashboardConfigMock).toHaveBeenCalledWith({ link_previews: false }),
     )
   })
 

@@ -808,6 +808,15 @@ def _tools_call_with_caller(req_id, tool_name: str, session_key: str) -> dict:
     return msg
 
 
+def _tools_call_with_tenant(req_id, tool_name: str, nonce: str) -> dict:
+    """A forwarded call as an UNNAMED co-tenant receives it: nonce, no identity."""
+    from kiro_crew.mcp_caller import build_tenant_meta
+
+    msg = _tools_call(req_id, tool_name)
+    msg["params"]["_meta"] = build_tenant_meta(nonce)
+    return msg
+
+
 class TestStdioLoopCallerIdentity:
     def setup_method(self):
         mcp_shared._use_content_length = False
@@ -858,6 +867,56 @@ class TestStdioLoopCallerIdentity:
             assert harness.wait_for(lambda: len(harness.responses) >= 1)
             assert seen == ["dashboard:chat-3"]
             assert mcp_caller.current_caller() is None  # cleared after dispatch
+        finally:
+            harness.close()
+
+    def test_tool_sees_the_tenant_nonce_WITHOUT_an_identity(self, monkeypatch):
+        """#5322: the separator arrives even when the identity does not.
+
+        This is the frame an unnamed co-tenant of a pooled backend receives. The
+        nonce must reach the tool (it is what per-tenant state is keyed on when
+        there is nothing else), the caller must stay None (a connection name is not
+        an identity), and both must be cleared afterwards so the next dispatch on
+        this thread cannot inherit them.
+        """
+        from kiro_crew import mcp_caller
+
+        seen: list = []
+
+        def call_tool(name, args):
+            seen.append((mcp_caller.current_caller(), mcp_caller.current_tenant_nonce()))
+            return "ok"
+
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call_with_tenant(12, "echo", "n0nce-a"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            assert seen == [(None, "n0nce-a")]
+            assert mcp_caller.current_tenant_nonce() == ""  # cleared after dispatch
+        finally:
+            harness.close()
+
+    def test_a_call_with_no_tenant_block_sees_an_empty_nonce(self, monkeypatch):
+        """The 1:1 topology, where no gateway injects anything.
+
+        An empty nonce is the signal to keep using the backend's own per-process
+        fallback, so it must not be a stale value from a previous call.
+        """
+        from kiro_crew import mcp_caller
+
+        seen: list = []
+
+        def call_tool(name, args):
+            seen.append(mcp_caller.current_tenant_nonce())
+            return "ok"
+
+        harness = _LoopHarness(monkeypatch, call_tool)
+        try:
+            harness.send(_tools_call_with_tenant(13, "echo", "n0nce-a"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 1)
+            harness.send(_tools_call(14, "echo"))
+            assert harness.wait_for(lambda: len(harness.responses) >= 2)
+            assert seen == ["n0nce-a", ""]
         finally:
             harness.close()
 

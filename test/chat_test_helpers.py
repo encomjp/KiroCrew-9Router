@@ -100,6 +100,8 @@ def _make_state(tmp_path, **kwargs):
     """Create a DashboardState with mocked services and real ConversationLog."""
     sessions = MagicMock(count=0)
     sessions.remove = AsyncMock()
+    sessions.discard_conversation = AsyncMock()
+    sessions.aflush = AsyncMock()
     sessions.recycle_background = AsyncMock()
     sessions.get_pid = MagicMock(return_value=None)
     # Real in-memory Slack-link store rather than bare MagicMocks. The unlink
@@ -134,24 +136,50 @@ def _make_state(tmp_path, **kwargs):
     # drain's mirror-retarget comparison reads the link's identity fields, so a
     # bare tuple would make every mirror identical).
     _mirror_links: dict[str, ChannelLink] = {}
+    #: Keys whose binding accepts INBOUND messages, so ``find_mirror_sessions``
+    #: can answer the ``inbound_only`` question the resume paths ask.
+    _inbound_keys: set[str] = set()
 
-    def _set_mirror_link(key, channel_id, thread_ts):
+    def _set_mirror_link(key, channel_id=None, thread_ts=None, *, accepts_inbound=False, reason=""):
+        # Two shapes reach this double. Production is
+        # ``(key, ChannelLink, *, accepts_inbound, reason)``; the Slack-era callers
+        # in these tests pass ``(key, channel_id, thread_ts)``. Accepting both is
+        # what lets ONE double serve every mirror path — without the keyword-only
+        # arguments the channel-neutral link endpoint raises TypeError, which
+        # surfaces as a 500 and hides whatever the test was actually asserting.
+        if isinstance(channel_id, ChannelLink):
+            _mirror_links[key] = channel_id
+            if accepts_inbound:
+                _inbound_keys.add(key)
+            else:
+                _inbound_keys.discard(key)
+            return
         if channel_id or thread_ts:
             _mirror_links[key] = ChannelLink(
                 channel_type="slack", channel_id=channel_id, thread_id=thread_ts
             )
         else:
             _mirror_links.pop(key, None)
+            _inbound_keys.discard(key)
 
     def _get_mirror_link(key):
         return _mirror_links.get(key)
 
-    def _clear_mirror_link(key):
+    def _clear_mirror_link(key, *, reason=""):
+        _inbound_keys.discard(key)
         return _mirror_links.pop(key, None) is not None
+
+    def _find_mirror_sessions(link, *, inbound_only=False):
+        return [
+            key
+            for key, candidate in _mirror_links.items()
+            if candidate == link and (not inbound_only or key in _inbound_keys)
+        ]
 
     sessions.set_mirror_link = MagicMock(side_effect=_set_mirror_link)
     sessions.get_mirror_link = MagicMock(side_effect=_get_mirror_link)
     sessions.clear_mirror_link = MagicMock(side_effect=_clear_mirror_link)
+    sessions.find_mirror_sessions = MagicMock(side_effect=_find_mirror_sessions)
     state = DashboardState(
         sessions=sessions,
         crons=MagicMock(list_jobs=MagicMock(return_value=[]), status=MagicMock(return_value={})),

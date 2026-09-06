@@ -7,7 +7,7 @@
  * release loses the work and the review history; shipping it visible releases
  * an unpolished page. A preview flag keeps the code on `main`, keeps the route
  * routable, and simply does not advertise the surface anywhere in the UI until
- * the operator turns it on from Developer > Feature Previews.
+ * the operator turns it on from Settings > Developer > Feature Previews.
  *
  * Deliberately localStorage, not backend config: this is a per-device "show me
  * the unfinished thing" switch with no server behavior attached (the surface's
@@ -17,7 +17,7 @@
  *
  * Retiring a flag is the goal, not an afterthought: when the surface is
  * polished, delete its `previewFlag` from the registry entry and its card from
- * Developer > Feature Previews. The stale localStorage key then reads as an
+ * Settings > Developer > Feature Previews. The stale localStorage key then reads as an
  * ordinary unused key and no longer gates anything.
  */
 import { safeGetItem, safeSetItem } from './safeStorage'
@@ -65,6 +65,35 @@ export const PREVIEW_WEBHOOKS = `${PREVIEW_FLAG_PREFIX}webhooks`
  * someone who has not opted in.
  */
 export const PREVIEW_CREW = `${PREVIEW_FLAG_PREFIX}crew`
+
+/**
+ * Creating a chat that RUNS ON a connected remote crew — the "New chat on crew"
+ * entry in the sidebar's create menu.
+ *
+ * Its own flag, deliberately NOT {@link PREVIEW_CREW}. The word "crew" carries
+ * two unrelated meanings here: `PREVIEW_CREW` holds Crew Mode (parallel
+ * sub-sessions) and the Crew Members page, while this holds sessions dispatched
+ * to another MACHINE over the instances tunnel. Sharing one key would release or
+ * hold both at once, which is the same half-ship failure `PREVIEW_CREW`'s own
+ * one-flag-two-doors reasoning exists to prevent — in the opposite direction.
+ *
+ * Held because the LANDING is unfinished, not the dispatch: the session really is
+ * created on the peer, but there is no native remote chat view yet, so it opens
+ * by switching to that crew's pane, and the local session list does not show
+ * live remote sessions — so the session is hard to return to afterwards.
+ *
+ * Its toggle lives in Settings > Developer > Feature Previews, alongside every other
+ * unreleased surface, and NOT on Settings > Remote Instances where it started: a
+ * held feature is found by looking at the one page that lists held features, so
+ * scattering an opt-in onto the page it happens to act on hides it from the only
+ * reader who wants it. It keeps its own card there rather than sharing
+ * {@link PREVIEW_CREW}'s, for the two-meanings reason above.
+ *
+ * Gating the INGRESS only. A session already created on a peer keeps running
+ * there and stays reachable through that crew's own dashboard; turning the flag
+ * off only stops offering the menu entry.
+ */
+export const PREVIEW_REMOTE_CREW_CHAT = `${PREVIEW_FLAG_PREFIX}remote-crew-chat`
 
 /**
  * Read a preview flag. Absent, unparseable, or storage-denied all mean OFF —

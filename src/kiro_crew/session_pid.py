@@ -25,7 +25,6 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.paths import config_dir
 from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
 from kiro_crew.mcp_gateway.shutdown_budget import TOTAL_SHUTDOWN_BUDGET_SECS
-from kiro_crew.providers.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -558,12 +557,23 @@ def _kill_confirmed_and_writeback(
     return orphan_killed
 
 
-def _sync_kill_provider(provider: LLMProvider) -> None:
+def _sync_kill_provider(provider: object) -> None:
     """Synchronously kill a provider's process.
 
     Used during CancelledError handling where async shutdown is unreliable
     (asyncio.shield + await raises CancelledError immediately, leaving
     shutdown fire-and-forget).  Falls back to SIGKILL if SIGTERM fails.
+
+    ``provider`` is deliberately ``object`` rather than ``LLMProvider``.  Every
+    read below goes through ``getattr(..., None)`` against a PRIVATE attribute
+    that the provider ABC does not declare, so the ABC never described this
+    parameter -- and importing it here for the annotation alone closed a cycle:
+    session_pid -> providers.base -> acp.types -> acp/__init__ -> acp.runtime ->
+    session_pid.  That cycle was fatal, not cosmetic: importing this module
+    first raised ``ImportError`` on ``_track_pid``.  It is why sibling
+    leaves carry ``LLMProvider = Any`` runtime stubs and why this module reaches
+    acp.client through function-local imports.  ``test_agent_lifecycle_cycle.py``
+    pins the absence; keep this leaf ignorant of the agent layer.
     """
     # ACP provider: long-lived process via client._pid
     client = getattr(provider, "_client", None)
@@ -1135,6 +1145,192 @@ _MARKED_MCP_LAUNCHER_MARKERS = (
     b"mcp start-server",  # generic ``<launcher> mcp start-server <name>`` shims
 )
 
+# ── Stranded playwright-cli browser daemon (issue #5986) ─────────────────────
+# playwright-core spawns its browser daemon as
+#   ``node <...>/playwright-core/lib/entry/cliDaemon.js <session-name> [flags]``
+# with ``detached: true`` and no ``env`` override (cli-client/session.js
+# ``startDaemon``). Two consequences make it its own orphan class:
+#
+# * detached => it is its own SESSION and PROCESS-GROUP leader, so it is
+#   invisible to the teardown child snapshot, to ``kill_process_tree``, and to
+#   the SID-based ownership test the work class uses (its SID is its own pid).
+# * no env override => it inherits the spawning agent's environment verbatim,
+#   so its EXEC-TIME environ carries both ``KIROCREW_SPAWNED`` and the
+#   generated ``PLAYWRIGHT_CLI_SESSION``. Exec-time environ is kernel-held and
+#   immutable after exec, so it is ownership evidence no process can forge for
+#   another -- unlike any on-disk registry or claim file, which a same-UID
+#   agent can write.
+#
+# Deliberately NOT keyed on the socket path the way the gatewayd class is:
+# ``Session._connect`` UNLINKS the socket whenever a connect fails, so an
+# absent socket means "a client already cleaned up after a refused connect",
+# not "the daemon is unreachable" -- and the daemon holds its listening fd
+# regardless, so absence proves nothing about the browser tree.
+_BROWSER_DAEMON_ENTRY = b"cliDaemon.js"
+
+#: Must track :data:`kiro_crew.browser_cli.launch.SESSION_ENV`. Duplicated as a
+#: literal rather than imported because ``session_pid`` is imported early by
+#: ``acp.runtime`` and must not pull the browser package's import graph onto
+#: that path; a test asserts the two stay equal.
+_BROWSER_SESSION_ENV = "PLAYWRIGHT_CLI_SESSION"
+
+#: Generated-session prefix from ``browser_cli.launch`` (``kc-<8hex>``).
+_BROWSER_SESSION_PREFIX = b"kc-"
+
+# Grace given to a TERMed browser-daemon GROUP before escalating to SIGKILL.
+# Chromium exits on TERM within a second or two; this leaves room for a profile
+# flush without letting a wedged tree hold the sweep's budget.
+_BROWSER_DAEMON_TERM_GRACE_SECONDS = 5.0
+
+
+def _is_generated_browser_session(name: bytes) -> bool:
+    """True for a Kiro-Crew-generated ``kc-<8hex>`` session name.
+
+    Mirrors ``browser_cli.launch._session_leaf``. ONLY generated names are
+    ever sweepable: an operator who named a session (``default``, ``chrome``,
+    an ``attach`` workflow) owns its lifetime, and the ``kc-`` prefix is
+    reserved precisely so the two populations cannot be confused.
+    """
+    if not name.startswith(_BROWSER_SESSION_PREFIX):
+        return False
+    leaf = name[len(_BROWSER_SESSION_PREFIX) :]
+    return len(leaf) == 8 and all(c in b"0123456789abcdef" for c in leaf)
+
+
+def _browser_daemon_session_arg(cmdline: bytes) -> bytes | None:
+    """Generated session name from a cliDaemon cmdline, or ``None``.
+
+    The daemon's argv is ``node <entry>/cliDaemon.js <session-name> [flags]``,
+    so the name is the element immediately following the entry script --
+    matched on the script's BASENAME so an npx/global/vendored install path
+    all resolve. NUL-separated argv ONLY: the space-joined ``ps`` fallback
+    cannot delimit a path containing spaces, and a mis-split argv could pair
+    the script with the wrong token, so anything without NULs fails closed.
+    """
+    args = [a for a in cmdline.split(b"\x00") if a]
+    if len(args) <= 1:
+        return None
+    for index, arg in enumerate(args[:-1]):
+        if arg.rsplit(b"/", 1)[-1] == _BROWSER_DAEMON_ENTRY:
+            name = args[index + 1]
+            return name if _is_generated_browser_session(name) else None
+    return None
+
+
+def _env_value(pid: int, key: str) -> bytes | None:
+    """Exec-time environment value for *key* in *pid*, or ``None`` if unset.
+
+    Deliberately PROPAGATES ``OSError`` instead of swallowing it like
+    :func:`_env_has_kirocrew_marker`: the callers here need to tell "read
+    said the key is absent" apart from "the read failed", because those two
+    outcomes must fail closed in OPPOSITE directions -- an absent owner
+    permits a kill, an unreadable one must forbid it. Linux-only; returns
+    ``None`` elsewhere so every caller fails closed off Linux.
+    """
+    if sys.platform != "linux":
+        return None
+    prefix = key.encode() + b"="
+    environ = Path(f"/proc/{pid}/environ").read_bytes()
+    for item in environ.split(b"\x00"):
+        if item.startswith(prefix):
+            return item[len(prefix) :]
+    return None
+
+
+def _browser_session_owner_alive(pid: int, session: bytes) -> bool:
+    """True while any live process OUTSIDE *pid*'s own tree holds *session*.
+
+    This is the ownership proof, and it is drawn entirely from the kernel.
+    Kiro Crew injects the generated ``PLAYWRIGHT_CLI_SESSION`` into exactly
+    one spawned agent process, so that value in a live process's EXEC-TIME
+    environ means the browser still has an owner. Scanning the whole process
+    table (not a manager-local set) is what makes a peer gateway sharing this
+    data home see its own live sessions and protect them.
+
+    The daemon's own tree is excluded by SID: it is spawned ``detached``, so
+    it is its own session leader and every Chromium child inherits that SID --
+    those inherit the variable too and must not be mistaken for owners.
+
+    FAIL-CLOSED to "alive": an unreadable ``/proc`` listing or an inconclusive
+    per-process read (EACCES, EIO) returns ``True``, so the sweep never kills
+    on a failed probe. A process that VANISHES mid-scan is simply not an
+    owner, which is the one error that is safe to skip.
+    """
+    if sys.platform != "linux":
+        return True
+    try:
+        entries = [e for e in Path("/proc").iterdir() if e.name.isdigit()]
+    except OSError:
+        return True
+    my_uid = os.getuid()
+    for entry in entries:
+        try:
+            other = int(entry.name)
+        except ValueError:
+            continue
+        if other == pid:
+            continue
+        try:
+            if entry.stat().st_uid != my_uid:
+                continue
+        except _PID_VANISHED_ERRORS:
+            continue
+        except OSError:
+            return True
+        if _linux_pid_sid(other) == pid:
+            continue  # the daemon's own detached tree, not an owner
+        try:
+            if _env_value(other, _BROWSER_SESSION_ENV) == session:
+                return True
+        except _PID_VANISHED_ERRORS:
+            continue
+        except OSError:
+            return True
+    return False
+
+
+def _is_sweepable_orphan_browser_daemon(pid: int, cmdline: bytes, age_seconds: float) -> bool:
+    """Fifth positive-identity path: a browser daemon whose owner is gone.
+
+    Positive identity is the conjunction of:
+
+    1. a structural cliDaemon argv carrying a GENERATED ``kc-<8hex>`` session
+       name (:func:`_browser_daemon_session_arg`, NUL-argv only) -- an
+       operator-named session is structurally excluded and never signalled;
+    2. that same name in the process's exec-time environ, which ties this
+       daemon to a name Kiro Crew itself generated rather than one an agent
+       passed with ``-s=``;
+    3. the ``KIROCREW_SPAWNED`` environ marker, proving Kiro Crew spawned the
+       tree (:func:`_env_has_kirocrew_marker`, Linux-only, fail-closed);
+    4. NO live process outside the daemon's own tree still holding that
+       session (:func:`_browser_session_owner_alive`);
+    5. age past :data:`_ORPHAN_WORK_MIN_AGE_SECONDS` -- the generous work-class
+       floor, not the 120s MCP one, so a daemon whose agent is mid-spawn or
+       briefly detached is never raced.
+
+    Every signal is a kernel fact (argv, exec-time environ, SID, process
+    liveness). Nothing here reads agent-writable filesystem state, which is
+    what made the previously withdrawn reapers unsafe.
+    """
+    if age_seconds < _ORPHAN_WORK_MIN_AGE_SECONDS:
+        return False
+    if not cmdline:
+        return False  # kernel thread / zombie — nothing meaningful to kill
+    normalized = cmdline.replace(b"\x00", b" ")
+    if any(marker in normalized for marker in _GATEWAY_MARKERS):
+        return False
+    session = _browser_daemon_session_arg(cmdline)
+    if session is None:
+        return False
+    try:
+        if _env_value(pid, _BROWSER_SESSION_ENV) != session:
+            return False
+    except OSError:
+        return False  # inconclusive — fail closed
+    if not _env_has_kirocrew_marker(pid):
+        return False
+    return not _browser_session_owner_alive(pid, session)
+
 
 def _our_orphan_pids() -> list[int]:
     """PIDs owned by current user whose parent is init (pid 1) or systemd --user.
@@ -1376,14 +1572,18 @@ def _kill_orphan_gatewayd(pid: int, cmdline: bytes) -> int:
     any foreign process.
     """
     try:
-        os.kill(pid, signal.SIGTERM)
+        platform_compat.kill_pid(pid, platform_compat.SIGTERM)
     except ProcessLookupError:
         return 0
     deadline = time.monotonic() + _GATEWAYD_TERM_GRACE_SECONDS
     while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        # platform_compat.pid_exists, not a raw `os.kill(pid, 0)`: on Windows a
+        # signal-zero "probe" TERMINATES the target instead of testing it, and
+        # raw os.kill/SIGKILL do not exist there. This path is POSIX-only in
+        # practice, but routing through the shim keeps it correct on its own
+        # terms rather than depending on a caller's early-out — the same
+        # rationale the browser-daemon probe below already carries.
+        if not platform_compat.pid_exists(pid):
             _sel_orphan_kill(pid, pid, cmdline, "sigterm")
             return 1
         time.sleep(0.1)
@@ -1399,10 +1599,61 @@ def _kill_orphan_gatewayd(pid: int, cmdline: bytes) -> int:
         if pgid == pid and pgid != os.getpgrp() and pgid > 1:
             os.killpg(pgid, signal.SIGKILL)
         else:
-            os.kill(pid, signal.SIGKILL)
+            platform_compat.kill_pid(pid, platform_compat.SIGKILL)
     except (ProcessLookupError, OSError):
         pass
     _sel_orphan_kill(pid, pid, cmdline, "sigterm+sigkill")
+    return 1
+
+
+def _kill_orphan_browser_daemon(pid: int, cmdline: bytes) -> int:
+    """Group-TERM a stranded browser daemon, escalating to a group SIGKILL.
+
+    Signals the process GROUP, not the pid. The daemon is spawned
+    ``detached``, so it is its own group leader and its Chromium children
+    inherit that group -- the browser tree is the whole point of the reclaim
+    (it is where the gigabytes are), and a pid-only signal would kill the
+    supervisor and leave Chromium reparented to init as a fresh, now
+    completely unattributable leak.
+
+    TERM first so Chromium exits through its own shutdown path and flushes
+    its profile. The group is signalled only when the daemon is genuinely an
+    isolated leader (``pgid == pid``, not our own group, not init's), so
+    ``killpg`` can never reach a foreign process; identity is re-verified
+    before the escalation so a PID recycled inside the grace window is never
+    SIGKILLed.
+    """
+    try:
+        pgid = os.getpgid(pid)
+    except (ProcessLookupError, OSError):
+        return 0
+    if not (pgid == pid and pgid != os.getpgrp() and pgid > 1):
+        # Not an isolated group leader: killpg would reach processes this
+        # predicate never identified. Leave it for a later sweep.
+        return 0
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return 0
+    deadline = time.monotonic() + _BROWSER_DAEMON_TERM_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        # platform_compat.pid_exists, not a raw `os.kill(pid, 0)`: on Windows a
+        # signal-zero "probe" TERMINATES the target instead of testing it. This
+        # path is POSIX-only in practice, but routing through the shim keeps it
+        # correct on its own terms rather than depending on a caller's early-out.
+        if not platform_compat.pid_exists(pid):
+            _sel_orphan_kill(pid, pgid, cmdline, "browser-daemon-sigterm")
+            return 1
+        time.sleep(0.1)
+    try:
+        if sys.platform == "linux":
+            if Path(f"/proc/{pid}/cmdline").read_bytes() != cmdline:
+                _sel_orphan_kill(pid, pgid, cmdline, "browser-daemon-sigterm")
+                return 1
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
+        pass
+    _sel_orphan_kill(pid, pgid, cmdline, "browser-daemon-sigterm+sigkill")
     return 1
 
 
@@ -1690,6 +1941,7 @@ def find_orphan_mcp_candidates(active_pids: set[int]) -> list[int]:
             _is_sweepable_orphan_mcp(pid, cmdline)
             or _is_sweepable_orphan_gatewayd(cmdline)
             or _is_sweepable_orphan_work(pid, cmdline, pid_age)
+            or _is_sweepable_orphan_browser_daemon(pid, cmdline, pid_age)
         ):
             continue
         candidates.append(pid)
@@ -1769,12 +2021,23 @@ def kill_orphan_mcps(pids: list[int]) -> int:
     my_pgid = os.getpgrp()
     my_pid = os.getpid()
     killed = 0
+    # Parent->children map for the subtree reap, built at most ONCE per sweep
+    # (one full /proc pass) and only when a marked MCP orphan is actually
+    # confirmed -- the common sweep finds none and pays nothing.
+    child_map: dict[int, list[int]] | None = None
     for pid in pids:
         if killed >= _ORPHAN_SWEEP_MAX_KILLS:
             break
         if pid == my_pid:
             continue
         try:
+            # Start identity FIRST -- before any other read about this pid.
+            # Everything below (the cmdline, the eligibility verdict, the pgid)
+            # is evidence about whichever process held this PID at the moment it
+            # was read, so capturing identity after any of them leaves a window
+            # where the orphan exits, the PID is reused, and that stale evidence
+            # licenses signalling the replacement. There is no earlier point.
+            root_token = _pid_start_token(pid)
             # Re-verify identity right before kill (TOCTOU mitigation):
             # PID may have been recycled between find and kill phases.
             if sys.platform == "linux":
@@ -1787,20 +2050,113 @@ def kill_orphan_mcps(pids: list[int]) -> int:
                 )
             if _is_sweepable_orphan_mcp(pid, cmdline):
                 pgid = os.getpgid(pid)
+                # ── PID-recycle invariant ──────────────────────────────
+                # No signal in this branch reaches a PID whose start identity
+                # was not captured BEFORE any other read about it and
+                # re-confirmed IMMEDIATELY before the signal. The three signal
+                # sites are this root killpg, this root kill, and each
+                # descendant's kill inside _kill_orphan_mcp_descendants (guarded
+                # there, with its own live parent-edge check).
+                #
+                # Enumerate the subtree BEFORE signalling the root: once the root
+                # dies its children reparent to init and the parent links this
+                # walk needs are gone.
+                if child_map is None:
+                    child_map = _build_child_map()
+                subtree = _orphan_descendants(pid, child_map)
+                # ── Descendants FIRST, root LAST ───────────────────────
+                # The root is the handle on this tree: it is marked and
+                # sweepable, so while it lives the whole tree stays
+                # re-enumerable on a later sweep. Killing it before the
+                # descendants are accounted for is what loses that handle --
+                # when the tree exceeds the kill cap the survivors can include
+                # the UNMARKED intermediate, which reparents to init, is not
+                # sweepable, and hides its marked children behind a non-init
+                # ppid. That is precisely the leak this function exists to
+                # close, so the ordering below is load-bearing, not stylistic.
+                #
+                # Observed shape, produced by any launcher wrapper that resolves
+                # a package and then execs the resolved binary:
+                #     <wrapper> mcp start-server <pkg>      <- marked
+                #       -> <wrapper> mcp start-server ...   <- marked
+                #         -> node .../bin/<pkg>-server      <- UNMARKED
+                #           -> npm exec <pkg>@latest        <- marked
+                # One host accumulated 112 such processes (15.2 GB RSS) over 23
+                # days of sweeps that were running the whole time.
+                #
+                # Reaping descendants first also makes the killpg below pure
+                # belt-and-braces for anything still sharing the root's group:
+                # a launcher that ``setsid``-s its payload escapes killpg
+                # entirely, which is why the explicit walk exists at all.
+                killed += _kill_orphan_mcp_descendants(
+                    subtree, root=pid, budget=_ORPHAN_SWEEP_MAX_KILLS - killed
+                )
+                if killed >= _ORPHAN_SWEEP_MAX_KILLS:
+                    # Budget spent on the subtree. Leave the root ALIVE and
+                    # unsignalled: it stays a marked, sweepable candidate, so the
+                    # next sweep re-enumerates what is left of this tree with a
+                    # fresh budget. Killing it here would strand the survivors
+                    # behind an unsweepable ancestor.
+                    logger.debug(
+                        "Orphan MCP sweep: kill cap reached on the subtree of root "
+                        "pid=%d — leaving the root alive so the remainder stays "
+                        "discoverable next sweep",
+                        pid,
+                    )
+                    continue
+                # Revalidate the FULL evidence set immediately before signalling
+                # the root: identity, eligibility, and the group being targeted.
+                # The token alone is not enough -- it proves the process, not that
+                # the argv still qualifies it or that it is still in this group.
+                live_token = _pid_start_token(pid)
+                if root_token is None or live_token is None or live_token != root_token:
+                    # Unproven or changed identity: never signal a PID that may
+                    # now belong to someone else. An unavailable token is never
+                    # read as a match -- see _pid_start_token's contract -- and a
+                    # genuine orphan is re-reaped next sweep.
+                    logger.debug(
+                        "Orphan MCP sweep: skipping root pid=%d — identity changed or "
+                        "unavailable across the subtree scan (pre=%r post=%r)",
+                        pid,
+                        root_token,
+                        live_token,
+                    )
+                    continue
+                try:
+                    if sys.platform == "linux":
+                        live_cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+                    else:
+                        live_cmdline = subprocess.check_output(
+                            ["ps", "-o", "command=", "-p", str(pid)],
+                            stderr=subprocess.DEVNULL,
+                            timeout=2,
+                        )
+                    if not _is_sweepable_orphan_mcp(pid, live_cmdline):
+                        continue  # no longer qualifies — do not signal it
+                    if os.getpgid(pid) != pgid:
+                        continue  # left the group; that group is no longer ours
+                except (OSError, subprocess.SubprocessError):
+                    continue  # exited between the token read and here
                 if pgid == pid and pgid != my_pgid and pgid > 1:
                     os.killpg(pgid, signal.SIGKILL)
                     killed += 1
                     _sel_orphan_kill(pid, pgid, cmdline, "killpg")
                 else:
                     # Candidate already passed UID + orphan-ppid + positive MCP
-                    # marker + two-phase active-PID re-verify + cmdline re-check.
-                    # Direct os.kill of the confirmed-orphan PID only — NOT a tree
-                    # walk. _kill_pid_tree is gated by kiro-cli/claude markers that
-                    # MCP processes don't carry. If this orphan shares a pgid (not
-                    # its own group leader) and has children, those children that
-                    # carry an MCP marker are reclaimed on a subsequent sweep; any
-                    # without a marker were never sweep candidates to begin with.
-                    os.kill(pid, signal.SIGKILL)
+                    # marker + two-phase active-PID re-verify + the full
+                    # evidence revalidation above. Routed through the
+                    # platform_compat shim like the work-tree reaper (exception
+                    # types are identical on POSIX).
+                    #
+                    # This signals the root ALONE. Its descendants were already
+                    # reaped explicitly above, which is what this commit adds:
+                    # the older reasoning here -- that surviving children with an
+                    # MCP marker get reclaimed on a subsequent sweep, and that
+                    # unmarked ones were never candidates -- is what the
+                    # 112-process leak falsified. An UNMARKED intermediate IS a
+                    # candidate yet is not sweepable, so it never reparents into
+                    # view and keeps its marked children behind a non-init ppid.
+                    platform_compat.kill_pid(pid, platform_compat.SIGKILL)
                     killed += 1
                     _sel_orphan_kill(pid, pgid, cmdline, "kill")
                 continue
@@ -1823,6 +2179,14 @@ def kill_orphan_mcps(pids: list[int]) -> int:
                 killed += _kill_orphan_work_tree(
                     pid, cmdline, work_age, budget=_ORPHAN_SWEEP_MAX_KILLS - killed
                 )
+                continue
+            # Stranded browser daemon. Re-verify the FULL identity — argv
+            # shape, exec-time environ, live-owner probe and the age floor —
+            # immediately before signalling, so a PID recycled since the find
+            # phase cannot inherit the verdict.
+            daemon_age = _linux_pid_age(pid, time.time()) if sys.platform == "linux" else 0.0
+            if _is_sweepable_orphan_browser_daemon(pid, cmdline, daemon_age):
+                killed += _kill_orphan_browser_daemon(pid, cmdline)
         except (
             ProcessLookupError,
             PermissionError,
@@ -1871,6 +2235,256 @@ def _sel_orphan_kill(pid: int, pgid: int, cmdline: bytes, method: str) -> None:
         )
     except Exception:
         logger.debug("SEL orphan-kill audit failed", exc_info=True)
+
+
+def _pid_cmdline(pid: int) -> bytes:
+    """Best-effort argv for *pid* on Linux; ``b""`` when unreadable or off-Linux.
+
+    Empty is inconclusive, never "clean": every caller treats it as fail-closed
+    (skip the process) rather than assuming it is safe to touch.
+
+    Off-Linux deliberately has NO ``ps`` branch. Every consumer of this argv
+    feeds a decision that also requires :func:`_env_has_kirocrew_marker`, which
+    is fail-closed off Linux, so a subprocess here would only ever supply
+    evidence for a verdict that is already "refuse".
+    """
+    if sys.platform != "linux":
+        return b""
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return b""
+
+
+def _pid_parent_and_token(pid: int) -> tuple[int | None, str | None]:
+    """``(ppid, start_token)`` for *pid* from ONE ``/proc/<pid>/stat`` read.
+
+    Both values must come from the SAME read. Reading the parent edge and the
+    start identity separately leaves a window in which the PID exits between
+    them, so a recycled PID's fresh token gets paired with the dead process's
+    parent edge -- and that token then matches at kill time, which is precisely
+    how a live worker gets SIGKILLed.
+
+    ``stat`` field 4 is PPid and field 22 is starttime; ``comm`` (field 2) can
+    contain spaces and parentheses, so both are read after the LAST ``)``, the
+    same way :func:`_build_child_map` and
+    ``platform_compat.get_process_start_id`` parse it.
+
+    ``(None, None)`` on any failure, and off Linux -- where the whole subtree
+    reap is already a no-op because :func:`_env_has_kirocrew_marker` is
+    fail-closed. Callers must treat ``None`` as unproven, never as a mismatch.
+    """
+    if sys.platform != "linux":
+        return (None, None)
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            return (None, None)
+        fields = stat[rparen + 2 :].split()
+        return (int(fields[1]), fields[19])
+    except (OSError, ValueError, IndexError):
+        return (None, None)  # exited mid-read or unreadable — fail closed
+
+
+def _prune_from_orphan_walk(pid: int) -> bool:
+    """True when the walk must neither include *pid* NOR descend into it.
+
+    Prunes gateway/CLI entrypoints (:data:`_GATEWAY_MARKERS`) -- an
+    agent-launched peer gateway or dev pod. Excluding only the entrypoint's own
+    PID is not enough: the walk is flat, so its live workers would still be
+    enumerated, and each carries ``KIROCREW_SPAWNED`` with no gateway marker in
+    its own argv, so each would pass the per-member gate and be SIGKILLed,
+    crashing that pod's active sessions. The whole subtree has to go.
+
+    An unreadable argv also prunes: it is either a process that just exited (no
+    children to find) or one whose identity cannot be established, and neither
+    is a case for descending.
+    """
+    cmdline = _pid_cmdline(pid)
+    if not cmdline:
+        return True
+    return any(marker in cmdline.replace(b"\x00", b" ") for marker in _GATEWAY_MARKERS)
+
+
+def _orphan_descendants(pid: int, child_map: dict[int, list[int]]) -> list[tuple[int, str | None]]:
+    """Preorder descendants of a confirmed orphan root, each with its identity.
+
+    Traverses *child_map* -- the authoritative parent->children map from
+    :func:`_build_child_map`, which reads every process's ``stat`` PPid field.
+    Deliberately NOT ``/proc/<pid>/task/*/children``: that needs
+    ``CONFIG_CHECKPOINT_RESTORE``/``CONFIG_PROC_CHILDREN`` and is documented
+    reliable only for frozen/stopped tasks, so for a live task it can return an
+    incomplete child set and silently drop whole subtrees -- which is precisely
+    the leak this sweep exists to close, so reaping through it could no-op with
+    no signal.
+
+    Always called BEFORE the root is signalled: after the root dies its children
+    reparent to init and the parent links this walk needs are gone.
+
+    Each member is returned with its :func:`_pid_start_token`, captured HERE so
+    the kill can refuse a PID that was recycled in between (see
+    :func:`_kill_orphan_mcp_descendants`).
+
+    *child_map* is a SNAPSHOT, and it is reused across every candidate root in
+    one sweep, so an edge in it can be stale by the time the walk reads it: the
+    child may have exited and its PID been reused. Each child's live PPid is
+    therefore re-read here and must still equal the parent it was traversed
+    from; a PID that no longer points back at that parent is a different
+    process and is dropped with its subtree. The PPid and the start token come
+    from ONE ``stat`` read (:func:`_pid_parent_and_token`) so they cannot
+    describe two different processes.
+
+    Iterative, not recursive: an orphan chain deeper than Python's recursion
+    limit would raise ``RecursionError``, which the caller's ``except`` clause
+    does not name and which fires BEFORE the root is signalled -- aborting the
+    whole sweep, every cycle, and preserving the very tree being reclaimed.
+
+    The visited set bounds the walk, so a PID cycle terminates instead of
+    looping forever -- checked per CHILD, which covers a self-parent too.
+
+    A pruned child (:func:`_prune_from_orphan_walk`) is skipped WITH its whole
+    subtree, so a peer gateway's live workers are never enumerated.
+    """
+    out: list[tuple[int, str | None]] = []
+    seen: set[int] = {pid}
+    # DFS stack of (child, parent) pairs still to validate. The parent travels
+    # WITH the child because it is what the live-PPid check compares against.
+    # Each pair is validated and emitted when POPPED, and its own children are
+    # pushed reversed, which is what makes the emitted order preorder -- the
+    # order the leaf-first kill reverses. Emitting inside the child loop instead
+    # would yield level order and kill a parent before its children.
+    stack: list[tuple[int, int]] = [(c, pid) for c in reversed(child_map.get(pid, []))]
+    while stack:
+        child, parent = stack.pop()
+        if child in seen:
+            continue
+        seen.add(child)
+        live_ppid, token = _pid_parent_and_token(child)
+        if live_ppid != parent:
+            # Stale edge: this PID exited and a different process now holds it,
+            # or its identity cannot be read. Either way it is not the child
+            # that was enumerated, so neither it nor anything the snapshot hangs
+            # beneath it may be signalled.
+            continue
+        if _prune_from_orphan_walk(child):
+            continue  # gateway subtree (or unreadable) -- do not descend
+        out.append((child, token))
+        for grandchild in reversed(child_map.get(child, [])):
+            stack.append((grandchild, child))
+    return out
+
+
+def _kill_orphan_mcp_descendants(
+    descendants: list[tuple[int, str | None]], *, root: int, budget: int
+) -> int:
+    """SIGKILL leftover subtree members of a reaped MCP-launcher orphan, leaf-first.
+
+    Mirrors :func:`_kill_orphan_work_tree`: descendants were enumerated once
+    (preorder) and are killed in reverse so every process dies before its
+    parent. *budget* is the caller's remaining
+    :data:`_ORPHAN_SWEEP_MAX_KILLS` allowance, so subtree members count
+    against the same global cap; survivors are re-reaped next sweep.
+
+    Positive identity per member — the root passing the sweep gate does NOT
+    license killing arbitrary descendants:
+
+    * ``KIROCREW_SPAWNED`` in the member's exec-time environ, proving it
+      belongs to a tree Kiro Crew spawned (:func:`_env_has_kirocrew_marker`,
+      Linux-only and fail-closed, so this whole reap is a no-op off Linux —
+      matching the work-class floor).
+    * NOT a gateway/CLI entrypoint (:data:`_GATEWAY_MARKERS`), so an
+      agent-launched peer gateway or dev pod under the same tree survives.
+    * Never this process, its group leader, or pid <= 1.
+    * The SAME process the walk saw -- its ``_pid_start_token`` must still
+      match the one captured at enumeration. Without this the reap has a
+      PID-recycle hole: the root's ``killpg`` reaps a descendant, the kernel
+      hands that PID to a NEW Kiro-Crew-spawned worker, and the stale entry
+      then SIGKILLs a live process that passes every other gate. A token that
+      cannot be read on either side is treated as unproven identity and the
+      member is skipped, never as a mismatch -- declining to act is not the
+      same as asserting recycling, and a skipped orphan is re-reaped next
+      sweep. Logged at debug so a host where identity is never available is
+      diagnosable rather than a silent no-op.
+
+    A member whose cmdline is unreadable is skipped rather than killed: the
+    marker read and the exclusion check both need it, and failing closed here
+    costs one sweep cycle while failing open could kill a live peer.
+
+    Returns the number of processes killed.
+    """
+    if budget <= 0 or not descendants:
+        return 0
+    my_pid = os.getpid()
+    my_pgid = os.getpgrp()
+    killed = 0
+    for target, walk_token in reversed(descendants):
+        if killed >= budget:
+            break  # global kill cap exhausted; next sweep cycle finishes the job
+        if target <= 1 or target == my_pid or target == my_pgid or target == root:
+            continue
+        cmdline = _pid_cmdline(target)
+        if not cmdline:
+            continue  # vanished or unreadable — fail closed
+        if any(marker in cmdline.replace(b"\x00", b" ") for marker in _GATEWAY_MARKERS):
+            # Defence in depth: _prune_from_orphan_walk already dropped this
+            # subtree during enumeration. Kept because a caller could pass a
+            # list it assembled some other way.
+            continue
+        if not _env_has_kirocrew_marker(target):
+            continue  # not provably part of a Kiro Crew tree
+        live_token = _pid_start_token(target)
+        if walk_token is None or live_token is None:
+            logger.debug(
+                "Orphan MCP sweep: skipping pid=%d — start identity unavailable "
+                "(walk=%r live=%r), re-reaped next sweep",
+                target,
+                walk_token,
+                live_token,
+            )
+            continue  # identity unproven — never kill on an unverifiable PID
+        if live_token != walk_token:
+            logger.debug(
+                "Orphan MCP sweep: skipping pid=%d — PID recycled since enumeration",
+                target,
+            )
+            continue  # a different process now holds this PID
+        try:
+            platform_compat.kill_pid(target, platform_compat.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+        killed += 1
+        logger.info(
+            "Orphan MCP sweep: SIGKILL pid=%d reason=descendant of MCP launcher orphan %d",
+            target,
+            root,
+        )
+    if killed:
+        _sel_orphan_mcp_subtree_kill(root, killed)
+    return killed
+
+
+def _sel_orphan_mcp_subtree_kill(root: int, killed: int) -> None:
+    """Emit SEL audit event for an MCP-launcher subtree kill."""
+    try:
+        # Lazy import to avoid a circular import (see kill_orphan_mcps).
+        from kiro_crew.sel import sel
+
+        sel().log_tool_invocation(
+            session_key="gateway",
+            agent="kirocrew",
+            source="background",
+            tool_name="orphan_mcp_sweep",
+            tool_kind="process_kill",
+            outcome="completed",
+            resources=f"root={root} method=mcp_subtree",
+            metadata={
+                "killed_in_tree": killed,
+                "reason": "descendants of KIROCREW_SPAWNED MCP launcher orphan",
+            },
+        )
+    except Exception:
+        logger.debug("SEL orphan-mcp-subtree-kill audit failed", exc_info=True)
 
 
 def _kill_orphan_work_tree(pid: int, cmdline: bytes, age_seconds: float, budget: int) -> int:

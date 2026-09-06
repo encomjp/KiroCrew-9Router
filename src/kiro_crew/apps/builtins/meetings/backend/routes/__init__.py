@@ -23,6 +23,7 @@ from typing import Any
 
 from aiohttp import web
 
+from kiro_crew.apps.builtins.meetings.backend import calendar_poller
 from kiro_crew.apps.builtins.meetings.backend import constants as k
 from kiro_crew.apps.builtins.meetings.backend import store
 from kiro_crew.apps.builtins.meetings.backend.domain import session as sess
@@ -213,6 +214,15 @@ def register_routes(app: web.Application) -> None:
         BASE + "/meetings/{meeting_id}/translations",
         route(lifecycle_routes.handle_get_translations),
     )
+    # Editable minutes. PUT/DELETE on the same path as the GET, with the agent id in
+    # the body — the shape the task routes already use, and the reason there is no
+    # `{agent_id}` path segment to validate.
+    router.add_put(
+        BASE + "/meetings/{meeting_id}/outputs", route(lifecycle_routes.handle_put_output)
+    )
+    router.add_delete(
+        BASE + "/meetings/{meeting_id}/outputs", route(lifecycle_routes.handle_delete_output)
+    )
     router.add_post(
         BASE + "/meetings/{meeting_id}/attachments",
         route(lifecycle_routes.handle_attachments),
@@ -256,6 +266,10 @@ def register_routes(app: web.Application) -> None:
     # so a hook-append failure can never break gateway startup.
     try:
         app.on_startup.append(_on_startup)
+        app.on_startup.append(calendar_poller.start_poller)
+        # Cleanup runs in order: stop the poller first so no tick can pre-create
+        # a meeting while the live session is being torn down.
+        app.on_cleanup.append(calendar_poller.stop_poller)
         app.on_cleanup.append(_on_cleanup)
     except Exception:  # pragma: no cover — defensive
         logger.warning("meetings: could not register lifecycle hooks", exc_info=True)

@@ -16,6 +16,7 @@ import platform
 import sys
 import threading
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -561,6 +562,98 @@ class TestTranscodeTempOwnership:
         assert src.exists()
 
     @pytest.mark.asyncio
+    async def test_transcode_closes_authenticated_decoder_after_child_exit(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression guard for #8918 at this call site: the staged decoder
+        handle outlives the spawn (the macOS syspolicy assessment resolves the
+        staged path asynchronously after ``create_subprocess_exec`` returns) and
+        is released exactly once, after the child has exited, by the invocation
+        itself rather than by ``__del__`` on the gateway event loop."""
+        from kiro_crew import transcribe as tr
+
+        owned = self._owned_temp(tmp_path, monkeypatch)
+        src = tmp_path / "voice.webm"
+        src.write_bytes(b"data")
+        events: list = []
+
+        binary = tmp_path / "ffmpeg"
+        binary.write_bytes(b"decoder")
+        descriptor = os.open(str(binary), os.O_RDONLY)
+
+        class _Recording(tr._AuthenticatedFfmpeg):
+            def close(self):
+                # Only the first effective close counts: ``close`` is
+                # idempotent and ``__del__`` re-enters it with the descriptor
+                # already surrendered.
+                if self.descriptor >= 0:
+                    events.append("closed")
+                super().close()
+
+        opened = _Recording(str(binary), descriptor, str(binary))
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self):
+                assert "closed" not in events, "handle closed before the child exited"
+                events.append("exited")
+                return b"", b""
+
+        async def fake_exec(*_args, **_kwargs):
+            assert "closed" not in events, "handle closed before the spawn returned"
+            return _Proc()
+
+        with (
+            patch(
+                "kiro_crew.transcribe._open_ffmpeg_for_execution",
+                return_value=opened,
+            ),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("asyncio.create_subprocess_exec", side_effect=fake_exec),
+        ):
+            result_path, is_temp = await apple_speech._to_native_audio(str(src))
+        assert result_path == str(owned)
+        assert is_temp is True
+        assert events == ["exited", "closed"]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_on_the_close_await_still_removes_the_owned_temp(
+        self, tmp_path, monkeypatch
+    ):
+        """A cancellation landing exactly on the deferred close await -- the
+        only suspension point between the child exiting and the success return
+        transferring the temp to the caller -- must not propagate with the
+        invocation-owned ``.wav`` still on disk (#8918 round 2)."""
+        owned = self._owned_temp(tmp_path, monkeypatch)
+        src = tmp_path / "voice.webm"
+        src.write_bytes(b"data")
+
+        proc = AsyncMock()
+        proc.returncode = 0
+        proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        async def cancelled_close(_executable, **_kwargs):
+            raise asyncio.CancelledError
+
+        with (
+            patch(
+                "kiro_crew.transcribe._open_ffmpeg_for_execution",
+                return_value="/fake/ffmpeg",
+            ),
+            patch("kiro_crew.transcribe.ensure_ffmpeg_in_path"),
+            patch("asyncio.create_subprocess_exec", return_value=proc),
+            patch(
+                "kiro_crew.transcribe._close_ffmpeg_for_execution",
+                side_effect=cancelled_close,
+            ),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await apple_speech._to_native_audio(str(src))
+        assert not owned.exists()
+        assert src.exists()
+
+    @pytest.mark.asyncio
     async def test_temp_creation_failure_closes_authenticated_decoder_off_loop(
         self, tmp_path, monkeypatch
     ):
@@ -770,6 +863,78 @@ class TestStreamingSession:
         session = apple_speech.StreamingSession()
         await session.close()
         await session.close()
+
+
+class TestHelperArgvPinsFast:
+    """Pin the ``--fast`` flag in the STREAMING helper argv (#5896).
+
+    ``--fast`` inserts ``.frequentFinalization`` into the transcriber's reporting
+    options; without it the helper emits only volatile partials for the whole open
+    stream and never a mid-stream final, so the endpointer's ``note_final()``-driven
+    auto-submit can never fire. The live helper is macOS-only with no CI runner
+    coverage, so the spawned argv IS the verifiable contract: these tests pin the
+    flag's presence on the streaming path and its deliberate absence on the one-shot
+    batch path (where the final arrives at stream close and frequent finalization
+    would only trade accuracy for unneeded latency).
+    """
+
+    @pytest.mark.asyncio
+    async def test_streaming_argv_includes_fast(self):
+        """StreamingSession.start() must pass --fast to the helper."""
+        session = apple_speech.StreamingSession(locale="en-US")
+        # Failing the spawn keeps the test on the argv contract alone: by the
+        # time create_subprocess_exec is called the argv is fully built, and no
+        # pump/ready plumbing needs to be faked.
+        spawn = Mock(side_effect=OSError("argv pin: no real spawn"))
+        with (
+            patch.object(
+                apple_speech, "availability", return_value=apple_speech.Availability(True)
+            ),
+            patch.object(apple_speech, "stream_helper_path", return_value="/fake/stream-helper"),
+            patch("asyncio.create_subprocess_exec", spawn),
+            _passthrough_sandbox(),
+        ):
+            problem = await session.start()
+        assert "could not start streaming helper" in problem
+        argv = list(spawn.call_args.args)
+        assert argv[0] == "/fake/stream-helper"
+        assert "--fast" in argv
+        # The helper's parser treats --fast as a bare switch; it must not have
+        # swallowed a neighbouring option's value.
+        assert argv[argv.index("--locale") + 1] == "en-US"
+        assert argv[argv.index("--sample-rate") + 1] == str(apple_speech.STREAM_SAMPLE_RATE_HZ)
+
+    @pytest.mark.asyncio
+    async def test_one_shot_argv_excludes_fast(self):
+        """The batch path must NOT opt into frequent finalization."""
+        spawn = Mock(side_effect=OSError("argv pin: no real spawn"))
+        with (
+            patch.object(
+                apple_speech, "availability", return_value=apple_speech.Availability(True)
+            ),
+            patch.object(apple_speech, "helper_path", return_value="/fake/helper"),
+            patch("asyncio.create_subprocess_exec", spawn),
+            _passthrough_sandbox(),
+        ):
+            text, meta = await apple_speech.transcribe("/tmp/x.wav")
+        assert text is None
+        assert "could not run speech helper" in meta["error"]
+        argv = list(spawn.call_args.args)
+        assert argv[0] == "/fake/helper"
+        assert "--fast" not in argv
+
+    def test_swift_helper_still_accepts_fast(self):
+        """Pin the OTHER side of the cross-process contract, by source inspection.
+
+        The helper is never compiled in CI (macOS-only), so the argv pins above
+        cannot see a Swift-side regression: renaming or dropping the ``--fast``
+        case would leave every Python test green while the helper dies at
+        startup with ``unexpected argument: --fast``. The helper source ships in
+        the same package directory ``_build_helper`` reads it from, so anchor on
+        the module rather than a CWD-relative path.
+        """
+        swift_src = Path(apple_speech.__file__).with_name("StreamTranscribe.swift")
+        assert 'case "--fast":' in swift_src.read_text(encoding="utf-8")
 
 
 class TestSandboxCleanupPathIsDropped:

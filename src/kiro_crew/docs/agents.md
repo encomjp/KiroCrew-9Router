@@ -39,7 +39,7 @@ Cron jobs can specify an agent at creation time.
 
 ## Built-in Agent Specs
 
-Kiro Crew owns specs named `kirocrew`, `kirocrew-lite`, `kirocrew-conductor`, `kirocrew-knowledge`, `kirocrew-research`, and `kirocrew-heartbeat`. The primary and lite specs are required; the others support conductor, knowledge extraction, research, and heartbeat features.
+Kiro Crew owns specs named `kirocrew`, `kirocrew-lite`, `kirocrew-conductor`, `kirocrew-pipeline-conductor`, `kirocrew-knowledge`, `kirocrew-research`, and `kirocrew-heartbeat`. The primary and lite specs are required; the others support goal conducting, pipeline fleet supervision, knowledge extraction, research, and heartbeat features.
 
 ## Custom Agents
 
@@ -58,7 +58,7 @@ Custom agents are JSON files in `~/.kiro/agents/`. They define their own system 
 
 ## Managing Agents
 
-The dashboard Agents page shows installed agents with their source, tools, and MCP servers. Drop a new JSON file into `~/.kiro/agents/` and it appears automatically; the page also provides edit and delete controls.
+**Agent Capabilities → Agent Templates** shows installed agents with their source, tools, and MCP servers. Drop a new JSON file into `~/.kiro/agents/` and it appears automatically; the tab also provides edit and delete controls. `/agents` redirects to Agent Capabilities.
 
 ## Mapping Skills to an Agent
 

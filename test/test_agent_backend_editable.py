@@ -17,19 +17,35 @@ from typing import Any, Dict, List
 import pytest
 
 from kiro_crew import acp_backends
-from kiro_crew.acp_backends import ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS, ACP_BACKEND_KIRO
+from kiro_crew.acp_backends import (
+    ACP_BACKEND_CLAUDE,
+    ACP_BACKEND_CODEX,
+    ACP_BACKEND_KAS,
+    ACP_BACKEND_KIRO,
+)
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard.handlers.agents import _supply_live_enum
 from kiro_crew.dashboard.handlers.core import _EDITABLE_CONFIG
 
 FIELD = "agent.acp_backend"
 
+#: Known ids the public baseline deliberately does not offer, each entry carrying its
+#: reason in ``test_baseline_ships_every_known_backend``. Empty is the healthy state.
+NOT_SHIPPED_SELECTABLE: frozenset = frozenset()
+
 
 @pytest.fixture
 def restore_registry():
-    """Snapshot/restore the module-global selectable set around a mutation."""
+    """Snapshot/restore the module-global selectable sets around a mutation.
+
+    BOTH sets, because ``register_selectable_backend`` writes both: restoring only
+    ``_selectable`` would leak a widened baseline into every later test in the run.
+    """
+    baseline_before = set(acp_backends._baseline)
     before = set(acp_backends._selectable)
     yield
+    acp_backends._baseline.clear()
+    acp_backends._baseline.update(baseline_before)
     acp_backends._selectable.clear()
     acp_backends._selectable.update(before)
 
@@ -44,8 +60,7 @@ def test_the_allowlist_resolves_the_set_and_never_carries_a_literal():
 
     This is the drift fix itself: the old literal made a registered backend fail
     the PATCH with a misleading "invalid value", which is what the dashboard
-    surfaced as an option that was "not enabled in this build" on a build that had
-    it.
+    surfaced as an unavailable option on a build that actually had it.
     """
     spec = _EDITABLE_CONFIG[FIELD]
     assert "values" not in spec, "a frozen list here is exactly the drift being removed"
@@ -59,9 +74,19 @@ def test_the_default_backend_is_accepted_by_its_own_allowlist():
 
 
 def test_a_registered_backend_reaches_the_allowlist(restore_registry):
-    """An edition registering a backend must not need a core edit to be writable."""
+    """An edition registering a backend must not need a core edit to be writable.
+
+    Every KNOWN backend is now in the public baseline, so the "not yet registered"
+    starting state has to be constructed rather than borrowed from Claude Code. That
+    is the honest shape anyway: what is being tested is that the allowlist RESOLVES
+    the registry per call, not that any particular id starts out absent.
+    """
+    acp_backends._baseline.discard(ACP_BACKEND_CLAUDE)
+    acp_backends._selectable.discard(ACP_BACKEND_CLAUDE)
     assert ACP_BACKEND_CLAUDE not in _EDITABLE_CONFIG[FIELD]["values_fn"]()
+
     acp_backends.register_selectable_backend(ACP_BACKEND_CLAUDE)
+
     assert ACP_BACKEND_CLAUDE in _EDITABLE_CONFIG[FIELD]["values_fn"]()
 
 
@@ -110,7 +135,24 @@ def test_the_field_declares_no_static_enum():
     assert meta.get("enum") is None
 
 
-def test_baseline_ships_kiro_and_kas_only():
-    """The public build's capability, stated once so a widening is deliberate."""
+def test_baseline_ships_every_known_backend():
+    """The public build's capability, stated once so a NARROWING is deliberate.
+
+    Claude Code used to be excluded here. That was wrong: ``acp/client.py`` owns the
+    whole Claude spawn path and the adapter is a public npm package, so the only thing
+    the exclusion removed was the switch. If a backend is ever taken back out, the
+    reason belongs next to that removal — a build that cannot run a harness is a
+    different claim from a machine that has not installed it, and the install probe
+    already answers the second one.
+
+    ``NOT_SHIPPED_SELECTABLE`` is where that reason goes. It is an explicit list
+    rather than a relaxed assertion so a plain ``baseline != known`` still fails:
+    an id may sit outside the baseline only by being named there. It is empty
+    today — every known id is offered, so a switch that renders always has an
+    install probe behind it to explain a session that failed to start.
+    """
     baseline: List[str] = sorted(acp_backends.BASELINE_SELECTABLE_BACKENDS)
-    assert baseline == sorted([ACP_BACKEND_KIRO, ACP_BACKEND_KAS])
+    assert baseline == sorted(
+        [ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE, ACP_BACKEND_KAS, ACP_BACKEND_CODEX]
+    )
+    assert baseline == sorted(acp_backends.ACP_BACKENDS_KNOWN - NOT_SHIPPED_SELECTABLE)

@@ -32,6 +32,7 @@ from kiro_crew import sel as sel_mod
 from kiro_crew.config.loader import KiroCrewAgentConfig, KiroCrewConfig, WorkspaceConfig
 from kiro_crew.cron import CronSchedule
 from kiro_crew.eval.scenario import AssertionType
+from kiro_crew.security import BUILTIN_DENIED_RULES
 from kiro_crew.vector_memory import LessonWriteOutcome, LessonWriteResult
 
 # ── helpers ──
@@ -461,8 +462,45 @@ class TestAppCli:
     def test_dev_off_restores_caching(self, capsys: pytest.CaptureFixture[str]) -> None:
         with patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value={"ok": True}) as setter:
             cc._handle_app(_ns(app_action="dev", name="demo", off=True))
-        setter.assert_called_once_with("demo", False)
+        setter.assert_called_once_with("demo", False, confirm_out_of_install_root=False)
         assert "dev mode off" in capsys.readouterr().out
+
+    def test_dev_confirmation_refusal_reaches_stderr(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The refusal's own text (which names the CLI flag) is printed as-is."""
+        refusal = {
+            "error": "needs confirmation: run `kirocrew app dev demo --confirm-out-of-install-root`",
+            "code": "dev_mode_out_of_install_confirmation_required",
+        }
+        with (
+            patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value=refusal) as setter,
+            pytest.raises(SystemExit) as exc,
+        ):
+            cc._handle_app(
+                _ns(app_action="dev", name="demo", off=False, confirm_out_of_install_root=False)
+            )
+        assert exc.value.code == 1
+        assert "--confirm-out-of-install-root" in capsys.readouterr().err
+        setter.assert_called_once_with("demo", True, confirm_out_of_install_root=False)
+
+    def test_dev_confirm_flag_is_forwarded(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value={"ok": True}) as setter:
+            cc._handle_app(
+                _ns(app_action="dev", name="demo", off=False, confirm_out_of_install_root=True)
+            )
+        setter.assert_called_once_with("demo", True, confirm_out_of_install_root=True)
+
+    def test_dev_confirm_flag_with_off_warns(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """The flag only applies to enabling — an ignored flag must say so,
+        not exit 0 looking like a confirmed grant."""
+        with patch("kiro_crew.apps.dev_mode.set_dev_mode", return_value={"ok": True}) as setter:
+            cc._handle_app(
+                _ns(app_action="dev", name="demo", off=True, confirm_out_of_install_root=True)
+            )
+        err = capsys.readouterr().err
+        assert "no effect with --off" in err
+        setter.assert_called_once_with("demo", False, confirm_out_of_install_root=True)
 
     def test_dev_error_exits_1(self, capsys: pytest.CaptureFixture[str]) -> None:
         with (
@@ -1173,18 +1211,30 @@ class TestPolicyCli:
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Regression for #3454: an agent's only prior discovery mechanism for
-        the 139 built-in denied-command rules was to attempt one and be
-        refused. `policy show` must surface them even on a standalone
-        (non-enterprise) install, which is the common case the early-return
-        branch serves."""
+        the built-in denied-command rules was to attempt one and be refused.
+        `policy show` must surface them even on a standalone (non-enterprise)
+        install, which is the common case the early-return branch serves.
+
+        The totals are DERIVED from the catalog rather than spelled out: the
+        printer itself derives them, so a literal here would only duplicate
+        the explicit count assertion in ``test_denied_commands_security.py``
+        and rot on every rule that gets added (it did -- the docstring said
+        139 while the catalog held 140)."""
+        by_category: dict[str, int] = {}
+        for rule in BUILTIN_DENIED_RULES:
+            by_category[rule.category] = by_category.get(rule.category, 0) + 1
+        biggest, biggest_n = max(by_category.items(), key=lambda kv: kv[1])
         with patch(
             "kiro_crew.platform.context.current_context",
             return_value=SimpleNamespace(governance=None),
         ):
             cc._policy(_ns(policy_action="show"))
         out = capsys.readouterr().out
-        assert "commands.denied: 140 rules in 10 categories" in out
-        assert "aws-destructive(47)" in out
+        assert (
+            f"commands.denied: {len(BUILTIN_DENIED_RULES)} rules "
+            f"in {len(by_category)} categories"
+        ) in out
+        assert f"{biggest}({biggest_n})" in out
         # Counts only by default -- rule ids are the --ids opt-in.
         assert "aws-destructive-ec2-terminate-instances" not in out
 
@@ -1810,6 +1860,244 @@ class TestArtifactCli:
             )
         assert "Saved: slug=new version=1" in capsys.readouterr().out
 
+    def test_save_warns_when_the_slug_was_suffixed(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `save` has no --slug, so a colliding name silently lands a NEW
+        # artifact at a suffixed slug while the canonical one keeps its old
+        # content. The warning has to name both the taken slug and the verb
+        # that versions in place.
+        with _ArtifactHarness(
+            [
+                _FakeResponse(
+                    {
+                        "slug": "run-summary-2",
+                        "version": 1,
+                        "slug_collided_with": "run-summary",
+                    }
+                )
+            ]
+        ):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Run Summary",
+                    content="corrected",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=run-summary-2 version=1" in captured.out
+        assert "run-summary" in captured.err
+        assert "kirocrew artifact update run-summary" in captured.err
+
+    def test_save_is_silent_when_the_slug_was_free(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with _ArtifactHarness([_FakeResponse({"slug": "fresh", "version": 1})]):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Fresh",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=fresh version=1" in captured.out
+        assert captured.err == ""
+
+    def test_save_forwards_an_explicit_slug(self) -> None:
+        with _ArtifactHarness([_FakeResponse({"slug": "chosen", "version": 1})]) as h:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Chosen",
+                    slug="chosen-by-hand",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        body = json.loads(h.urlopen.call_args[0][0].data.decode())
+        assert body["slug"] == "chosen-by-hand"
+
+    def test_save_forwards_an_empty_explicit_slug(self) -> None:
+        # "" is a slug the caller named, not a request to derive one. Filtering it
+        # out would silently route an explicit save into the derive-and-suffix
+        # branch — the exact asymmetry this flag exists to close.
+        with _ArtifactHarness([_FakeResponse({"slug": "x", "version": 1})]) as h:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Empty Slug",
+                    slug="",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        body = json.loads(h.urlopen.call_args[0][0].data.decode())
+        assert "slug" in body
+        assert body["slug"] == ""
+
+    def test_save_with_an_empty_slug_surfaces_the_refusal(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Forwarding "" is only worth anything if the refusal reaches the caller.
+        # The store rejects it via _validate_slug and the handler answers 400, so
+        # it arrives on the CLI's existing error path — no new error surface.
+        err = _http_error(
+            400,
+            json.dumps({"error": "invalid slug '': must match ^[a-z0-9]..."}).encode(),
+        )
+        with _ArtifactHarness([err]), pytest.raises(SystemExit) as exc:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Empty Slug",
+                    slug="",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "invalid slug" in captured.err
+        assert captured.out == ""
+
+    def test_save_omits_the_slug_key_when_none_was_given(self) -> None:
+        # An ABSENT flag must send no key at all. Forwarding it as "" would hand
+        # the store a slug it refuses, so every plain `save` would start failing;
+        # only an explicitly-passed value may reach the request body.
+        with _ArtifactHarness([_FakeResponse({"slug": "derived", "version": 1})]) as h:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Derived",
+                    slug=None,
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        body = json.loads(h.urlopen.call_args[0][0].data.decode())
+        # Positive control: this is the save request body, so the absence below
+        # is a fact about the field and not about a request that never went out.
+        assert body["name"] == "Derived"
+        assert "slug" not in body
+
+    def test_save_with_a_taken_slug_reports_the_conflict(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The store refuses an explicit slug rather than suffixing it, so the
+        # handler answers 409. It has to reach the caller as the named condition
+        # and a non-zero exit, never a traceback.
+        err = _http_error(409, json.dumps({"error": "artifact already exists: taken"}).encode())
+        with _ArtifactHarness([err]), pytest.raises(SystemExit) as exc:
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Taken",
+                    slug="taken",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        assert exc.value.code == 1
+        captured = capsys.readouterr()
+        assert "artifact already exists: taken" in captured.err
+        assert captured.out == ""
+
+    def test_save_with_an_explicit_slug_emits_no_suffix_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The warning advises `artifact update`, which is wrong guidance for a
+        # caller who named the slug: they get a 409, never a rename. The CLI must
+        # therefore key it on the server's field alone and not on the flag being
+        # set. The server half — an explicit slug reporting no collision — is
+        # pinned in test_artifacts_handlers.py.
+        with _ArtifactHarness([_FakeResponse({"slug": "chosen-by-hand", "version": 1})]):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Run Summary",
+                    slug="chosen-by-hand",
+                    content="body",
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=chosen-by-hand version=1" in captured.out
+        assert captured.err == ""
+
+    def test_save_relays_the_theme_contrast_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The gateway computes the verdict (same relay pattern as
+        # slug_collided_with); the CLI must surface it — this direct-POST
+        # path is the one the motivating incident traveled, which the
+        # MCP-layer hint alone never covered.
+        with _ArtifactHarness(
+            [_FakeResponse({"slug": "perf", "version": 1, "theme_contrast_warning": True})]
+        ):
+            cc._artifact(
+                _ns(
+                    artifact_action="save",
+                    name="Perf",
+                    content='<div style="color:#111">x</div>',
+                    content_file=None,
+                    tags=None,
+                    kind=None,
+                    description=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Saved: slug=perf version=1" in captured.out
+        assert "theme variables" in captured.err
+
+    def test_update_relays_the_theme_contrast_warning(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        with _ArtifactHarness(
+            [_FakeResponse({"slug": "perf", "version": 2, "theme_contrast_warning": True})]
+        ):
+            cc._artifact(
+                _ns(
+                    artifact_action="update",
+                    slug="perf",
+                    content='<body style="background:#fffbe6">x</body>',
+                    content_file=None,
+                    name=None,
+                    description=None,
+                    tags=None,
+                )
+            )
+        captured = capsys.readouterr()
+        assert "Updated: slug=perf version=2" in captured.out
+        assert "theme variables" in captured.err
+
     def test_save_reads_content_file(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -2370,3 +2658,50 @@ class TestRunEval:
             await cc._run_eval(_ns(all_scenarios=False, scenarios=None, judge=True))
         h.judge.judge_turn.assert_not_awaited()
         assert turn.assertion_results[0][1] is False
+
+
+class TestDevConfirmFlagNoAbbreviation:
+    """The dev subparser must reject flag abbreviations (#7169 review).
+
+    The builtin agent deny rule for `--confirm-out-of-install-root` matches
+    the flag's LITERAL text, but argparse's default `allow_abbrev=True` would
+    accept `--confirm` (or `--c`) as the same flag — an agent shell could then
+    supply the operator attestation in a spelling the rule never sees. The
+    `dev` subparser is built with `allow_abbrev=False`, so only the exact
+    flag parses and the substring rule stays sufficient.
+    """
+
+    def test_abbreviated_confirm_flag_is_rejected(self, capsys) -> None:
+        import sys
+        from unittest.mock import patch
+
+        for abbrev in ("--confirm", "--confirm-out-of-install-roo", "--c"):
+            argv = ["kirocrew", "app", "dev", "demo", abbrev]
+            with (
+                patch.object(sys, "argv", argv),
+                patch("kiro_crew.cli_commands._handle_app") as handler,
+            ):
+                from kiro_crew.cli import main
+
+                with pytest.raises(SystemExit) as exc:
+                    main()
+                assert exc.value.code == 2, f"{abbrev} did not exit 2"
+                handler.assert_not_called()
+            err = capsys.readouterr().err
+            assert "unrecognized arguments" in err, f"{abbrev}: {err!r}"
+
+    def test_literal_confirm_flag_still_parses(self) -> None:
+        import sys
+        from unittest.mock import patch
+
+        argv = ["kirocrew", "app", "dev", "demo", "--confirm-out-of-install-root"]
+        with (
+            patch.object(sys, "argv", argv),
+            patch("kiro_crew.cli_commands._handle_app") as handler,
+        ):
+            from kiro_crew.cli import main
+
+            main()
+            ns = handler.call_args[0][0]
+            assert ns.confirm_out_of_install_root is True
+            assert ns.off is False

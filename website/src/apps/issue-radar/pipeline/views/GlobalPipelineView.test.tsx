@@ -262,6 +262,31 @@ describe('GlobalPipelineView — drilling into a step', () => {
     expect(await screen.findByText(/An issue that is sitting in the step/)).toBeTruthy()
   })
 
+  it('surfaces the queue-migration reason on a step 503, not the generic failure', async () => {
+    // A 503 `queue_migration_pending` is the common state for a teammate whose cron
+    // scripts predate the per-repository dispatch queue. The generic "Could not load
+    // this data" plus a bare Retry is a trap: retrying can never clear it, only
+    // re-running the installer can. The view must name the real reason and the real
+    // fix, and must NOT show the generic copy that implies retrying is enough.
+    const refused = Object.assign(new Error('request failed with status 503'), {
+      status: 503,
+      code: 'queue_migration_pending',
+    })
+    step.mockRejectedValue(refused)
+    renderView()
+    fireEvent.click(await screen.findByText('Implement'))
+
+    expect(await screen.findByTestId('atp-queue-migration-pending')).toBeTruthy()
+    // The migration-specific copy names the installer as the fix.
+    expect(screen.getByText(/pipeline installer/)).toBeTruthy()
+    expect(screen.getByText(/Retry after running the installer/)).toBeTruthy()
+    // NOT the generic panel, and NOT the bare "Retry" label that implies retrying
+    // alone is the fix.
+    expect(screen.queryByTestId('atp-step-error')).toBeNull()
+    expect(screen.queryByText('Could not load this data')).toBeNull()
+    expect(screen.queryByText('Retry')).toBeNull()
+  })
+
   it('closes the step from the close control', async () => {
     renderView()
     fireEvent.click(await screen.findByText('Implement'))
@@ -290,6 +315,27 @@ describe('GlobalPipelineView — drilling into an item', () => {
     fireEvent.click(await screen.findByText('Implement'))
     fireEvent.click(await screen.findByText(/An issue that is sitting in the step/))
     expect(await screen.findByTestId('atp-sessions-error')).toBeTruthy()
+  })
+
+  it('surfaces the queue-migration reason on a sessions 503, not the generic failure', async () => {
+    // Same trap as the step level: `_handle_item_sessions` refuses with
+    // `queue_migration_pending` on an un-migrated install. The row's session panel
+    // must explain the installer is the fix rather than offer a Retry that cannot
+    // work on its own.
+    const refused = Object.assign(new Error('request failed with status 503'), {
+      status: 503,
+      code: 'queue_migration_pending',
+    })
+    itemSessions.mockRejectedValue(refused)
+    renderView()
+    fireEvent.click(await screen.findByText('Implement'))
+    fireEvent.click(await screen.findByText(/An issue that is sitting in the step/))
+
+    expect(await screen.findByTestId('atp-queue-migration-pending')).toBeTruthy()
+    expect(screen.getByText(/pipeline installer/)).toBeTruthy()
+    expect(screen.getByText(/Retry after running the installer/)).toBeTruthy()
+    expect(screen.queryByTestId('atp-sessions-error')).toBeNull()
+    expect(screen.queryByText('Could not load this data')).toBeNull()
   })
 
   it('collapses the item when it is clicked again, and stops showing its sessions', async () => {

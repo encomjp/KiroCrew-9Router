@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import errno
 import fnmatch
 import functools
 import hashlib
@@ -14,14 +15,19 @@ import re
 import shutil
 import stat
 import time
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from itertools import zip_longest
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable, Iterator
 
-from kiro_crew import skill_trust
-from kiro_crew.atomic_write import atomic_write
+from kiro_crew import pinned_fs, skill_trust
+from kiro_crew.atomic_write import (
+    atomic_write,
+    open_access_control_source,
+    pinned_parent_replace_supported,
+)
 from kiro_crew.config.loader import KiroCrewConfig, config_dir
 from kiro_crew.cron import referenced_skill_names
 from kiro_crew.frontmatter import SKILL_LOADER, parse_frontmatter
@@ -48,6 +54,33 @@ logger = logging.getLogger(__name__)
 
 SKILLS_DIR_NAME = "skills"
 _MIN_TRIGGER_OVERLAP = 0.7
+
+# Whether skill CRUD can address the skill directory and its SKILL.md relative to
+# a pinned parent descriptor. supports_pinned_walk covers the openat capability
+# itself; the extras are exactly the OTHER descriptor-relative syscalls this
+# module's pinned branches issue, named one per call site so the probe stays
+# derived from the code rather than copied from a neighbour:
+#   os.mkdir  -- create, the leaf skill directory under the pinned parent
+#   os.unlink -- create's rollback (the partial SKILL.md), and update, via
+#                atomic_write's staging cleanup under the pinned parent
+#   os.stat   -- delete, via pinned_fs.stat_at, and create's rollback, via
+#                pinned_fs.remove_dir_verified (os.lstat is not a supports_dir_fd
+#                member even on Linux; the capability belongs to os.stat)
+#   os.rename -- create's rollback, via remove_dir_verified's stage-aside
+#   os.rmdir  -- create's rollback, both the staged-aside directory and the
+#                reclaim when the leaf open loses a race to the mkdir
+# delete's own removal is still a by-name shutil.rmtree, the residual documented
+# there -- os.rmdir is here for the ROLLBACK, not for that. update additionally
+# needs a descriptor-relative rename for atomic_write's publish, which is that
+# module's own probe and is asked at the call site. Where this is False (Windows)
+# the by-name create/write/rmtree are the floor, unchanged.
+_DIR_FD_SUPPORTED = pinned_fs.supports_pinned_walk() and {
+    os.mkdir,
+    os.unlink,
+    os.stat,
+    os.rename,
+    os.rmdir,
+}.issubset(os.supports_dir_fd)
 
 
 def _matches_any(path: str, globs: list[str]) -> bool:
@@ -598,6 +631,66 @@ def _disabled_app_names() -> frozenset[str]:
         return frozenset()
 
 
+def _skill_content_digest(path: str, cache: dict[str, "bytes | None"]) -> "bytes | None":
+    """SHA-256 of the file at *path*, memoized in *cache*; ``None`` if unreadable.
+
+    Only ever called for rows whose cheap fingerprint already collided, so the
+    read cost is zero on the no-duplicate path and one read per colliding copy
+    otherwise. ``None`` (unreadable) never compares equal — a row that cannot
+    be verified identical is kept, not dropped.
+    """
+    if path in cache:
+        return cache[path]
+    try:
+        digest: bytes | None = hashlib.sha256(Path(path).read_bytes()).digest()
+    except OSError:
+        digest = None
+    cache[path] = digest
+    return digest
+
+
+def _dedupe_identical_skills(skills: list[dict]) -> list[dict]:
+    """Drop later rows that are verified byte-identical copies of an earlier row.
+
+    Two stages, so correctness never rests on a metadata coincidence:
+
+    1. **Candidate fingerprint** — ``(name, description, size_bytes)``, the
+       fields a summary line is rendered from, all already loaded by
+       ``list_skills()``. No collision (the overwhelmingly common case) means
+       no file I/O at all.
+    2. **Content verification** — on a fingerprint collision only, hash the
+       actual file bytes of both rows and drop the later row **only when the
+       digests match**. Equal-metadata skills whose bodies differ (which the
+       pinned path would inject in full) are all kept; an unreadable file is
+       kept, never dropped.
+
+    The first row wins, preserving the walk order's operator-installed
+    precedence. Confined project rows are exempt entirely: their reads are
+    gated through the descriptor-pinned reader, and mirrored-root duplicates
+    only arise from unconfined trees anyway.
+    """
+    seen: dict[tuple[str, str, int], list[dict]] = {}
+    digest_cache: dict[str, bytes | None] = {}
+    out: list[dict] = []
+    for s in skills:
+        if s.get("confine_root"):
+            out.append(s)
+            continue
+        fp = (str(s.get("name", "")), str(s.get("description", "")), int(s.get("size_bytes") or 0))
+        rivals = seen.setdefault(fp, [])
+        this_digest = None
+        if rivals:
+            this_digest = _skill_content_digest(str(s.get("path", "")), digest_cache)
+            if this_digest is not None and any(
+                _skill_content_digest(str(r.get("path", "")), digest_cache) == this_digest
+                for r in rivals
+            ):
+                continue  # verified byte-identical copy of an earlier row
+        rivals.append(s)
+        out.append(s)
+    return out
+
+
 @functools.lru_cache(maxsize=None)
 def _builtin_dir_app_name(pkg_dir: str) -> str | None:
     """The manifest name of the builtin app shipped in *pkg_dir*, or ``None``.
@@ -1011,6 +1104,122 @@ def _verified_unchanged_fingerprint(dest_dir: Path, src_dir: Path | None) -> str
     return dest_fingerprint
 
 
+# A cron script body is one file, not a tree, so its ceiling sits far below the
+# whole-tree budget above. A body over this size reads as unverifiable rather
+# than being compared -- the same fail-safe direction an unprovable tree takes.
+_CRON_SOURCE_MAX_BYTES = 2 * 1024 * 1024
+
+CRON_SOURCE_IN_SYNC = "in-sync"
+CRON_SOURCE_DIVERGED = "diverged"
+CRON_SOURCE_UNVERIFIABLE = "unverifiable"
+
+
+@dataclass(frozen=True)
+class CronScriptSource:
+    """One deployed cron script judged against the installed skill asset it came from."""
+
+    name: str
+    source: Path
+    state: str
+
+
+def _skill_script_index(base: Path) -> dict[str, list[Path]]:
+    """Map each ``*.py`` script asset name to the installed skills shipping it.
+
+    A name can be shipped by more than one skill, so the value is a list and the
+    caller decides -- guessing an owner would invent provenance the copy never
+    recorded.
+    """
+    index: dict[str, list[Path]] = {}
+    for _name, skill_file in _iter_skill_files(base):
+        scripts = skill_file.parent / "scripts"
+        if not scripts.is_dir():
+            continue
+        for entry in sorted(scripts.glob("*.py")):
+            index.setdefault(entry.name, []).append(entry)
+    return index
+
+
+def _read_for_comparison(path: Path, root: Path) -> bytes | None:
+    """Read *path* under *root* containment, or None when it cannot be proven."""
+    try:
+        return safe_read_file_bytes_nolink(
+            str(path), within_root=str(root), max_bytes=_CRON_SOURCE_MAX_BYTES
+        )
+    except FileTooLargeError:
+        return None
+    except OSError:
+        return None
+
+
+def deployed_cron_script_sources() -> list[CronScriptSource]:
+    """Judge each deployed cron script that has an installed skill asset of its name.
+
+    This is the second hop of the journey :func:`_verified_unchanged_fingerprint`
+    already guards. The first hop -- packaged ``builtin_skills/`` into the
+    installed skills dir -- is verified by CONTENT, the ``scripts/`` subtree
+    included, precisely because a release that changes only a script leaves
+    ``SKILL.md`` byte-identical, so a manifest-only comparison reports "up to
+    date" while the install keeps running superseded code. The second hop --
+    installed skill asset into ``<config_dir>/crons/`` -- is a hand-run ``cp``
+    documented in the owning skill, and nothing has ever compared its two sides.
+    The same silent staleness the first hop was taught to catch is therefore
+    unobserved one step later.
+
+    Scope is deliberately narrow. A deployed script with NO installed skill asset
+    of that name is ABSENT from the result rather than reported: cron script
+    bodies are LLM-writeable by design (see :mod:`kiro_crew.cron_script`) and
+    most are authored in place with no source anywhere, so whether they ought to
+    have one is a product question this function does not raise. Only a script
+    that DOES have a source can be out of step with it.
+
+    Reads go through the containment-checked reader the fingerprint helpers use,
+    so a symlink, a hardlinked inode, a non-regular file, a path escaping its
+    root, or an oversized body yields ``CRON_SOURCE_UNVERIFIABLE`` instead of a
+    comparison. Unverifiable never reads as agreement -- an instrument whose read
+    failed must not report the two sides equal.
+
+    When several skills ship the same script name, agreement with ANY of them is
+    ``CRON_SOURCE_IN_SYNC``: the copy records no owner, so a mismatch against an
+    arbitrarily chosen candidate would be a fabricated finding.
+    """
+    crons_root = config_dir() / "crons"
+    skills_root = skills_dir()
+    if not crons_root.is_dir() or not skills_root.is_dir():
+        return []
+    index = _skill_script_index(skills_root)
+    if not index:
+        return []
+
+    results: list[CronScriptSource] = []
+    for deployed in sorted(crons_root.glob("*.py")):
+        candidates = index.get(deployed.name)
+        if not candidates:
+            # No source to be out of step with -- out of scope by design.
+            continue
+        body = _read_for_comparison(deployed, crons_root)
+        state = CRON_SOURCE_UNVERIFIABLE
+        matched = candidates[0]
+        if body is not None:
+            unreadable = 0
+            for candidate in candidates:
+                source_body = _read_for_comparison(candidate, skills_root)
+                if source_body is None:
+                    unreadable += 1
+                    continue
+                if source_body == body:
+                    matched = candidate
+                    state = CRON_SOURCE_IN_SYNC
+                    break
+            else:
+                # Every candidate was read and none matched, or some could not
+                # be read at all. Only the fully-read case is a real divergence;
+                # an unread candidate might have been the matching one.
+                state = CRON_SOURCE_UNVERIFIABLE if unreadable else CRON_SOURCE_DIVERGED
+        results.append(CronScriptSource(name=deployed.name, source=matched, state=state))
+    return results
+
+
 def _claim_dir_for_replacement(dest_dir: Path) -> Path | None:
     """Atomically move *dest_dir* to a dot-prefixed sibling before verifying.
 
@@ -1038,6 +1247,70 @@ def _claim_dir_for_replacement(dest_dir: Path) -> Path | None:
         )
         return None
     return claim
+
+
+def _manifest_is_newer(src_file: Path, dest_file: Path) -> bool:
+    """Whether the packaged manifest is newer than the installed one.
+
+    Both stats are guarded because this runs on the gateway's startup path while
+    another process (the CLI syncing the same home) may be claiming the very
+    destination being measured. The two outcomes are deliberately different:
+
+    * an unreadable DESTINATION means it vanished or was claimed mid-sync, so
+      installing the packaged version is the correct answer -- update-due;
+    * an unreadable SOURCE means the package itself cannot be read, and there is
+      nothing to install from, so the destination is left alone.
+
+    Raising instead would abort the whole sync for every remaining skill, which
+    is what an unguarded ``stat`` did once the tree walks widened the window
+    between the destination check and this comparison.
+    """
+    try:
+        dest_mtime = dest_file.stat().st_mtime
+    except OSError:
+        return True
+    try:
+        return src_file.stat().st_mtime > dest_mtime
+    except OSError:
+        return False
+
+
+def _tree_newest_mtime(root: Path) -> float | None:
+    """Newest mtime of any regular file in *root*, or None when unprovable.
+
+    The update gate needs to know whether a PACKAGED skill changed at all, not
+    whether its ``SKILL.md`` did: a skill directory ships scripts, profiles and
+    references alongside the manifest, and those are the files that carry the
+    behaviour. Walking for the newest mtime is what makes a script-only release
+    visible to the gate.
+
+    The provenance marker is excluded for the same reason
+    ``_tree_entries`` excludes it: the sync writes it AFTER copying, so its
+    mtime is install time and would dominate every destination tree, making a
+    later package update read as older than the copy it should replace — the
+    gate would then never fire again.
+
+    Returns None when the tree cannot be measured: an unreadable entry, or more
+    entries than ``_FINGERPRINT_MAX_ENTRIES``. None is not a comparable value,
+    so the caller falls back to the manifest comparison rather than guessing.
+    """
+    newest: float | None = None
+    entries = 0
+    for rel, kind, _value in _tree_entries(root):
+        entries += 1
+        if entries > _FINGERPRINT_MAX_ENTRIES:
+            return None
+        if kind == "unreadable":
+            return None
+        if kind != "file":
+            continue
+        try:
+            mtime = os.lstat(root / rel).st_mtime
+        except OSError:
+            return None
+        if newest is None or mtime > newest:
+            newest = mtime
+    return newest
 
 
 def _tree_has_content(root: Path) -> bool:
@@ -1236,17 +1509,47 @@ def _ensure_builtin_skills(base: Path) -> None:
     ``_FINGERPRINT_MAX_BYTES`` / ``_FINGERPRINT_MAX_ENTRIES``.
     """
     source_names: set[str] = set()
+    supplied: set[str] = set()
     for src_root in (_project_skills_dir(), _BUILTIN_SKILLS_DIR):
         if not src_root or not src_root.exists():
             continue
         for name, src_file in _iter_skill_files(src_root):
             source_names.add(name)
+            # First source root to ship a name owns it for this run. Without
+            # this, the second root races the copy the first just made: the
+            # destination is no longer user data but this run's own output, and
+            # which tree ends up installed is decided by comparing mtimes
+            # across two unrelated source trees. The project dir is iterated
+            # first, so a project skill is no longer replaced by a packaged
+            # one that merely carries a newer file.
+            if name in supplied:
+                continue
+            supplied.add(name)
             src_dir = src_file.parent
             dest_dir = base / name
             dest_file = dest_dir / "SKILL.md"
-            update_due = (
-                not dest_file.exists() or src_file.stat().st_mtime > dest_file.stat().st_mtime
-            )
+            # The manifest's own mtime is not a proxy for the skill's: a
+            # release that only changes ``scripts/`` leaves ``SKILL.md``
+            # byte-identical with its packaged mtime, so a manifest-only
+            # comparison reports "up to date" and the installed skill keeps
+            # running superseded code indefinitely. Observed on prepare-pr,
+            # whose extractor was fixed in the package while every install
+            # kept the previous copy and failed against the current workflow.
+            #
+            # Both arms are kept, OR-ed: the tree arm adds the updates the
+            # manifest arm cannot see, and the manifest arm still governs when
+            # the tree is unmeasurable or when a locally edited destination
+            # carries an mtime newer than anything the package ships. Since
+            # ``copytree`` copies with ``copy2``, an unmodified install
+            # fingerprints mtime-equal to its package, so a steady state does
+            # not re-copy on every startup.
+            update_due = not dest_file.exists()
+            if not update_due:
+                src_newest = _tree_newest_mtime(src_dir)
+                dest_newest = _tree_newest_mtime(dest_dir)
+                update_due = (
+                    src_newest is not None and dest_newest is not None and src_newest > dest_newest
+                ) or _manifest_is_newer(src_file, dest_file)
             if not update_due:
                 # First-install migration adoption: an up-to-date destination
                 # with no marker is from a pre-provenance install. Record
@@ -1671,7 +1974,7 @@ class SkillsLoader:
                     "description": description,
                     "path": str(skill_file),
                     "dir": str(skill_file.parent),
-                    "always": meta.get("always", "").lower() == "true",
+                    "always": meta.get("always", "").strip().lower() == "true",
                     "repo_scope": repo_scope,
                     # Project paths cannot safely offer a live pointer to the
                     # agent, so report the effective forced-body behavior.
@@ -1923,12 +2226,15 @@ class SkillsLoader:
                     "description": meta.get("description", name),
                     "path": str(skill_file),
                     "dir": str(skill_file.parent),
-                    "always": meta.get("always", "").lower() == "true",
+                    "always": meta.get("always", "").strip().lower() == "true",
                     # Carried so a caller assembling context can drop a
                     # repo-scoped skill from the INDEX, not just from the
                     # injected body: a summary line the agent is told to read
-                    # advertises the skill just as effectively.
-                    "repo_scope": meta.get("repo_scope", ""),
+                    # advertises the skill just as effectively. Stripped because
+                    # the consumer guards on this value's truthiness before
+                    # calling the gate, so it has to agree with the other two
+                    # gate call sites about what counts as "no scope at all".
+                    "repo_scope": meta.get("repo_scope", "").strip(),
                     # Mirrors split_triggered: confined project rows always use
                     # the body; only an explicit `false` on an unconfined skill
                     # opts out. A malformed value therefore reads as injecting.
@@ -2211,8 +2517,29 @@ class SkillsLoader:
 
     @staticmethod
     def _safe_name(name: str) -> bool:
-        """Return True if skill name is safe (no path traversal)."""
-        return bool(name) and ".." not in name and "\\" not in name
+        """Return True if skill name is safe (no traversal, rooted, or dot-only).
+
+        A rooted name must be rejected because ``Path.__truediv__`` discards
+        the base directory when the joined segment is absolute, so
+        ``self._dir / name`` would resolve outside the skills root. Both
+        flavours are checked: POSIX-absolute (``/etc/x``) and Windows
+        rooted/drive-qualified in the forward-slash spelling (``C:/x``,
+        ``C:x``, ``//server/share/x``) — the backslash spelling is already
+        caught by the ``"\\\\"`` rule. Dot-only spellings (``.``, ``./``)
+        must also be rejected: pathlib drops ``.`` components on join, so
+        ``self._dir / "."`` collapses to the skills root itself and a delete
+        would remove every installed skill. ``PurePosixPath(name).parts`` is
+        empty exactly for those spellings.
+        """
+        return (
+            bool(name)
+            and ".." not in name
+            and "\\" not in name
+            and bool(PurePosixPath(name).parts)
+            and not PurePosixPath(name).is_absolute()
+            and not PureWindowsPath(name).is_absolute()
+            and not PureWindowsPath(name).drive
+        )
 
     def load_skill(
         self,
@@ -2312,8 +2639,195 @@ class SkillsLoader:
         skill_dir = self._dir / name
         if skill_dir.exists():
             return False
-        skill_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+        if not _DIR_FD_SUPPORTED:
+            # exist_ok=False so a skill directory that appeared between the
+            # exists() check above and here is REFUSED rather than written
+            # through: two concurrent creates would otherwise both mkdir, both
+            # write_text the same SKILL.md, and both report success, losing one
+            # submitted body. The pinned branch answers the same way, through
+            # its own O_EXCL-equivalent -- os.mkdir under the pinned parent raising
+            # FileExistsError -- so without this the two branches of this fork
+            # disagree on the same request. parents=True
+            # still creates the intermediates a nested name needs; only the leaf
+            # is refused.
+            try:
+                skill_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                return False
+            (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+            self._invalidate_iter_cache()  # so the new skill shows in list_skills() now
+            logger.info("Created skill: %s", name)
+            return True
+
+        # Ensure the intermediate tree by name (a nested skill name has parents
+        # the caller owns), then create the leaf skill dir and its SKILL.md
+        # relative to a pinned descriptor so an ancestor swapped for a link after
+        # the exists() check cannot redirect the write. The leaf mkdir refuses a
+        # skill dir that appeared in the meantime, matching the exists() guard.
+        skill_dir.parent.mkdir(parents=True, exist_ok=True)
+        # ONE resolution of the parent chain, and everything below it addressed
+        # through the descriptor it produced: the leaf directory, its SKILL.md, and
+        # the rollback that removes both. A second walk would be a second chance for
+        # an ancestor swapped since the first to be followed, and would also leave
+        # the create and the rollback pointing at different directories.
+        try:
+            parent_fd = pinned_fs.open_dir_pinned(skill_dir.parent, what="skill directory")
+        except pinned_fs.PinnedPathRefusal:
+            return False
+        except OSError:
+            return False
+        try:
+            return self._create_skill_pinned(name, content, skill_dir, parent_fd)
+        finally:
+            os.close(parent_fd)
+
+    def _create_skill_pinned(
+        self, name: str, content: str, skill_dir: Path, parent_fd: int
+    ) -> bool:
+        """Create *skill_dir* and its SKILL.md under *parent_fd*, or leave nothing behind.
+
+        Split out so the rollback has one exit rather than being threaded through
+        ``create_skill``'s branches. A partial create is not merely untidy here: the
+        leftover directory makes ``create_skill``'s ``exists()`` guard answer False
+        forever, so every retry is a 409 over a truncated body that ``list_skills()``
+        still serves. Steering's create already unlinks its partial leaf for exactly
+        that reason; this is the same rule, plus the directory, because this call is
+        the one that created it.
+
+        The leaf directory is created and opened RELATIVE to *parent_fd*, not through
+        ``pinned_fs.create_and_open_dir_pinned``. That helper resolves
+        ``skill_dir.parent`` with its own ``realpath`` and pins it again, discarding
+        the descriptor the caller already walked -- a second resolution, which an
+        ancestor swapped since the first is followed by. It would also leave the
+        create and the rollback addressing two different directories, so on such a
+        swap ``SKILL.md`` lands outside the skills root while the rollback reports an
+        identity mismatch on an unrelated one. The helper's two other jobs are
+        reproduced here rather than borrowed: a name that already exists is refused
+        because ``os.mkdir`` under the pinned parent raises ``FileExistsError`` (the
+        exclusivity is the syscall's, not a flag on a helper), and a link or
+        non-directory at the leaf becomes the one refusal the caller maps rather than
+        a raw errno.
+        """
+        try:
+            os.mkdir(skill_dir.name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            # Something holds the name that this call did not create, so it is not
+            # ours to write into -- the exists() guard's answer, re-asked without a
+            # window. 0o700 matches create_and_open_dir_pinned's mode for every
+            # caller, so the directory-mode behaviour is unchanged.
+            return False
+        try:
+            dir_fd = os.open(skill_dir.name, pinned_fs.dir_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            # A link or a plain file raced onto the name between the mkdir and here.
+            # Reclaim the directory this call just made -- rmdir only ever removes an
+            # EMPTY one, so the worst case on a swap is losing a directory nobody has
+            # written to yet, and leaving it would make every retry answer 409.
+            with suppress(OSError):
+                os.rmdir(skill_dir.name, dir_fd=parent_fd)
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                return False
+            raise
+        # Identity of the directory THIS call created, taken from the descriptor before
+        # anything can be swapped at the name, so the rollback below can only ever
+        # remove what this call brought into being. Guarded, because an fstat that
+        # fails (EIO or ESTALE on a network filesystem) would otherwise leak the
+        # descriptor AND strand the directory, and a stranded directory answers every
+        # retry with 409.
+        try:
+            created = os.fstat(dir_fd)
+        except BaseException:
+            os.close(dir_fd)
+            with suppress(OSError):
+                os.rmdir(skill_dir.name, dir_fd=parent_fd)
+            raise
+        # Bound before the guarded region so the rollback can tell "no identity to
+        # verify against" from "the identity is X" without inspecting locals.
+        leaf: os.stat_result | None = None
+        try:
+            # 0o666, masked by umask, is what the by-name floor's write_text
+            # produces, so the two branches land the same permissions and the pin
+            # changes no default. This is the mode prompts.py's own pinned O_EXCL
+            # create of user content passes, for the same reason. A tighter default
+            # for user-authored skill bodies is a policy change that has to cover
+            # both branches and both platforms, so it does not ride a migration.
+            fd = os.open(
+                "SKILL.md",
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0),
+                0o666,
+                dir_fd=dir_fd,
+            )
+            try:
+                try:
+                    # Identity of the inode this call created, from the descriptor while
+                    # it is provably ours: the rollback addresses a NAME, and a rival can
+                    # unlink ours and create its own inside the failure window.
+                    leaf = os.fstat(fd)
+                    data = content.encode("utf-8")
+                    written = 0
+                    while written < len(data):
+                        written += os.write(fd, data[written:])
+                except BaseException:
+                    # Ask for the identity once more while the descriptor is still open --
+                    # the close below is what takes it away, and the rollback arm cannot
+                    # unlink anything without one. An EIO or ESTALE that made the first
+                    # fstat fail on a network filesystem is usually transient, so this is
+                    # a free path back to the verified arm; it can never answer with
+                    # another object, because it addresses a descriptor rather than a name.
+                    if leaf is None:
+                        with suppress(OSError):
+                            leaf = os.fstat(fd)
+                    raise
+            finally:
+                os.close(fd)
+        except BaseException:
+            # Roll the whole create back, leaf first, both through descriptors. Caught
+            # broadly rather than on OSError: a KeyboardInterrupt or a MemoryError
+            # building the buffer leaves the same half-made skill, and the retry is
+            # just as permanently 409 either way.
+            #
+            # Both halves verify identity, because both address a NAME under a
+            # descriptor and a name can be replaced inside the failure window. The
+            # leaf goes through unlink_verified, which stats through the directory's
+            # own fd and unlinks only if the inode is still the one created above, so
+            # a rival that replaced SKILL.md keeps ITS file. The directory goes
+            # through remove_dir_verified, which renames it aside under the pinned
+            # parent, re-checks (st_dev, st_ino), and only then rmdirs -- a directory
+            # swapped in at the name is reported rather than removed. A bare unlink
+            # or rmdir by name would delete whatever answers to the name, which is
+            # the step this whole migration exists to remove.
+            #
+            # ``leaf`` is None only when the leaf open failed, or when BOTH fstats on
+            # the descriptor this call owned failed -- and the first of those precedes
+            # the first os.write, so in every one of those cases nothing was written.
+            # No identity therefore means no unlink: the empty SKILL.md keeps the
+            # directory non-empty, remove_dir_verified's rmdir fails and puts the name
+            # back, and the create is left as a skill with an empty body, which the
+            # Skills tab lists and which update_skill and delete_skill both reach. That
+            # is a save away from correct; unlinking whatever answers to the name to
+            # spare that would destroy a file this code has never read.
+            if leaf is not None:
+                pinned_fs.unlink_verified(dir_fd, "SKILL.md", (leaf.st_dev, leaf.st_ino))
+            outcome = pinned_fs.remove_dir_verified(
+                parent_fd, skill_dir.name, expect=(created.st_dev, created.st_ino)
+            )
+            if not outcome.removed:
+                # Reported, not raised over: the original failure is the one the caller
+                # needs, and a rollback that could not finish leaves a name a human has
+                # to look at. staged_name is set only when the entry was left aside.
+                logger.warning(
+                    "skill create rollback left %s behind (%s%s)",
+                    name,
+                    outcome.reason,
+                    f", staged as {outcome.staged_name}" if outcome.staged_name else "",
+                )
+            raise
+        finally:
+            os.close(dir_fd)
         self._invalidate_iter_cache()  # so the new skill shows in list_skills() now
         logger.info("Created skill: %s", name)
         return True
@@ -2322,12 +2836,96 @@ class SkillsLoader:
         """Overwrite an existing skill's SKILL.md.  Returns True if found."""
         if not self._safe_name(name):
             return False
-        skill_file = self._dir / name / "SKILL.md"
+        skill_dir = self._dir / name
+        skill_file = skill_dir / "SKILL.md"
         if not skill_file.exists():
             return False
-        skill_file.write_text(content, encoding="utf-8")
+        # Both capabilities, not one: the walk that produces the descriptor and the
+        # descriptor-relative rename that consumes it are separate probes, and
+        # atomic_write REFUSES a descriptor it cannot publish through rather than
+        # quietly writing by name, so the floor is chosen here instead.
+        if not (_DIR_FD_SUPPORTED and pinned_parent_replace_supported()):
+            if not self._write_skill_md(skill_file, content, dir_fd=None):
+                return False
+            self._invalidate_iter_cache()  # so the edit is reflected in list_skills() now
+            logger.info("Updated skill: %s", name)
+            return True
+
+        # Pin the skill directory so the atomic replace stages and renames
+        # through the walked descriptor rather than by name.
+        #
+        # open_dir_pinned, not pin_parent: ``self._dir / name`` is a lexical join
+        # that nothing canonicalized, so this realpath is the FIRST resolution of
+        # the chain rather than a second one, and there is no earlier canonical form
+        # for pin_parent to walk. pin_parent here would instead refuse the ordinary
+        # symlinks that legitimately sit above the skills root -- a symlinked $HOME
+        # is the common one -- and break every update on such a host.
+        try:
+            dir_fd = pinned_fs.open_dir_pinned(skill_dir, what="skill directory")
+        except pinned_fs.PinnedPathRefusal:
+            return False
+        except OSError:
+            return False
+        try:
+            if not self._write_skill_md(skill_file, content, dir_fd=dir_fd):
+                return False
+        finally:
+            os.close(dir_fd)
         self._invalidate_iter_cache()  # so the edit is reflected in list_skills() now
         logger.info("Updated skill: %s", name)
+        return True
+
+    @staticmethod
+    def _write_skill_md(skill_file: Path, content: str, *, dir_fd: int | None) -> bool:
+        """Atomically replace *skill_file*, carrying its access-control xattrs.
+
+        Routes through ``atomic_write`` with the same ACL carry the steering and
+        file-write update paths use: ``mode=`` alone reproduces permission BITS
+        only, so a named POSIX ACL the owner set on a skill's SKILL.md would be
+        dropped the moment the replace installs a fresh inode. When *dir_fd* is a
+        pinned parent the temp create and rename run relative to it, and the ACL
+        source is opened relative to it too -- addressing the leaf by name after
+        the caller pinned its directory would let a directory replaced at that
+        name supply the mode and the ACL while the write published into the pinned
+        original, handing the real skill back with permissions chosen by whoever
+        did the replacing.
+
+        Returns False when the target is REJECTED -- the source open failed, so
+        there is no inode to carry from. A write failure still raises.
+        """
+        try:
+            src_fd = open_access_control_source(skill_file, dir_fd=dir_fd)
+        except OSError:
+            # The same disposition the steering and file-write updates give this:
+            # a rejected target, not a server fault. Continuing with src_fd=None
+            # would publish a fresh inode carrying only the permission bits, so a
+            # named POSIX ACL the owner set on this SKILL.md would be dropped and
+            # the file handed back protected differently from the one it replaced
+            # -- silently, on the one path that was supposed to fix that.
+            return False
+        try:
+            # By-name stat only on the unpinned floor: with dir_fd the helper
+            # always hands back a descriptor, so the bits and the ACL come from
+            # one inode and neither is re-resolved.
+            mode = (
+                stat.S_IMODE(os.fstat(src_fd).st_mode)
+                if src_fd is not None
+                else stat.S_IMODE(skill_file.stat().st_mode)
+            )
+            atomic_write(
+                skill_file,
+                content,
+                mode=mode,
+                newline="",
+                preserve_access_control_from=src_fd,
+                parent_dir_fd=dir_fd,
+            )
+        finally:
+            if src_fd is not None:
+                try:
+                    os.close(src_fd)
+                except OSError:
+                    pass
         return True
 
     def delete_skill(self, name: str) -> bool:
@@ -2336,6 +2934,30 @@ class SkillsLoader:
             return False
         skill_dir = self._dir / name
         if not skill_dir.is_dir():
+            return False
+        if _DIR_FD_SUPPORTED:
+            # A recursive descriptor-relative delete is out of proportion for a
+            # skill dir, so the residual guarded here is narrower: pin the parent,
+            # answer "is this name a real directory?" from a descriptor-relative
+            # lstat, and only then rmtree. The is_dir() above FOLLOWS a link, so a
+            # symlinked skill dir reaches this point; shutil.rmtree then refuses it
+            # with an OSError the caller would surface as a 500 instead of the
+            # not-found the by-name floor gives. A directory swapped for a link
+            # after this check is the remaining window -- recorded, and the by-name
+            # floor below carries the same posture.
+            try:
+                parent_fd = pinned_fs.open_dir_pinned(skill_dir.parent, what="skill directory")
+            except pinned_fs.PinnedPathRefusal:
+                return False
+            except OSError:
+                return False
+            try:
+                st = pinned_fs.stat_at(parent_fd, skill_dir.name)
+                if st is None or not stat.S_ISDIR(st.st_mode):
+                    return False
+            finally:
+                os.close(parent_fd)
+        elif is_link_or_junction(skill_dir):
             return False
         shutil.rmtree(skill_dir)
         self._invalidate_iter_cache()  # so the removal is reflected in list_skills() now
@@ -2825,7 +3447,7 @@ class SkillsLoader:
             # recorded rather than reading it unconfined for a ranking signal.
             meta = self._cached_frontmatter(Path(s["path"]), within=s.get("confine_root"))
             hits, anchor = self._auto_activity(key, s["path"], meta)
-            pinned = str(meta.get("pinned", "")).lower() == "true"
+            pinned = str(meta.get("pinned", "")).strip().lower() == "true"
             slug = key.split("/")[-1]
             exempt_row = (
                 pinned
@@ -3989,8 +4611,16 @@ class SkillsLoader:
         result: list[str] = []
         for name, skill_file, _within in self._iter_visible(project_dir):
             meta = self._cached_frontmatter(skill_file, within=_within)
-            if meta.get("always", "").lower() == "true":
-                scope = meta.get("repo_scope", "")
+            if meta.get("always", "").strip().lower() == "true":
+                # Stripped so a whitespace-only value means "no scope" here exactly as it
+                # does at the other two gate call sites. The guard below tests this
+                # value's TRUTHINESS, and `repo_scope: |` over a blank line now resolves
+                # to a break rather than to "" -- truthy, so the gate would be handed
+                # whitespace and refuse it, suppressing a skill its author never scoped.
+                # A trailing break on a real path is NOT the concern:
+                # `project_scope_satisfied` strips its own fragment, so `src/x\n` was
+                # always gated as `src/x`.
+                scope = meta.get("repo_scope", "").strip()
                 if scope and not self._repo_scope_satisfied(scope, project_dir):
                     continue
                 result.append(name)
@@ -4028,15 +4658,17 @@ class SkillsLoader:
         negated_skills: list[str] = []
         for name, skill_file, _within in self._iter_visible(project_dir):
             meta = self._cached_frontmatter(skill_file, within=_within)
-            if meta.get("always", "").lower() == "true":
+            if meta.get("always", "").strip().lower() == "true":
                 continue
             triggers = meta.get("triggers", "")
             if not triggers:
                 continue
             # Repo-scoped skills are mechanically suppressed outside their
             # repo — word-overlap can fire on ordinary user phrasing, and a
-            # prose scope guard alone is probabilistic.
-            scope = meta.get("repo_scope", "")
+            # prose scope guard alone is probabilistic. Stripped so a
+            # whitespace-only value reads as "no scope" at every gate call site
+            # (see the always-on lister for why the truthiness test needs it).
+            scope = meta.get("repo_scope", "").strip()
             if scope and not self._repo_scope_satisfied(scope, project_dir):
                 continue
 
@@ -4273,6 +4905,18 @@ class SkillsLoader:
             if not s.get("repo_scope")
             or self._repo_scope_satisfied(str(s["repo_scope"]), project_dir)
         ]
+        # Collapse verified byte-identical copies of the same skill before
+        # anything is rendered, for the same reason the scope filter above
+        # lives here: this is the single place that covers the index, both
+        # renderers, and the pinned set. Multi-root installs commonly
+        # materialize one skill twice — a package tree and a flat mirror of it
+        # — at different key depths, so `_iter_uncached`'s per-key shadowing
+        # never sees the collision and the injected index carries N identical
+        # summary lines (and, for a pinned skill, N identical full bodies).
+        # Dropping a copy is only safe when the bytes are the same, and
+        # `_dedupe_identical_skills` verifies exactly that: same-metadata rows
+        # whose content differs are all kept.
+        all_skills = _dedupe_identical_skills(all_skills)
         if not all_skills:
             return ""
         if budget is None:
@@ -4663,7 +5307,9 @@ class SkillsLoader:
         ``frontmatter._COLUMN0_BLOCK_RE`` — the ``column0_fence`` extraction
         that ``frontmatter.SKILL_LOADER`` binds to the skills surface: the
         closer is the first line after the opener that STARTS with ``---`` —
-        trailing text on the closer line is tolerated and consumed (#6182). Anything
+        trailing text on the closer line is tolerated and consumed (#6182), and
+        an optional carriage return before each fence newline is tolerated the
+        way the parser tolerates one. Anything
         the display parser reads as frontmatter must also be stripped here:
         a stricter closer (the old ``---`` must-be-followed-by-newline
         grammar) let a ``---junk`` or ``--- `` closer parse fields in the UI
@@ -4671,7 +5317,7 @@ class SkillsLoader:
         means revisiting the other.
         """
         if content.startswith("---"):
-            match = re.match(r"^---\n.*?\n---[^\n]*\n?", content, re.DOTALL)
+            match = re.match(r"^---\r?\n.*?\r?\n---[^\n]*\n?", content, re.DOTALL)
             if match:
                 return content[match.end() :].strip()
         return content

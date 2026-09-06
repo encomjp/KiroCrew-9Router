@@ -139,7 +139,7 @@ The source install below remains the fully supported path.
 |------|-----|--------|
 | **Git for Windows** | clone the repo | https://git-scm.com/download/win |
 | **kiro-cli** | the agent backend (ACP); the first dashboard launch can install it | Kiro Crew setup page or kiro-cli's native Windows release |
-| **Python 3.10-3.13** | the venv runtime. `python_requires` is `>=3.10` and 3.13 is in the supported range, but **3.12 is the tested Windows runtime** (it is what the Windows CI shard runs, and numpy 1.x ships no 3.13 Windows wheel) | https://python.org (install user-scoped), or `winget install Python.Python.3.12` |
+| **Python 3.12-3.13** | the venv runtime. `python_requires` is `>=3.12` and 3.13 is in the supported range, but **3.12 is the tested Windows runtime** (it is what the Windows CI shard runs, and numpy 1.x ships no 3.13 Windows wheel) | https://python.org (install user-scoped), or `winget install Python.Python.3.12` |
 | **Node.js** (optional) | builds the full React dashboard; without it the gateway serves the prebuilt bundle | `winget install OpenJS.NodeJS.LTS` |
 
 No admin is required — everything installs user-scoped under `%USERPROFILE%`.
@@ -426,7 +426,7 @@ The scope is deliberately only the signal-0 *probe* form. The tree contains many
 raw POSIX call sites — `fcntl`, `resource`, `os.killpg`, `pty`, `termios` — and
 nearly all are legitimately POSIX-gated implementation detail, so auditing them
 here would bury the signal in noise; those are governed by the shim table in
-`AGENTS.md` and by review. What makes signal-0 worth its own gate is that getting
+[platform-compat](../system-specs/common/platform-compat.md) and by review. What makes signal-0 worth its own gate is that getting
 it wrong is destructive rather than merely unavailable, and that the added-line CI
 check cannot see a probe which arrives by a file move or a rebase. This test reads
 the whole tree on every run.
@@ -583,6 +583,6 @@ stay Windows-skipped in `test/windows-expected-failures.txt`.
 
 - [README](../../README.md) — quick-start Platforms note
 - [install](install.md) — the build-target table shared with macOS and Linux
-- [AGENTS.md](../../AGENTS.md) — the cross-platform shim table
+- [platform-compat](../system-specs/common/platform-compat.md) — the cross-platform shim table
 - `src/kiro_crew/platform_compat.py` — the cross-platform shim
 - `make.ps1` — the Windows build driver

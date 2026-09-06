@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from kiro_crew.acp.types import EVENT_COMPLETE, EVENT_TEXT_CHUNK, AcpEvent
+from kiro_crew.session_allocation import SessionClosingError
 from kiro_crew.wecom.client import WeComInbound
 from kiro_crew.wecom.commands import ConversationState, parse_command
 from kiro_crew.wecom.transport_dispatch import WeComDispatcher
@@ -81,6 +82,10 @@ class FakeSessions:
         self.mirror_links: dict = {}
         self.opted_out: dict = {}
         self.cleared_mirror: list = []
+        # `closing` mirrors SessionManager._closing so begin_turn refuses the
+        # dispatch the way the real gate does after close_all.
+        self.closing = False
+        self.begin_turns = 0
 
     @contextlib.contextmanager
     def batched_save(self):
@@ -118,6 +123,12 @@ class FakeSessions:
         if self._raise is not None:
             raise self._raise
         return self._p, self._is_new, False
+
+    def begin_turn(self, key):
+        """The real manager's synchronous pre-dispatch closing gate."""
+        self.begin_turns += 1
+        if self.closing:
+            raise SessionClosingError("SessionManager is closing")
 
     async def set_channel(self, key, cid) -> None:
         self.channels.append((key, cid))
@@ -219,7 +230,7 @@ class FakeConvLog:
         self.appended: list[tuple[str, str, str]] = []
         self.titles: dict[str, str] = {}
 
-    def append(self, key, role, text, agent=None) -> None:
+    def append(self, key, role, text, agent=None, mid=None) -> None:
         self.appended.append((key, role, text))
 
     def set_title(self, key, title) -> None:
@@ -401,6 +412,69 @@ class TestCommands:
         assert sessions.acquired == [key]
         assert sessions.released == [key]
         assert client.said == ["🗜️ 已压缩上下文。"]
+
+    @pytest.mark.asyncio
+    async def test_compact_declined_on_auto_managed_backend(self) -> None:
+        # A backend that cannot serve /compact gets the informational reply and
+        # compact() is NEVER dispatched (#8156).
+        provider = FakeProvider([])
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        key = d._session_key("Wei")
+        assert provider.compacted is False
+        assert sessions.released == [key]  # the acquired semaphore is handed back
+        assert any("自动压缩上下文" in s for s in client.said)
+
+    @pytest.mark.asyncio
+    async def test_compact_none_capability_preserves_dispatch(self) -> None:
+        # The ABC's None (supported) default keeps the existing dispatch.
+        provider = FakeProvider([])
+        provider.manual_compact_unsupported_backend = None
+        sessions = FakeSessions(provider)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("/compact"))
+
+        assert provider.compacted is True
+
+    @pytest.mark.asyncio
+    async def test_hard_threshold_declines_silently_on_auto_managed_backend(self) -> None:
+        # No /compact to dispatch and no notice: the backend compacts on its
+        # own as context fills (#8156).
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider, ctx_pct=96.0)  # >= hard (95)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("hello"))
+
+        assert provider.compacted is False
+        assert not any("已自动压缩" in c for _chat, c in client.pushed)
+
+    @pytest.mark.asyncio
+    async def test_soft_nudge_suppressed_on_auto_managed_backend(self) -> None:
+        # The nudge advises /compact, which this backend refuses — it compacts
+        # on its own, so there is nothing for the user to act on (#8156).
+        provider = FakeProvider(
+            [AcpEvent(kind=EVENT_TEXT_CHUNK, text="answer"), AcpEvent(kind=EVENT_COMPLETE)]
+        )
+        provider.manual_compact_unsupported_backend = "kas"
+        sessions = FakeSessions(provider, ctx_pct=85.0)  # >= soft (80), < hard (95)
+        client = FakeClient()
+        d = _dispatcher(sessions, FakeCtx(), client)
+
+        await d.handle_message(_inbound("hello"))
+
+        assert not any("对话上下文已较长" in c for _chat, c in client.pushed)
 
     @pytest.mark.asyncio
     async def test_compact_refused_while_turn_busy(self) -> None:

@@ -665,6 +665,65 @@ describe('ChatPane plan follow-ups dispatch (issue #5893)', () => {
     expect(api.planAction).toHaveBeenCalledWith('pane-bg', 'Go')
   })
 
+  it('double-click on a plan chip dispatches the plan action, never sendChat (issue #6240)', async () => {
+    // Single-click is the #5893 / #6040 path. Double-click used to call
+    // onSend(label) and type "Go" / "Cancel" as ordinary chat.
+    await renderPane('pane-plan-dbl', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    fireEvent.doubleClick(chip('Go'))
+    await waitFor(() => expect(api.planAction).toHaveBeenCalledTimes(1))
+    expect(api.planAction).toHaveBeenCalledWith('pane-plan-dbl', 'Go')
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
+  })
+
+  it('Send now on a plan chip dispatches the plan action, never sendChat (issue #6240)', async () => {
+    // The visible split-button segment is the discoverable form of the same
+    // onSend bypass. Cancel is the sharp edge: a typed Cancel never stops the
+    // plan.
+    await renderPane('pane-plan-sendnow', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Send now: Cancel' }))
+    await waitFor(() => expect(api.planAction).toHaveBeenCalledTimes(1))
+    expect(api.planAction).toHaveBeenCalledWith('pane-plan-sendnow', 'Cancel')
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
+  })
+
+  it('a double-click whose footer is REPLACED between clicks never dispatches (issue #6240 race)', async () => {
+    // First click of a double-click arms the chip with row-1. A byte-identical
+    // replacement footer reuses the chip; the second click must hand the
+    // FIRST-click key to onSend so the hook refuses the replacement stage.
+    const store = await renderPane('pane-plan-dbl-stale', { mode: 'orchestrator' }, PLAN_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Go' })).toBeTruthy())
+    vi.useFakeTimers()
+    await act(async () => { fireEvent.click(chip('Go'), { detail: 1 }) })
+    await act(async () => {
+      store.dispatch(appendSlotMessage({
+        slot: 'pane-plan-dbl-stale',
+        message: { role: 'assistant', content: ASSISTANT_WITH_PLAN, ts: '2026-08-25T00:06:00Z' } as never,
+      }))
+    })
+    await act(async () => {
+      fireEvent.click(chip('Go'), { detail: 2 })
+      fireEvent.doubleClick(chip('Go'))
+    })
+    expect(api.planAction).not.toHaveBeenCalled()
+    expect(api.sendChat).not.toHaveBeenCalled()
+    expect(composer().value).toBe('')
+  })
+
+  it('Send now on a NON-plan chip still sends the label through the pane\'s send path', async () => {
+    await renderPane('pane-plan-sendnow-plain', { mode: 'orchestrator' }, PANE_MESSAGES)
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Alpha' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Send now: Alpha' }))
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+    const [wireText, slot] = (api.sendChat as ReturnType<typeof vi.fn>).mock.calls[0]
+    expect(wireText).toBe('Alpha')
+    expect(slot).toBe('pane-plan-sendnow-plain')
+    expect(api.planAction).not.toHaveBeenCalled()
+  })
+
   it('a click whose footer is REPLACED during the 220ms debounce never dispatches (host forwards the click-time row)', async () => {
     // End-to-end proof of the wiring, not just the hook: FollowUpBar snapshots
     // its sourceKey at click time, ChatInput forwards it, and the pane hands it

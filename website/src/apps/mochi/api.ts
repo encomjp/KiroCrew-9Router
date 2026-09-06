@@ -25,6 +25,7 @@ export type {
   WatchPriority,
   WatchStatus,
 } from './src/shared/watchlistTypes'
+import { toApiError } from '../../api/apiError'
 import type {
   WatchItem,
   WatchKind,
@@ -117,8 +118,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   })
   if (!res.ok) {
-    const body = await res.text().catch(() => '')
-    throw new Error(`mochi api ${path}: ${res.status} ${body.slice(0, 200)}`)
+    throw await toApiError(res)
   }
   return (await res.json()) as T
 }
@@ -237,7 +237,7 @@ export async function probeEnabled(): Promise<'enabled' | 'disabled' | 'starting
   if (res.ok) return 'enabled'
   if (res.status === 403) return 'disabled'
   if (res.status === 503) return 'starting'
-  throw new Error(`mochi api /pet-state: ${res.status}`)
+  throw await toApiError(res)
 }
 
 /** Enable the app — reuses core's app registry route, not a Mochi-specific one. */
@@ -246,7 +246,7 @@ export async function enableMochi(): Promise<void> {
     method: 'POST',
     credentials: 'same-origin',
   })
-  if (!res.ok) throw new Error(`enable mochi: ${res.status}`)
+  if (!res.ok) throw await toApiError(res)
 }
 
 /**

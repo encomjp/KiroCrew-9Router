@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import logging
 import shlex
 import subprocess
 import sys
@@ -1104,6 +1105,25 @@ def test_session_runner_unavailable_when_config_load_raises(monkeypatch):
 
     monkeypatch.setattr(R, "KiroCrewConfig", SimpleNamespace(load=_boom))
     assert R.SessionAgentRunner.available() is False
+
+
+def test_session_runner_logs_the_reason_availability_failed(monkeypatch, caplog):
+    """``create_provider_factory`` cannot return None, so False is reachable ONLY from the
+    ``except`` — the raised exception is therefore the sole record of why the backend went
+    offline, and discarding it left the operator-facing offline reason unable to name a
+    cause (#6566). The boolean contract is unchanged; only the log is added."""
+
+    def _boom():
+        raise RuntimeError("acp -> client -> session -> config.loader circular import")
+
+    monkeypatch.setattr(R, "KiroCrewConfig", SimpleNamespace(load=_boom))
+    with caplog.at_level(logging.WARNING, logger=R.logger.name):
+        assert R.SessionAgentRunner.available() is False
+
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert warnings, "the swallowed exception was not logged at all"
+    assert warnings[0].exc_info is not None, "logged without exc_info, so the cause is lost"
+    assert "circular import" in str(warnings[0].exc_info[1])
 
 
 def test_resolve_factory_prefers_the_injected_one():

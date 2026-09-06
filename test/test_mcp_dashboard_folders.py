@@ -75,7 +75,7 @@ def _verified_caller() -> Any:
     this to empty itself, and the inner patch wins.
     """
     with patch(
-        "kiro_crew.mcp_dashboard._resolve_session_key_strict",
+        "kiro_crew.mcp_core._resolve_session_key_strict",
         return_value="dashboard:chat-1-100",
     ):
         yield
@@ -135,9 +135,10 @@ class TestFolderTree:
 class TestFolderCreate:
     def test_creates_subfolder_under_existing_parent_path(self) -> None:
         made = {"id": "dddddddddddd", "name": "0812", "parent_id": "aaaaaaaaaaaa"}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post", return_value=made
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "0812", "parent": "kirocrew"})
         path, body = mock_post.call_args.args
         assert path == "/api/chat/folders"
@@ -146,17 +147,19 @@ class TestFolderCreate:
 
     def test_accepts_parent_by_id(self) -> None:
         made = {"id": "dddddddddddd", "name": "x", "parent_id": "bbbbbbbbbbbb"}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post", return_value=made
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
             _call_tool_inner("chat_folder_create", {"name": "x", "parent": "bbbbbbbbbbbb"})
         assert mock_post.call_args.args[1]["parent_id"] == "bbbbbbbbbbbb"
 
     def test_top_level_when_parent_omitted(self) -> None:
         made = {"id": "eeeeeeeeeeee", "name": "Solo", "parent_id": ""}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post", return_value=made
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
             _call_tool_inner("chat_folder_create", {"name": "Solo"})
         assert mock_post.call_args.args[1] == {"name": "Solo", "parent_id": ""}
 
@@ -191,8 +194,9 @@ class TestFolderCreate:
 
         secret = "AKIAIOSFODNN7EXAMPLE"
         args = {"name": "leaf", "parent": f"keys-{secret}"}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_get), patch(
-            "kiro_crew.mcp_dashboard._post", side_effect=_post
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_get),
+            patch("kiro_crew.mcp_dashboard._post", side_effect=_post),
         ):
             _call_tool_inner("chat_folder_create", args)
             before = len(posts)
@@ -210,9 +214,11 @@ class TestFolderCreate:
         redacted form — so a segment that only overruns AFTER redaction must
         still be refused, or it comes back truncated and unmatchable."""
         seg = "k" * 95
-        with patch("kiro_crew.mcp_dashboard.redact", side_effect=lambda s: s + "x" * 20), patch(
-            "kiro_crew.mcp_dashboard._get", side_effect=_rows
-        ), patch("kiro_crew.mcp_dashboard._post") as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard.redact", side_effect=lambda s: s + "x" * 20),
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "leaf", "parent": seg})
         assert "too long" in out
         mock_post.assert_not_called()
@@ -224,11 +230,11 @@ class TestFolderCreate:
         during redaction would be persisted truncated — unmatchable by any later
         path, the same mismatch the segment walk refuses.
         """
-        with patch(
-            "kiro_crew.mcp_dashboard.redact", side_effect=lambda s: s + "x" * 30
-        ), patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post"
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard.redact", side_effect=lambda s: s + "x" * 30),
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "k" * 90})
         assert "too long after redaction" in out
         mock_post.assert_not_called()
@@ -244,8 +250,9 @@ class TestFolderCreate:
                 "parent_id": body["parent_id"],
             }
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post", side_effect=_post
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", side_effect=_post),
         ):
             out = _call_tool_inner(
                 "chat_folder_create", {"name": "week1", "parent": "kirocrew/2026/august"}
@@ -268,8 +275,9 @@ class TestFolderCreate:
                 return {"id": "new000000001", "name": body["name"], "parent_id": ""}
             return {"error": "name required"}
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post", side_effect=_post
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", side_effect=_post),
         ):
             out = _call_tool_inner("chat_folder_create", {"name": "leaf", "parent": "new/deeper"})
         assert out.startswith("Error:")
@@ -281,12 +289,11 @@ class TestFolderCreate:
         Treating it as a path segment would create a folder literally named
         after the hex id.
         """
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post"
-        ) as mock_post:
-            out = _call_tool_inner(
-                "chat_folder_create", {"name": "x", "parent": "0123456789ab"}
-            )
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
+            out = _call_tool_inner("chat_folder_create", {"name": "x", "parent": "0123456789ab"})
         assert out.startswith("Error:") and "folder not found" in out
         mock_post.assert_not_called()
 
@@ -318,20 +325,20 @@ class TestAmbiguousFolderPaths:
         return [{"key": "chat-1-100", "title": "S", "folder_id": ""}]
 
     def test_create_refuses_an_ambiguous_parent_path(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._get), patch(
-            "kiro_crew.mcp_dashboard._post"
-        ) as mock_post:
-            out = _call_tool_inner(
-                "chat_folder_create", {"name": "x", "parent": "kirocrew/0811"}
-            )
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._get),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
+            out = _call_tool_inner("chat_folder_create", {"name": "x", "parent": "kirocrew/0811"})
         assert out.startswith("Error:")
         assert "bbbbbbbbbbbb" in out and "cccccccccccc" in out
         mock_post.assert_not_called()
 
     def test_move_refuses_an_ambiguous_destination_path(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._get), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._get),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move", {"folder": "kirocrew", "new_parent": "kirocrew/0811"}
             )
@@ -339,9 +346,10 @@ class TestAmbiguousFolderPaths:
         mock_patch.assert_not_called()
 
     def test_session_move_refuses_an_ambiguous_destination_path(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._get), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._get),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "chat-1-100", "folder": "kirocrew/0811"},
@@ -351,9 +359,10 @@ class TestAmbiguousFolderPaths:
 
     def test_an_id_still_addresses_one_of_the_duplicates(self) -> None:
         """The refusal must leave a way through: the id is unambiguous."""
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._get), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._get),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "chat-1-100", "folder": "cccccccccccc"},
@@ -362,9 +371,10 @@ class TestAmbiguousFolderPaths:
         assert mock_patch.call_args.args[1] == {"folder_id": "cccccccccccc"}
 
     def test_mkdir_p_does_not_add_a_third_duplicate_sibling(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._get), patch(
-            "kiro_crew.mcp_dashboard._post"
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._get),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner(
                 "chat_folder_create", {"name": "leaf", "parent": "kirocrew/0811/deeper"}
             )
@@ -400,9 +410,10 @@ class TestSlashBearingFolderNames:
         return _get
 
     def test_the_literal_folder_wins_when_no_nested_pair_exists(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(self.LITERAL)), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(self.LITERAL)),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session", {"session": "chat-1-100", "folder": "A/B"}
             )
@@ -411,18 +422,20 @@ class TestSlashBearingFolderNames:
 
     def test_create_under_a_literal_slash_name_does_not_build_a_nested_pair(self) -> None:
         made = {"id": "dddddddddddd", "name": "leaf", "parent_id": "aaaaaaaaaaaa"}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(self.LITERAL)), patch(
-            "kiro_crew.mcp_dashboard._post", return_value=made
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(self.LITERAL)),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
             _call_tool_inner("chat_folder_create", {"name": "leaf", "parent": "A/B"})
         # Exactly one POST: the leaf. No "A" and no "B" were manufactured.
         assert mock_post.call_count == 1
         assert mock_post.call_args.args[1] == {"name": "leaf", "parent_id": "aaaaaaaaaaaa"}
 
     def test_collision_between_the_two_readings_is_refused(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(self.BOTH)), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(self.BOTH)),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session", {"session": "chat-1-100", "folder": "A/B"}
             )
@@ -444,9 +457,10 @@ class TestSlashBearingFolderNames:
             {"id": "bbbbbbbbbbbb", "name": "A", "parent_id": ""},
             {"id": "cccccccccccc", "name": " B", "parent_id": "bbbbbbbbbbbb"},
         ]
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(padded)), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(padded)),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session", {"session": "chat-1-100", "folder": "A/B"}
             )
@@ -455,9 +469,10 @@ class TestSlashBearingFolderNames:
         mock_patch.assert_not_called()
 
     def test_an_id_resolves_either_way(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(self.BOTH)), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._getter(self.BOTH)),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "chat-1-100", "folder": "cccccccccccc"},
@@ -471,9 +486,10 @@ class TestSlashBearingFolderNames:
         The sidebar keeps its freedom — a human may still name a folder ``A/B``;
         this only stops the agent adding more unaddressable-by-path names.
         """
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post"
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "Projects/Web"})
         assert out.startswith("Error:") and "cannot contain '/'" in out
         mock_post.assert_not_called()
@@ -489,10 +505,13 @@ class TestFolderNameRedaction:
     LEAKY = "AKIAIOSFODNN7EXAMPLE"
 
     def test_leaf_name_is_redacted_before_the_write(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post",
-            return_value={"id": "dddddddddddd", "name": "x", "parent_id": ""},
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._post",
+                return_value={"id": "dddddddddddd", "name": "x", "parent_id": ""},
+            ) as mock_post,
+        ):
             _call_tool_inner("chat_folder_create", {"name": self.LEAKY})
         assert self.LEAKY not in mock_post.call_args.args[1]["name"]
 
@@ -507,8 +526,9 @@ class TestFolderNameRedaction:
                 "parent_id": body["parent_id"],
             }
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post", side_effect=_post
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", side_effect=_post),
         ):
             out = _call_tool_inner(
                 "chat_folder_create", {"name": "leaf", "parent": f"kirocrew/{self.LEAKY}"}
@@ -519,10 +539,13 @@ class TestFolderNameRedaction:
 
 class TestFolderMove:
     def test_reparents_by_path(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch",
-            return_value={"id": "cccccccccccc", "name": "Travel", "parent_id": "aaaaaaaaaaaa"},
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._patch",
+                return_value={"id": "cccccccccccc", "name": "Travel", "parent_id": "aaaaaaaaaaaa"},
+            ) as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move", {"folder": "Travel", "new_parent": "kirocrew"}
             )
@@ -532,10 +555,13 @@ class TestFolderMove:
         assert "kirocrew/Travel" in out
 
     def test_move_to_root(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch",
-            return_value={"id": "bbbbbbbbbbbb", "name": "0811", "parent_id": ""},
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._patch",
+                return_value={"id": "bbbbbbbbbbbb", "name": "0811", "parent_id": ""},
+            ) as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move", {"folder": "kirocrew/0811", "new_parent": "root"}
             )
@@ -543,17 +569,21 @@ class TestFolderMove:
         assert "0811" in out
 
     def test_root_is_not_a_movable_subject(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner("chat_folder_move", {"folder": "root"})
         assert out.startswith("Error:")
         mock_patch.assert_not_called()
 
     def test_cycle_verdict_comes_from_the_endpoint(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch",
-            return_value={"error": "cannot move a folder into its own descendant"},
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._patch",
+                return_value={"error": "cannot move a folder into its own descendant"},
+            ),
         ):
             out = _call_tool_inner(
                 "chat_folder_move", {"folder": "kirocrew", "new_parent": "kirocrew/0811"}
@@ -562,9 +592,11 @@ class TestFolderMove:
 
     def test_unknown_folder_errors(self) -> None:
         """Move RESOLVES a folder; it must never create one on the way."""
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post"
-        ) as mock_post, patch("kiro_crew.mcp_dashboard._patch") as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner("chat_folder_move", {"folder": "Nope/Missing"})
         assert out.startswith("Error:") and "folder not found" in out
         mock_post.assert_not_called()
@@ -581,9 +613,11 @@ class TestFolderMove:
         def _get(path: str) -> list[dict]:
             return [dict(f) for f in dupes] if path == "/api/chat/folders" else _slots_with_caller()
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_get), patch(
-            "kiro_crew.mcp_dashboard._post"
-        ) as mock_post, patch("kiro_crew.mcp_dashboard._patch") as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_get),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner("chat_folder_move", {"folder": "kirocrew/0811/deeper"})
         assert out.startswith("Error:") and "share the same parent" in out
         assert "bbbbbbbbbbbb" in out and "cccccccccccc" in out
@@ -599,9 +633,11 @@ class TestFolderMoveSession:
         all, where it reads as the unconfined dashboard user — so the write is
         refused here rather than sent with an authority nobody can name.
         """
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=""
-        ), patch("kiro_crew.mcp_dashboard._patch") as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=""),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "chat-3-300", "folder": "kirocrew/0811"},
@@ -617,12 +653,14 @@ class TestFolderMoveSession:
         with no matching row is the closed-tab race and is refused, so an absent
         one would exercise that refusal instead of the pass-through.
         """
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="dashboard:chat-2-200",
-        ), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="dashboard:chat-2-200",
+            ),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch,
+        ):
             _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "chat-3-300", "folder": "kirocrew/0811"},
@@ -630,9 +668,13 @@ class TestFolderMoveSession:
         assert mock_patch.call_args.kwargs["session_key"] == "dashboard:chat-2-200"
 
     def test_moves_by_slot_key_into_a_path(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True, "folder_id": "bbbbbbbbbbbb"}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._patch",
+                return_value={"ok": True, "folder_id": "bbbbbbbbbbbb"},
+            ) as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "chat-3-300", "folder": "kirocrew/0811"},
@@ -643,9 +685,10 @@ class TestFolderMoveSession:
         assert "kirocrew/0811" in out
 
     def test_accepts_a_dashboard_session_key(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch,
+        ):
             _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "dashboard:chat-1-100", "folder": "Travel"},
@@ -653,9 +696,10 @@ class TestFolderMoveSession:
         assert mock_patch.call_args.args[0] == "/api/chat/slots/chat-1-100/folder"
 
     def test_accepts_an_exact_unique_title(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch,
+        ):
             _call_tool_inner(
                 "chat_folder_move_session", {"session": "folder mcp", "folder": "Travel"}
             )
@@ -670,9 +714,10 @@ class TestFolderMoveSession:
         def _get(path: str) -> list[dict]:
             return [dict(f) for f in _FOLDERS] if path == "/api/chat/folders" else dupes
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_get), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_get),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session", {"session": "Same", "folder": "Travel"}
             )
@@ -680,9 +725,10 @@ class TestFolderMoveSession:
         mock_patch.assert_not_called()
 
     def test_partial_title_is_not_a_match(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session", {"session": "Folder", "folder": "Travel"}
             )
@@ -710,9 +756,10 @@ class TestFolderMoveSession:
         def _get(path: str) -> list[dict]:
             return [dict(f) for f in _FOLDERS] if path == "/api/chat/folders" else rows
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_get), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_get),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "dashboard:chat-9-999", "folder": "Travel"},
@@ -730,9 +777,10 @@ class TestFolderMoveSession:
         def _get(path: str) -> list[dict]:
             return [dict(f) for f in _FOLDERS] if path == "/api/chat/folders" else rows
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_get), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_get),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session", {"session": "chat-1-100", "folder": "Travel"}
             )
@@ -749,9 +797,10 @@ class TestFolderMoveSession:
         def _get(path: str) -> list[dict]:
             return [dict(f) for f in _FOLDERS] if path == "/api/chat/folders" else rows
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_get), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_get),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "dashboard:chat-1-100", "folder": "Travel"},
@@ -760,17 +809,21 @@ class TestFolderMoveSession:
         assert mock_patch.call_args.args[0] == "/api/chat/slots/chat-1-100/folder"
 
     def test_unfile_to_top_level(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True, "folder_id": ""}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch(
+                "kiro_crew.mcp_dashboard._patch", return_value={"ok": True, "folder_id": ""}
+            ) as mock_patch,
+        ):
             out = _call_tool_inner("chat_folder_move_session", {"session": "chat-1-100"})
         assert mock_patch.call_args.args[1] == {"folder_id": ""}
         assert "top level" in out
 
     def test_unknown_destination_folder_never_reaches_the_endpoint(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session", {"session": "chat-1-100", "folder": "Nope"}
             )
@@ -784,9 +837,10 @@ class TestFolderMoveSession:
         def _get(path: str) -> list[dict]:
             return [dict(f) for f in _FOLDERS] if path == "/api/chat/folders" else odd
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_get), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True}
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_get),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch,
+        ):
             _call_tool_inner(
                 "chat_folder_move_session", {"session": "Artifact: My Doc", "folder": "Travel"}
             )
@@ -805,8 +859,9 @@ class TestFolderMoveSession:
         def _get(path: str) -> list[dict]:
             return [dict(f) for f in _FOLDERS] if path == "/api/chat/folders" else rows
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_get), patch(
-            "kiro_crew.mcp_dashboard._patch", return_value={"ok": True, "folder_id": ""}
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_get),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True, "folder_id": ""}),
         ):
             out = _call_tool_inner("chat_folder_move_session", {"session": leaky})
         assert leaky not in out
@@ -848,18 +903,20 @@ class TestNamesTheEndpointWouldTruncate:
     LONG = "x" * 101
 
     def test_the_schema_refuses_an_overlong_leaf_name(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post"
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             with pytest.raises(ValidationError):
                 _call_tool_inner("chat_folder_create", {"name": self.LONG})
         mock_post.assert_not_called()
 
     def test_a_parent_segment_is_refused_before_any_write(self) -> None:
         """The schema's 4096-char path bound cannot see a per-segment overrun."""
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post"
-        ) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner(
                 "chat_folder_create", {"name": "leaf", "parent": f"Travel/{self.LONG}"}
             )
@@ -877,9 +934,10 @@ class TestNamesTheEndpointWouldTruncate:
         error in ``redact()`` and would mask an unredacted message.
         """
         leaky = "AKIAIOSFODNN7EXAMPLE" + "z" * 90
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner("chat_folder_move", {"folder": f"Travel/{leaky}"})
         assert "too long" in out
         assert "AKIAIOSFODNN7EXAMPLE" not in out
@@ -889,12 +947,11 @@ class TestNamesTheEndpointWouldTruncate:
         """Exactly at the limit round-trips, so the guard is off-by-one clean."""
         at_limit = "y" * 100
         made = {"id": "ffffffffffff", "name": at_limit, "parent_id": ""}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows), patch(
-            "kiro_crew.mcp_dashboard._post", return_value=made
-        ) as mock_post:
-            out = _call_tool_inner(
-                "chat_folder_create", {"name": "leaf", "parent": at_limit}
-            )
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
+            out = _call_tool_inner("chat_folder_create", {"name": "leaf", "parent": at_limit})
         assert not out.startswith("Error:")
         assert mock_post.call_count == 2  # the parent segment, then the leaf
 
@@ -918,9 +975,12 @@ class TestASubagentCannotOutrankItsParent:
         ]
 
     def test_a_subagent_is_shown_no_sessions(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="subagent:abc123",
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="subagent:abc123",
+            ),
         ):
             out = _call_tool_inner("chat_folder_tree", {})
         assert out.startswith("Error:")
@@ -928,20 +988,28 @@ class TestASubagentCannotOutrankItsParent:
         assert "Radar run" not in out and "Raymond's own" not in out
 
     def test_a_subagent_cannot_reshape_the_tree(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="subagent:abc123",
-        ), patch("kiro_crew.mcp_dashboard._post") as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="subagent:abc123",
+            ),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "Output"})
         assert out.startswith("Error:")
         mock_post.assert_not_called()
 
     def test_a_subagent_cannot_file_a_session(self) -> None:
         """The resolver reads the withheld list, so the write is refused too."""
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="subagent:abc123",
-        ), patch("kiro_crew.mcp_dashboard._patch") as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="subagent:abc123",
+            ),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "chat-1-100", "folder": "kirocrew/0811"},
@@ -951,19 +1019,26 @@ class TestASubagentCannotOutrankItsParent:
 
     def test_an_app_cron_is_shown_no_sessions(self) -> None:
         """A cron can be app-created, so a cron key can carry an app's reach."""
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="cron:job-abc123",
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="cron:job-abc123",
+            ),
         ):
             out = _call_tool_inner("chat_folder_tree", {})
         assert out.startswith("Error:")
         assert "Radar run" not in out and "Raymond's own" not in out
 
     def test_a_cron_cannot_reshape_the_tree(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="cron:job-abc123",
-        ), patch("kiro_crew.mcp_dashboard._post") as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="cron:job-abc123",
+            ),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "Output"})
         assert out.startswith("Error:")
         mock_post.assert_not_called()
@@ -989,19 +1064,26 @@ class TestASubagentCannotOutrankItsParent:
         app-owned session's agent can outlive its own row. Reading that absence
         as "no app" would hand it the authority the app does not have.
         """
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="dashboard:chat-gone-999",
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="dashboard:chat-gone-999",
+            ),
         ):
             out = _call_tool_inner("chat_folder_tree", {})
         assert out.startswith("Error:")
         assert "Radar run" not in out and "Raymond's own" not in out
 
     def test_a_vanished_dashboard_caller_cannot_reshape_the_tree(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="dashboard:chat-gone-999",
-        ), patch("kiro_crew.mcp_dashboard._post") as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="dashboard:chat-gone-999",
+            ),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "Output"})
         assert out.startswith("Error:")
         mock_post.assert_not_called()
@@ -1023,9 +1105,12 @@ class TestASubagentCannotOutrankItsParent:
 
     def test_a_slack_or_channel_caller_is_still_unscoped(self) -> None:
         """The exemption covers delegated callers only — these have no app."""
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="slack:T1:C1:1777",
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="slack:T1:C1:1777",
+            ),
         ):
             out = _call_tool_inner("chat_folder_tree", {})
         assert not out.startswith("Error:")
@@ -1042,9 +1127,12 @@ class TestASubagentCannotOutrankItsParent:
                 {"key": "chat-2-200", "title": "Other app", "folder_id": "", "app": "spec-builder"},
             ]
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=_rows_with_sub), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="subagent:abc123",
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows_with_sub),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="subagent:abc123",
+            ),
         ):
             out = _call_tool_inner("chat_folder_tree", {})
         assert not out.startswith("Error:")
@@ -1073,25 +1161,29 @@ class TestTheFolderPolicyIsTheEndpointsNotThisServers:
 
     def _as(self, slot: str) -> Any:
         return patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
+            "kiro_crew.mcp_core._resolve_session_key_strict",
             return_value=f"dashboard:{slot}",
         )
 
     def test_an_apps_create_reaches_the_endpoint(self) -> None:
         """Previously refused here outright; the endpoint now stamps the owner."""
         made = {"id": "new000000001", "name": "Radar output", "parent_id": ""}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
-            "chat-1-100"
-        ), patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            self._as("chat-1-100"),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "Radar output"})
         assert not out.startswith("Error:")
         assert mock_post.called
 
     def test_an_apps_move_reaches_the_endpoint(self) -> None:
         moved = {"id": "fldr00000002", "name": "0811", "parent_id": "fldr00000003"}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
-            "chat-1-100"
-        ), patch("kiro_crew.mcp_dashboard._patch", return_value=moved) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            self._as("chat-1-100"),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=moved) as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move", {"folder": "kirocrew/0811", "new_parent": "Travel"}
             )
@@ -1102,9 +1194,11 @@ class TestTheFolderPolicyIsTheEndpointsNotThisServers:
         """The tool must report the endpoint's verdict rather than pre-judging
         it — that is what keeps one rule in one place."""
         denied = {"error": "this app does not own that folder", "code": "folder_not_owned"}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
-            "chat-1-100"
-        ), patch("kiro_crew.mcp_dashboard._patch", return_value=denied):
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            self._as("chat-1-100"),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=denied),
+        ):
             out = _call_tool_inner(
                 "chat_folder_move", {"folder": "kirocrew/0811", "new_parent": "Travel"}
             )
@@ -1112,9 +1206,11 @@ class TestTheFolderPolicyIsTheEndpointsNotThisServers:
         assert "does not own that folder" in out
 
     def test_an_app_can_still_file_its_own_session(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
-            "chat-1-100"
-        ), patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            self._as("chat-1-100"),
+            patch("kiro_crew.mcp_dashboard._patch", return_value={"ok": True}) as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "chat-1-100", "folder": "kirocrew/0811"},
@@ -1123,9 +1219,7 @@ class TestTheFolderPolicyIsTheEndpointsNotThisServers:
         assert mock_patch.called
 
     def test_an_app_can_still_read_the_tree(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
-            "chat-1-100"
-        ):
+        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as("chat-1-100"):
             out = _call_tool_inner("chat_folder_tree", {})
         assert not out.startswith("Error:")
         assert "kirocrew" in out
@@ -1134,17 +1228,21 @@ class TestTheFolderPolicyIsTheEndpointsNotThisServers:
         """Reorganising sessions is the point of the tools — an unscoped caller
         is the person's own agent and is not confined."""
         made = {"id": "new000000001", "name": "Q3", "parent_id": ""}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
-            "chat-3-300"
-        ), patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            self._as("chat-3-300"),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "Q3"})
         assert not out.startswith("Error:")
         assert mock_post.called
 
     def test_an_unverifiable_caller_cannot_reshape_it_either(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=""
-        ), patch("kiro_crew.mcp_dashboard._post") as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=""),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "Q3"})
         assert out.startswith("Error:")
         assert "cannot verify which session is calling" in out
@@ -1169,10 +1267,14 @@ class TestTheFolderPolicyIsTheEndpointsNotThisServers:
                 }
             ]
 
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=rows), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="channel:C123",
-        ), patch("kiro_crew.mcp_dashboard._post") as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=rows),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="channel:C123",
+            ),
+            patch("kiro_crew.mcp_dashboard._post") as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "Runs"})
         assert out.startswith("Error:")
         assert "channel- or schedule-bound" in out
@@ -1188,10 +1290,14 @@ class TestTheFolderPolicyIsTheEndpointsNotThisServers:
             return [{"key": "chat-5-500", "title": "Mine", "folder_id": "", "app": ""}]
 
         made = {"id": "new000000001", "name": "Runs", "parent_id": ""}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=rows), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="slack:T1/C1",
-        ), patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=rows),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="slack:T1/C1",
+            ),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
             out = _call_tool_inner("chat_folder_create", {"name": "Runs"})
         assert not out.startswith("Error:")
         assert mock_post.called
@@ -1216,24 +1322,28 @@ class TestEveryFolderWriteCarriesTheVerifiedKey:
 
     def _as(self, slot: str) -> Any:
         return patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
+            "kiro_crew.mcp_core._resolve_session_key_strict",
             return_value=f"dashboard:{slot}",
         )
 
     def test_create_sends_the_verified_key(self) -> None:
         made = {"id": "new000000001", "name": "Runs", "parent_id": ""}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
-            "chat-1-100"
-        ), patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            self._as("chat-1-100"),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
             _call_tool_inner("chat_folder_create", {"name": "Runs"})
         assert mock_post.call_args.kwargs["session_key"] == "dashboard:chat-1-100"
 
     def test_mkdir_p_segments_are_created_under_the_verified_key(self) -> None:
         """The intermediate segments are real folders, so each write needs it too."""
         made = {"id": "new000000001", "name": "seg", "parent_id": ""}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
-            "chat-1-100"
-        ), patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            self._as("chat-1-100"),
+            patch("kiro_crew.mcp_dashboard._post", return_value=made) as mock_post,
+        ):
             _call_tool_inner("chat_folder_create", {"name": "Leaf", "parent": "Fresh/Deep"})
         assert mock_post.call_count > 1
         for call in mock_post.call_args_list:
@@ -1241,9 +1351,11 @@ class TestEveryFolderWriteCarriesTheVerifiedKey:
 
     def test_move_sends_the_verified_key(self) -> None:
         moved = {"id": "fldr00000002", "name": "0811", "parent_id": "fldr00000003"}
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), self._as(
-            "chat-1-100"
-        ), patch("kiro_crew.mcp_dashboard._patch", return_value=moved) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            self._as("chat-1-100"),
+            patch("kiro_crew.mcp_dashboard._patch", return_value=moved) as mock_patch,
+        ):
             _call_tool_inner(
                 "chat_folder_move", {"folder": "kirocrew/0811", "new_parent": "Travel"}
             )
@@ -1268,9 +1380,12 @@ class TestTheSessionListIsScopedToTheCaller:
         ]
 
     def test_an_app_sees_only_its_own_sessions(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="dashboard:chat-1-100",
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="dashboard:chat-1-100",
+            ),
         ):
             out = _call_tool_inner("chat_folder_tree", {})
         assert "Radar run" in out
@@ -1279,16 +1394,20 @@ class TestTheSessionListIsScopedToTheCaller:
 
     def test_the_user_sees_every_session(self) -> None:
         """An unscoped caller is the person's own agent — the point of the tools."""
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="dashboard:chat-3-300",
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="dashboard:chat-3-300",
+            ),
         ):
             out = _call_tool_inner("chat_folder_tree", {})
         assert "Radar run" in out and "Spec draft" in out and "Raymond's own work" in out
 
     def test_an_unverifiable_caller_is_shown_nothing(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=""
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=""),
         ):
             out = _call_tool_inner("chat_folder_tree", {})
         assert out.startswith("Error:")
@@ -1297,10 +1416,14 @@ class TestTheSessionListIsScopedToTheCaller:
 
     def test_an_app_cannot_resolve_a_foreign_session_by_title(self) -> None:
         """The resolver reads the same filtered list, so scope covers writes too."""
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict",
-            return_value="dashboard:chat-1-100",
-        ), patch("kiro_crew.mcp_dashboard._patch") as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch(
+                "kiro_crew.mcp_core._resolve_session_key_strict",
+                return_value="dashboard:chat-1-100",
+            ),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session",
                 {"session": "Spec draft", "folder": "Work"},
@@ -1321,9 +1444,24 @@ class TestPrivateSessionsAreInvisible:
         if path == "/api/chat/folders":
             return [dict(f) for f in _FOLDERS]
         return [
-            {"key": "chat-1-100", "title": "Public work", "folder_id": "", "memory_mode": "persistent"},
-            {"key": "chat-9-900", "title": "Secret thing", "folder_id": "", "memory_mode": "incognito"},
-            {"key": "chat-8-800", "title": "Scratch pad", "folder_id": "", "memory_mode": "temporary"},
+            {
+                "key": "chat-1-100",
+                "title": "Public work",
+                "folder_id": "",
+                "memory_mode": "persistent",
+            },
+            {
+                "key": "chat-9-900",
+                "title": "Secret thing",
+                "folder_id": "",
+                "memory_mode": "incognito",
+            },
+            {
+                "key": "chat-8-800",
+                "title": "Scratch pad",
+                "folder_id": "",
+                "memory_mode": "temporary",
+            },
         ]
 
     def test_no_archived_count_is_rendered(self) -> None:
@@ -1355,9 +1493,10 @@ class TestPrivateSessionsAreInvisible:
         assert "Scratch pad" not in out and "chat-8-800" not in out
 
     def test_one_cannot_be_moved_by_key(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session", {"session": "chat-9-900", "folder": "Work"}
             )
@@ -1365,9 +1504,10 @@ class TestPrivateSessionsAreInvisible:
         mock_patch.assert_not_called()
 
     def test_one_cannot_be_moved_by_title(self) -> None:
-        with patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed), patch(
-            "kiro_crew.mcp_dashboard._patch"
-        ) as mock_patch:
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=self._mixed),
+            patch("kiro_crew.mcp_dashboard._patch") as mock_patch,
+        ):
             out = _call_tool_inner(
                 "chat_folder_move_session", {"session": "Secret thing", "folder": "Work"}
             )
@@ -1388,30 +1528,73 @@ class TestTheVerifiedCallerKeyReachesTheRequest:
     VERIFIED = "dashboard:chat-verified"
 
     def test_create_carries_the_verified_key(self):
-        with patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
-        ), patch(
-            "kiro_crew.mcp_dashboard._post", return_value={"target": "chat-2", "title": "w"}
-        ) as post:
+        with (
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=self.VERIFIED),
+            patch(
+                "kiro_crew.mcp_dashboard._post", return_value={"target": "chat-2", "title": "w"}
+            ) as post,
+        ):
             _call_tool_inner("session_create", {"title": "worker"})
         assert post.call_args.kwargs["session_key"] == self.VERIFIED
 
     def test_stop_carries_the_verified_key(self):
-        with patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
-        ), patch("kiro_crew.mcp_dashboard._post", return_value={"ok": True}) as post:
+        with (
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=self.VERIFIED),
+            patch("kiro_crew.mcp_dashboard._post", return_value={"ok": True}) as post,
+        ):
             _call_tool_inner("session_stop", {"target": "peer"})
         assert post.call_args.kwargs["session_key"] == self.VERIFIED
 
     def test_read_carries_the_verified_key(self):
-        with patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
-        ), patch(
-            "kiro_crew.mcp_dashboard._get", return_value={"messages": [], "total": 0}
-        ) as get:
+        with (
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=self.VERIFIED),
+            patch("kiro_crew.mcp_dashboard._get", return_value={"messages": [], "total": 0}) as get,
+        ):
             _call_tool_inner("session_read_message", {"target": "peer"})
         # `_get` takes the key positionally, matching its signature.
         assert get.call_args.args[1] == self.VERIFIED
+
+    def test_a_re_sent_stop_is_not_reported_as_nothing_to_stop(self):
+        """A de-duplicated retry (#5074) lands on the no-op reply routinely.
+
+        Its earlier cooperative stop IS still in flight, so rendering it the way a
+        never-running target is rendered would tell the caller the opposite of what
+        happened — and invite it to act as though the target were free-running.
+
+        Mutation guard: ignoring `already_stopping` restores "nothing to stop".
+        """
+        with (
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=self.VERIFIED),
+            patch(
+                "kiro_crew.mcp_dashboard._post",
+                return_value={
+                    "ok": True,
+                    "target": "peer",
+                    "info": "stop already in progress",
+                    "already_stopping": True,
+                },
+            ),
+        ):
+            out = _call_tool_inner("session_stop", {"target": "peer"})
+        assert "stop already in progress" in out
+        assert "nothing to stop" not in out
+        assert "the earlier stop still stands" in out
+
+    def test_a_target_that_was_never_running_still_says_nothing_to_stop(self):
+        with (
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=self.VERIFIED),
+            patch(
+                "kiro_crew.mcp_dashboard._post",
+                return_value={
+                    "ok": True,
+                    "target": "peer",
+                    "info": "not running",
+                    "already_stopping": False,
+                },
+            ),
+        ):
+            out = _call_tool_inner("session_stop", {"target": "peer"})
+        assert "nothing to stop" in out
 
     def test_an_empty_window_still_hands_back_the_cursor(self):
         """A poll loop's commonest answer is empty, and it must not lose its place.
@@ -1423,11 +1606,12 @@ class TestTheVerifiedCallerKeyReachesTheRequest:
 
         Mutation guard: returning only the head line and "No messages" fails here.
         """
-        with patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
-        ), patch(
-            "kiro_crew.mcp_dashboard._get",
-            return_value={"messages": [], "total": 7, "next_since": 7},
+        with (
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=self.VERIFIED),
+            patch(
+                "kiro_crew.mcp_dashboard._get",
+                return_value={"messages": [], "total": 7, "next_since": 7},
+            ),
         ):
             out = _call_tool_inner("session_read_message", {"target": "peer"})
         assert "since=7" in out, "an empty window must still carry next_since"
@@ -1439,21 +1623,20 @@ class TestTheVerifiedCallerKeyReachesTheRequest:
         this pins the renderer's defensive behaviour for a cursor-less
         response shape, whatever produces one.
         """
-        with patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=self.VERIFIED
-        ), patch(
-            "kiro_crew.mcp_dashboard._get", return_value={"messages": [], "total": 7}
+        with (
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=self.VERIFIED),
+            patch("kiro_crew.mcp_dashboard._get", return_value={"messages": [], "total": 7}),
         ):
             out = _call_tool_inner("session_read_message", {"target": "peer"})
         assert "since=" not in out, "no cursor may be invented once rows are trimmed"
 
     def test_an_unverifiable_caller_never_reaches_the_request(self):
         """The refusal must precede the call, not merely alter its key."""
-        with patch(
-            "kiro_crew.mcp_dashboard._resolve_session_key_strict", return_value=""
-        ), patch("kiro_crew.mcp_dashboard._post") as post, patch(
-            "kiro_crew.mcp_dashboard._get"
-        ) as get:
+        with (
+            patch("kiro_crew.mcp_core._resolve_session_key_strict", return_value=""),
+            patch("kiro_crew.mcp_dashboard._post") as post,
+            patch("kiro_crew.mcp_dashboard._get") as get,
+        ):
             for tool, args in (
                 ("session_create", {"title": "worker"}),
                 ("session_stop", {"target": "peer"}),
@@ -1463,6 +1646,151 @@ class TestTheVerifiedCallerKeyReachesTheRequest:
                 assert "cannot be identified" in out
         post.assert_not_called()
         get.assert_not_called()
+
+
+class TestSessionCreateFolder:
+    """`session_create.folder` — filing atomic with creation (#6118).
+
+    The reference resolves with `chat_folder_create`'s `parent` semantics
+    (missing segments created), which is tree shaping — so the SAME gate
+    applies, not a second authorization path. The endpoint receives the
+    resolved id and re-confirms it in the create's own synchronous window;
+    these cases cover the MCP half: gate, resolution, payload shape, refusal.
+    """
+
+    CREATED = {"target": "chat-9-900", "title": "worker", "folder_id": "bbbbbbbbbbbb"}
+
+    def test_files_at_creation_with_the_resolved_id(self) -> None:
+        """One POST, to the create route, already carrying the folder id."""
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", return_value=dict(self.CREATED)) as post,
+        ):
+            out = _call_tool_inner("session_create", {"title": "worker", "folder": "kirocrew/0811"})
+        assert post.call_count == 1, "filing must not be a second call after the create"
+        path, body = post.call_args.args
+        assert path == "/api/session-control/create"
+        assert body["folder_id"] == "bbbbbbbbbbbb"
+        assert "kirocrew/0811" in out
+
+    def test_missing_segments_are_created_like_a_parent_ref(self) -> None:
+        """mkdir -p over the reference, then the create rides the new leaf id."""
+        made = {"id": "dddddddddddd", "name": "fresh", "parent_id": "aaaaaaaaaaaa"}
+
+        def _post_route(path, body, **kwargs):
+            if path == "/api/chat/folders":
+                return dict(made)
+            assert path == "/api/session-control/create"
+            return {**self.CREATED, "folder_id": body["folder_id"]}
+
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", side_effect=_post_route) as post,
+        ):
+            out = _call_tool_inner(
+                "session_create", {"title": "worker", "folder": "kirocrew/fresh"}
+            )
+        create_call = post.call_args_list[-1]
+        assert create_call.args[0] == "/api/session-control/create"
+        assert create_call.args[1]["folder_id"] == "dddddddddddd"
+        assert "created folder path" in out
+
+    def test_an_unresolvable_folder_refuses_the_whole_create(self) -> None:
+        """No session may exist when the filing half cannot be honored.
+
+        An id-shaped reference that does not exist is a lookup failure even
+        under mkdir -p (ids are minted server-side), and 'created but unfiled'
+        would silently honor half the request — so the create POST never fires.
+        """
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as post,
+        ):
+            out = _call_tool_inner("session_create", {"title": "worker", "folder": "ffffffffffff"})
+        assert out.startswith("Error:")
+        assert "folder not found" in out
+        post.assert_not_called()
+
+    def test_folder_resolution_rides_the_tree_shaping_gate(self) -> None:
+        """A caller the gate refuses cannot file-by-naming at create time.
+
+        Resolution can CREATE folders, so it is tree shaping: reusing the gate —
+        rather than a second authorization path — is what keeps 'could not
+        reshape the tree by creating a folder' and 'cannot reach the same write
+        through session_create' the same statement.
+        """
+        with (
+            patch(
+                "kiro_crew.mcp_dashboard._refuse_tree_shaping_if_unverifiable",
+                return_value=("", "Error: refused by the tree-shaping gate"),
+            ),
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post") as post,
+        ):
+            out = _call_tool_inner("session_create", {"title": "worker", "folder": "kirocrew/0811"})
+        assert out == "Error: refused by the tree-shaping gate"
+        post.assert_not_called()
+
+    def test_no_folder_means_no_gate(self) -> None:
+        """A plain create is not tree shaping and must not grow that refusal."""
+        with (
+            patch("kiro_crew.mcp_dashboard._refuse_tree_shaping_if_unverifiable") as gate,
+            patch(
+                "kiro_crew.mcp_dashboard._post", return_value={"target": "chat-9", "title": "w"}
+            ) as post,
+        ):
+            _call_tool_inner("session_create", {"title": "worker"})
+        gate.assert_not_called()
+        assert post.call_count == 1
+        assert "folder_id" not in post.call_args.args[1]
+
+    def test_an_app_scoped_caller_cannot_leave_folder_segments_behind(self) -> None:
+        """The endpoint refuses `app_scoped_caller`, so resolution must not run.
+
+        An app may create folders in its own subtree, but it can never complete
+        session_create — resolving (and mkdir -p creating) the folder for it
+        would leave path segments behind for a call that cannot succeed. The
+        refusal here is a side-effect guard; the endpoint's own refusal stays
+        authoritative.
+        """
+
+        def _rows_with_app(path: str) -> list[dict]:
+            if path == "/api/chat/slots":
+                return [{"key": "chat-1-100", "title": "Caller", "app": "some-app"}]
+            return _rows(path)
+
+        with (
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows_with_app),
+            patch("kiro_crew.mcp_dashboard._post") as post,
+        ):
+            out = _call_tool_inner(
+                "session_create", {"title": "worker", "folder": "kirocrew/fresh"}
+            )
+        assert out.startswith("Error:")
+        assert "app-scoped" in out
+        post.assert_not_called()
+
+    def test_segment_creation_writes_under_the_gates_verified_key(self) -> None:
+        """The gate's returned key is what the folder writes carry — its contract."""
+        made = {"id": "dddddddddddd", "name": "fresh", "parent_id": "aaaaaaaaaaaa"}
+
+        def _post_route(path, body, **kwargs):
+            if path == "/api/chat/folders":
+                return dict(made)
+            return dict(self.CREATED)
+
+        with (
+            patch(
+                "kiro_crew.mcp_dashboard._refuse_tree_shaping_if_unverifiable",
+                return_value=("dashboard:gate-key", None),
+            ),
+            patch("kiro_crew.mcp_dashboard._get", side_effect=_rows),
+            patch("kiro_crew.mcp_dashboard._post", side_effect=_post_route) as post,
+        ):
+            _call_tool_inner("session_create", {"title": "worker", "folder": "kirocrew/fresh"})
+        folder_call = post.call_args_list[0]
+        assert folder_call.args[0] == "/api/chat/folders"
+        assert folder_call.kwargs["session_key"] == "dashboard:gate-key"
 
 
 class TestAdvertisedSet:
@@ -1481,6 +1809,7 @@ class TestAdvertisedSet:
             "chat_folder_move_session",
             "session_create",
             "session_stop",
+            "session_close",
             "session_send",
             "session_read_message",
         }

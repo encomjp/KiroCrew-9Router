@@ -906,6 +906,95 @@ class TestBuiltinAutoApprovalsGoThroughTheFinalPass:
         assert config["allowedTools"] == ["fs_write", "@ok"], "the silent ones are kept"
 
 
+class TestTemplateGrantsAreCeilingFilteredAtBuild:
+    """The template's ``allowedTools`` is ceiling-filtered inside
+    ``build_agent_config`` itself, so every derived spec inherits the filter.
+
+    ``rebuild_agent_config``'s final pass covers only ``kirocrew.json``. A
+    sibling installer that derives from ``build_agent_config`` and writes its
+    own file (``_install_research_agent``) shipped the template's floor-gated
+    builtins (``fs_read``, ``code``, …) on a blanket auto-approve list —
+    ``code`` auto-approved means unrestricted edits that never reach the
+    PreToolUse gate (#7401). Filtering at the constructor holds the invariant
+    by the predicate rather than by each installer's author remembering it.
+    """
+
+    @staticmethod
+    def _floor_builtins() -> set[str]:
+        from kiro_crew.platform.governance import _FLOOR_GATE_SCOPES, BUILTIN_TOOL_SCOPES
+
+        return {
+            name
+            for name, scopes in BUILTIN_TOOL_SCOPES.items()
+            if _FLOOR_GATE_SCOPES.intersection(scopes)
+        }
+
+    def test_build_output_carries_no_floor_scoped_builtin_grant(self) -> None:
+        from kiro_crew import agent
+
+        config = agent.build_agent_config()
+        leaked = self._floor_builtins().intersection(config.get("allowedTools", []))
+        assert not leaked, f"template floor builtins survived the build filter: {leaked}"
+        # Mount, not auto-approve: the tools list is untouched by the filter.
+        shipped = set(agent.get_shipped_tools()["tools"])
+        assert self._floor_builtins() & shipped <= set(config.get("tools", []))
+
+    def test_the_filter_is_idempotent_so_rebuilds_are_unchanged(self) -> None:
+        """No-op proof for the primary spec: ``rebuild_agent_config``'s own
+        final pass re-filters this same list through the same pure predicate,
+        so a fresh rebuild's ``kirocrew.json`` is byte-for-byte what it was
+        before the filter moved into the constructor."""
+        from kiro_crew import agent
+
+        config = agent.build_agent_config()
+        allowed = config.get("allowedTools", [])
+        assert [ref for ref in allowed if agent._may_auto_approve(ref)] == allowed
+
+    def test_the_build_filter_is_pinned_in_source(self) -> None:
+        """The anchor the writer-parity rule below leans on: deriving from
+        ``build_agent_config`` IS inheriting the ceiling filter."""
+        import inspect
+
+        from kiro_crew import agent
+
+        src = inspect.getsource(agent.build_agent_config)
+        assert "_apply_allowed_tools_ceiling(" in src
+
+    def test_every_crew_spec_writer_filters_or_inherits(self) -> None:
+        """Writer parity: the NEXT installer cannot reintroduce the gap.
+
+        Every Crew-authored agent-spec writer in ``agent.py`` must either
+        derive from ``build_agent_config`` (which filters), filter what it
+        writes through ``_may_auto_approve``, or not write an ``allowedTools``
+        key at all. ``_install_research_agent`` failed this before the fix:
+        it derived from a then-unfiltered constructor.
+        """
+        import inspect
+
+        from kiro_crew import agent
+
+        writers = [
+            fn
+            for name, fn in vars(agent).items()
+            if callable(fn)
+            and getattr(fn, "__module__", "") == agent.__name__
+            and (name.startswith("_install_") and name.endswith("_agent"))
+        ]
+        writers.append(agent.rebuild_agent_config)
+        assert len(writers) >= 5, "installer inventory shrank; update this parity test"
+        for fn in writers:
+            src = inspect.getsource(fn)
+            covered = (
+                "build_agent_config(" in src
+                or "_may_auto_approve(" in src
+                or "allowedTools" not in src
+            )
+            assert covered, (
+                f"{fn.__name__} writes an agent spec without inheriting or applying "
+                "the governance ceiling over allowedTools (see #7401)"
+            )
+
+
 class TestTheCodeToolIsGovernedForWrites:
     """`code` edits files and runs formatters, so a write/commands/tools ceiling
     must withhold its blanket auto-approve.
@@ -1090,9 +1179,9 @@ class TestQueuedSpawnKeepsAppIdentity:
     def test_the_queued_params_include_app(self) -> None:
         import inspect
 
-        from kiro_crew import subagent
+        from kiro_crew.subagent_manager.admission import SpawnAdmissionCoordinator
 
-        src = inspect.getsource(subagent.SubagentManager.spawn)
+        src = inspect.getsource(SpawnAdmissionCoordinator.spawn_impl)
         assert '"app": app,' in src, "the queued params must carry the app identity"
 
 

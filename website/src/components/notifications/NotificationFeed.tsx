@@ -2,6 +2,7 @@ import { safeSetItem } from '../../utils/safeStorage'
 import { useState, useMemo, useCallback, useEffect, useRef, type ReactNode } from 'react'
 import { Bell, BellOff, Check, CheckCheck, Layers, Trash2, X } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
+import { useGuardedLeave } from '../NavigationLeaveGuard'
 import { useAppSelector, useAppDispatch } from '../../store'
 import { deleteNotification, clearNotifications, ackAllNotifications } from '../../store/notificationsSlice'
 import { api } from '../../api/client'
@@ -128,6 +129,10 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
   }, [filtered])
 
   const navigate = useNavigate()
+  // Same gate as the detail panel: a note's action button navigates away from
+  // whatever page the feed is floating over, and the ask belongs in front of the
+  // handler rather than around its navigate call.
+  const leave = useGuardedLeave()
   // group_key stacking -- notes sharing a group_key within a date group
   // collapse into one stack (newest is the visible head), macOS Notification
   // Center style. Expansion is per stack key, session-local.
@@ -231,7 +236,13 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
         className={`px-2 py-1 rounded-md text-[12px] font-medium cursor-pointer border border-dashed transition-all font-body ${showMuted ? 'bg-bg-hover text-text border-border-strong' : 'bg-transparent text-muted border-border hover:text-text hover:border-border-strong'}`}
         onClick={() => setShowMuted(v => !v)}
       >
-        <BellOff className="lucide-inline" /> {i18nT('components.notifications.notificationFeed.muted_count', { count: silencedCount })}
+        {/* The label names the ACTION the press performs, not the state the rows
+            are in: "Muted (3)" left it ambiguous whether pressing reveals muted
+            rows or mutes something. Both halves keep the count in parentheses so
+            neither needs a plural form. */}
+        <BellOff className="lucide-inline" /> {showMuted
+          ? i18nT('components.notifications.notificationFeed.hide_muted_count', { count: silencedCount })
+          : i18nT('components.notifications.notificationFeed.show_muted_count', { count: silencedCount })}
       </button>
     </div>
   ) : null
@@ -390,7 +401,7 @@ export default function NotificationFeed({ selectedTs, onSelect, variant = 'pane
                               key={a.id}
                               type="button"
                               className={`${actionBtn} text-text`}
-                              onClick={e => { e.stopPropagation(); navigate(a.safeUrl!) }}
+                              onClick={e => { e.stopPropagation(); leave(() => navigate(a.safeUrl!), a.safeUrl!) }}
                             >{a.label}</button>
                           ))}
                           <span className="flex-1" />

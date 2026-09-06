@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,148 @@ class TestOpenPortForward:
         assert captured["stdout"] == subprocess.DEVNULL
         assert captured["stderr"] == subprocess.DEVNULL
         assert captured["start_new_session"] is True
+
+    def test_child_env_can_find_the_session_manager_plugin(self, monkeypatch, tmp_path):
+        """The child needs its OWN widened PATH, not just a resolved argv head.
+
+        Resolving ``aws`` absolutely does not help the CLI find
+        ``session-manager-plugin``: it looks that up by name against the child's
+        inherited PATH at start-session time, which under a GUI-launched gateway
+        is the minimal launchd one — so the tunnel died inside a correctly
+        resolved ``aws`` (#5392).
+        """
+        from kiro_crew.deploy import engine
+
+        captured: dict = {}
+
+        def fake_popen(argv, **kwargs):
+            captured.update(kwargs, argv=argv)
+            return object()
+
+        # tmp_path stand-ins for the inherited minimal PATH and the plugin's real
+        # install dir: a host literal would flake and is unrunnable on Windows.
+        # `aws` sits on the inherited PATH so the head resolves absolutely (a PATH
+        # hit needs no provenance check) and the widening is therefore offered.
+        # Windows resolves executables by PATHEXT, not the exec bit, so the planted
+        # file has to differ there or the head would fall back to the bare name and
+        # the widening would (correctly) be withheld.
+        inherited = tmp_path / "sysbin"
+        inherited.mkdir()
+        if os.name == "nt":
+            fake_aws = inherited / "aws.cmd"
+            fake_aws.write_text("@echo off\n")
+            monkeypatch.setenv("PATHEXT", ".cmd")
+        else:
+            fake_aws = inherited / "aws"
+            fake_aws.write_text("#!/bin/sh\n")
+            fake_aws.chmod(0o755)
+        install_dir = tmp_path / "install"
+        monkeypatch.setenv("PATH", str(inherited))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(install_dir),))
+        monkeypatch.setattr(ssm, "require_session_manager_plugin", lambda: None)
+        monkeypatch.setattr(ssm.subprocess, "Popen", fake_popen)
+
+        ssm.open_port_forward("i-0abc", 5476, 5599, "dev", "us-east-1")
+
+        assert captured["argv"][0] == str(fake_aws)  # absolute head
+        child_path = captured["env"]["PATH"].split(os.pathsep)
+        assert str(install_dir) in child_path  # the plugin's install dir
+        assert child_path.index(str(inherited)) < child_path.index(str(install_dir))
+
+    @pytest.mark.skipif(os.name == "nt", reason="provenance branch is dead on Windows")
+    def test_refused_aws_binary_is_not_put_back_on_the_child_path(self, monkeypatch, tmp_path):
+        """A provenance-REFUSED aws must not become reachable again via the env.
+
+        The resolver falls back to the bare name exactly when it found a candidate
+        in the install dirs and ``validate_provider_executable`` refused it, and
+        that refusal is enforced ONLY by the bare name failing execvp against a
+        PATH those dirs are absent from. Widening the child's PATH would put the
+        refused binary back in execvp's reach and hand it AWS credentials — a
+        fail-closed rejection silently turned into an execution.
+        """
+        from kiro_crew import github_runner
+        from kiro_crew.deploy import engine
+
+        captured: dict = {}
+
+        def fake_popen(argv, **kwargs):
+            captured.update(kwargs, argv=argv)
+            return object()
+
+        inherited = tmp_path / "sysbin"  # deliberately contains no aws
+        inherited.mkdir()
+        install_dir = tmp_path / "install"
+        install_dir.mkdir()
+        planted = install_dir / "aws"
+        planted.write_text("#!/bin/sh\n")
+        planted.chmod(0o755)
+        monkeypatch.setenv("PATH", str(inherited))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(install_dir),))
+
+        def _refuse(_candidate):
+            raise ValueError("planted shim")
+
+        monkeypatch.setattr(github_runner, "validate_provider_executable", _refuse)
+        monkeypatch.setattr(ssm, "require_session_manager_plugin", lambda: None)
+        monkeypatch.setattr(ssm.subprocess, "Popen", fake_popen)
+
+        ssm.open_port_forward("i-0abc", 5476, 5599, "dev", "us-east-1")
+
+        assert captured["argv"][0] == "aws"  # refused -> bare name
+        # The dir holding the refused binary must NOT be on the child's PATH.
+        assert str(install_dir) not in captured["env"]["PATH"].split(os.pathsep)
+        assert captured["env"]["PATH"] == str(inherited)
+
+
+class TestSessionManagerPluginProbe:
+    """#5392: the probe must agree with what the spawn actually does.
+
+    Reported against a shipped desktop build: the plugin was installed at
+    /usr/local/bin/session-manager-plugin and worked in a shell, but the
+    launchd-launched gateway inherits /usr/bin:/bin:/usr/sbin:/sbin, so a bare
+    shutil.which() missed it and every SSM tunnel was refused by the
+    prerequisite gate before one was attempted. A symlink into the minimal PATH
+    is not a workaround on macOS — those dirs are all SIP-restricted.
+    """
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="provenance validation needs POSIX uid semantics; the fallback "
+        "dir branch is dead on Windows by design",
+    )
+    def test_probe_finds_plugin_in_install_dir_under_minimal_path(self, monkeypatch, tmp_path):
+        from kiro_crew.deploy import engine
+
+        plugin = tmp_path / "session-manager-plugin"
+        plugin.write_text("#!/bin/sh\n")
+        plugin.chmod(0o755)
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        # A PATH that cannot see the plugin, standing in hermetically for the
+        # minimal launchd one (a literal /usr/bin would flake on a host that has
+        # the real plugin installed there).
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", (str(tmp_path),))
+
+        from kiro_crew import github_runner
+
+        monkeypatch.setattr(github_runner, "validate_provider_executable", lambda c: c)
+
+        assert ssm.session_manager_plugin_installed() is True
+
+    def test_probe_false_when_the_plugin_is_absent_everywhere(self, monkeypatch, tmp_path):
+        """Genuinely missing still reports missing — the actionable install hint
+        must not be traded away for the false-negative fix."""
+        from kiro_crew.deploy import engine
+
+        empty_bin = tmp_path / "emptybin"
+        empty_bin.mkdir()
+        monkeypatch.setenv("PATH", str(empty_bin))
+        monkeypatch.setattr(engine, "_AWS_BIN_DIRS", ())
+
+        assert ssm.session_manager_plugin_installed() is False
+        with pytest.raises(aws.AWSError):
+            ssm.require_session_manager_plugin()
 
     def test_open_port_forward_refused_under_agent_session(self, monkeypatch):
         # The streaming tunnel bypasses run_aws, so it carries its own

@@ -12,6 +12,7 @@ from __future__ import annotations
 from aiohttp import web
 
 from kiro_crew.dashboard import handlers
+from kiro_crew.dashboard.handlers.acp_backend_status import api_acp_backend_status
 from kiro_crew.dashboard.handlers.mcp_custom import (
     api_mcp_custom_add,
     api_mcp_custom_get,
@@ -32,6 +33,11 @@ def register(app: web.Application) -> None:
     app.router.add_get("/api/config/default-agent", handlers.api_default_agent)
     app.router.add_put("/api/config/default-agent", handlers.api_default_agent)
     app.router.add_get("/api/config/schema", handlers.api_config_schema)
+    # Per-backend selectability + whether THIS machine has the harness installed.
+    # Beside the schema route because the dashboard's backend switch reads both:
+    # the schema says which options this build/policy allows, this says which of
+    # them would actually start.
+    app.router.add_get("/api/acp-backends", api_acp_backend_status)
     app.router.add_get("/api/config/kirocrew", handlers.api_kirocrew_config)
     app.router.add_put("/api/config/kirocrew", handlers.api_kirocrew_config)
     app.router.add_patch("/api/config/kirocrew", handlers.api_kirocrew_config_patch)
@@ -78,7 +84,9 @@ def register(app: web.Application) -> None:
     app.router.add_post("/api/mcp/oauth/relay", handlers.api_mcp_oauth_relay)
     app.router.add_post("/api/connections/mint", handlers.api_connections_mint)
     app.router.add_get("/api/connections/mint", handlers.api_connections_mint_state)
+    app.router.add_post("/api/connections/premint", handlers.api_connections_premint)
     app.router.add_get("/api/connections/status", handlers.api_connections_status)
+    app.router.add_post("/api/connections/test", handlers.api_connections_test)
     app.router.add_post("/api/connections/cancel", handlers.api_connections_cancel)
     app.router.add_post("/api/connections/disconnect", handlers.api_connections_disconnect)
     # REST-style MCP server registration (App Kit)

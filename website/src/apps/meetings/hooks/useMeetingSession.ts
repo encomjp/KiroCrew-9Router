@@ -421,6 +421,37 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
         : false,
   })
 
+  // ── editable minutes ──────────────────────────────────────────────────────
+  //
+  // Both mutations INVALIDATE the outputs poll rather than seeding the cache. An
+  // agent output has TWO writers, and after a save or a revert the interesting
+  // question is what the other one has been doing: the mutation response cannot
+  // answer it, because `stale` is computed against a generated file that the agent
+  // may have rewritten in the meantime. So a refetch is the correct thing here.
+  //
+  // Safe to refetch, too: the editor's draft is local state seeded when edit mode
+  // opens, so a poll landing under it cannot overwrite what the user is typing.
+  const editOutputMutation = useMutation({
+    mutationFn: ({ agentId, content }: { agentId: string; content: string }) =>
+      meetingsApi.saveOutput(meetingId, agentId, content),
+    // Returned (not void-ed) so the mutation stays pending until the refetch
+    // lands, and `throwOnError` so a FAILED refetch fails the save rather than
+    // resolving it: either way the editor must not close over a pre-save cache,
+    // where re-saving the stale draft would overwrite the correction.
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: [...scope, 'outputs'] }, { throwOnError: true }),
+    onError: () => notify(i18nT('apps.meetings.session.minutesSaveFailed'), { type: 'error' }),
+  })
+
+  const revertOutputMutation = useMutation({
+    mutationFn: (agentId: string) => meetingsApi.revertOutput(meetingId, agentId),
+    // Same reason as above: the revert is not "done" until the generated text
+    // is actually back in the cache.
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: [...scope, 'outputs'] }, { throwOnError: true }),
+    onError: () => notify(i18nT('apps.meetings.session.minutesRevertFailed'), { type: 'error' }),
+  })
+
   const agents = config?.meeting_agents ?? []
   const enabledIds = meta?.agents_enabled ?? resolveEnabledAgents(selectedPreset, config, agents)
   // Is `enabledIds` a real roster, or the empty list that a not-yet-loaded config
@@ -446,6 +477,9 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
   )
   const mutedAgents = meta?.muted_agents ?? []
   const outputs = outputsQuery.data?.outputs ?? {}
+  // Present only for agents the user has edited, so a key check answers "is this
+  // panel showing my text or the agent's?".
+  const outputEdits = outputsQuery.data?.edits ?? {}
   const tasks: Task[] = outputsQuery.data?.tasks ?? []
   const transcript: TranscriptSegment[] = transcriptQuery.data?.segments ?? []
   const transcriptFull = fullMeetingId === meetingId
@@ -726,6 +760,18 @@ export function useMeetingSession({ eventId, fallbackTitle, config, notify }: Op
     enabledIds,
     mutedAgents,
     outputs,
+    /** Editable minutes: keyed by agent id, present only where an edit exists. */
+    outputEdits,
+    /** True while a minutes save or revert is in flight, for either agent. */
+    editingOutput: editOutputMutation.isPending || revertOutputMutation.isPending,
+    // The panel awaits this promise and only closes its draft on success. A void
+    // `mutate` call made a rejected save indistinguishable from a completed one and
+    // permanently discarded the user's local correction.
+    saveOutput: (agentId: string, content: string) =>
+      editOutputMutation.mutateAsync({ agentId, content }),
+    // Also a promise, for the same reason: the toast in `onError` fades, and the
+    // panel needs the rejection to keep an in-page notice that the revert did not land.
+    revertOutput: (agentId: string) => revertOutputMutation.mutateAsync(agentId),
     tasks,
     transcript,
     partialTranscript,

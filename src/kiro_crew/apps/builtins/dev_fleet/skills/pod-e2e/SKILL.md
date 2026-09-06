@@ -105,8 +105,14 @@ green). Flags:
 1. **up** — `kirocrew pod up <wt> --json`. If already active, reuses it (and
    won't stop it on exit). Boots the worktree's own gateway with `--no-crons`,
    blank-seed DB, isolated HOME.
-2. **health** — polls `base_url/api/health` until 200/401/403 (≤45s). On timeout
-   it dumps logs to `boot-fail.log` and aborts.
+2. **health** — polls `kirocrew pod status <wt> --json` until its `health` is
+   200/401/403 (≤60s). Deliberately not a bare `curl base_url/api/health`: a
+   derived port is routinely held by another pod or by the live gateway, every
+   gateway answers that path identically, so a 200 there proves only that
+   *something* is listening. `pod status` reports the pod's OWN health and returns
+   `-2` when the responder is provably somebody else's, which this phase reports
+   as a port conflict naming `PORT=`. On timeout it dumps logs to `boot-fail.log`
+   and aborts.
 3. **auth** — proves auth: `/api/sessions` → 200 with token, 403 without.
    Token comes from `kirocrew pod up --json` output (no manual minting needed).
 4. **API tests** — runs the fixed command `python -m pytest -q` with cwd=the

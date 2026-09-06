@@ -11,7 +11,6 @@ that take a target share one guard.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from aiohttp import web
@@ -43,25 +42,21 @@ async def _require_internal(request: web.Request) -> web.Response | None:
     """
     if request.get("internal_auth") is True:
         return None
-    # Off the loop AND best-effort, the two properties `_audit_denied` exists to
-    # carry for exactly this shape of site: a refusal logged BEFORE the audit
-    # middleware has run. `log_api_access` only enqueues, but the FIRST `sel()` of
-    # a process constructs the log -- trust-dir creation and key validation,
-    # blocking file IO -- so a fresh gateway whose first session-control request
-    # is unauthenticated would run that synchronously on
-    # the event loop. And construction can raise (a trust root too short to sign
-    # the chain), which unguarded would turn this 403 into a 500: losing the
+    # Best-effort, the property `_audit_denied` exists to carry for exactly this
+    # shape of site: a refusal logged BEFORE the audit middleware has run.
+    # `log_api_access` only enqueues — SEL is warmed at gateway startup
+    # (sel.warm_sel_singleton, #8608), so no thread hop is needed. Construction
+    # can still raise on a FAILED warm (a trust root too short to sign the
+    # chain), which unguarded would turn this 403 into a 500: losing the
     # denial in order to report it.
     try:
-        await asyncio.to_thread(
-            lambda: sel().log_api_access(
-                caller="unknown",
-                operation=f"session_control.{request.path.rsplit('/', 1)[-1]}",
-                outcome="denied",
-                source="dashboard",
-                resources=request.path,
-                error="internal secret required",
-            )
+        sel().log_api_access(
+            caller="unknown",
+            operation=f"session_control.{request.path.rsplit('/', 1)[-1]}",
+            outcome="denied",
+            source="dashboard",
+            resources=request.path,
+            error="internal secret required",
         )
     except Exception:
         logger.warning("Failed to log a session-control denial to SEL", exc_info=True)
@@ -85,6 +80,12 @@ def _refusal(exc: sc.SessionControlError) -> web.Response:
         return web.json_response({"error": exc.message, "code": exc.code}, status=409)
     if exc.status == 429:
         return web.json_response({"error": exc.message, "code": exc.code}, status=429)
+    if exc.status == 500:
+        # A genuine server-side failure — `close_target` raises this for the three
+        # close-path failures (nudge retire / app hook / history save), each of
+        # which left the tab open with every partial step rolled back. It is not a
+        # client error, so it must not degrade to 400.
+        return web.json_response({"error": exc.message, "code": exc.code}, status=500)
     return web.json_response({"error": exc.message, "code": exc.code}, status=400)
 
 
@@ -123,6 +124,7 @@ async def api_session_control_create(request: web.Request) -> web.Response:
             caller_session_key=_read_session_key(request),
             title=str(body.get("title") or ""),
             agent=str(body.get("agent") or ""),
+            folder_id=str(body.get("folder_id") or ""),
         )
     except sc.SessionControlError as exc:
         return _refusal(exc)
@@ -141,6 +143,27 @@ async def api_session_control_stop(request: web.Request) -> web.Response:
     try:
         body = await _body(request)
         result = await sc.stop_target(
+            state,
+            caller_session_key=_read_session_key(request),
+            target=_target(body),
+        )
+    except sc.SessionControlError as exc:
+        return _refusal(exc)
+    return web.json_response(result)
+
+
+async def api_session_control_close(request: web.Request) -> web.Response:
+    """POST /api/session-control/close — archive another session (tab ✕)."""
+    refused = await _require_internal(request)
+    if refused is not None:
+        return refused
+    # No prewarm here: `close_target` warms the SEL logger and the config after
+    # its own SEL prewarm, the same ordering `stop_target`/`send_to_target` use
+    # and for the same reason — the body read above is a suspension point.
+    state: DashboardState = request.app["state"]
+    try:
+        body = await _body(request)
+        result = await sc.close_target(
             state,
             caller_session_key=_read_session_key(request),
             target=_target(body),

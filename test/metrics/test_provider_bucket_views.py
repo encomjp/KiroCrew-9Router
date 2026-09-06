@@ -18,6 +18,7 @@ properties load-bearing, and both are asserted here:
    twice under one metric name. ``test_no_duplicate_streams_per_instrument``
    pins that.
 """
+import ast
 import re
 from pathlib import Path
 
@@ -26,10 +27,14 @@ import pytest
 from kiro_crew.dashboard.handlers.telemetry import _Hist
 from kiro_crew.metrics import provider as provider_mod
 from kiro_crew.metrics.provider import (
+    _CREDIT_BUCKETS,
     _FAST_BUCKETS_MS,
+    _HISTOGRAM_BUCKETS_BY_UNIT,
     _HISTOGRAM_BUCKETS_MS,
     _STARTUP_BUCKETS_MS,
     _TURN_BUCKETS_MS,
+    _USD_BUCKETS,
+    histogram_bounds,
 )
 
 _SRC = Path(provider_mod.__file__).resolve().parent.parent
@@ -47,6 +52,66 @@ def _source_histogram_names() -> set[str]:
             continue
         found.update(_NAME_RE.findall(text))
     return found
+
+
+def _emitted_histogram_units() -> dict[str, set[str]]:
+    """Instrument name -> the set of ``unit=`` values its emit calls pass.
+
+    The naming scan above can only recognise a histogram by a ``.duration``
+    suffix. That is not a property of the code: ``kirocrew.embed.queue_wait`` and
+    ``kirocrew.embed.inference`` are millisecond histograms with no such suffix,
+    and a non-duration histogram (``kirocrew.turn.credits``) has no reason to
+    carry one — all three were therefore invisible to the old guard and inherited
+    OTEL's default 10s-ceiling buckets in silence.
+
+    So this walks every module for a call to ``histogram`` and reads its first
+    argument (a string literal, or a module-level ``str`` constant resolved by
+    name, which is how the turn family spells its instruments) together with its
+    ``unit=`` keyword. Finding instruments by SHAPE is what makes the guard hold
+    for a histogram nobody remembered to name in a regex, and reading the unit is
+    what lets the two bucket maps be checked against what they actually claim
+    rather than against a spelling convention.
+    """
+    found: dict[str, set[str]] = {}
+    for path in _SRC.rglob("*.py"):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        consts: dict[str, str] = {}
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and isinstance(node.value, ast.Constant):
+                if isinstance(node.value.value, str):
+                    consts[target.id] = node.value.value
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            fn = node.func
+            fname = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if fname != "histogram":
+                continue
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                name = first.value
+            elif isinstance(first, ast.Name) and first.id in consts:
+                name = consts[first.id]
+            else:
+                continue
+            if not name.startswith("kirocrew."):
+                continue
+            unit = "ms"  # the recorder's default
+            for kw in node.keywords:
+                if kw.arg == "unit" and isinstance(kw.value, ast.Constant):
+                    unit = str(kw.value.value)
+            found.setdefault(name, set()).add(unit)
+    return found
+
+
+def _emitted_histogram_names() -> set[str]:
+    return set(_emitted_histogram_units())
 
 
 class TestCompleteness:
@@ -67,13 +132,127 @@ class TestCompleteness:
         )
 
     def test_no_stale_map_entries(self):
-        """A name dropped from the source should not linger in the map."""
-        stale = sorted(set(_HISTOGRAM_BUCKETS_MS) - _source_histogram_names())
+        """A name dropped from the source should not linger in the map.
+
+        Checked against the union of both scans: the ms map legitimately holds
+        millisecond histograms whose names do not end in ``.duration`` (the embed
+        pair), which the name scan alone cannot see.
+        """
+        live = _source_histogram_names() | _emitted_histogram_names()
+        stale = sorted(set(_HISTOGRAM_BUCKETS_MS) - live)
         assert not stale, f"map entries with no emitting call site: {stale}"
 
 
+class TestNonDurationHistograms:
+    """A histogram whose values are not milliseconds needs the same guarantees.
+
+    Two properties, both load-bearing and neither covered by the name-suffix scan
+    above:
+
+    1. **Explicit buckets.** `kirocrew.turn.credits` spans 0.03 to 658 in real
+       data. OTEL's default boundaries top out at 10000 with nothing below 5, so
+       every one of those samples would land in the FIRST bucket and the reported
+       p50/p90 would be a constant.
+    2. **Unit separation.** `_HISTOGRAM_BUCKETS_MS` is the map the dashboard's
+       generic aggregation trusts when it reports every histogram under `*_ms`
+       keys, so a non-ms instrument must not be registered there.
+    """
+
+    def test_emitted_scan_finds_both_families(self):
+        """Guard the guard, again: an empty AST harvest would pass vacuously."""
+        units = _emitted_histogram_units()
+        assert units.get("kirocrew.turn.duration") == {"ms"}
+        assert units.get("kirocrew.turn.credits") == {"credit"}
+        assert units.get("kirocrew.turn.cost_usd") == {"usd"}
+        # The pair that motivated the unit-based check: ms, no `.duration` suffix.
+        assert units.get("kirocrew.embed.queue_wait") == {"ms"}
+
+    def test_every_emitted_histogram_is_registered_somewhere(self):
+        missing = sorted(_emitted_histogram_names() - set(histogram_bounds()))
+        assert not missing, (
+            "These histograms are recorded in the source but have no bucket "
+            f"entry in either provider bucket map: {missing}. Without a View "
+            "they inherit OTEL's default 0..10000 boundaries. Register a "
+            "millisecond instrument in _HISTOGRAM_BUCKETS_MS and anything else "
+            "in _HISTOGRAM_BUCKETS_BY_UNIT."
+        )
+
+    def test_by_unit_entries_have_an_emitting_call_site(self):
+        stale = sorted(set(_HISTOGRAM_BUCKETS_BY_UNIT) - _emitted_histogram_names())
+        assert not stale, f"non-ms map entries with no emitting call site: {stale}"
+
+    def test_the_two_maps_are_disjoint(self):
+        """Merge order in histogram_bounds() must not be able to hide an entry."""
+        overlap = sorted(set(_HISTOGRAM_BUCKETS_MS) & set(_HISTOGRAM_BUCKETS_BY_UNIT))
+        assert not overlap, f"registered in both bucket maps: {overlap}"
+        assert len(histogram_bounds()) == len(_HISTOGRAM_BUCKETS_MS) + len(
+            _HISTOGRAM_BUCKETS_BY_UNIT
+        )
+
+    def test_ms_map_holds_only_millisecond_instruments(self):
+        """The invariant the dashboard's `*_ms` reporting actually depends on.
+
+        Checked against the emitted ``unit=``, not against a ``.duration`` name
+        suffix: the suffix is a convention two shipped ms histograms do not
+        follow, so asserting on it would either reject them or force a rename
+        that changes an instrument's published name for a test's benefit.
+        """
+        units = _emitted_histogram_units()
+        wrong = sorted(
+            name for name in _HISTOGRAM_BUCKETS_MS
+            if name in units and units[name] != {"ms"}
+        )
+        assert not wrong, (
+            f"non-millisecond instruments in the ms map: {wrong}. The dashboard "
+            "reports every histogram in this map under *_ms keys."
+        )
+
+    def test_by_unit_map_holds_no_millisecond_instruments(self):
+        units = _emitted_histogram_units()
+        wrong = sorted(
+            name for name in _HISTOGRAM_BUCKETS_BY_UNIT
+            if units.get(name) == {"ms"}
+        )
+        assert not wrong, f"millisecond instruments belong in the ms map: {wrong}"
+
+    def test_one_instrument_never_carries_two_units(self):
+        """Two units under one name make every reported statistic meaningless."""
+        mixed = sorted(n for n, u in _emitted_histogram_units().items() if len(u) > 1)
+        assert not mixed, f"instruments emitted with conflicting units: {mixed}"
+
+    def test_credit_bounds_cover_the_measured_range(self):
+        """Calibration facts from 17,240 real per-turn credit rows."""
+        assert _CREDIT_BUCKETS[0] < 0.0304, "observed minimum would floor at the first bound"
+        assert _CREDIT_BUCKETS[-1] > 658, "observed maximum would fall into +Inf"
+        # p50 6.76 and p90 53.3 must each sit strictly inside a bucket, not on a
+        # boundary that a percentile can only report as a floor.
+        for observed in (6.76, 53.3, 155.1):
+            assert any(
+                lo < observed <= hi
+                for lo, hi in zip(_CREDIT_BUCKETS, _CREDIT_BUCKETS[1:])
+            ), observed
+
+    def test_usd_bounds_span_sub_cent_to_tens_of_dollars(self):
+        assert _USD_BUCKETS[0] <= 0.001
+        assert _USD_BUCKETS[-1] >= 100
+
+    def test_default_otel_buckets_would_have_destroyed_the_credit_signal(self):
+        """Why an explicit View is required rather than nice to have.
+
+        OTEL's default boundaries start at 0 and 5. Against the measured credit
+        distribution (p50 6.8, p90 53) they are not merely coarse — over half the
+        population lands in the first two buckets, so the reported p50 could only
+        ever be 0 or 5.
+        """
+        otel_default = [0.0, 5.0, 10.0, 25.0, 50.0, 75.0, 100.0, 250.0, 500.0, 750.0,
+                        1000.0, 2500.0, 5000.0, 7500.0, 10000.0]
+        below_five = sum(1 for b in _CREDIT_BUCKETS if b <= 5.0)
+        assert below_five >= 7, "the credit array must resolve the sub-5 decade"
+        assert sum(1 for b in otel_default if 0 < b <= 5.0) == 1
+
+
 class TestBoundaryShape:
-    @pytest.mark.parametrize("name,bounds", sorted(_HISTOGRAM_BUCKETS_MS.items()))
+    @pytest.mark.parametrize("name,bounds", sorted(histogram_bounds().items()))
     def test_bounds_are_sorted_positive_and_unique(self, name, bounds):
         assert bounds, name
         assert all(b > 0 for b in bounds), name
@@ -266,7 +445,7 @@ class TestViewWiring:
                     instrument_name=name,
                     aggregation=ExplicitBucketHistogramAggregation(bounds),
                 )
-                for name, bounds in _HISTOGRAM_BUCKETS_MS.items()
+                for name, bounds in histogram_bounds().items()
             ],
         )
         return mp, reader
@@ -321,6 +500,26 @@ class TestViewWiring:
         (fast,) = self._points(reader, "kirocrew.mcp.backend.acquire.duration")
         assert list(turn.explicit_bounds) == list(_TURN_BUCKETS_MS)
         assert list(fast.explicit_bounds) == list(_FAST_BUCKETS_MS)
+
+    def test_billing_histograms_get_their_own_non_ms_bounds(self):
+        """A credit and a dollar must not inherit a duration family's array."""
+        mp, reader = self._provider()
+        meter = mp.get_meter("t")
+        meter.create_histogram("kirocrew.turn.credits", unit="credit").record(6.76)
+        meter.create_histogram("kirocrew.turn.cost_usd", unit="usd").record(0.0032)
+
+        (credits,) = self._points(reader, "kirocrew.turn.credits")
+        (cost,) = self._points(reader, "kirocrew.turn.cost_usd")
+        assert list(credits.explicit_bounds) == list(_CREDIT_BUCKETS)
+        assert list(cost.explicit_bounds) == list(_USD_BUCKETS)
+        # Each sample sits inside a bounded bucket, so a percentile over it can
+        # report a real amount rather than a floor.
+        for dp in (credits, cost):
+            counts = list(dp.bucket_counts)
+            overflow = len(dp.explicit_bounds)
+            assert counts[overflow] == 0
+            landed = next(i for i, c in enumerate(counts) if c)
+            assert 0 < landed < overflow, "sample landed in the unbounded first bucket"
 
 
 class TestAggregatorReadsRealPercentiles:

@@ -15,6 +15,7 @@ organized for someone browsing the repository.
 | [configuration.md](configuration.md) | Config file reference, environment variables, and sandbox modes. |
 | [use-cases.md](use-cases.md) | Real-world workflows. |
 | [troubleshooting.md](troubleshooting.md) | Common problems and fixes. |
+| [blocked-commands.md](blocked-commands.md) | Why a command was refused, what the agent is told to do instead, and how to check your credential setup. |
 
 ## Core capabilities
 
@@ -36,6 +37,13 @@ organized for someone browsing the repository.
 | [inbound-webhooks.md](inbound-webhooks.md) | Letting external systems trigger an agent turn over HTTP. |
 | [deploy-web.md](deploy-web.md) | Publishing artifacts to a public HTTPS URL on your own AWS. |
 | [snapshot-and-restore.md](snapshot-and-restore.md) | Backing up and restoring Kiro Crew state. |
+| [workflows.md](workflows.md) | Multi-phase agent runs you can watch, restart in part, and save for reuse. |
+| [secrets-vault.md](secrets-vault.md) | Storing credentials encrypted where the agent cannot read them. |
+| [monitor-loops.md](monitor-loops.md) | Keeping one session checking something on an interval until an exit condition fires. |
+| [session-ledger.md](session-ledger.md) | The durable per-session work record that survives context compaction. |
+| [artifacts.md](artifacts.md) | Saving, versioning, and reverting generated UI and documents. |
+| [computer-use.md](computer-use.md) | Reading and driving native desktop applications; opt-in and off by default. |
+| [browser-control.md](browser-control.md) | Driving a real web page from the dashboard's Browser panel. |
 
 ## Channels
 
@@ -50,15 +58,14 @@ organized for someone browsing the repository.
 | [weixin-integration.md](weixin-integration.md) | Weixin setup, and the risks to read first. |
 | [whatsapp-integration.md](whatsapp-integration.md) | WhatsApp (QR-linked personal account) setup, and the risks to read first. |
 | [feishu-integration.md](feishu-integration.md) | Feishu (Lark/飞书) setup and behavior. |
-| [messaging-transport.md](messaging-transport.md) | The channel-neutral contracts every transport shares. |
+| [imessage-integration.md](imessage-integration.md) | iMessage setup and behavior on a Mac that owns the Messages database. |
+| [channel-capabilities.md](channel-capabilities.md) | One matrix of what every channel can do: streaming, buttons, uploads, reply length, approval timeout. |
 
 ## Platform
 
 | Doc | Covers |
 |---|---|
-| [app-platform-trust-model.md](app-platform-trust-model.md) | Enabled apps run in-process with full privileges: the trust boundary and its audit. |
 | [mcp-apps.md](mcp-apps.md) | Rendering interactive MCP tool output in chat: the two gates, what a server declares, and the plain-text fallback. |
-| [dashboard-iframe-hosts.md](dashboard-iframe-hosts.md) | The four iframe hosts, their differing sandboxes, and why they are not interchangeable. |
 
 ## Maintaining this directory
 

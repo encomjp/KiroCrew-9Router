@@ -17,6 +17,12 @@
 // menu-dismissal tests so each step stays synchronous and the assertion sits
 // immediately after the event that should have caused it.
 import { describe, it, expect, vi, beforeEach, beforeAll } from 'vitest'
+
+// Radix's DropdownMenu doesn't open under jsdom; the shared mock renders its
+// items inline (same seam TrustDropdown.test.tsx / ApprovalCard.test.tsx use),
+// which the approval card's trust-tier tests below need.
+vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
+
 import { screen, waitFor, fireEvent, act, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import ChannelPage from '../pages/ChannelPage'
@@ -181,14 +187,103 @@ describe('ChannelPage — message list', () => {
     await renderPage()
     await userEvent.click(screen.getByRole('button', { name: /Approve/ }))
     await waitFor(() => expect(vi.mocked(api).channelApproveAgent)
-      .toHaveBeenCalledWith('ch1', 'a1', 'approved'))
+      .toHaveBeenCalledWith('ch1', 'a1', 'approved', undefined))
   })
 
-  // The channel approval message carries no tool command (the card is titled
-  // with the agent's role) and the approve endpoint accepts only
-  // approved/rejected/trust, so the command-scoped tiers must not be offered
-  // on this surface (#4421).
-  it('offers only the plain trust action on a channel approval — no command-scoped tiers', async () => {
+  it('hides the per-command tiers on a non-shell approval card', async () => {
+    // A non-shell pending tool has no per-command trust seam server-side
+    // (the endpoint refuses with pattern_underivable) — the doomed tiers
+    // must not be offered; blanket trust remains.
+    mockApi([channelOf({
+      messages: [message({
+        msg_type: 'approval',
+        content: '⚠️ Approval needed: **cron_add**\n```\n{"name": "job"}\n```',
+      })],
+    })])
+    await renderPage()
+    fireEvent.click(screen.getByRole('button', { name: /Trust/ }))
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0].textContent).toMatch(/Trust all tools/)
+  })
+
+  it('hides the per-command tiers when the tool input is redacted', async () => {
+    // The backend refuses to scope a grant to a redacted command (two
+    // commands differing only in credentials redact to the same text), so
+    // the tiers must not be offered for it either.
+    mockApi([channelOf({
+      messages: [message({
+        msg_type: 'approval',
+        content: '⚠️ Approval needed: **Running: curl -H auth https://x**\n```\n{"command": "curl -H [REDACTED: credential] https://x"}\n```',
+      })],
+    })])
+    await renderPage()
+    fireEvent.click(screen.getByRole('button', { name: /Trust/ }))
+    const items = screen.getAllByRole('menuitem')
+    expect(items).toHaveLength(1)
+    expect(items[0].textContent).toMatch(/Trust all tools/)
+  })
+
+  it('forwards the trust_command pattern from the trust dropdown', async () => {
+    // The tool title embedded by the backend (not the agent role) is what the
+    // TrustDropdown derives its pattern from.
+    mockApi([channelOf({
+      messages: [message({
+        msg_type: 'approval',
+        content: '⚠️ Approval needed: **Running: rm -rf build**\n```\n{"command": "rm -rf build"}\n```',
+      })],
+    })])
+    await renderPage()
+    fireEvent.click(screen.getByRole('button', { name: /Trust/ }))
+    const items = screen.getAllByRole('menuitem')
+    const cmdItem = items.find(b => b.textContent?.includes('rm -rf build'))!
+    fireEvent.click(cmdItem)
+    await waitFor(() => expect(vi.mocked(api).channelApproveAgent)
+      .toHaveBeenCalledWith('ch1', 'a1', 'trust_command', 'rm -rf build'))
+  })
+
+  it('forwards the trust_base pattern from the trust dropdown', async () => {
+    mockApi([channelOf({
+      messages: [message({
+        msg_type: 'approval',
+        content: '⚠️ Approval needed: **Running: rm -rf build**\n```\n{"command": "rm -rf build"}\n```',
+      })],
+    })])
+    await renderPage()
+    fireEvent.click(screen.getByRole('button', { name: /Trust/ }))
+    const items = screen.getAllByRole('menuitem')
+    const baseItem = items.find(b => b.textContent?.includes('commands'))!
+    fireEvent.click(baseItem)
+    await waitFor(() => expect(vi.mocked(api).channelApproveAgent)
+      .toHaveBeenCalledWith('ch1', 'a1', 'trust_base', 'rm *'))
+  })
+
+  it('restores the live card when a command trust decision is refused', async () => {
+    mockApi([channelOf({
+      messages: [message({
+        msg_type: 'approval',
+        content: '⚠️ Approval needed: **Running: rm -rf build**\n```\n{"command": "rm -rf build"}\n```',
+      })],
+    })])
+    vi.mocked(api).channelApproveAgent.mockRejectedValueOnce(
+      new Error('response lost'),
+    )
+    await renderPage()
+    fireEvent.click(screen.getByRole('button', { name: /Trust/ }))
+    const cmdItem = screen.getAllByRole('menuitem')
+      .find(b => b.textContent?.includes('rm -rf build'))!
+    fireEvent.click(cmdItem)
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('may not have been recorded')
+    expect(screen.queryByText(/auto-approving future calls/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Approve/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Reject/ })).toBeInTheDocument()
+  })
+
+  // Legacy/non-shell cards carry no safely bound shell command, so they keep
+  // the existing channel-wide trust action without dead command tiers (#4421).
+  it('offers only the plain trust action on a legacy channel approval', async () => {
     mockApi([channelOf({
       messages: [message({
         msg_type: 'approval',
@@ -215,8 +310,8 @@ describe('ChannelPage — message list', () => {
     await userEvent.click(screen.getByRole('button', { name: /Trust/ }))
     await userEvent.click(screen.getByText('Trust all tools in this channel — persists across restarts'))
     await waitFor(() => expect(vi.mocked(api).channelApproveAgent)
-      .toHaveBeenCalledWith('ch1', 'a1', 'trust'))
-    // trust_command / trust_base must never reach the API from this surface.
+      .toHaveBeenCalledWith('ch1', 'a1', 'trust', undefined))
+    // Legacy cards must never send a command-scoped action.
     for (const call of vi.mocked(api).channelApproveAgent.mock.calls) {
       expect(['approved', 'rejected', 'trust']).toContain(call[2])
     }
@@ -342,14 +437,20 @@ describe('ChannelPage — agents sidebar', () => {
     await waitFor(() => expect(screen.queryByRole('menu')).not.toBeInTheDocument())
   })
 
-  it('keeps the optimistic listen mode when the patch fails', async () => {
+  it('puts the listen mode back and reports it when the patch fails', async () => {
+    // The row and the notice must agree: an optimistic "all" left standing
+    // under "Failed to update agent" would claim the change took.
     vi.mocked(api).channelUpdateAgent = vi.fn().mockRejectedValue(new Error('nope'))
     await renderPage()
     await openAgentsPanel()
     await userEvent.click(screen.getByText('mention'))
     const menu = await screen.findByRole('menu')
     await userEvent.click(within(menu).getByText('all'))
-    await waitFor(() => expect(screen.getByText('all')).toBeInTheDocument())
+    const notice = await screen.findByTestId('channel-error')
+    expect(notice).toHaveTextContent('Failed to update agent')
+    expect(notice).toHaveTextContent('nope')
+    await waitFor(() => expect(screen.getByText('mention')).toBeInTheDocument())
+    expect(screen.queryByText('all')).not.toBeInTheDocument()
   })
 
   it('closes the listen menu on Escape', async () => {
@@ -380,17 +481,22 @@ describe('ChannelPage — agents sidebar', () => {
     await userEvent.click(screen.getByTitle('Dismiss'))
     await waitFor(() => expect(vi.mocked(api).channelDismissAgent)
       .toHaveBeenCalledWith('ch1', 'a1'))
-    // A dismissed agent is `done`, so its row loses both action buttons.
-    await waitFor(() => expect(screen.queryByTitle('Dismiss')).not.toBeInTheDocument())
-  })
-
-  it('hides the row actions for an already-finished agent', async () => {
-    mockApi([channelOf({ members: { a1: member({ state: 'failed' }) } })])
-    await renderPage()
-    await openAgentsPanel()
-    expect(screen.queryByTitle('Dismiss')).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByTitle('Dismiss')).toBeInTheDocument())
     expect(screen.queryByTitle('Clear context')).not.toBeInTheDocument()
   })
+
+  it.each(['done', 'failed'] as const)(
+    'allows dismissing a terminal %s agent but not clearing its context',
+    async state => {
+      mockApi([channelOf({ members: { a1: member({ state }) } })])
+      await renderPage()
+      await openAgentsPanel()
+      await userEvent.click(screen.getByTitle('Dismiss'))
+      await waitFor(() => expect(vi.mocked(api).channelDismissAgent)
+        .toHaveBeenCalledWith('ch1', 'a1'))
+      expect(screen.queryByTitle('Clear context')).not.toBeInTheDocument()
+    },
+  )
 
   it('closes the agents sidebar again', async () => {
     await renderPage()
@@ -460,10 +566,13 @@ describe('ChannelPage — Add Agent form', () => {
     await userEvent.click(screen.getByRole('button', { name: '+ Add Agent' }))
     fireEvent.change(await screen.findByLabelText('Role'), { target: { value: 'Extra' } })
     await userEvent.click(screen.getByRole('button', { name: 'Add' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Failed to add agent' })
-    expect(within(dialog).getByText('agent cap reached')).toBeInTheDocument()
+    // In-page ErrorNotice, titled with the failed action; the inputs were
+    // already submitted so it carries the agent hand-off.
+    const notice = await screen.findByTestId('channel-error')
+    expect(notice).toHaveTextContent('Failed to add agent')
+    expect(notice).toHaveTextContent('agent cap reached')
     expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument()
-    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Close' })).toHaveFocus())
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
   })
 
   it('falls back to the raw message when the api error is not JSON', async () => {
@@ -473,8 +582,9 @@ describe('ChannelPage — Add Agent form', () => {
     await userEvent.click(screen.getByRole('button', { name: '+ Add Agent' }))
     fireEvent.change(await screen.findByLabelText('Role'), { target: { value: 'Extra' } })
     await userEvent.click(screen.getByRole('button', { name: 'Add' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Failed to add agent' })
-    expect(within(dialog).getByText('gateway timeout')).toBeInTheDocument()
+    const notice = await screen.findByTestId('channel-error')
+    expect(notice).toHaveTextContent('Failed to add agent')
+    expect(notice).toHaveTextContent('gateway timeout')
     expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument()
   })
 
@@ -608,7 +718,7 @@ describe('ChannelPage — New Channel dialog', () => {
     await waitFor(() => expect(screen.queryByRole('dialog', { name: 'New channel' })).not.toBeInTheDocument())
   })
 
-  it('labels a create failure with its action and dismisses the shared modal with OK', async () => {
+  it('labels a create failure with its action in the shared in-page notice and dismisses it', async () => {
     vi.mocked(api).channelCreate = vi.fn()
       .mockRejectedValue(new Error(JSON.stringify({ error: 'channel cap reached' })))
     await renderPage()
@@ -616,11 +726,16 @@ describe('ChannelPage — New Channel dialog', () => {
     const dialog = await screen.findByRole('dialog', { name: 'New channel' })
     fireEvent.change(within(dialog).getByLabelText('Topic'), { target: { value: 'One too many' } })
     await userEvent.click(within(dialog).getByRole('button', { name: 'Create' }))
-    const errorDialog = await screen.findByRole('dialog', { name: 'Failed to create channel' })
-    expect(within(errorDialog).getByText('channel cap reached')).toBeInTheDocument()
+    // The failure is the shared ErrorNotice (role="alert" + agent hand-off), not
+    // a blocking modal: the inputs were already submitted, so nothing is lost.
+    const notice = await screen.findByTestId('channel-error')
+    expect(notice).toHaveAttribute('role', 'alert')
+    expect(notice.textContent).toContain('Failed to create channel')
+    expect(notice.textContent).toContain('channel cap reached')
     expect(screen.queryByText('Limit Reached')).not.toBeInTheDocument()
-    await userEvent.click(within(errorDialog).getByRole('button', { name: 'OK' }))
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Failed to create channel' })).not.toBeInTheDocument())
+    expect(within(notice).getByRole('button', { name: /ask the agent/i })).toBeInTheDocument()
+    await userEvent.click(within(notice).getByRole('button', { name: 'Dismiss' }))
+    await waitFor(() => expect(screen.queryByTestId('channel-error')).not.toBeInTheDocument())
   })
 
   it('ignores a create response that carries no channel', async () => {
@@ -654,12 +769,18 @@ describe('ChannelPage — close channel', () => {
     await waitFor(() => expect(screen.getByText('Create a channel to get started')).toBeInTheDocument())
   })
 
-  it('removes the channel locally even when the close request fails', async () => {
+  it('keeps the channel and reports it when the close request fails', async () => {
+    // Removing the channel under a "Failed to close channel" notice would show
+    // the action as done; a refused close leaves the list as it was.
     vi.spyOn(window, 'confirm').mockReturnValue(true)
     vi.mocked(api).channelClose = vi.fn().mockRejectedValue(new Error('already gone'))
     await renderPage()
     await userEvent.click(screen.getByTitle('Close channel'))
-    await waitFor(() => expect(screen.getByText('No channels yet')).toBeInTheDocument())
+    const notice = await screen.findByTestId('channel-error')
+    expect(notice).toHaveTextContent('Failed to close channel')
+    expect(notice).toHaveTextContent('already gone')
+    expect(screen.getByRole('heading', { name: 'Gamma rollout' })).toBeInTheDocument()
+    expect(screen.queryByText('No channels yet')).not.toBeInTheDocument()
   })
 
   it('does nothing when the confirm is cancelled', async () => {
@@ -746,10 +867,16 @@ describe('ChannelPage — socket events', () => {
 })
 
 describe('ChannelPage — load failures', () => {
-  it('renders the empty state when the channel list request fails', async () => {
+  it('names a failed channel-list read instead of rendering the empty state', async () => {
+    // "No channels yet" under a refused read would claim zero channels; the
+    // list is unknown, and the notice says so.
     vi.mocked(api).channelsList = vi.fn().mockRejectedValue(new Error('gateway down'))
     await renderPage()
-    expect(screen.getByText('No channels yet')).toBeInTheDocument()
+    const notice = await screen.findByTestId('channel-error')
+    expect(notice).toHaveTextContent('Failed to load channels')
+    expect(notice).toHaveTextContent('gateway down')
+    expect(screen.queryByText('No channels yet')).not.toBeInTheDocument()
+    expect(screen.queryByText('Create a channel to get started')).not.toBeInTheDocument()
   })
 
   it('keeps the summary row when the per-channel fetch fails', async () => {

@@ -103,7 +103,9 @@ class _FakeBackend:
     async def recycle_if_idle(self) -> bool:
         return False
 
-    async def forward_from_stub(self, _uuid: str, _msg: dict, caller: Any = None) -> None:
+    async def forward_from_stub(
+        self, _uuid: str, _msg: dict, caller: Any = None, tenant_nonce: str = ""
+    ) -> None:
         self.callers.append(caller)
 
 

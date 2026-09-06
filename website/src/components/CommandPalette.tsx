@@ -23,6 +23,7 @@ import { useRecentsProvider } from './commandPalette/providers/recentsProvider'
 import { useSettingsProvider } from './commandPalette/providers/settingsProvider'
 import { useAppsProvider } from './commandPalette/providers/appsProvider'
 import { Highlighted } from './commandPalette/Highlighted'
+import ErrorNotice from './ErrorNotice'
 
 import { i18nT } from '../i18n/t'
 import { useVisualViewport } from '../hooks/useVisualViewport'
@@ -314,6 +315,7 @@ export default function CommandPalette({
           default: {
             // Exhaustiveness guard — every EnterAction kind must have a branch.
             const _exhaustive: never = action
+            // eslint-disable-next-line no-console -- unreachable while `EnterAction` is exhaustively handled; it only fires when a kind is ADDED without a branch, and the compile-time `never` above cannot report that at runtime. Silence would make Enter do nothing with no trace.
             console.warn('[CommandPalette] dispatchEnter: unhandled enter action', _exhaustive)
           }
         }
@@ -481,7 +483,13 @@ export default function CommandPalette({
     // tab (or the recents quick-switcher), leaving the All tab's swallow
     // untouched.
     <div className="px-3 py-6 text-center text-[12px] flex flex-col items-center gap-2">
-      <span className="text-muted">{i18nT('components.commandPalette.search_failed')}</span>
+      {/* The palette holds only a transient search string, so the hand-off loses nothing. */}
+      <ErrorNotice
+        variant="inline"
+        askAgent
+        testId="command-palette-search-error"
+        message={i18nT('components.commandPalette.search_failed')}
+      />
       <button
         type="button"
         onClick={() => { void refetch() }}
@@ -526,6 +534,10 @@ export default function CommandPalette({
   )
 
   return createPortal(
+    // The backdrop's onMouseDown is click-outside dismissal, a pointer-only
+    // convenience: Escape closes the palette through useListKeyboardNav, so the
+    // keyboard already has the same exit and needs no path to this element.
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- backdrop dismissal on the dialog shell, with Escape as the keyboard equivalent
     <div
       // Pinned to the VISUAL viewport, not `inset-0`. A keyboard shrinks the visual
       // viewport on every browser; only Chromium also shrinks the layout one (via
@@ -540,6 +552,10 @@ export default function CommandPalette({
       aria-label={i18nT('components.commandPalette.search_everywhere')}
       onMouseDown={onClose}
     >
+      {/* Containment only: the panel's onMouseDown performs no action, it just
+          keeps a press inside the panel from reaching the backdrop's dismiss.
+          Every control in here is a real input or button. */}
+      {/* eslint-disable-next-line jsx-a11y/no-static-element-interactions -- stopPropagation barrier, not an activatable control; there is no behaviour for a keyboard to be given */}
       <div
         className="w-full max-w-xl mx-4 bg-card border border-border rounded-xl shadow-xl overflow-hidden flex flex-col"
         // Both numbers come from the VISUAL viewport in px, not a percentage

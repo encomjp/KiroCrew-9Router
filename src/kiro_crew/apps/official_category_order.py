@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Any
 
 from kiro_crew.apps.official_catalog import OFFICIAL_CATALOG_BASE, fetch_document
+from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import config_dir
 
 logger = logging.getLogger(__name__)
@@ -108,14 +109,25 @@ def _read_cache() -> dict[str, Any] | None:
 def _write_cache(doc: dict[str, Any]) -> None:
     path = _cache_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(doc), encoding="utf-8")
+        atomic_write(path, json.dumps(doc))
     except OSError:
         logger.debug("could not cache the category-order document", exc_info=True)
 
 
 def _write_failure() -> None:
     _write_cache({_FAILED_KEY: time.time()})
+
+
+def forget_cache() -> None:
+    """Drop the cached document and any failure memory; the next read re-fetches.
+
+    Same contract as ``official_catalog.forget_cache`` -- see there for why a
+    file delete (not a re-fetch) is the whole job.
+    """
+    try:
+        _cache_path().unlink(missing_ok=True)
+    except OSError:
+        logger.debug("could not drop the category-order cache", exc_info=True)
 
 
 def _download() -> dict[str, Any] | None:
@@ -195,4 +207,4 @@ def load_category_order(fetcher: Any = None) -> list[str]:
     return out
 
 
-__all__ = ["load_category_order", "MAX_CATEGORIES", "OFFICIAL_CATEGORY_ORDER_URL"]
+__all__ = ["forget_cache", "load_category_order", "MAX_CATEGORIES", "OFFICIAL_CATEGORY_ORDER_URL"]

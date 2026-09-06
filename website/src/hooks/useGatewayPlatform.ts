@@ -22,10 +22,18 @@ export type GatewayPlatform = 'darwin' | 'windows' | 'other'
  */
 export function classifyPlatform(raw: string | undefined | null): GatewayPlatform {
   const platform = raw ?? ''
-  if (platform === 'darwin') return 'darwin'
-  // Matches the backend's own `sys.platform.startswith("win")` test, so the two
-  // sides cannot disagree about what counts as Windows.
-  if (platform.startsWith('win')) return 'windows'
+  // The gateway sends a human DISPLAY label, not `sys.platform`: the prerequisite
+  // snapshot reports `"macOS"` and `"Windows"` (see `_platform_label` in
+  // kiro_prerequisite.py), while Mochi's shell hands us raw `process.platform`
+  // values (`"darwin"`, `"win32"`). BOTH spellings have to classify the same way
+  // or an affordance is worded and gated by which surface asked: matching only
+  // `"darwin"` collapsed every macOS gateway to `'other'`, so a Mac user was
+  // offered the generic "Show in file manager" instead of Finder.
+  const lower = platform.toLowerCase()
+  if (lower === 'darwin' || lower === 'macos') return 'darwin'
+  // A lowercase-only `startsWith('win')` would likewise collapse the display
+  // label to `'other'` and mis-gate every Windows-only affordance.
+  if (lower.startsWith('win')) return 'windows'
   return 'other'
 }
 

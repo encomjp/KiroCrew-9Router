@@ -35,9 +35,10 @@ retrieval at all: against a lockfile pinning a tarball that 404s, measured,
 ``npm ci --dry-run --ignore-scripts`` exits 0 and reports "added 1 package"
 while the same command without ``--dry-run`` exits 1 on the missing tarball. A
 dry run would therefore pass exactly the case this module exists to catch, so
-the probe has to fetch. The cost of that honesty is one script-free install per
-sync -- seconds against a warm cache -- which is cheap next to the emptied
-``node_modules`` it prevents.
+the probe has to fetch. That install is cheap next to the emptied
+``node_modules`` it prevents -- and it is no longer paid on every sync:
+:func:`_install_already_proven` skips it when the incoming ref touches nothing
+under ``website/`` and a populated tree is already there to answer for it.
 
 The flags otherwise MIRROR the real step exactly. A probe that resolves
 differently from the install is worse than no probe: it either passes what will
@@ -262,6 +263,87 @@ def _extract(git: str, repo: str, ref: str, subdir: str, dest: Path) -> tuple[in
     return None
 
 
+def _install_already_proven(git: str, repo: str, ref: str) -> str | None:
+    """Reason to SKIP the probe install, or ``None`` to run it.
+
+    The probe answers "can the INCOMING lockfile be installed?", and it pays a
+    real script-free install to answer honestly. But when the incoming ref
+    changes NOTHING under ``website/``, that question has already been put to
+    disk: no new resolution is arriving, and a populated ``node_modules`` sits
+    beside the one that is already there. Re-deriving it costs a full scratch
+    install on every backend-only sync -- the common case, since most syncs move
+    Python and never touch the frontend half at all.
+
+    Both halves are load-bearing, and the skip is refused unless both hold:
+
+    * **The whole frontend subtree is unchanged**, not merely its resolution
+      inputs. Comparing only ``package-lock.json`` / ``package.json`` /
+      ``.npmrc`` was not enough, and the gap is worth stating because it is
+      subtle: with those three identical but frontend SOURCE changed, a skipped
+      probe lets the merge land, and a failing ``npm ci`` afterwards leaves the
+      checkout with new source and the previously-built bundle. Requiring the
+      entire subtree to be identical makes that unreachable -- with no frontend
+      change there is no new bundle to be missing, so a failed sync leaves the
+      frontend byte-for-byte as it was.
+    * **A populated tree to point at.** With no ``node_modules`` there is no
+      evidence at all -- so a fresh checkout's first sync still probes, which is
+      exactly when the answer is least known. Populated rather than merely
+      present, because an interrupted ``npm ci`` can leave an empty directory
+      behind and an empty tree proves nothing.
+
+      Be precise about what populated does NOT prove: it is evidence, not a
+      verified install. A prior FRONTEND sync whose post-merge ``npm ci`` died
+      partway can leave a partial tree beside the merged lockfile, and a later
+      backend-only sync will skip on it -- the subtree is unchanged from there
+      on, so nothing re-examines it. That stays benign for the same reason the
+      dead-registry residual does: the skip decides only whether this sync PAYS
+      for a rehearsal, so a refusal lands one step later instead of never, and
+      the transaction keeps the checkout consistent either way. The evidence test
+      tracked in #7132 should cover this scenario and not only the interrupted
+      one.
+
+    What makes skipping SAFE rather than merely cheap is where a failure lands.
+    The probe exists because ``npm ci`` deletes ``node_modules`` first, so a
+    refusal after the merge used to leave new source beside an emptied tree.
+    Under this condition that outcome is not reachable: the runner's transaction
+    moves the tree aside and puts it back on any non-zero step, the lockfile did
+    not change, and neither did the source the bundle was built from.
+    A skipped probe can only leave a state a later ``npm ci`` fixes.
+
+    ``git diff`` rather than a byte comparison of the resolution files, because
+    the question is about the whole subtree and git already answers exactly that
+    against the working tree. Anything it cannot answer -- a failing or missing
+    git, a timeout -- returns ``None`` and the probe runs, so the unknown case
+    costs an install rather than a guarantee.
+    """
+    try:
+        proc = subprocess.run(  # nosec B603 - argv list, no shell
+            [git, "-C", repo, "diff", "--name-only", ref, "--", _FRONTEND_SUBDIR],
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0 or (proc.stdout or b"").strip():
+        # Non-zero: the comparison could not be made, so nothing is established.
+        # Non-empty: at least one path under the frontend half differs.
+        return None
+    node_modules = Path(repo) / _FRONTEND_SUBDIR / "node_modules"
+    try:
+        if not any(node_modules.iterdir()):
+            return None
+    except OSError:
+        # Absent, a file, or unreadable -- in every case there is no tree to
+        # treat as evidence, so probe.
+        return None
+    return (
+        f"skipped the install: the incoming ref changes nothing under "
+        f"{_FRONTEND_SUBDIR}/ and its node_modules is populated, so no new "
+        "resolution is arriving and no new bundle is owed"
+    )
+
+
 def probe(
     *,
     git: str,
@@ -292,6 +374,14 @@ def probe(
         failure = _extract(git, repo, ref, _FRONTEND_SUBDIR, tmp)
         if failure:
             return failure
+        # Asked AFTER the extraction, which is deliberate rather than leftover:
+        # `_extract` is what establishes that the incoming ref carries a readable
+        # lockfile at all, and that precondition should hold before any verdict
+        # is returned. Three small `git show` calls are nothing against the
+        # install being skipped.
+        proven = _install_already_proven(git, repo, ref)
+        if proven:
+            return EXIT_OK, proven
         try:
             proc = subprocess.run(  # nosec B603 - argv list, no shell
                 [npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
@@ -355,7 +445,12 @@ def main(argv: list[str] | None = None) -> int:
         ref=args.ref,
     )
     if code == EXIT_OK:
-        print(f"{DETAIL_PREFIX}incoming lockfile is installable", flush=True)
+        # The detail carries the SKIP reason when the install was not needed, and
+        # is empty when it ran and passed. Printing it rather than the generic
+        # line is what keeps a skipped probe visible: an operator reading the run
+        # log should never have to infer from a missing pause that the safety
+        # step did not run.
+        print(f"{DETAIL_PREFIX}{detail or 'incoming lockfile is installable'}", flush=True)
         return EXIT_OK
     # The DIAGNOSIS travels as the exit code, which the gateway maps through
     # explain_exit(). Only a human-readable detail goes to stdout, and it is log

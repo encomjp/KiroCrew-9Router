@@ -1578,6 +1578,39 @@ class TestKnowledgeRoutes:
         assert any("'synced'" in s for s in statuses)
 
     @pytest.mark.asyncio
+    async def test_ingest_store_statements_run_off_the_event_loop(self, _isolate: Path):
+        """Issue #7020's loop-stall class: every store statement for the
+        to-knowledge flow must run in a worker thread, so a lock wait on the
+        store's busy timeout stalls a thread instead of the event loop (which
+        the watchdog would kill). Pins add_source, the syncing/synced UPDATEs,
+        and their commits to non-loop threads."""
+        import threading
+
+        cid = _campaign()
+        (h._campaign_dir(cid) / "FINDINGS.md").write_text("findings body")
+        loop_thread = threading.get_ident()
+        seen_threads: list[int] = []
+
+        def _record(*_a, **_k):
+            seen_threads.append(threading.get_ident())
+            return MagicMock()
+
+        store = MagicMock()
+        store.get_source_by_uri.side_effect = lambda *_a: (_record(), None)[1]
+        store.add_source.side_effect = lambda **_k: (_record(), 11)[1]
+        store.db.execute.side_effect = _record
+        store.db.commit.side_effect = _record
+        pipeline = SimpleNamespace(ingest_file=AsyncMock())
+        app = _app(state=SimpleNamespace(knowledge_store=store), knowledge_pipeline=pipeline)
+        resp = await h._handle_to_knowledge(_mk("POST", "k", app=app, match={"id": cid}))
+        assert resp.status == 201
+        await _drain_bg_tasks(app)
+        # get_source_by_uri + add_source + 2 UPDATEs + 2 commits all recorded,
+        # none on the loop.
+        assert len(seen_threads) >= 6
+        assert all(t != loop_thread for t in seen_threads)
+
+    @pytest.mark.asyncio
     async def test_ingest_failure_marks_the_source_errored(self, _isolate: Path):
         cid = _campaign()
         (h._campaign_dir(cid) / "FINDINGS.md").write_text("findings body")

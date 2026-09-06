@@ -12,11 +12,14 @@
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
-/** Default threshold: sessions idle for more than two days collapse. */
-export const DEFAULT_STALE_COLLAPSE_MS = 2 * DAY_MS
+/** Default threshold: sessions idle for more than a week collapse. Deliberately
+ *  generous — the collapse exists to de-noise settled work, and a shorter
+ *  default hid sessions people still considered current, making the list feel
+ *  incomplete rather than tidy. */
+export const DEFAULT_STALE_COLLAPSE_MS = 7 * DAY_MS
 
 /** Menu presets. 0 disables the feature entirely (no expander rows render). */
-export const STALE_COLLAPSE_PRESETS_MS: readonly number[] = [0, DAY_MS, 2 * DAY_MS, 7 * DAY_MS]
+export const STALE_COLLAPSE_PRESETS_MS: readonly number[] = [0, DAY_MS, 2 * DAY_MS, 7 * DAY_MS, 14 * DAY_MS]
 
 /**
  * How often the sidebar re-evaluates staleness while the feature is on.

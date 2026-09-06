@@ -28,12 +28,14 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
     from kiro_crew.platform.interfaces import (
         AgentCatalogProvider,
         AgentExecutableResolver,
+        AgentIdentityProvider,
         AgentRuntime,
         AppRegistryPolicy,
         AppsLoader,
         CapabilityManager,
         CredentialPolicy,
         DashboardContributor,
+        DeniedRuleProvider,
         EmbeddingSource,
         ExternalAccessPolicy,
         FeatureApp,
@@ -42,13 +44,16 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
         JailProvider,
         KnowledgeProvider,
         McpToolingProvider,
+        MobileConnectProvider,
         PackageManager,
         PromptSourceProvider,
         ProviderRegistry,
         PublishRegistry,
         SandboxPolicy,
+        SkillDiscoveryProvider,
         SlackEnterpriseGate,
         TelemetryProvider,
+        TipsProvider,
         TunnelProvider,
     )
     from kiro_crew.platform.security_authority import PolicyAuthority
@@ -64,7 +69,7 @@ if TYPE_CHECKING:  # avoid import cycles — config.loader imports heavy modules
 # incrementing this only after the first public release, when a separately-built
 # companion can pin against a frozen contract.  (Every seam added pre-launch —
 # the ``governance`` carrier, then the ``knowledge``/``dashboard``/``jail``
-# extension points — landed under this same v1, no bump.)
+# extension points, then ``agent_identity`` — landed under this same v1, no bump.)
 CONTRACT_VERSION = 1
 
 _logger = logging.getLogger(__name__)
@@ -283,10 +288,24 @@ class PlatformContext:
     slack_gate: "SlackEnterpriseGate"
     # ``whoami``/``issuer`` are [RESERVED] — see RESERVED_METHODS.
     identity: "IdentityProvider"
+    # Agent workload identity / token vending. Distinct from ``identity``
+    # (operator SSO). v1 addition (no CONTRACT_VERSION bump).
+    agent_identity: "AgentIdentityProvider"
     embeddings: "EmbeddingSource"  # [RESERVED] — see RESERVED_SLOTS
     mcp_tooling: "McpToolingProvider"
     agent_catalog: "AgentCatalogProvider"
     prompt_sources: "PromptSourceProvider"
+    skill_discovery: "SkillDiscoveryProvider"
+    # The edition's feature-tip pool. The one REPLACE-capable seam in this
+    # contract: a supplied pool takes over from the public curated file AND the
+    # docs-scan catalog rather than being unioned into them, because a public tip
+    # advertises a capability an edition build may not have. v1 addition (no
+    # CONTRACT_VERSION bump).
+    tips: "TipsProvider"
+    # Edition-contributed denied-command rules the OPERATOR can switch off.
+    # Distinct from ``security`` (the un-weakenable overlay floor).
+    # v1 addition (no CONTRACT_VERSION bump).
+    denied_rules: "DeniedRuleProvider"
     import_sources: "ImportSourceProvider"
     capability_manager: "CapabilityManager"
 
@@ -302,6 +321,7 @@ class PlatformContext:
     telemetry: "TelemetryProvider"
     dashboard: "DashboardContributor"
     jail: "JailProvider"
+    mobile_connect: "MobileConnectProvider"
 
     # ── bundled feature apps ──
     feature_apps: "Tuple[FeatureApp, ...]"  # [RESERVED] — see RESERVED_SLOTS
@@ -382,13 +402,139 @@ _ACTIVE: Optional[PlatformContext] = None
 _GOVERNANCE_GENERATION = 0
 _GENERATION_LOCK = threading.Lock()
 
+# Callbacks run on every DECLARED install of ``_ACTIVE`` (every one except the silent
+# lazy default -- see ``register_ceiling_install_hook``), so a consumer that must
+# re-derive something from the new ceiling is PUSHED the change instead of polling.
+#
+# The alternative — every consumer re-reading governance behind a TTL cache — was
+# tried for the ``approval_modes`` YOLO verdict and is what this registry replaces:
+# a cache needs a freshness key, a three-state "not resolved under this ceiling yet"
+# verdict, and an off-loop refresh, and each of those carries its own window in
+# which a stale answer is served. An install is a discrete event, so a consumer told
+# about it holds an answer that is either current or does not exist.
+#
+# A registry rather than a direct import because the consumers sit ABOVE this module
+# (``safety_override`` already imports from here), so calling into them by name would
+# be a cycle. Each registers itself at its own import.
+_CEILING_INSTALL_HOOKS: "list[Callable[[Optional[PlatformContext]], None]]" = []
+# Run BEFORE ``_ACTIVE`` is reassigned, so a consumer can invalidate what it derived
+# from the OUTGOING ceiling while the incoming one is not yet visible.
+#
+# Publishing first and invalidating after leaves a window whose width is a full
+# governance resolution: the new ceiling is live, the derived answer still belongs to
+# the retired one, and a concurrent authorization read is decided by the stale answer.
+# For an authorization consumer that window is a bypass, so invalidation cannot be the
+# second half of the install -- it has to be the first.
+_CEILING_INVALIDATE_HOOKS: "list[Callable[[], None]]" = []
+_HOOKS_LOCK = threading.Lock()
 
-def _install(ctx: Optional[PlatformContext]) -> None:
-    """Assign ``_ACTIVE`` and bump the generation.  The single writer."""
+
+def register_ceiling_install_hook(cb: "Callable[[Optional[PlatformContext]], None]") -> None:
+    """Call ``cb(ctx)`` after every DECLARED install of the active context.
+
+    ``ctx`` is the context just installed, or ``None`` for :func:`reset_context` —
+    a hook that caches something ceiling-derived should treat ``None`` as "there is
+    no ceiling to derive from" rather than as a ceiling that permits everything.
+
+    "Declared" excludes ONE install: the lazy default :func:`current_context` composes
+    when nothing was installed. That one is reached from inside a governance read (the
+    profile store resolves the active context to build its freshness key), so a hook
+    that reads governance would call back into a store that is mid-load and be handed
+    its fail-closed "not loaded" answer -- a verdict about nothing. It also needs no
+    hook: a consumer cannot be holding anything derived from a ceiling before the first
+    derivation happens, and that first derivation is what triggers the lazy install.
+
+    Idempotent per callable, so a module imported twice under different names does
+    not get its hook run twice. Registration does NOT replay the install that may
+    already have happened: a hook that needs to cope with being registered late must
+    say so itself (see ``safety_override.yolo_policy_permits``), because resolving
+    governance from inside an import is how import cycles are born.
+    """
+    with _HOOKS_LOCK:
+        if cb not in _CEILING_INSTALL_HOOKS:
+            _CEILING_INSTALL_HOOKS.append(cb)
+
+
+def register_ceiling_invalidate_hook(cb: "Callable[[], None]") -> None:
+    """Call ``cb()`` just BEFORE a declared install replaces the active context.
+
+    For a consumer whose derived value is an AUTHORIZATION answer. ``cb`` must make
+    that value fail closed and must do no I/O and take no lock a reader might hold:
+    it runs on the install path, ahead of the new ceiling becoming visible, and the
+    matching install hook writes the real answer immediately afterwards. It is told
+    nothing about the incoming ceiling on purpose -- its only job is to stop serving
+    the outgoing one.
+
+    Paired with :func:`register_ceiling_install_hook` and skipped on exactly the same
+    one install (the lazy default), so a consumer registering both is masked and
+    re-resolved as a unit.
+    """
+    with _HOOKS_LOCK:
+        if cb not in _CEILING_INVALIDATE_HOOKS:
+            _CEILING_INVALIDATE_HOOKS.append(cb)
+
+
+def _notify_ceiling_invalidating() -> None:
+    """Run the pre-publication invalidate hooks. Never raises.
+
+    A hook that raises must not stop the install, and it cannot leave a consumer
+    fail-OPEN either: the hooks here only ever withdraw a derived permission, so a
+    failure at worst leaves the previous answer in place -- which is the same state
+    publishing-then-invalidating had, and the install hook still corrects it.
+    """
+    with _HOOKS_LOCK:
+        hooks = list(_CEILING_INVALIDATE_HOOKS)
+    for cb in hooks:
+        try:
+            cb()
+        except Exception:
+            _logger.debug("ceiling invalidate hook %r failed", cb, exc_info=True)
+
+
+def _notify_ceiling_installed(ctx: Optional[PlatformContext]) -> None:
+    """Run the install hooks. Called with NO lock held, and never raises.
+
+    Outside ``_GENERATION_LOCK`` deliberately: a hook resolves governance, which
+    reads :func:`governance_generation` through ``ProfileStore``'s freshness key —
+    and that takes the same non-reentrant lock, so calling a hook while holding it
+    deadlocks the install. A hook that raises must not take the install down with
+    it either: the context IS installed by the time these run, so a failed hook
+    leaves a stale derived value, not a half-installed ceiling.
+    """
+    with _HOOKS_LOCK:
+        hooks = list(_CEILING_INSTALL_HOOKS)
+    for cb in hooks:
+        try:
+            cb(ctx)
+        except Exception:
+            _logger.debug("ceiling install hook %r failed", cb, exc_info=True)
+
+
+def _install(ctx: Optional[PlatformContext], *, notify: bool = True) -> None:
+    """Assign ``_ACTIVE``, bump the generation, then push to the hooks.
+
+    The single writer of ``_ACTIVE``, which is what makes the hooks complete: every
+    declared install -- boot, ``policy_distribution.apply_ceiling``, the test reset --
+    goes through here, so no install site can forget to announce itself.
+
+    Three phases, and the ORDER is the point. Invalidation runs first, so no consumer
+    serves an answer derived from the outgoing ceiling once the incoming one is live;
+    then the context is published; then the install hooks resolve the real answer
+    against it. Publishing before invalidating leaves a governance-resolution-wide
+    window in which the new ceiling is in force and the old answer is still being
+    handed out -- for an authorization answer, a bypass.
+
+    ``notify=False`` is for the lazy default alone; see
+    :func:`register_ceiling_install_hook` for why that one install is silent.
+    """
     global _ACTIVE, _GOVERNANCE_GENERATION
+    if notify:
+        _notify_ceiling_invalidating()
     with _GENERATION_LOCK:
         _ACTIVE = ctx
         _GOVERNANCE_GENERATION += 1
+    if notify:
+        _notify_ceiling_installed(ctx)
 
 
 def governance_generation() -> int:
@@ -411,6 +557,67 @@ def set_context(ctx: PlatformContext) -> None:
     _install(ctx)
 
 
+# ── Declared no-I/O peek callers ──
+#
+# ``installed_context()`` is the one context accessor that does NOT take the
+# fail-closed path: where ``current_context()`` refuses to compose open-source
+# defaults on a non-standalone host, the peek simply answers ``None``.  That is
+# safe only where the no-context answer is already the conservative one — and
+# that is a property of the CALLER, not of this function, so the function cannot
+# check it.
+#
+# For a while nothing did.  The contract lived in the docstring below and in
+# ``docs/system-specs/modules/platform-context.md``, and the caller set grew from
+# one to three with nothing objecting — the spec sentence naming "the one such
+# caller" was still describing a set of three.
+#
+# So the caller set is declared HERE and gated by
+# ``test_platform_cpp_seam_coverage.py``, the same declared-map-plus-AST-scan
+# shape :data:`RESERVED_SLOTS` uses, rot-proof in both directions:
+#
+#   1. Every call site of ``installed_context()`` in the package must appear in
+#      this map.  A new peek fails the build until its author writes down why ITS
+#      no-context answer is conservative — the review question the docstring
+#      could only ask politely.
+#   2. Every entry must still have a real call site.  A caller that is deleted or
+#      renamed takes its entry with it, so the map cannot decay into a list of
+#      permissions nobody exercises.
+#
+# The gate is a forcing function, not a proof: it cannot verify that a written
+# justification is TRUE.  What it removes is the silent path — adding a peek now
+# costs a diff to the very file whose fail-closed contract is being bypassed, and
+# every justification lands in front of a reviewer.
+#
+# Keys are ``"<path under src/kiro_crew>::<enclosing function>"``.  Each value
+# must contain the phrase ``no-context answer`` so the justification is greppable
+# and cannot dodge the question it exists to answer.
+PEEK_CALLERS: "dict[str, str]" = {
+    "security.py::_exempt_exact_hosts": (
+        "no-context answer is the empty exempt-host set, which means MORE "
+        "redaction: every host runs the base64-blob / query-length heuristics. "
+        "The lookup can only ever RELAX those heuristics, never the hard-"
+        "credential floor, so an absent context cannot be the reason a "
+        "credential survives — it is stricter than any companion-supplied "
+        "exemption list could be."
+    ),
+    "platform/context.py::redact_log_via_context": (
+        "no-context answer is the full OSS baseline redaction pass, which is "
+        "byte-for-byte what each of these log sites did before adopting the "
+        "helper. Nothing in that state evidences a companion whose policy is "
+        "being skipped; the genuine downgrade case — a context IS installed and "
+        "its policy failed to compose — is handled separately by withholding "
+        "the line's text (LOG_WITHHELD_PLACEHOLDER)."
+    ),
+    "platform/governance.py::active_policy_distribution": (
+        "no-context answer is an unconfigured PolicyDistribution, i.e. no "
+        "central fetch. It is reached only when boot never installed a context, "
+        "and then this process holds no ceiling to refresh and runs no refresher "
+        "against one; it is also exactly what this function's own except-branch "
+        "returns, so the peek cannot produce an answer its error path would not."
+    ),
+}
+
+
 def installed_context() -> Optional[PlatformContext]:
     """The INSTALLED context, or ``None``. Never resolves, never raises, no I/O.
 
@@ -425,6 +632,11 @@ def installed_context() -> Optional[PlatformContext]:
     Use this ONLY where the no-context answer is already the conservative one.
     A caller that must honour a companion's policy has to go through
     ``current_context()`` and take the fail-closed error.
+
+    Every call site must be declared in :data:`PEEK_CALLERS` with the reason its
+    no-context answer is conservative; ``test_platform_cpp_seam_coverage.py``
+    fails the build on an undeclared peek, and on a declaration whose call site
+    is gone.
     """
     return _ACTIVE
 
@@ -478,8 +690,12 @@ def current_context() -> PlatformContext:
                 "open-source defaults (fail-closed). Boot did not run or failed "
                 "to compose the companion."
             )
+        # Silent: this runs INSIDE a governance read (the profile store resolves the
+        # active context for its freshness key), so notifying here would re-enter a
+        # store that is mid-load. Nothing needs it -- see
+        # ``register_ceiling_install_hook``.
         ctx = build_default_context(cfg, profile=PROFILE_STANDALONE)
-        _install(ctx)
+        _install(ctx, notify=False)
         # Return the value just built rather than re-reading the global: the read
         # would need a narrowing cast, and another thread could have installed a
         # different context between the install and the read.
@@ -652,3 +868,74 @@ def redact_via_context(text: str) -> str:
         from kiro_crew.security import redact as _security_redact
 
         return _security_redact(text)
+
+
+#: Substituted for a log line's text when redaction could not be composed. Names
+#: the cause, because on the host where this fires the operator's real problem is
+#: the failed companion composition, not the missing line.
+LOG_WITHHELD_PLACEHOLDER = "<withheld: redaction unavailable>"
+
+
+def redact_log_via_context(text: str) -> str:
+    """Context-aware redaction for an operational LOG line, which must not raise.
+
+    Same redaction as :func:`redact_via_context` -- so a loaded companion's extra
+    credential/cookie regexes apply instead of the OSS baseline -- but it never
+    propagates :class:`PlatformCompositionError` to the caller.
+
+    Why a log site needs its own spelling. ``redact_via_context`` re-raises that
+    error deliberately: for an EGRESS sink, refusing to send is both safe and the
+    whole point. A gate-side log line is not an egress boundary, and there the
+    same raise buys nothing while costing availability -- several of these sites
+    log from a path whose failure is worse than a missing line (a background
+    drain, a boot-time install step, an audit write).
+
+    The two no-companion states are NOT the same, and conflating them is what
+    makes this helper subtle:
+
+    * **A context is installed but its policy could not be composed.** The host
+      is known to be non-standalone and its companion genuinely failed, so the
+      baseline would be a real downgrade -- exactly what
+      ``redact_via_context``'s fail-closed contract exists to forbid. The line's
+      TEXT is withheld (:data:`LOG_WITHHELD_PLACEHOLDER`): strictly safer than
+      either raising or downgrading, and the caller's own log call still records
+      that a line arrived and why its content is absent. Same shape as
+      ``auto_improvement.backend.mcp_server._redact_result``.
+    * **No context is installed at all.** Nothing here evidences a companion,
+      the full OSS pass still runs, and this is byte-for-byte what the site did
+      before it adopted this helper -- so withholding would DESTROY diagnostics
+      to protect against a companion that may not exist. Baseline it is. A
+      process that deliberately does not compose (``mcp_gateway.gatewayd`` is
+      one: see ``mcp_gateway/app_call.py``, "this daemon is not the composition
+      process") therefore keeps its logs, and closing that residual properly
+      means handing such a process a composed context -- a separate change, and
+      the same remedy that module already names for the security ceiling.
+
+    Transient (non-composition) adapter errors degrade to baseline, inherited
+    from ``redact_via_context``, so a merely flaky companion does not blank the
+    logs either.
+
+    Costs NO I/O per call. ``installed_context()`` is a bare attribute read, and
+    it is the right primitive here for the reason its own contract gives -- the
+    no-context answer is the SAME as the default-context answer, since
+    ``DefaultCredentialPolicy.redact`` delegates to ``security.redact``, so
+    resolving one would be pure cost. That matters because
+    ``current_context()`` never memoizes its fail-closed verdict on a
+    non-standalone profile, so a per-line caller reaching it would re-pay a
+    config load and an entry-point discovery for every line on the event loop
+    (``docs/system-specs/modules/platform-context.md`` calls this out). Once a
+    context IS installed the delegation below is also just an attribute read, so
+    no path resolves.
+
+    Callers keep their own truncation, and must apply it AFTER this returns:
+    slicing a redacted string is what keeps a credential from surviving as an
+    unmatchable fragment.
+    """
+    if installed_context() is None:
+        from kiro_crew.security import redact as _security_redact
+
+        return _security_redact(text)
+    try:
+        return redact_via_context(text)
+    except PlatformCompositionError:
+        return LOG_WITHHELD_PLACEHOLDER

@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { useQuery } from '@tanstack/react-query'
 import { FileText, Folder, Eye } from 'lucide-react'
 import { api } from '../api/client'
+import ErrorNotice from './ErrorNotice'
 import { useListKeyboardNav } from '../hooks/useListKeyboardNav'
 import { menuGeometry, bottomUpOrder } from '../lib/pickerMenu'
 import type { SendMode } from '../pages/chat/ChatSettings'
@@ -35,9 +36,9 @@ interface Props {
   onFileOpen?: (path: string) => void
   project?: string
   /**
-   * The composer's effective send binding (see ChatInput's SendMode). Only
-   * consulted for the settled-empty copy: in 'ctrl-enter' mode a bare Enter
-   * is not a send key, so the empty state must not promise "Enter sends".
+   * The composer's effective send binding (see ChatInput's SendMode). Consulted
+   * for every empty-state copy: in 'ctrl-enter' mode a bare Enter is not a send
+   * key, so the empty state must not name it as sending or as the held sender.
    */
   sendOnEnter?: SendMode
 }
@@ -192,25 +193,60 @@ export default function FilePickerMenu({ query, anchorRef, open, onSelect, onClo
 
   if (!open || !anchorRef.current) return null
 
-  const { top, left, width, maxHeight } = menuGeometry(anchorRef.current, results.length, 48)
+  const { above, top, bottom, left, width, maxHeight } = menuGeometry(anchorRef.current, results.length, 48)
 
-  const empty = query.length < 2
-    ? <div className="px-3 py-3 text-[12px] text-muted">{i18nT('components.filePickerMenu.type_2_chars_to_search_files')}</div>
+  // 'ctrl-enter' makes a bare Enter a newline, so naming it as the send key —
+  // held or releasing — would be false there.
+  const ctrl = sendOnEnter === 'ctrl-enter'
+
+  // Enter AND Tab are swallowed while the gate is closed, so Send is not
+  // keyboard-reachable — the copy names Escape, whose branch runs before them.
+  const emptyKey = query.length < 2
+    ? (ctrl
+        ? 'components.filePickerMenu.type_2_chars_to_search_files_ctrl_enter_held'
+        : 'components.filePickerMenu.type_2_chars_to_search_files_enter_held')
     : isFetching
-    ? <div className="px-3 py-3 text-[12px] text-muted">{i18nT('components.filePickerMenu.searching')}</div>
-    // Enter's meaning flips with the release gate (pick → send), so the copy
-    // must announce it at the point of action rather than silently sending.
-    // Named per the composer's send binding: in 'ctrl-enter' mode a bare
-    // Enter is a newline, so promising "Enter sends" there would be false.
-    : <div className="px-3 py-3 text-[12px] text-muted">{i18nT(!releaseKeysWhenEmpty ? 'components.filePickerMenu.no_matches' : sendOnEnter === 'ctrl-enter' ? 'components.filePickerMenu.no_matches_ctrl_enter_sends' : 'components.filePickerMenu.no_matches_enter_sends')}</div>
+    ? (ctrl
+        ? 'components.filePickerMenu.searching_ctrl_enter_held'
+        : 'components.filePickerMenu.searching_enter_held')
+    // Enter's meaning flips with the gate (pick → send), so the copy announces
+    // it; the plain arm is the ≤200ms debounce flash between two announced ones.
+    : !releaseKeysWhenEmpty
+    ? 'components.filePickerMenu.no_matches'
+    : ctrl
+    ? 'components.filePickerMenu.no_matches_ctrl_enter_sends'
+    : 'components.filePickerMenu.no_matches_enter_sends'
+
+  // One region for every empty state, so a transition is a text change inside a
+  // live region rather than a mount — what screen readers announce least well.
+  const empty = <div role="status" className="px-3 py-3 text-[12px] text-muted">{i18nT(emptyKey)}</div>
+
+  // A SETTLED search failure gets its own surface: the ordinary "no matches"
+  // copy would claim the search ran and found nothing, when it did not run at
+  // all. Rendered above whatever (stale, placeholder) results are still on
+  // screen so the keyboard gate above keeps working unchanged.
+  const searchFailed = isError && query.length >= 2 && debounced === query && !isFetching
 
   return createPortal(
     <div
       className="fixed z-[9999] bg-card border border-border rounded-lg shadow-lg overflow-y-auto py-1 animate-slide-up"
       role="listbox"
-      style={{ top, left, width: Math.min(width, 420), maxHeight }}
+      style={{ ...(above ? { bottom } : { top }), left, width: Math.min(width, 420), maxHeight }}
     >
-      {results.length === 0 ? empty : results.map((f, i) => {
+      {searchFailed && (
+        <div className="px-3 py-2">
+          {/* No hand-off: the composer draft this picker is completing an
+              @-mention inside is unsaved — the hand-off would navigate away
+              from it. */}
+          <ErrorNotice
+            variant="inline"
+            className="whitespace-normal"
+            message={i18nT('components.filePickerMenu.search_failed')}
+            testId="file-picker-search-error"
+          />
+        </div>
+      )}
+      {results.length === 0 ? (searchFailed ? null : empty) : results.map((f, i) => {
         const kind = resultKind(f)
         const isDir = kind === 'dir'
         return (

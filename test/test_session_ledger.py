@@ -1,6 +1,6 @@
 """Session work ledger — core primitive, nudge injection, routes, cleanup.
 
-Covers the contracts docs/system-specs/features/session-work-ledger.md pins:
+Covers the contracts docs/system-specs/modules/session-work-ledger.md pins:
 exact-key identity (lossless fold, no channel-key collisions), directory
 guarding, the crash-atomic phase-requires-event discipline, partial updates
 preserving stored state, bounds (tried/events/artifacts/state-file size), the
@@ -12,7 +12,9 @@ purge.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -245,6 +247,183 @@ def test_coerce_preserves_unknown_fields():
     assert state["tried"] == []
 
 
+# -- the bounded write reports what it discards -----------------------------
+
+
+def test_record_returns_exactly_what_landed_on_disk(monkeypatch):
+    """``record``'s return value is the authoritative post-write view.
+
+    The dashboard handler puts it straight into ``{"ok": True, "state": ...}``
+    and the MCP tool reports it as "what is now recorded", so it must not
+    describe entries the write budget evicted. ``_serialize_bounded`` evicts
+    from the very dict ``record`` returns, which is what keeps the two equal;
+    serializing a copy instead would return the pre-eviction lists while disk
+    held the evicted ones. Pinned so that aliasing is not "cleaned up" later.
+    """
+    key = "chat-62-90a"
+    sl.record(key, goal="keep me", event="seed", event_kind="progress")
+    for i in range(4):
+        sl.record(key, tried_approach=f"a{i}", tried_rejected_because="x" * 400)
+        sl.record(key, event=f"e{i}" + "y" * 400, event_kind="progress")
+    path = sl.ledger_dir(key) / sl._STATE_FILE
+    before = json.loads(path.read_text(encoding="utf-8"))
+
+    # Squeeze the ceiling so the budget lands just UNDER the current document:
+    # the next write must evict, while the read that precedes it still passes
+    # the same ceiling's file-size guard. Derived from the real size so a
+    # timestamp-width change cannot silently turn this into a no-op.
+    size = path.stat().st_size
+    monkeypatch.setattr(sl, "_MAX_STATE_BYTES", size + 4096 - 200)
+    returned = sl.record(key, next_step="advance")
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+
+    kept = len(returned["events"]) + len(returned["tried"])
+    assert kept < len(before["events"]) + len(before["tried"]), "no eviction happened"
+    assert returned["events"] or returned["tried"], "eviction emptied the history entirely"
+    assert returned == on_disk, "the caller's post-write view diverged from disk"
+    assert returned["goal"] == "keep me"
+
+
+class TestBoundedWriteIsLoudAboutLoss:
+    """``_serialize_bounded`` drops history to keep the document readable.
+
+    That data never reaches disk, so — unlike the read side, where the
+    original file survives until a write-back — the loss is unrecoverable the
+    moment the write lands. ``_read_state_unlocked`` already WARNs when the
+    same ceiling makes it discard a whole file; these pin that the partial
+    discard is reported too, that the counts are named, that a refused write
+    still reports, and that a document which fits stays silent.
+    """
+
+    def _warnings(self, caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING and "serialization budget" in r.getMessage()
+        ]
+
+    def _over_budget_state(self, extra_events: int = 6) -> dict[str, Any]:
+        state = sl._empty_state()
+        state["goal"] = "survives"
+        state["events"] = [
+            {"ts": "t", "kind": "progress", "text": "e" * 200} for _ in range(extra_events)
+        ]
+        state["tried"] = [
+            {"approach": "a" * 200, "rejected_because": "r" * 200, "at": "t"} for _ in range(3)
+        ]
+        return state
+
+    def test_a_record_that_fits_logs_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        """The control that makes this safe to ship: no discard, no line.
+        Without it every ledger write would emit a WARNING."""
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            sl.record("chat-62-fits", goal="small", event="tiny", event_kind="note")
+        assert self._warnings(caplog) == []
+
+    def test_evicted_history_is_counted(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sl, "_MAX_STATE_BYTES", 4096 + 600)
+        state = self._over_budget_state()
+        before_events, before_tried = len(state["events"]), len(state["tried"])
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            blob = sl._serialize_bounded(state, source="chat-62-abcd1234")
+        found = self._warnings(caplog)
+        assert len(found) == 1, f"the discard was silent (warnings: {found})"
+        msg = found[0]
+        evicted_events = before_events - len(state["events"])
+        assert evicted_events > 0, "fixture did not cross the budget"
+        assert f"oldest events[] evicted x{evicted_events}" in msg
+        assert "chat-62-abcd1234" in msg, "the line must name which ledger lost data"
+        # Reporting the loss changes nothing about what is kept or written.
+        assert len(blob.encode("utf-8")) <= sl._MAX_STATE_BYTES - 4096
+        assert json.loads(blob) == state
+        assert json.loads(blob)["goal"] == "survives"
+        if len(state["tried"]) < before_tried:
+            assert f"oldest tried[] evicted x{before_tried - len(state['tried'])}" in msg
+
+    def test_dropped_unknown_fields_are_named(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Forward-compat baggage from a newer writer is dropped wholesale.
+        That is the widest discard this function makes and was the quietest."""
+        monkeypatch.setattr(sl, "_MAX_STATE_BYTES", 4096 + 600)
+        state = sl._empty_state()
+        state["goal"] = "survives"
+        state["future_blob"] = "z" * 4000
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            blob = sl._serialize_bounded(state, source="chat-62-ffff0000")
+        found = self._warnings(caplog)
+        assert len(found) == 1, f"the discard was silent (warnings: {found})"
+        assert "unknown fields dropped: future_blob" in found[0]
+        assert json.loads(blob)["goal"] == "survives"
+        assert "future_blob" not in json.loads(blob)
+
+    def test_a_refused_write_reports_what_it_gutted(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The refusal raises with the in-memory record already stripped —
+        the moment an operator most needs to know what went."""
+        monkeypatch.setattr(sl, "_MAX_STATE_BYTES", 4096 + 10)
+        state = self._over_budget_state(extra_events=2)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            with pytest.raises(ValueError, match="too large"):
+                sl._serialize_bounded(state, source="chat-62-dead0000")
+        found = self._warnings(caplog)
+        assert len(found) == 1, f"the refusal was silent (warnings: {found})"
+        assert "oldest events[] evicted x2" in found[0]
+
+    def test_a_failed_write_still_reports_but_leaves_the_stored_file_intact(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Why the line describes the DOCUMENT, not a durable write.
+
+        ``atomic_write`` runs after the serializer and can fail (ENOSPC),
+        leaving the previous state file whole — so nothing was durably lost,
+        even though this call's in-memory record was already stripped. A
+        message claiming a write discarded data would be false here.
+        """
+        key = "chat-62-enospc"
+        sl.record(key, goal="on disk")
+        for i in range(5):
+            sl.record(key, event=f"e{i}" + "y" * 300, event_kind="progress")
+        path = sl.ledger_dir(key) / sl._STATE_FILE
+        before = path.read_text(encoding="utf-8")
+
+        def _boom(*a: Any, **kw: Any) -> None:
+            raise OSError(28, "No space left on device")
+
+        # Gentle squeeze: one evicted event is enough to fit, so serialization
+        # SUCCEEDS and the failing write is genuinely reached.
+        monkeypatch.setattr(sl, "_MAX_STATE_BYTES", path.stat().st_size + 4096 - 200)
+        monkeypatch.setattr(sl, "atomic_write", _boom)
+        with caplog.at_level(logging.WARNING, logger="kiro_crew.session_ledger"):
+            with pytest.raises(OSError):
+                sl.record(key, next_step="never lands")
+        found = self._warnings(caplog)
+        assert len(found) == 1, f"the discard was silent (warnings: {found})"
+        assert "oldest events[] evicted x" in found[0]
+        assert "write" not in found[0], "must not claim a write that did not happen"
+        assert path.read_text(encoding="utf-8") == before, "the stored file must be untouched"
+
+    def test_the_eviction_branch_needs_both_lists_at_scale(self) -> None:
+        """Why these tests squeeze the budget instead of using real bounds.
+
+        A full astral-script EVENT tail is ~806 KB — under the 995,904-byte
+        budget on its own, so ``test_writer_guarantees_the_read_ceiling_...``
+        never actually reaches the eviction branch. Crossing it at production
+        bounds needs ``events`` AND ``tried`` both loaded (~1.87 MB), which
+        costs 150 locked read-modify-write cycles over a multi-megabyte
+        document. Pinned as arithmetic so the reason stays visible.
+        """
+        four_byte = 4  # astral-plane char in UTF-8
+        events = sl._MAX_EVENTS * sl._MAX_TEXT * four_byte
+        tried = sl._MAX_TRIED * 2 * sl._MAX_TEXT * four_byte
+        budget = sl._MAX_STATE_BYTES - 4096
+        assert events < budget, "events alone would cross the budget; revisit the fast tests"
+        assert events + tried > budget, "the eviction branch would be unreachable"
+
+
 def test_purge_removes_dir_and_tolerates_bad_keys():
     key = "chat-10-000"
     sl.record(key, goal="x")
@@ -257,22 +436,41 @@ def test_purge_removes_dir_and_tolerates_bad_keys():
 
 @pytest.mark.skipif(not IS_POSIX, reason="flock-based holder simulation is POSIX-only")
 def test_record_fails_closed_on_held_lock(monkeypatch):
-    """A wedged cross-process holder costs one refused write (OSError), never
-    an unbounded wait — and removing the lock entirely would break this test,
-    because an unlocked record would succeed while the lock is held."""
+    """A live cross-process flock HOLDER costs one refused write (``OSError``),
+    and the refusal is bounded rather than an unbounded wait — removing the
+    lock entirely would break this test, because an unlocked record would
+    succeed while the lock is held.
+
+    Deliberately NOT asserted: a bound on a wedged FILESYSTEM/mount. The
+    pre-lock mkdir/os.open are ordinary syscalls that a dead mount can stall
+    unboundedly, and no in-process deadline can interrupt a stalled syscall
+    (see ``session_ledger._locked``). There is no portable way to simulate a
+    hung mkdir/os.open, and asserting a bound there would re-assert the
+    over-broad "never a parked worker thread" promise the docs do not make.
+    """
     import fcntl
 
+    timeout = 0.2
+    # Generous absolute ceiling: the claim under test is "bounded, not
+    # forever", so the margin only has to exclude an unbounded wait.
+    slack = 2.0
     key = "chat-lock-1"
     sl.record(key, goal="x")  # create the dir + lock inode
-    monkeypatch.setattr(sl, "_LOCK_TIMEOUT_SECS", 0.2)
+    monkeypatch.setattr(sl, "_LOCK_TIMEOUT_SECS", timeout)
     fd = os.open(str(sl.ledger_dir(key) / ".lock"), os.O_RDWR)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        start = time.monotonic()
         with pytest.raises(OSError, match="held by another process"):
             sl.record(key, goal="y")
+        elapsed = time.monotonic() - start
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+    assert elapsed < timeout + slack, (
+        f"refusal took {elapsed:.3f}s; the deadline is not governing the "
+        f"acquire poll (expected < {timeout + slack:.3f}s)"
+    )
     # Holder released: the next write goes through.
     sl.record(key, goal="z")
     assert sl.read_state(key)["goal"] == "z"

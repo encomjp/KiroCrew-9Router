@@ -106,6 +106,7 @@ class TestRestoreRecentSessions:
         assert len(slot.messages) == 2
         assert slot.messages[0]["content"] == "hello"
         assert slot.messages[1]["content"] == "hi there"
+        assert all(not (message.get("meta") or {}).get("mid") for message in slot.messages)
         assert slot._dirty is False
         assert slot._resumed_count == 2
 
@@ -386,7 +387,7 @@ class TestRestoreRecentSessions:
         # The credential is gone from what the slot-detail endpoint returns...
         from kiro_crew.dashboard.chat_utils import _prepare_messages
 
-        emitted = _prepare_messages(slot.messages, False)
+        emitted = _prepare_messages(slot.messages, False, live_child="")
         rendered = " ".join(m.get("content", "") for m in emitted)
         assert "AKIAIOSFODNN7EXAMPLE" not in rendered
         assert "[REDACTED" in rendered

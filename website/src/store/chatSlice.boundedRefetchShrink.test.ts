@@ -111,7 +111,13 @@ describe('a bounded refetch must not shrink what is already loaded', () => {
     expect(store.getState().chat.slotRun?.active).toBeUndefined()
 
     await store.dispatch(switchSlot('active'))
-    expect(limitsFor('active').at(-1)).toBeUndefined()
+    // The property, not the mechanism. This used to require the last read to be
+    // UNBOUNDED, and what satisfied that was the coverage check assuming a hole for
+    // want of an earlier server total -- the same false positive that read a whole
+    // 2,644-message transcript on a phone. A window sized to what the tab holds
+    // already reaches every cached row, so what has to be true is that the window
+    // COVERS the cache and nothing the reader had goes missing.
+    expect(limitsFor('active').at(-1)).toBeGreaterThanOrEqual(full)
     expect(visible(store)).toBe(full)
   })
 
@@ -180,6 +186,53 @@ describe('a bounded refetch must not shrink what is already loaded', () => {
     store.dispatch(setActiveSlot('other'))
     await store.dispatch(warmSlotCache('coldwarm'))
     expect(limitsFor('coldwarm')).toEqual([WARM])
+  })
+
+  /** `olderHeadAbovePage` is the ONE cut all three reducers share, so the identity rule
+   *  lives there. A bare `findIndex` cut at the FIRST row carrying the page-oldest id,
+   *  and `meta.mid` is caller-supplied (minted only when absent), so a repeated id cut
+   *  at the wrong occurrence. These two pin both directions of that rule on the warm
+   *  path, which reaches the cut without the thunk-side strict check in front of it. */
+  it('keeps the cache whole when the page-oldest id names two rows', async () => {
+    const dup = 'mid-repeated'
+    HISTORY = makeHistory(true).map((r, i) =>
+      i === 0 || i === 60 ? { ...r, meta: { mid: dup } } : r,
+    )
+    const store = makeStore()
+    store.dispatch(setActiveSlot('other'))
+    store.dispatch(hydrateSlotMessages({
+      slot: 'bg', messages: HISTORY.slice(0, 140), hasMore: false,
+      bounded: false, total: TOTAL, running: false,
+    }))
+
+    await store.dispatch(warmSlotCache('bg'))
+
+    // The ambiguous id declines the cut, and declining must not lose rows: the
+    // reducer keeps the longer prior array instead of trusting a wrong boundary.
+    const cache = store.getState().chat.slotMessages.bg
+    const kept = new Set(cache.map(m => m.content))
+    const dropped = HISTORY.slice(0, 140).filter(m => !kept.has(m.content)).map(m => m.content)
+    expect(dropped).toEqual([])
+  })
+
+  it('still cuts on an id whose rows carry no ts', async () => {
+    // Declining inside the shared cut costs the KEPT HEAD, not a round trip, so the
+    // rule only requires that the two rows do not contradict each other. Demanding a
+    // `ts` here would drop scrollback for legacy rows that have none.
+    HISTORY = makeHistory(true).map(({ ts: _ts, ...rest }) => rest as never)
+    const store = makeStore()
+    store.dispatch(setActiveSlot('other'))
+    store.dispatch(hydrateSlotMessages({
+      slot: 'bg', messages: HISTORY.slice(0, 140), hasMore: false,
+      bounded: false, total: TOTAL, running: false,
+    }))
+
+    await store.dispatch(warmSlotCache('bg'))
+
+    const cache = store.getState().chat.slotMessages.bg
+    const kept = new Set(cache.map(m => m.content))
+    const dropped = HISTORY.slice(0, 140).filter(m => !kept.has(m.content)).map(m => m.content)
+    expect(dropped).toEqual([])
   })
 
   it('leaves the cursor consistent with what is loaded', async () => {

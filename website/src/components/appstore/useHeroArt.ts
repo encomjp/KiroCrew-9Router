@@ -16,7 +16,7 @@ type HeroFields = Pick<RegistryApp, 'heroImage' | 'heroImageDark' | 'screenshots
 const SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i
 
 /**
- * Resolve a manifest art path the way ``InstalledAppCard`` resolves
+ * Resolve a manifest art path the way the installed-app surfaces resolve
  * ``iconPath``: a repo-relative path (registry apps declare art relative to
  * their repo root) is routed through the blob proxy, while absolute paths
  * (``/app-assets/...`` built-ins) and full URLs pass through untouched so

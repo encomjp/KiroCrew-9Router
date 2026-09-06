@@ -28,11 +28,14 @@ import importlib.util
 import logging
 import os
 import pathlib
+import queue
 import sys
 import tempfile
+from logging.handlers import QueueListener
 
 import pytest
 
+from kiro_crew import cli
 from kiro_crew.log_redaction import install_log_redaction
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -787,6 +790,18 @@ def _autouse_floor_generator(name: str):
     return getattr(definition, "__wrapped__", definition)
 
 
+def _listener_thread_alive(listener: QueueListener) -> bool:
+    """Whether the listener's drain thread is still running.
+
+    ``QueueListener.stop`` joins the thread and then drops the handle, so a stopped
+    listener reports ``None`` here. Checked rather than trusting the cleared slot: the
+    leak this floor absorbs is the live thread and the descriptor it holds, and dropping
+    the reference alone would satisfy every assertion about the slot while leaking both.
+    """
+    thread = getattr(listener, "_thread", None)
+    return thread is not None and thread.is_alive()
+
+
 class TestDynamicCredentialEnvironmentIsRestored:
     """A dynamic per-host Jira token must not leak to the next test.
 
@@ -816,6 +831,72 @@ class TestDynamicCredentialEnvironmentIsRestored:
         with pytest.raises(StopIteration):
             next(cycle)  # the floor's teardown: the restore under test
         assert "JIRA_TOKEN_AABBCC" not in os.environ
+
+
+class TestInheritedShellEnvironmentIsScrubbed:
+    """The entries ``name_grant`` refuses as inherited preloads are hidden per test.
+
+    On a RHEL-family host ``which2.sh`` puts ``BASH_FUNC_which%%`` in every login
+    shell's environment, and ``name_grant``'s AMBIGUOUS_ENV refusal -- checked before
+    every narrower code -- then rewrote what 79 unrelated assertions observed
+    (issue #8395). The scrub under test is ``conftest._scrub_inherited_preload_env``,
+    driven directly (see ``_autouse_floor_generator``); the domain-level regression
+    lives in ``test_name_grant.py::TestInheritedHostEnvironment``, but only this
+    direct drive survives ``autouse=True`` being dropped or the restore half being
+    lost, because it asserts the marker and both halves of one real cycle.
+    """
+
+    def test_this_test_starts_without_the_injected_entries(self) -> None:
+        """True on every host: the live scrub hides even a genuinely inherited entry."""
+        assert "BASH_FUNC_kcfloor%%" not in os.environ
+        assert "BASH_ENV" not in os.environ
+
+    def test_an_inherited_entry_is_scrubbed_then_restored_by_one_cycle(self) -> None:
+        """One full cycle of the real fixture: inject first, so it reads as inherited.
+
+        The fixture records its removals on the monkeypatch instance it is handed,
+        so the restore under test is that instance's ``undo`` -- driven explicitly
+        here, exactly as pytest drives the shared per-test instance after every
+        fixture teardown. A failure part-way cannot leak the entries past this
+        test: the live autouse instance of the same fixture wraps this test too,
+        and its teardown sweep removes matching entries its own snapshot never saw.
+        """
+        mp = pytest.MonkeyPatch()
+        os.environ["BASH_FUNC_kcfloor%%"] = "() { :; }"
+        os.environ["BASH_ENV"] = "/etc/kc-floor-rc"
+        try:
+            cycle = _autouse_floor_generator("_scrub_inherited_preload_env")(mp)
+            next(cycle)  # the floor's setup: the scrub under test
+            assert "BASH_FUNC_kcfloor%%" not in os.environ
+            assert "BASH_ENV" not in os.environ
+            with pytest.raises(StopIteration):
+                next(cycle)  # the floor's teardown sweep: inherited keys stay absent
+            assert "BASH_FUNC_kcfloor%%" not in os.environ
+            mp.undo()  # the restore under test: rides the monkeypatch undo stack
+            assert os.environ.get("BASH_FUNC_kcfloor%%") == "() { :; }"
+            assert os.environ.get("BASH_ENV") == "/etc/kc-floor-rc"
+        finally:
+            mp.undo()
+            os.environ.pop("BASH_FUNC_kcfloor%%", None)
+            os.environ.pop("BASH_ENV", None)
+
+    def test_an_entry_leaked_during_a_test_is_swept_by_the_floors_own_teardown(self) -> None:
+        """The sweep half: a raw write that appeared mid-test does not leak on."""
+        mp = pytest.MonkeyPatch()
+        try:
+            cycle = _autouse_floor_generator("_scrub_inherited_preload_env")(mp)
+            next(cycle)  # the floor's setup: nothing inherited, nothing recorded
+
+            os.environ["BASH_FUNC_kcfloor%%"] = "() { leaked; }"
+
+            with pytest.raises(StopIteration):
+                next(cycle)  # the floor's teardown: the sweep under test
+            assert "BASH_FUNC_kcfloor%%" not in os.environ
+            mp.undo()  # no record for a raw write, so the sweep's removal stands
+            assert "BASH_FUNC_kcfloor%%" not in os.environ
+        finally:
+            mp.undo()
+            os.environ.pop("BASH_FUNC_kcfloor%%", None)
 
 
 # ── the logging record factory ─────────────────────────────────────────────
@@ -971,6 +1052,124 @@ class TestLoggerLevelsAreRestored:
         with caplog.at_level("DEBUG"):
             logging.getLogger("kiro_crew.slack.gateway").debug("floor canary")
         assert "floor canary" in caplog.text
+
+
+# ── the CLI log queue listener ─────────────────────────────────────────────
+
+
+class TestTheLogQueueListenerIsRestored:
+    """``cli._LOG_QUEUE_LISTENER`` is ONE process-global slot, per worker.
+
+    ``_setup_cli_logging`` starts a ``QueueListener`` for a LONG-LIVED command and never
+    stops it -- correct in production, which does it once per process -- so every test
+    that drives the real ``cli.main()`` for ``serve`` / ``gateway`` / ``chat`` leaves one
+    running. The SHORT-LIVED branch then reads it: it takes the ``else`` path and does not
+    touch the global, so a test asserting a short-lived verb starts no listener sees the
+    PREVIOUS test's and fails on its own first line, in a file that cleans up after itself
+    correctly. Two tests in ``test_cli_logging.py`` assert exactly that, and under
+    ``-n auto --dist loadgroup`` whether a leaker precedes them on the worker varies run
+    to run, so it surfaces as an intermittent failure rather than an ordering bug.
+
+    ``conftest._restore_log_queue_listener`` is what removes the class; without a test, an
+    edit to it reverts silently and the failures reappear as a flake. Its teardown is
+    driven directly (see ``_autouse_floor_generator``), so the proof needs no adjacent
+    observer test.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolated_cli_logging(self, monkeypatch):
+        """Foreground mode, and remove the handlers these tests' real setup calls attach.
+
+        Driving the real ``_setup_cli_logging`` is the point -- a test that assigned the
+        global instead would pass even if the production install site moved -- but it also
+        attaches a handler holding an open descriptor, and the floor under test
+        deliberately does not restore handlers. Removing only what this test ADDED is what
+        ``_pristine_logging`` does; the snapshotted list is never written back, because
+        ``caplog`` swaps a handler on the root logger at every phase boundary and writing
+        a setup-phase list back during teardown would drop the one it is capturing
+        through.
+        """
+        monkeypatch.setattr("kiro_crew.cli._fd_targets_file", lambda fd, path: False)
+        loggers = (logging.getLogger(), logging.getLogger("kiro_crew"))
+        saved = [(lgr, lgr.handlers[:]) for lgr in loggers]
+        yield
+        for lgr, handlers in saved:
+            for handler in lgr.handlers[:]:
+                if handler not in handlers:
+                    lgr.removeHandler(handler)
+                    handler.close()
+
+    def test_this_test_starts_with_no_listener(self) -> None:
+        """Which is only true if no earlier test on this worker left one running."""
+        assert cli._LOG_QUEUE_LISTENER is None
+
+    def test_a_leaked_listener_is_removed_by_the_floors_own_teardown(self) -> None:
+        """One full cycle of the real fixture: snapshot, leak a listener, restore.
+
+        The leak is produced by the real ``_setup_cli_logging`` on the real long-lived
+        branch, which is exactly how it happens in the wild, so the test still fails if
+        the production install site moves. A failure part-way cannot leak the listener
+        past this test: the live autouse instance of the same fixture wraps this test too,
+        and its snapshot predates the install.
+        """
+        cycle = _autouse_floor_generator("_restore_log_queue_listener")()
+        next(cycle)  # the floor's setup: snapshot, taken while the slot is empty
+
+        cli._setup_cli_logging("gateway", 1)
+        leaked = cli._LOG_QUEUE_LISTENER
+        assert leaked is not None, "the long-lived branch no longer starts a listener"
+
+        with pytest.raises(StopIteration):
+            next(cycle)  # the floor's teardown: the restore under test
+        assert cli._LOG_QUEUE_LISTENER is None, (
+            f"the slot still holds {cli._LOG_QUEUE_LISTENER!r} -- the next test to run "
+            "_setup_cli_logging for a SHORT-LIVED command would read this listener and "
+            "fail asserting it started none"
+        )
+        assert not _listener_thread_alive(leaked), (
+            "the listener object was dropped but its thread is still running -- it holds "
+            "the file handler's descriptor open on a gateway.log under a tmp_path the "
+            "next test deletes"
+        )
+
+    def test_the_restore_target_is_what_the_test_inherited(self, monkeypatch) -> None:
+        """The floor restores the INHERITED listener, so a higher-scoped installer survives.
+
+        Same reason the record-factory floor restores to its snapshot: a class- or
+        module-scoped fixture that starts a listener for its whole scope must not have it
+        torn out after the first test.
+        """
+        sentinel = QueueListener(queue.SimpleQueue())
+        monkeypatch.setattr(cli, "_LOG_QUEUE_LISTENER", sentinel)
+
+        cycle = _autouse_floor_generator("_restore_log_queue_listener")()
+        next(cycle)  # snapshot taken while the sentinel holds the slot
+
+        cli._setup_cli_logging("gateway", 1)
+        assert cli._LOG_QUEUE_LISTENER is not sentinel
+
+        with pytest.raises(StopIteration):
+            next(cycle)
+        assert cli._LOG_QUEUE_LISTENER is sentinel, (
+            "the floor restored past the listener this cycle inherited, so a "
+            "higher-scoped installer would be torn out after its first test"
+        )
+
+    def test_a_short_lived_command_leaves_the_slot_alone(self, monkeypatch) -> None:
+        """The production behaviour the floor exists to accommodate, pinned at source.
+
+        ``_setup_cli_logging`` deliberately does not clear the global on the short-lived
+        branch -- a listener a long-lived command started genuinely still exists -- which
+        is why the leak is absorbed in the test seam rather than by clearing it there. If
+        this ever changes, the floor becomes redundant rather than wrong, and this test is
+        what says so.
+        """
+        sentinel = QueueListener(queue.SimpleQueue())
+        monkeypatch.setattr(cli, "_LOG_QUEUE_LISTENER", sentinel)
+
+        cli._setup_cli_logging("status", 1)
+
+        assert cli._LOG_QUEUE_LISTENER is sentinel
 
 
 # ── the worker budget ─────────────────────────────────────────────────────

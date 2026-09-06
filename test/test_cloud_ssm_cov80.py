@@ -225,10 +225,19 @@ class TestPluginPrerequisite:
         monkeypatch.setattr(ssm, "session_manager_plugin_installed", lambda: True)
         assert ssm.require_session_manager_plugin() is None
 
-    def test_installed_probe_uses_path_lookup(self, monkeypatch) -> None:
-        monkeypatch.setattr(ssm.shutil, "which", lambda name: None)
+    def test_installed_probe_goes_through_the_shared_resolver(self, monkeypatch) -> None:
+        """#5392: the probe resolves through the deploy engine's shared resolver,
+        so it searches the well-known install dirs too.
+
+        A bare PATH lookup reported "not installed" for a plugin that WAS
+        installed (AWS's .pkg symlinks it into /usr/local/bin, absent from the
+        minimal launchd PATH a GUI-launched gateway inherits), which refused every
+        SSM tunnel at the prerequisite gate. Hence the ``path=`` kwarg below: the
+        resolver searches an explicit dir list, not just the inherited PATH.
+        """
+        monkeypatch.setattr(ssm.shutil, "which", lambda name, path=None: None)
         assert ssm.session_manager_plugin_installed() is False
-        monkeypatch.setattr(ssm.shutil, "which", lambda name: _stub_bin(name))
+        monkeypatch.setattr(ssm.shutil, "which", lambda name, path=None: _stub_bin(name))
         assert ssm.session_manager_plugin_installed() is True
 
 

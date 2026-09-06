@@ -34,11 +34,13 @@ from __future__ import annotations
 import importlib.util
 import logging
 import os
+import platform
 import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
+from kiro_crew import __version__, beacon
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.config.paths import config_dir
 from kiro_crew.metrics.recorder import MetricsRecorder
@@ -150,6 +152,28 @@ logger = logging.getLogger(__name__)
 _SERVICE_NAME = "kirocrew"
 _SCOPE = "kiro_crew"
 
+# ``platform.machine()`` spellings -> OTel semantic-convention ``host.arch``
+# values. Every environment attribute below is a CLOSED set: a spelling this
+# map does not know folds to :data:`_ATTR_OTHER` rather than passing through,
+# so an exotic platform cannot mint a label of its own.
+_ARCH_BY_MACHINE = {
+    "x86_64": "amd64",
+    "amd64": "amd64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+    "i386": "x86",
+    "i686": "x86",
+}
+_KNOWN_OS_TYPES = frozenset({"linux", "darwin", "windows"})
+#: ``platform.python_implementation()`` spellings, lowercased -- the four the
+#: stdlib documents it can return. An interpreter outside this set folds to
+#: :data:`_ATTR_OTHER` like every other environment reading, so a patched or
+#: exotic runtime cannot mint a label of its own.
+_KNOWN_RUNTIME_NAMES = frozenset({"cpython", "pypy", "jython", "ironpython"})
+#: Fold target for any environment reading outside its known set. One shared
+#: bucket, so "unknown" stays a single bounded label per attribute.
+_ATTR_OTHER = "other"
+
 # Explicit histogram bucket boundaries (milliseconds), applied PER INSTRUMENT via
 # MeterProvider Views. OTEL's default boundaries top out at 10s, so anything
 # slower lands entirely in the +Inf overflow bucket — and because
@@ -160,7 +184,7 @@ _SCOPE = "kiro_crew"
 # sizing one array for both costs either resolution at the fast end or truth at
 # the slow end.
 #
-# Three families, each sized to its instrument's MEASURED range:
+# Each family below is sized to its instrument's MEASURED range:
 
 # Sub-ms through a minute — pooled acquires, skill loads, HTTP requests.
 # These are dominated by ~1ms values, so the fine end matters. The 60s ceiling
@@ -204,6 +228,32 @@ _WATCHDOG_IDLE_BUCKETS_MS: list[float] = [
     600000, 900000, 1800000, 3600000, 5400000, 7200000, 10800000, 14400000,
 ]
 
+# Sub-ms through one hour — a single tool round-trip. The widest span of any
+# family here, and both ends are real: a cached file read returns in well under
+# a millisecond while a build or test run invoked through the execute tool runs
+# for minutes. The fine end is copied from _FAST_BUCKETS_MS because reads
+# dominate the population by count, and the ceiling matches _TURN_BUCKETS_MS
+# because a tool call cannot outlive the turn that contains it.
+_TOOL_CALL_BUCKETS_MS: list[float] = [
+    0.5, 1, 2, 5, 10, 25, 50, 100, 250, 500,
+    1000, 2500, 5000, 10000, 30000, 60000,
+    120000, 300000, 600000, 1800000, 3600000,
+]
+
+# One second through one week — session lifetime. Sessions are the only
+# instrument here measured in hours and days: a speculative session removed
+# before its first turn lives seconds, while a dashboard tab left open across a
+# working week is ordinary. Resolution is densest from a minute to a few hours,
+# where interactive sessions land, and the 7-day ceiling exists so a long-lived
+# tab is not floored into an overflow bucket. Sub-minute bounds are kept because
+# the short-lived teardown paths (unclaimed, destroyed) are a real population
+# whose distribution would otherwise collapse onto one boundary.
+_SESSION_BUCKETS_MS: list[float] = [
+    1000, 5000, 15000, 30000, 60000, 300000, 900000, 1800000,
+    3600000, 7200000, 14400000, 28800000, 43200000,
+    86400000, 172800000, 259200000, 604800000,
+]
+
 # Instrument name -> boundaries. This map is the COMPLETE set of kirocrew
 # duration histograms: the Views below are built from it and there is no
 # catch-all, because the OTEL SDK applies EVERY matching View rather than the
@@ -215,7 +265,9 @@ _WATCHDOG_IDLE_BUCKETS_MS: list[float] = [
 # fails when a histogram metric name in the source has no entry here — add the
 # instrument to this map when you add the metric. All values are ms — the
 # dashboard's generic aggregation reports every histogram under *_ms keys, so
-# a non-ms instrument would surface 1000x off there.
+# a non-ms instrument would surface 1000x off there. A histogram that is NOT a
+# duration therefore belongs in `_HISTOGRAM_BUCKETS_BY_UNIT` below, whose
+# instruments the dashboard reads under unit-neutral keys instead.
 _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.gateway.request.duration": _FAST_BUCKETS_MS,
     "kirocrew.db.query.duration": _FAST_BUCKETS_MS,
@@ -240,8 +292,78 @@ _HISTOGRAM_BUCKETS_MS: dict[str, list[float]] = {
     "kirocrew.mcp.lazy_load.duration": _STARTUP_BUCKETS_MS,
     "kirocrew.gateway.boot.duration": _STARTUP_BUCKETS_MS,
     "kirocrew.turn.duration": _TURN_BUCKETS_MS,
+    "kirocrew.tool.call.duration": _TOOL_CALL_BUCKETS_MS,
+    "kirocrew.session.duration": _SESSION_BUCKETS_MS,
     "kirocrew.watchdog.idle.duration": _WATCHDOG_IDLE_BUCKETS_MS,
+    # Embedding queue wait + inference time. Both are ms and both predate this
+    # map; neither name ends in `.duration`, which is precisely why the guard
+    # test's old name-suffix scan could not see them and they have been running
+    # on OTEL's default 0..10000 boundaries. The guard now finds histograms by
+    # reading their emit calls, so they are registered here. _FAST_BUCKETS_MS
+    # because they behave like the other sub-ms-to-seconds work: a warm local
+    # embed is single-digit ms, a cold model load or a long batch reaches
+    # seconds.
+    "kirocrew.embed.queue_wait": _FAST_BUCKETS_MS,
+    "kirocrew.embed.inference": _FAST_BUCKETS_MS,
 }
+
+# Per-turn billed amount. Calibrated against 17,240 real per-turn credit rows
+# from a kiro-backend install: min 0.03, p10 0.076, p50 6.8, p90 53, p99 155,
+# max 658 — four and a half decades, so the array is one-bound-per-half-decade
+# rather than dense anywhere. The bottom bound sits BELOW the observed minimum
+# and the top two decades above the observed maximum, because a sample outside
+# the explicit range has its percentile floored at the nearest bound (the
+# overflow artifact `_HISTOGRAM_BUCKETS_MS` documents), and credit pricing is not
+# ours to hold still.
+_CREDIT_BUCKETS: list[float] = [
+    0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
+    10, 25, 50, 100, 250, 500, 1000, 2500,
+]
+
+# The same shape in dollars, one decade lower: a claude_code turn bills
+# fractions of a cent at the low end and tens of dollars for a long tool-heavy
+# turn. This is the one array here with NO local calibration — the host these
+# bounds were sized on runs the kiro backend, so every `cost_usd` row it has is
+# zero (the two are mutually exclusive by the "whichever is non-zero" contract).
+# Sized from published per-token pricing against the observed token range
+# instead, and worth re-checking against real rows once a claude_code host
+# reports.
+_USD_BUCKETS: list[float] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25,
+    0.5, 1, 2.5, 5, 10, 25, 50, 100,
+]
+
+# Non-duration histograms: instrument name -> boundaries, in the instrument's
+# OWN unit. A SEPARATE map from _HISTOGRAM_BUCKETS_MS on purpose — that map's
+# contract is "all values are ms", which the dashboard's generic aggregation
+# relies on when it reports every histogram under `*_ms` keys, and adding a
+# credit or a dollar amount to it would make both the contract and the reported
+# key a lie. `test_provider_bucket_views.py` guards the split in both
+# directions off the emitted `unit=`, NOT off the name suffix: nothing here is a
+# millisecond instrument, nothing there is anything else, and every histogram
+# instrument in the source must appear in exactly one of them. The suffix would
+# be the wrong test — `kirocrew.embed.queue_wait` and `.inference` above are ms
+# and do not carry it, which is the whole reason the guard reads units.
+#
+# The dashboard reads these two under unit-neutral keys (see
+# `handlers/telemetry.py`'s turn block), which is what keeps them out of the
+# `*_ms` surface.
+_HISTOGRAM_BUCKETS_BY_UNIT: dict[str, list[float]] = {
+    "kirocrew.turn.credits": _CREDIT_BUCKETS,
+    "kirocrew.turn.cost_usd": _USD_BUCKETS,
+}
+
+
+def histogram_bounds() -> dict[str, list[float]]:
+    """Every kirocrew histogram's explicit boundaries, ms and non-ms alike.
+
+    One mapping so the View list below has a single source, and so the guard test
+    can assert completeness over the whole instrument set rather than over the
+    duration family alone. The two maps are disjoint (asserted), so merge order
+    cannot hide an entry.
+    """
+    return {**_HISTOGRAM_BUCKETS_MS, **_HISTOGRAM_BUCKETS_BY_UNIT}
+
 
 _lock = threading.Lock()
 _recorder: Optional[MetricsRecorder] = None
@@ -321,6 +443,125 @@ def _consent_enabled(cfg: object) -> bool:
 
 def _default_metrics_dir() -> Path:
     return config_dir() / "metrics"
+
+
+def _resource_attributes() -> "dict[str, str | int]":
+    """Resource attributes for the MeterProvider.
+
+    A resource attribute becomes a LABEL on every series this process exports,
+    which cuts both ways: it is the only place fleet-level GROUP BYs can come
+    from, and any unbounded value here multiplies every instrument's series
+    count. So every attribute is a closed set or explicitly clamped, and every
+    probe fails soft -- a failed read omits the attribute rather than losing
+    telemetry or inventing a value.
+
+    ``service.instance.id`` is set EXPLICITLY to the persisted install id
+    rather than left to the SDK, whose default identifies a PROCESS: a fresh
+    UUID per restart starts a brand-new series set every time -- fast,
+    pure-cost growth on desktops, which restart constantly -- and it severs
+    "this install over time" across restarts. Machines must still be separable
+    (a fleet percentile is computed ACROSS series; identical labels would
+    collide every host into one series), which is why the id exists at all.
+    It is a random UUID persisted on disk, deliberately NOT derived from
+    hostname or username, which on a corporate desktop routinely embed the
+    employee's alias.
+
+    ``process.pid`` (OTel semconv) carries the PROCESS identity SEPARATELY:
+    one install runs several telemetry-enabled processes at once (the gateway
+    plus spawned agents/apps each build their own recorder -- the reason the
+    local exporter shards per PID), and with an install-scoped resource alone
+    their per-process gauges and cumulative counters would interleave into one
+    corrupted series at any OTLP backend. The pid makes each process its own
+    resource; the install id groups them back together for fleet questions
+    (distinct devices, per-install rollups). PID reuse across restarts reads
+    as an ordinary counter reset downstream.
+
+    This function only ever READS the install id (``create=False``: one stat
+    + a 32-byte read, the same class as the config fingerprint check). The
+    single WRITE that can create it lives in :func:`_build_recorder`'s live
+    branch, immediately before this call, so a resource is labelled from the
+    very first export rather than acquiring its identity mid-life -- a
+    mid-life resource swap reads downstream as a brand-new series set, which
+    is a worse outcome than the ~1ms it would save. Keeping the mint in the
+    build path rather than in a rebuild worker is also what lets this module
+    hold no backfill state at all. Residual, accepted: omitting the key does
+    NOT yield an unlabelled resource -- the SDK substitutes its own
+    per-process UUID (measured: a dashed 36-char uuid4, versus our 32-char
+    hex) -- so a host whose mint FAILS (unwritable data dir) falls back to
+    exactly the per-restart series churn this attribute exists to prevent.
+    That is the cost of a broken data dir, not of a fresh install: minting
+    before the first build means there is no startup window in which the
+    substitute can reach an export at all. Local shards stay unambiguous
+    either way, because the exporter stamps per-process identity on every
+    line.
+
+    ``service.version`` is the release-clamped build version
+    (:func:`beacon.release`, the same clamp the beacon ships). Without it
+    nothing in a payload identifies the build that produced it, so
+    release-over-release comparison degenerates to comparing time ranges --
+    which a gradual rollout muddies, since both versions report into the same
+    buckets. With the label it is a GROUP BY. The clamp matters as much as the
+    field: a raw dev/nightly ``__version__`` carries a per-build stamp, so an
+    unclamped value would mint a new series set per build.
+
+    The environment attributes (``os.type``, ``host.arch``,
+    ``process.runtime.name``/``version``) follow the OTel semantic conventions
+    and are CLOSED sets: readings outside the known values fold to
+    :data:`_ATTR_OTHER`, and the runtime version is clamped to ``major.minor``
+    (the patch level adds cardinality without answering anything the minor
+    does not -- the beacon's rule). ``host.cpu.logical_count`` is what lets
+    ``kirocrew.process.cpu.seconds`` be normalized into a machine percentage
+    downstream: the core count exists only client-side, so it must travel
+    with the data.
+
+    Deliberately absent:
+
+      * the distribution channel. The beacon's data-minimization pass REMOVED
+        its channel field because channel sharply narrows the crowd a stable id
+        hides in (a nightly population is small by definition). Stamping it on
+        every metric payload would quietly undo that decision; re-adding it is
+        a consent-inventory question, not a code convenience.
+      * an install type (desktop / cli / remote-gateway). There is no reliable
+        detection today; a guessed label would be confidently wrong.
+    """
+    attrs: "dict[str, str | int]" = {"service.name": _SERVICE_NAME}
+    try:
+        # Process identity, SEPARATE from install identity: several
+        # telemetry-enabled processes run per install, and without a
+        # per-process resource their gauges/counters interleave into one
+        # corrupted series at any OTLP backend.
+        attrs["process.pid"] = int(os.getpid())
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("process.pid resource attr unavailable: %s", exc)
+    try:
+        attrs["service.version"] = beacon.release(__version__)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("service.version resource attr unavailable: %s", exc)
+    try:
+        os_type = platform.system().lower()
+        attrs["os.type"] = os_type if os_type in _KNOWN_OS_TYPES else _ATTR_OTHER
+        machine = platform.machine().lower()
+        attrs["host.arch"] = _ARCH_BY_MACHINE.get(machine, _ATTR_OTHER)
+        runtime = platform.python_implementation().lower()
+        attrs["process.runtime.name"] = (
+            runtime if runtime in _KNOWN_RUNTIME_NAMES else _ATTR_OTHER
+        )
+        # beacon.python_minor() owns the major.minor clamp and records why the
+        # patch level is dropped; a second spelling here would be a rule with
+        # two owners.
+        attrs["process.runtime.version"] = beacon.python_minor()
+        cores = os.cpu_count()
+        if cores:
+            attrs["host.cpu.logical_count"] = int(cores)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("environment resource attrs unavailable: %s", exc)
+    try:
+        install_id = beacon.install_id(create=False)
+        if install_id:
+            attrs["service.instance.id"] = install_id
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("stable install id unavailable: %s", exc)
+    return attrs
 
 
 class _Build(NamedTuple):
@@ -412,22 +653,38 @@ def _build_recorder() -> _Build:
                 started_readers.append(reader)
                 otlp_names.append(dest.name)
         otlp_active = bool(otlp_names)
+        # Mint the persisted install id HERE, in the live branch, so the
+        # resource below is labelled from the very first export instead of
+        # acquiring its identity mid-life. This is the one write on this path:
+        # mkdir + mkstemp + link, race-safe per ``beacon.install_id``, once per
+        # install ever, and only ever under consent True (a disabled build
+        # returns before reaching this branch, so turning telemetry OFF still
+        # creates nothing). It is noise against what this same path already
+        # pays synchronously -- ~14ms for a changed-config load plus ~57ms of
+        # SDK import, both documented in docs/system-specs/modules/metrics.md
+        # -- and a failed mint costs only the attribute, never the recorder.
+        try:
+            beacon.install_id(create=True)
+        except Exception:
+            logger.debug("install id mint failed", exc_info=True)
+        resource_attrs = _resource_attributes()
         provider = MeterProvider(
             metric_readers=started_readers,
-            resource=Resource.create({"service.name": _SERVICE_NAME}),
-            # One View per instrument, from _HISTOGRAM_BUCKETS_MS. Deliberately
-            # NOT a catch-all `instrument_type=Histogram` View: the OTEL SDK
-            # applies every matching View, so a catch-all alongside these would
-            # publish each named instrument twice under one metric name with
-            # different bounds, and the telemetry aggregator merges same-length
-            # bucket arrays without comparing bounds — it would silently double
-            # the counts. See the completeness guard test.
+            resource=Resource.create(resource_attrs),
+            # One View per instrument, from histogram_bounds() (the ms families
+            # plus the non-ms ones). Deliberately NOT a catch-all
+            # `instrument_type=Histogram` View: the OTEL SDK applies every
+            # matching View, so a catch-all alongside these would publish each
+            # named instrument twice under one metric name with different
+            # bounds, and the telemetry aggregator merges same-length bucket
+            # arrays without comparing bounds — it would silently double the
+            # counts. See the completeness guard test.
             views=[
                 View(
                     instrument_name=name,
                     aggregation=ExplicitBucketHistogramAggregation(bounds),
                 )
-                for name, bounds in _HISTOGRAM_BUCKETS_MS.items()
+                for name, bounds in histogram_bounds().items()
             ],
         )
         logger.info(
@@ -457,6 +714,17 @@ def _build_recorder() -> _Build:
             register_process_gauges(meter)
         except Exception:
             logger.warning("process gauges unavailable", exc_info=True)
+        # Install-inventory gauges (crons/skills/knowledge/MCP/toggles) ride the
+        # same consent gate and the same observable-callback contract. Registered
+        # in its OWN try so a failure in either set cannot cost the other one —
+        # they read entirely different subsystems, and the process gauges must
+        # not go dark because, say, the skills tree is unreadable.
+        try:
+            from kiro_crew.metrics.inventory_gauges import register_inventory_gauges
+
+            register_inventory_gauges(meter)
+        except Exception:
+            logger.warning("inventory gauges unavailable", exc_info=True)
         return _Build(MetricsRecorder(meter), provider, consent)
     except Exception as exc:
         logger.warning("telemetry init failed; metrics disabled: %s", exc)
@@ -589,8 +857,8 @@ def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_Reade
     Egress is OFF by default: reaching here at all means an edition named a
     destination (the public default does so only when ``telemetry.otlp_endpoint``
     is a non-empty string). The OTLP exporter lives in the separate
-    ``kirocrew[otlp]`` package extra (install with ``pip install
-    "kirocrew[otlp]"``), not the hard dependency set. If a host opts in without
+    ``otlp`` package extra (install its exporter directly -- see
+    :mod:`kiro_crew.extras`), not the hard dependency set. If a host opts in without
     installing it, we log a warning and degrade to local-only rather than
     crashing telemetry init. The exporter sees only what the MetricsRecorder
     facade lets through: attributes are sanitised before they reach any reader,
@@ -601,7 +869,10 @@ def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_Reade
 
     The export CADENCE stays a core decision, read from
     ``telemetry.export_interval_seconds`` — a destination says where to send, not
-    how often to send.
+    how often to send. TEMPORALITY is a core decision for the same reason: both
+    of this provider's readers describe the same instruments, so they must encode
+    them the same way unless the operator says otherwise
+    (:func:`kiro_crew.metrics.temporality.otlp_preference`).
     """
     endpoint = dest.endpoint
     # Callable directly (not only via _build_recorder), so make sure the lazily
@@ -609,6 +880,11 @@ def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_Reade
     if not _load_otel():
         logger.warning("opentelemetry not importable; OTLP egress disabled")
         return None
+    # After the gate: this module imports the OTel metrics SDK at module scope,
+    # and the whole point of _load_otel is that a default-off host never pays
+    # for it.
+    from kiro_crew.metrics import temporality
+
     try:
         from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
             OTLPMetricExporter,
@@ -625,6 +901,15 @@ def _build_otlp_reader(dest: "OtlpDestination", cfg: object) -> Optional["_Reade
         return None
     try:
         kwargs: dict = {"endpoint": endpoint}
+        # The same DELTA map the local sink uses, so one MeterProvider's two
+        # destinations cannot report the same instrument differently. Omitted
+        # entirely when the operator has set the OTel temporality variable: the
+        # exporter applies an explicit dict ON TOP of whichever base that
+        # variable chose, so passing it unconditionally would override an
+        # operator who asked for CUMULATIVE. See metrics.temporality.
+        preference = temporality.otlp_preference()
+        if preference is not None:
+            kwargs["preferred_temporality"] = preference
         # Passed only when supplied so the exporter keeps its own defaults (and
         # its env-var fallbacks) for everything an edition did not set.
         if dest.session is not None:

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { screen, waitFor } from '@testing-library/react'
+import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { renderWithProviders } from './helpers'
 import { RemoteCrewPanel } from '../pages/settings/RemoteCrewPanel'
@@ -9,9 +9,14 @@ import { __resetInstanceFailuresForTests } from '../utils/instanceFailureReport'
 vi.mock('../api/client', () => {
   class ApiError extends Error {
     status: number
-    constructor(status: number, message: string) {
+    // The real class carries the raw response body so a caller can read the
+    // structured `code` the human message collapses away — the panel branches
+    // on it to tell an unsupported-platform refusal from a load failure.
+    body: string
+    constructor(status: number, message: string, body = '') {
       super(message)
       this.status = status
+      this.body = body
     }
   }
   return {
@@ -166,7 +171,7 @@ describe('RemoteCrewPanel', () => {
 
   it('refreshes the crew list when a launch finishes, without waiting for a manual reload', async () => {
     // Switching tabs does not remount the panel, so nothing would invalidate the
-    // instances cache and the brand-new crew would stay missing from Your crews.
+    // instances cache and the brand-new crew would stay missing from Your instances.
     vi.mocked(api.listInstances).mockResolvedValue({ active: true, warm_set_cap: 5, instances: [] })
     vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [RUNNING_JOB] })
     vi.mocked(api.cloudLaunchStatus).mockResolvedValue({ ...RUNNING_JOB, status: 'done' as const })
@@ -195,6 +200,42 @@ describe('RemoteCrewPanel', () => {
     await u.click(screen.getByRole('menuitem', { name: /Remove Kiro Crew Cloud/i }))
     expect(await screen.findByText(/keeps running and billing/i)).toBeInTheDocument()
     expect(api.removeInstance).not.toHaveBeenCalled()
+  })
+
+  it('still lists the crews when the gateway cannot do cloud provisioning at all', async () => {
+    // A Windows gateway POSIX-gates the launch-history route, so the launches query
+    // fails with 400 posix_host_required. Treating that as a load failure replaced
+    // the whole list — hand-added SSH crews included — with a cloud-provisioning
+    // error, leaving no way to connect, edit or remove anything the user had saved.
+    // It is not a failure: it means this host cannot have launched a cloud crew.
+    vi.mocked(api.listInstances).mockResolvedValue({
+      active: true, warm_set_cap: 5, instances: [MANUAL_INSTANCE, CLOUD_INSTANCE],
+    })
+    vi.mocked(api.cloudLaunches).mockRejectedValue(
+      new ApiError(
+        400,
+        'cloud provisioning requires a POSIX host (Linux/macOS); use WSL on Windows',
+        JSON.stringify({
+          error: 'cloud provisioning requires a POSIX host (Linux/macOS); use WSL on Windows',
+          code: 'posix_host_required',
+        }),
+      ),
+    )
+    renderWithProviders(<RemoteCrewPanel />)
+
+    // Both saved crews render, each with its own Connect button.
+    expect(await screen.findByText('dev-box-1')).toBeInTheDocument()
+    expect(screen.getByText(/Kiro Crew Cloud/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Connect$/i })).toBeInTheDocument()
+    // The POSIX message belongs on the Set-up tab, not over the crew list.
+    expect(screen.queryByText(/requires a POSIX host/i)).not.toBeInTheDocument()
+
+    // With no launch history, the SSM row must NOT be downgraded to "added by you":
+    // the CLI launcher registers real cloud crews the same way, so it stays
+    // possibly-cloud with the confirm step and the honest copy.
+    expect(
+      screen.getByText(/cannot verify whether this machine has AWS resources/i),
+    ).toBeInTheDocument()
   })
 
   it('shows the install command the gateway reported, not a hardcoded macOS one', async () => {
@@ -327,7 +368,7 @@ describe('RemoteCrewPanel', () => {
     const card = (await screen.findByText(/WXYZ-1234/)).closest('div')?.parentElement
     expect(card).toBeTruthy()
     const page = document.body.textContent ?? ''
-    expect(page).toMatch(/leave the page or switch crews and it keeps going/i)
+    expect(page).toMatch(/leave the page or switch instances and it keeps going/i)
     expect(page).not.toMatch(/quit the app/i)
     expect(page).not.toMatch(/get a notification/i)
   })
@@ -401,8 +442,8 @@ describe('RemoteCrewPanel', () => {
     vi.mocked(api.listInstances).mockRejectedValue(new ApiError(403, 'instances feature is disabled'))
     vi.mocked(api.cloudLaunches).mockResolvedValue({ jobs: [] })
     renderWithProviders(<RemoteCrewPanel />)
-    expect(await screen.findByText(/Remote crew management is off/i)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /Enable remote crew management/i })).toBeInTheDocument()
+    expect(await screen.findByText(/Remote instance management is off/i)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Enable remote instance management/i })).toBeInTheDocument()
   })
 
   it('does not flash the tabbed UI before showing the disabled state', async () => {
@@ -418,14 +459,14 @@ describe('RemoteCrewPanel', () => {
 
     // While loading: a spinner, no tabs, no form.
     expect(screen.getByText(/Loading/i)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Your crews/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Your instances/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Set up a new one/i })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Enable remote crew management/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Enable remote instance management/i })).not.toBeInTheDocument()
 
     // After the 403 resolves: transitions directly to the disabled card.
     rejectInstances(new ApiError(403, 'instances feature is disabled'))
-    expect(await screen.findByText(/Remote crew management is off/i)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Your crews/i })).not.toBeInTheDocument()
+    expect(await screen.findByText(/Remote instance management is off/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Your instances/i })).not.toBeInTheDocument()
   })
 
   it('distinguishes cloud crews from hand-added machines, and shows an in-progress launch', async () => {
@@ -485,7 +526,7 @@ describe('RemoteCrewPanel', () => {
     renderWithProviders(<RemoteCrewPanel />)
 
     expect(await screen.findByText(/gateway exploded/i)).toBeInTheDocument()
-    expect(screen.queryByText(/No crews yet/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/No instances yet/i)).not.toBeInTheDocument()
     // A retry sits with the error, in addition to the header's refresh control.
     expect(screen.getAllByRole('button', { name: /Refresh/i }).length).toBeGreaterThan(1)
   })
@@ -576,6 +617,16 @@ describe('RemoteCrewPanel', () => {
         probes: [{ name: 'ssh', ok: true }, { name: 'remote_dashboard', ok: false }],
       },
     }
+    /** The hand-off ON THE DIAGNOSIS NOTE. A broken row now carries its own
+     *  "Ask the agent" link next to `status.error` (StatusBadge renders it through
+     *  ErrorNotice), so the note's button must be picked by its container — the
+     *  row's link would send the bare message without the ladder. */
+    // The diagnosis note is the shared ErrorNotice (role="alert") since #8749;
+    // this helper still looked for the role="status" box #8729 was written
+    // against, so `closest` returned null and every hand-off case failed.
+    const noteAgentButton = () =>
+      within(screen.getByTestId('remote-crew-diagnosis'))
+        .getByRole('button', { name: /agent/i })
 
     it('hands the diagnosis to the agent with the ladder code and probe chain', async () => {
       // A diagnosis that names the broken link and then leaves the user with
@@ -592,7 +643,7 @@ describe('RemoteCrewPanel', () => {
       await openRowMenu(u)
       await u.click(await screen.findByRole('menuitem', { name: /Diagnose Nimbus/i }))
       await screen.findByText(/c1: Remote dashboard down/i)
-      await u.click(screen.getByRole('button', { name: /agent/i }))
+      await u.click(noteAgentButton())
 
       const prompt = consumeChatHandoff() || ''
       expect(prompt).toContain('remote_down')
@@ -620,7 +671,7 @@ describe('RemoteCrewPanel', () => {
       await openRowMenu(u)
       await u.click(await screen.findByRole('menuitem', { name: /Diagnose Nimbus/i }))
       await screen.findByText(/c1: Remote dashboard down/i)
-      await u.click(screen.getByRole('button', { name: /agent/i }))
+      await u.click(noteAgentButton())
       first.unmount()
 
       renderWithProviders(<RemoteCrewPanel />, { store: first.store })
@@ -647,7 +698,7 @@ describe('RemoteCrewPanel', () => {
       await openRowMenu(u)
       await u.click(await screen.findByRole('menuitem', { name: /Diagnose Nimbus/i }))
       await screen.findByText(/c1: Remote dashboard down/i)
-      await u.click(screen.getByRole('button', { name: /agent/i }))
+      await u.click(noteAgentButton())
       first.unmount()
 
       renderWithProviders(<RemoteCrewPanel />, { store: first.store })
@@ -682,7 +733,7 @@ describe('RemoteCrewPanel', () => {
       await openRowMenu(u)
       await u.click(await screen.findByRole('menuitem', { name: /Diagnose Nimbus/i }))
       await screen.findByText(/c1: Remote dashboard down/i)
-      await u.click(screen.getByRole('button', { name: /agent/i }))
+      await u.click(noteAgentButton())
       first.unmount()
 
       // Someone else moved the TTL while the user was in the chat.

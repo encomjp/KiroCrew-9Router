@@ -109,11 +109,11 @@ beforeEach(() => localStorage.clear())
 afterEach(() => vi.clearAllMocks())
 
 describe('chat sidebar — stale-session collapse', () => {
-  it('collapses root sessions older than the default 2 days behind an expander row', () => {
+  it('collapses root sessions older than the default 7 days behind an expander row', () => {
     const { getByTestId, queryByText, getByText } = renderSidebar([
       slot('fresh', 'fresh session', 2),
-      slot('old-1', 'old session one', 3 * 24),
-      slot('old-2', 'old session two', 5 * 24),
+      slot('old-1', 'old session one', 10 * 24),
+      slot('old-2', 'old session two', 12 * 24),
     ])
     expect(getByText('fresh session')).toBeInTheDocument()
     expect(queryByText('old session one')).toBeNull()
@@ -123,10 +123,21 @@ describe('chat sidebar — stale-session collapse', () => {
     expect(expander).toHaveTextContent('2')
   })
 
+  it('shows the pinned boundary only when dormant unpinned rows are expanded', () => {
+    const { getByTestId, queryByTestId } = renderSidebar([
+      slot('pinned', 'pinned session', 1, { pinned: true }),
+      slot('old', 'dormant unpinned', 10 * 24),
+    ])
+
+    expect(queryByTestId('pinned-session-divider')).toBeNull()
+    fireEvent.click(getByTestId('stale-expander-root'))
+    expect(getByTestId('pinned-session-divider')).toBeInTheDocument()
+  })
+
   it('expands and re-collapses on click, flipping aria-expanded', () => {
     const { getByTestId, queryByText } = renderSidebar([
       slot('fresh', 'fresh session', 2),
-      slot('old-1', 'old session one', 3 * 24),
+      slot('old-1', 'old session one', 10 * 24),
     ])
     // Re-query after each click: the row re-renders and the node is replaced.
     fireEvent.click(getByTestId('stale-expander-root'))
@@ -185,8 +196,8 @@ describe('chat sidebar — stale-session collapse', () => {
     const folders = [{ id: 'f1', name: 'Work', order: 0, collapsed: false }]
     const { getByTestId, queryByText, getByText } = renderSidebar([
       slot('in-fresh', 'foldered fresh', 1, { folder_id: 'f1' }),
-      slot('in-old', 'foldered old', 4 * 24, { folder_id: 'f1' }),
-      slot('root-old', 'root old', 4 * 24),
+      slot('in-old', 'foldered old', 10 * 24, { folder_id: 'f1' }),
+      slot('root-old', 'root old', 10 * 24),
     ], { folders })
     expect(getByText('foldered fresh')).toBeInTheDocument()
     expect(queryByText('foldered old')).toBeNull()
@@ -223,7 +234,7 @@ describe('chat sidebar — stale-session collapse', () => {
   it('renders the aria-controls target even while collapsed, so the relationship never dangles', () => {
     const { getByTestId, container } = renderSidebar([
       slot('fresh', 'fresh session', 2),
-      slot('old-1', 'old session one', 3 * 24),
+      slot('old-1', 'old session one', 10 * 24),
     ])
     const expander = getByTestId('stale-expander-root')
     const regionId = expander.getAttribute('aria-controls')!
@@ -235,16 +246,16 @@ describe('chat sidebar — stale-session collapse', () => {
   it('exempts a row the user just moved, so it does not vanish behind the destination expander', () => {
     const folders = [{ id: 'f1', name: 'Work', order: 0, collapsed: false }]
     const before = [
-      slot('in-old', 'foldered old', 4 * 24, { folder_id: 'f1' }),
-      slot('moving-old', 'freshly moved old', 4 * 24),
+      slot('in-old', 'foldered old', 10 * 24, { folder_id: 'f1' }),
+      slot('moving-old', 'freshly moved old', 10 * 24),
     ]
     const view = renderSidebar(before, { folders })
     // At rest: both old rows are collapsed in their containers.
     expect(view.queryByText('freshly moved old')).toBeNull()
     // The session moves into f1 (any path: drag, row menu, header menu).
     const after = [
-      slot('in-old', 'foldered old', 4 * 24, { folder_id: 'f1' }),
-      slot('moving-old', 'freshly moved old', 4 * 24, { folder_id: 'f1' }),
+      slot('in-old', 'foldered old', 10 * 24, { folder_id: 'f1' }),
+      slot('moving-old', 'freshly moved old', 10 * 24, { folder_id: 'f1' }),
     ]
     view.rerender(
       <QueryClientProvider client={view.qc}>
@@ -275,7 +286,7 @@ describe('chat sidebar — stale-session collapse', () => {
     )
     const { findByTestId, queryByText } = renderSidebar([
       slot('in-fresh', 'foldered fresh', 1, { folder_id: 'f1' }),
-      slot('in-old', 'foldered old', 4 * 24, { folder_id: 'f1' }),
+      slot('in-old', 'foldered old', 10 * 24, { folder_id: 'f1' }),
     ], { seedFolders: false })
     // Once folders hydrate, the old foldered row is collapsed, not exempted.
     expect(await findByTestId('stale-expander-f1')).toHaveTextContent('1')
@@ -290,7 +301,7 @@ describe('chat sidebar — stale-session collapse', () => {
     chatFoldersMock.mockRejectedValueOnce(new Error('gateway restarting'))
     const view = renderSidebar([
       slot('in-fresh', 'foldered fresh', 1, { folder_id: 'f1' }),
-      slot('in-old', 'foldered old', 4 * 24, { folder_id: 'f1' }),
+      slot('in-old', 'foldered old', 10 * 24, { folder_id: 'f1' }),
     ], { seedFolders: false })
     // Let the rejection settle, then recover via the cache seed path.
     await act(async () => { await new Promise(r => setTimeout(r, 20)) })

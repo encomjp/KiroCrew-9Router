@@ -131,8 +131,9 @@ class _FakeProc:
             raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0)
         return self.returncode
 
-    def communicate(self, timeout=None):
+    def communicate(self, input=None, timeout=None):  # noqa: A002 - match Popen
         self.communicate_calls += 1
+        self.communicate_input = input
         if self._comm_raises_timeout > 0:
             self._comm_raises_timeout -= 1
             raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout or 0)
@@ -545,7 +546,7 @@ class TestScriptContextCallTool:
         ctx = _ctx()
         client = MagicMock()
         client.call_tool.return_value = "tool output"
-        monkeypatch.setattr(cron_script, "McpToolClient", lambda server: client)
+        monkeypatch.setattr(cron_script, "McpToolClient", lambda server, **kw: client)
         audits: list[tuple] = []
         monkeypatch.setattr(
             ctx, "_audit_tool_call", lambda *a, **k: audits.append((a, k))
@@ -561,7 +562,7 @@ class TestScriptContextCallTool:
         ctx = _ctx()
         client = MagicMock()
         client.call_tool.side_effect = RuntimeError("tool exploded")
-        monkeypatch.setattr(cron_script, "McpToolClient", lambda server: client)
+        monkeypatch.setattr(cron_script, "McpToolClient", lambda server, **kw: client)
         audits: list[tuple] = []
         monkeypatch.setattr(ctx, "_audit_tool_call", lambda *a: audits.append(a))
 
@@ -574,7 +575,7 @@ class TestScriptContextCallTool:
     def test_construction_failure_needs_no_close(self, monkeypatch):
         ctx = _ctx()
 
-        def _boom(server):
+        def _boom(server, **kw):
             raise RuntimeError("not found in agent config")
 
         monkeypatch.setattr(cron_script, "McpToolClient", _boom)
@@ -613,7 +614,11 @@ class TestScriptContextAudit:
 @pytest.fixture
 def mcp_spawn(monkeypatch):
     """Patch the spawn chain so McpToolClient never starts a real process."""
-    monkeypatch.setattr(cron_script, "_resolve_mcp_server", lambda name: ("srv-bin", "--stdio"))
+    # _resolve_mcp_server returns (argv, spec_env) — the per-server env block is
+    # forwarded to the spawned server, so the mock must supply both halves.
+    monkeypatch.setattr(
+        cron_script, "_resolve_mcp_server", lambda name: (("srv-bin", "--stdio"), {})
+    )
     monkeypatch.setattr(cron_script, "wrap_argv", lambda argv, **k: (list(argv), None))
     monkeypatch.setattr(cron_script, "cgroup_scope_argv", lambda argv: list(argv))
     state = SimpleNamespace(proc=None, popen_exc=None, calls=[])
@@ -870,7 +875,7 @@ class TestResolveMcpServer:
         )
         monkeypatch.setattr(cron_script, "kiro_agents_dir", lambda: agents)
 
-        assert _resolve_mcp_server("core") == ("node", "srv.js")
+        assert _resolve_mcp_server("core") == (("node", "srv.js"), {})
 
     def test_absent_server_entry_returns_none(self, tmp_path, monkeypatch):
         agents = tmp_path / "agents"
@@ -882,7 +887,7 @@ class TestResolveMcpServer:
 
         assert _resolve_mcp_server("server-b") is None
 
-    def test_argless_spec_yields_a_single_element_tuple(self, tmp_path, monkeypatch):
+    def test_argless_spec_yields_a_single_element_argv(self, tmp_path, monkeypatch):
         agents = tmp_path / "agents"
         agents.mkdir()
         (agents / "kirocrew.json").write_text(
@@ -890,7 +895,7 @@ class TestResolveMcpServer:
         )
         monkeypatch.setattr(cron_script, "kiro_agents_dir", lambda: agents)
 
-        assert _resolve_mcp_server("bare") == ("srv-bin",)
+        assert _resolve_mcp_server("bare") == (("srv-bin",), {})
 
 
 # ── path + secret resolution ──
@@ -1282,9 +1287,20 @@ class TestRunCommandSandboxed:
         assert killed == [command_run.proc]
         assert cron_script._RUNNING_PROCS == {}
 
-    def test_cancellation_is_reported_over_the_output(self, command_run):
-        command_run.proc = _FakeProc(comm_results=[("ignored", "")], returncode=-15)
-        cron_script._CANCELLED_PROC_JOBS.add("job-c")
+    def test_cancellation_is_reported_over_the_output(self, command_run, monkeypatch):
+        # The cancel lands DURING the spawn, which is the only way this path is
+        # reachable now that a cancel recorded BEFORE the spawn returns without
+        # launching at all. Pre-seeding the flag instead exercised a state
+        # production cannot produce: _begin_spawn is reached only when the job is
+        # in neither registry, and every helper clears the flag on the way out.
+        proc = _FakeProc(comm_results=[("ignored", "")], returncode=-15)
+        command_run.proc = proc
+
+        def _popen_then_cancel(argv, **kw):
+            cron_script._CANCELLED_PROC_JOBS.add("job-c")
+            return proc
+
+        monkeypatch.setattr(cron_script, "popen_limited", _popen_then_cancel)
 
         result = run_command_sandboxed("sleep 100", job_id="job-c")
 

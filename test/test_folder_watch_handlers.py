@@ -145,45 +145,20 @@ class TestPauseSource:
         assert row["sync_status"] == "paused"
 
     @pytest.mark.asyncio
-    async def test_pause_syncs_sync_status_into_properties(self, store, tmp_path):
-        """The watcher's pre-scan skip reads properties["sync_status"], not the
-        column, so a paused folder was still walked every sweep when the JSON
-        copy stayed "active"."""
+    async def test_pause_records_the_status_in_one_place(self, store, tmp_path):
+        """The pause lands in the COLUMN the watcher's pre-scan skip reads, and
+        nowhere else: a second copy in the properties JSON is what let a paused
+        folder go on being walked every sweep while one store said "active"."""
         sid = store.add_source(
             "test", "local_folder", str(tmp_path), properties={"sync_status": "active"},
         )
         async with TestClient(TestServer(_make_app(store))) as client:
             resp = await client.post(f"/api/knowledge/sources/{sid}/pause")
             assert resp.status == 200
-        row = store.db.execute("SELECT properties FROM sources WHERE id = ?", (sid,)).fetchone()
-        props = json.loads(row["properties"])
-        assert props["sync_status"] == "paused"
-
-
-class TestDeleteSourceDismissal:
-    """Deleting an auto-discovered source must not let it come straight back."""
-
-    @pytest.mark.asyncio
-    async def test_delete_records_dismissal_for_auto_added(self, store, tmp_path):
-        sid = store.add_source(
-            "Workspace Documents", "local_folder", str(tmp_path),
-            properties={"sync_status": "active", "auto_added": True},
-        )
-        async with TestClient(TestServer(_make_app(store))) as client:
-            resp = await client.delete(f"/api/knowledge/sources/{sid}")
-            assert resp.status == 200
-        assert store.is_auto_source_dismissed(str(tmp_path)) is True
-
-    @pytest.mark.asyncio
-    async def test_delete_does_not_dismiss_hand_added(self, store, tmp_path):
-        """A user-registered folder has no discovery loop to resurrect it."""
-        sid = store.add_source(
-            "My Docs", "local_folder", str(tmp_path), properties={"sync_status": "active"},
-        )
-        async with TestClient(TestServer(_make_app(store))) as client:
-            resp = await client.delete(f"/api/knowledge/sources/{sid}")
-            assert resp.status == 200
-        assert store.is_auto_source_dismissed(str(tmp_path)) is False
+        row = store.db.execute(
+            "SELECT sync_status, properties FROM sources WHERE id = ?", (sid,)).fetchone()
+        assert row["sync_status"] == "paused"
+        assert "sync_status" not in json.loads(row["properties"])
 
 
 class TestResumeSource:

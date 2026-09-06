@@ -222,8 +222,16 @@ def _spawn(args: argparse.Namespace) -> None:
             print("No subagents.")
             return
         for a in agents:
-            status = "✅" if a.get("done") else "⏳"
-            print(f"  {status} {a['id']}  {a.get('task', '')[:60]}")
+            if a.get("done"):
+                status, note = "✅", ""
+            elif a.get("awaiting_approval"):
+                # A run parked on its spawn-approval prompt used to render the
+                # same bare hourglass as one that is executing, so `spawn list`
+                # could not answer "is this working or waiting for me?" (#6484).
+                status, note = "🔐", "  — waiting for spawn approval"
+            else:
+                status, note = "⏳", ""
+            print(f"  {status} {a['id']}  {a.get('task', '')[:60]}{note}")
         return
 
     if action == "run":
@@ -269,6 +277,7 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
     print(f"Spawned subagent {agent_id}, waiting for result...", file=sys.stderr)
     poll_url = f"{base}/api/spawn/{agent_id}"
     secret = _internal_secret(args.port)
+    told_awaiting = False
     while True:
         _time.sleep(2)
         poll_req = urllib.request.Request(poll_url, headers={"X-Internal-Secret": secret})
@@ -278,6 +287,18 @@ def _spawn_run(args: argparse.Namespace, base: str) -> None:
         except Exception:
             print("Error: lost connection to gateway", file=sys.stderr)
             sys.exit(1)
+        # Say WHY the wait is not progressing. A spawn with no parent session
+        # raises its approval prompt unowned, so it appears only on the global
+        # approvals surface -- not in any chat tab -- and this loop would
+        # otherwise sit on "waiting for result..." indefinitely with nothing to
+        # act on (#6484). Announced once, not every 2s poll.
+        if status.get("awaiting_approval") and not told_awaiting:
+            told_awaiting = True
+            print(
+                "Waiting for spawn approval: approve it in the dashboard "
+                "(Approvals) to start this run.",
+                file=sys.stderr,
+            )
         if status.get("done"):
             if status.get("error"):
                 print(f"Error: {status['error']}", file=sys.stderr)
@@ -593,6 +614,54 @@ def _register_app_crons_to_scheduler(app_name: str) -> list[str]:
     return registered
 
 
+def _warn_hooks_need_restart(app_name: str) -> bool:
+    """Tell the operator how a CLI enable's backend-hook change reaches a gateway.
+
+    Everything else a CLI enable writes is re-read by a running gateway:
+    ``enable_app`` writes ``installed.json``, ``register_app`` writes agent and
+    skill files, and ``_register_app_crons_to_scheduler`` writes through the
+    shared cron store that the gateway's timer tick re-syncs by content digest.
+    Backend hooks are Python modules imported INTO the gateway process, and only
+    the gateway can replace them (``on_app_enable`` ->
+    ``RouteRegistry.register_app_routes`` -> ``load_app_module``, reached by the
+    HTTP enable route and by ``on_gateway_startup``). This CLI process has no
+    handle on that one's ``sys.modules``, so it cannot load them directly --
+    but it no longer needs to: the gateway runs a hook reconciler
+    (``apps/hook_reconcile.py``) that notices an on-disk hook change this CLI
+    made and reloads it in-process within a poll interval (issue #7880). A
+    stopped gateway loads the new code on its next start.
+
+    Printing only "enabled <app>" reads as though the change were already live in
+    a running gateway, when in fact it lands a few seconds later; and pre-#7880
+    it never landed at all until a manual restart. This notice states the actual
+    timing so an operator does not verify a hook change against stale code and
+    draw the wrong conclusion.
+
+    Deliberately NOT gated on a live-gateway probe. ``_marker_port`` is the only
+    verified one available here, and it writes its own multi-gateway warning to
+    stderr, which would surface out of context on an app enable. The notice is
+    phrased conditionally instead, so it stays true whether or not a gateway is
+    up.
+
+    Only for apps that declare ``backend.hooks``: there is nothing to say
+    otherwise. Returns whether the notice was printed.
+    """
+    info = get_app(app_name)
+    manifest = info.get("manifest") if isinstance(info, dict) else None
+    backend = manifest.get("backend") if isinstance(manifest, dict) else None
+    hooks = backend.get("hooks") if isinstance(backend, dict) else None
+    if not isinstance(hooks, dict) or not hooks:
+        return False
+    declared = ", ".join(sorted(str(k) for k in hooks))
+    print(
+        f"  note: this app declares backend hooks ({declared}).\n"
+        "  A gateway that is already running reloads them automatically within a\n"
+        "  few seconds (the gateway reconciles hook changes it did not perform\n"
+        "  itself); if the gateway is stopped, they load on its next start."
+    )
+    return True
+
+
 def _run_app_mcp_server(app_name: str) -> None:
     """Run the named app's stdio MCP server in this process.
 
@@ -676,6 +745,7 @@ def _handle_app(args: argparse.Namespace) -> None:
             if reg.skills:
                 print(f"   Skills registered: {len(reg.skills)}")
             _register_app_crons_to_scheduler(args.name)
+            _warn_hooks_need_restart(args.name)
         else:
             print(f"❌ {result.error}", file=sys.stderr)
             sys.exit(1)
@@ -734,7 +804,22 @@ def _handle_app(args: argparse.Namespace) -> None:
         from kiro_crew.apps.dev_mode import set_dev_mode
 
         enabled = not getattr(args, "off", False)
-        dev_result = set_dev_mode(args.name, enabled)
+        confirm_root = getattr(args, "confirm_out_of_install_root", False)
+        if confirm_root and not enabled:
+            # The confirmation only applies to enabling: a disable never
+            # grants. Say so rather than silently ignoring the flag — an
+            # operator who reaches for it on the wrong invocation would
+            # otherwise read the exit-0 as "confirmed".
+            print(
+                "⚠️  --confirm-out-of-install-root has no effect with --off "
+                "(disabling grants nothing)",
+                file=sys.stderr,
+            )
+        dev_result = set_dev_mode(
+            args.name,
+            enabled,
+            confirm_out_of_install_root=confirm_root,
+        )
         if "error" in dev_result:
             print(f"❌ {dev_result['error']}", file=sys.stderr)
             sys.exit(1)
@@ -1476,7 +1561,7 @@ def _print_denied_command_summary(*, ids: bool) -> None:
     """Print the built-in denied-command catalog as grouped counts (or, with
     ``--ids``, each category's rule ids).
 
-    The 139 built-in rules are visible and configurable to the USER (Settings
+    The built-in rules are visible and configurable to the USER (Settings
     → Security renders them in category accordions, backed by
     ``GET /api/security/denied-commands``) but were invisible to the AGENT --
     ``policy show`` reported everything except them, so an agent planning a
@@ -1913,6 +1998,58 @@ def _learn(args: argparse.Namespace) -> None:
             # only way into that branch.
             result = vs.write_lesson(rule, category, negative)
             neg = f" ({negative})" if negative else ""
+            # What the save COST. The store's dedup rules tombstone a stored lesson
+            # the submitted rule contains or heavily overlaps, and this command
+            # printed "Saved:" and the dedup NOTE below without ever naming the rule
+            # it removed -- so adding a conditional rule retired the general rule
+            # inside it and the only trace was a row with is_deleted=1. Printed in
+            # full for every outcome that can carry it, because the row is a
+            # tombstone: `learn list` cannot show it and this is the last readable
+            # copy.
+            lost = ""
+            if result.superseded:
+                # Strip terminal controls FIRST, then redact. The order is the whole
+                # correctness of this function, and the intuitive order is the wrong
+                # one: redacting first leaves `AKIA<CSI>IOSFODNN7EXAMPLE` untouched,
+                # because the escape breaks the token so the credential regex does not
+                # match it -- and the control-strip then REASSEMBLES the complete
+                # credential and prints it. Measured: redact-then-strip leaks that
+                # input verbatim; strip-then-redact masks it. Stripping can only ever
+                # JOIN characters, never split a token, so running it first can only
+                # help the regex, never hide a credential from it.
+                #
+                # Both treatments are needed, and both were added in response to a
+                # real finding: an OSC payload stored in a rule would otherwise be
+                # interpreted by the terminal, and a credential in a lesson would
+                # otherwise be printed. This block prints a rule the user did NOT ask
+                # to see, on the one path guaranteed to surface it.
+                #
+                # Redacting at all (rather than control-stripping only) reversed an
+                # earlier decision here. `learn list` prints every stored lesson with
+                # control-stripping alone, and that looked like the convention to
+                # match -- but it is an EXPLICIT request to see the store, while this
+                # block surfaces a lesson the user is about to lose. The right
+                # comparison is the route, which delivers the SAME field and does
+                # redact, so controls-only made one feature's two delivery paths
+                # disagree about whether a superseded rule may carry a secret. A lesson
+                # written by history consolidation also holds model output the user
+                # never typed, so "their own store" is not "their own knowledge".
+                def _safe(text: str) -> str:
+                    text = _TERMINAL_CTRL_RE.sub("", text)
+                    text, _ = redact_exfiltration_urls(text)
+                    text, _ = redact_credentials(text)
+                    return text
+
+                lines = "".join(f"\n    - {_safe(s)}" for s in result.superseded)
+                lost = (
+                    f"\n  REMOVED {len(result.superseded)} stored "
+                    f"lesson{'s' if len(result.superseded) != 1 else ''} this rule "
+                    f"contains or overlaps:{lines}\n"
+                    "  Those are no longer in effect. A verbatim re-add is DECLINED "
+                    "while this rule is stored, so to restore one exactly, "
+                    "`learn remove` this rule first; wording that shares few "
+                    "significant words with it can coexist."
+                )
             # The category is echoed ONLY where the store adopted the submitted one.
             # It is write-once (vector_memory.py builds an enrichment with the STORED
             # category, falling back to the submitted one only when the row has none),
@@ -1921,7 +2058,10 @@ def _learn(args: argparse.Namespace) -> None:
             # the same defect this PR fixes on the reporting side. `learn list` is
             # where stored values belong.
             if result.outcome is LessonWriteOutcome.INSERTED:
-                print(f"Saved: {rule}{neg} [{category}]\n{_LEARN_EMBED_NOTE}\n{_LEARN_DEDUP_NOTE}")
+                print(
+                    f"Saved: {rule}{neg} [{category}]\n{_LEARN_EMBED_NOTE}\n"
+                    f"{_LEARN_DEDUP_NOTE}{lost}"
+                )
             elif result.outcome is LessonWriteOutcome.ENRICHED:
                 # No _LEARN_DEDUP_NOTE here: an enrichment matched its existing row in
                 # pass 1, which SKIPS the generic dedup scan. Instead say what the
@@ -1941,14 +2081,18 @@ def _learn(args: argparse.Namespace) -> None:
                     "changing one means `learn remove` then `learn add`."
                 )
             elif result.outcome is LessonWriteOutcome.DEDUPED:
-                print(f"Not saved: an existing lesson already covers this ({result.reason})")
+                covered = f"Not saved: an existing lesson already covers this ({result.reason})"
+                print(f"{covered}{lost}")
             else:
                 # REFUSED -- and any outcome a later change adds, which is deliberate:
                 # every branch above names ONE outcome, so a new one lands here and
                 # exits non-zero rather than being silently reported as a success. A
                 # non-zero exit so a script driving this command sees the failure.
                 reason = f" ({result.reason})" if result.reason else ""
-                print(f"NOT saved: the memory store refused this lesson{reason}", file=sys.stderr)
+                print(
+                    f"NOT saved: the memory store refused this lesson{reason}{lost}",
+                    file=sys.stderr,
+                )
                 sys.exit(1)
 
         elif action == "list":
@@ -2329,6 +2473,13 @@ def _artifact(args: argparse.Namespace) -> None:
             "content": _read_content(args),
             "tags": _parse_tags(getattr(args, "tags", None)),
         }
+        # An explicit --slug is forwarded whenever it is not None, INCLUDING the
+        # empty string. "" is a slug the caller named, not a request to derive
+        # one, and the store refuses it; truthy filtering would swallow it and
+        # silently take the derive-and-suffix branch instead.
+        slug_arg = getattr(args, "slug", None)
+        if slug_arg is not None:
+            body["slug"] = slug_arg
         for k in ("kind", "description"):
             v = getattr(args, k, None)
             if v:
@@ -2337,7 +2488,37 @@ def _artifact(args: argparse.Namespace) -> None:
         if d.get("error"):
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
-        print(f"Saved: slug={d.get('slug', '?')} version={d.get('version', 1)}")
+        slug = d.get("slug", "?")
+        print(f"Saved: slug={slug} version={d.get('version', 1)}")
+        # Present only when the slug was derived from --name, because that is the
+        # branch where a taken slug resolves by suffixing. That reads as success
+        # (exit 0, "version=1"), which is how a re-save of corrected content ends
+        # up published at a slug nobody looks at while the original keeps serving
+        # the old text. Name the slug that was taken and the verb that versions in
+        # place. An explicit --slug cannot land here: the store refuses it rather
+        # than renaming — 409 when the slug is taken, 400 when it is malformed
+        # (the empty string included) — so both surface on the error path above.
+        taken = d.get("slug_collided_with")
+        if taken:
+            print(
+                f"Warning: slug '{taken}' is already taken, so this created a NEW "
+                f"artifact at '{slug}' rather than a new version of '{taken}'. "
+                f"To version the existing artifact in place, use: "
+                f"kirocrew artifact update {taken}",
+                file=sys.stderr,
+            )
+        # Relayed from the gateway (same pattern as slug_collided_with): the
+        # handler computes the theme-contrast verdict at the convergence
+        # point, so this CLI path -- the one the motivating incident traveled
+        # -- hears it without duplicating the detector. Advisory only.
+        if d.get("theme_contrast_warning"):
+            print(
+                "Warning: content hardcodes colors with no theme variables — it "
+                "will clash in dark/light/custom dashboard themes. Prefer "
+                "var(--text,#111) / var(--bg,#fff) style fallbacks (see the "
+                "widgets skill's theme table).",
+                file=sys.stderr,
+            )
         return
 
     if action == "update":
@@ -2369,6 +2550,17 @@ def _artifact(args: argparse.Namespace) -> None:
             print(f"Error: {d['error']}", file=sys.stderr)
             sys.exit(1)
         print(f"Updated: slug={d.get('slug', slug)} version={d.get('version', '?')}")
+        # Relayed from the gateway (see the save action above) -- the PATCH
+        # path is exactly how the motivating incident's script pushed its
+        # hardcoded-palette page. Advisory only; the update succeeded.
+        if d.get("theme_contrast_warning"):
+            print(
+                "Warning: content hardcodes colors with no theme variables — it "
+                "will clash in dark/light/custom dashboard themes. Prefer "
+                "var(--text,#111) / var(--bg,#fff) style fallbacks (see the "
+                "widgets skill's theme table).",
+                file=sys.stderr,
+            )
         return
 
     if action == "delete":

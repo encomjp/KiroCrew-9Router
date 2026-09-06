@@ -19,7 +19,7 @@ from aiohttp.client_exceptions import ClientConnectionResetError
 
 from kiro_crew import __version__ as _local_version
 from kiro_crew import dep_sync, shutdown_event
-from kiro_crew.changelog import Release, base_version, build_release_list
+from kiro_crew.changelog import Release, base_version, build_release_list, release_of_build
 from kiro_crew.config.loader import (
     ConfigReadError,
     KiroCrewConfig,
@@ -27,7 +27,7 @@ from kiro_crew.config.loader import (
     update_config_locked,
 )
 from kiro_crew.dashboard.handlers._shared import read_capped_response
-from kiro_crew.dashboard.state import DashboardState
+from kiro_crew.dashboard.state import DashboardState, chat_message_frame
 from kiro_crew.executors import subprocess_executor
 from kiro_crew.git_divergence import (
     UNREADABLE_TIMEOUT,
@@ -66,6 +66,7 @@ from kiro_crew.platform.update_layout import release_channel as _release_channel
 from kiro_crew.platform.update_layout import set_release_channel, wheel_update_command
 from kiro_crew.platform.update_provider import CommandProvider, resolve_provider
 from kiro_crew.platform_compat import reexec_python_module
+from kiro_crew.safety_override import flush_breadcrumb_writes
 from kiro_crew.security import redact_credentials, redact_exfiltration_urls
 
 logger = logging.getLogger(__name__)
@@ -1166,7 +1167,15 @@ async def _check_release_feed(capability: UpdateCapability) -> None:
         # lane publishes, so the lane never shipped it. Written from the same
         # response as the verdict so a consumer can never pair one channel's
         # move state with another channel's version.
-        channel_move_pending=_is_newer(_local_version, remote_version) is True,
+        #
+        # Compared by RELEASE: a distribution build stamp (``0.6.0.12``, see
+        # ``kiro_crew/__init__``) is a build OF ``0.6.0``, which the lane did
+        # ship. Comparing the raw stamp would read every stamped build as
+        # permanently ahead of its own lane and pin a standing "re-run the
+        # installer" affordance on the About panel, pointing at the bare wheel
+        # that would un-stamp it. The ``available`` verdict above needs no fold:
+        # ``0.6.0`` is not newer than ``0.6.0.12`` either way.
+        channel_move_pending=_is_newer(release_of_build(_local_version), remote_version) is True,
         check_status=CHECK_SUCCEEDED,
         **extra,
     )
@@ -1442,6 +1451,16 @@ async def _restart_gateway(state: DashboardState) -> bool:
             logger.debug("Session cleanup before restart failed", exc_info=True)
         sys.stdout.flush()
         sys.stderr.flush()
+        # The safety-override record publishes on a worker thread (its callers sit
+        # on the event loop), and os.execv replaces this process image without
+        # draining that worker -- so a grant activated moments before a restart
+        # would lose the very notice this restart is what makes necessary (found
+        # in review). Offloaded so a stalled write cannot block the loop, and
+        # bounded, so a restart is never held up by it.
+        try:
+            await asyncio.to_thread(flush_breadcrumb_writes, 2.0)
+        except Exception:
+            logger.debug("Breadcrumb flush before restart failed", exc_info=True)
         await asyncio.sleep(0.5)
         reexec_python_module("kiro_crew", sys.argv[1:], executable=exe)
         return True
@@ -1487,7 +1506,9 @@ async def api_update_apply(request: web.Request) -> web.Response:
     )
     if capability.managed_by != MANAGED_BY_GIT:
         return web.json_response(
-            {"error": "Not a git checkout — update by redeploying (e.g. `kirocrew cloud launch`)"},
+            {
+                "error": "Not a git checkout — update this install with `kirocrew update`, then restart the gateway"
+            },
             status=409,
         )
 
@@ -1940,6 +1961,13 @@ async def api_stream(request: web.Request) -> web.StreamResponse:
     and avoids future leaks from asyncio.wait().
     """
     state: DashboardState = request.app["state"]
+    # POSITIVE signal from the auth middleware, read once per connection (the
+    # token cannot change mid-stream). Never inferred from the absence of an app
+    # name, and defaulting to False keeps this deny-by-default: a refactor that
+    # reaches this handler without the middleware withholds `meta` rather than
+    # publishing it to an unscoped client. Mirrors `api_ws`'s
+    # `ws["_is_dashboard_user"]`. Consumed by the chat_message arm below.
+    is_dashboard_user: bool = bool(request.get("is_dashboard_user", False))
     resp = web.StreamResponse()
     resp.content_type = "text/event-stream"
     resp.headers["Cache-Control"] = "no-cache"
@@ -1967,13 +1995,24 @@ async def api_stream(request: web.Request) -> web.StreamResponse:
                     elif msg_type == "refresh":
                         await resp.write(f"event: refresh\ndata: {note['kinds']}\n\n".encode())
                     elif msg_type == "chat_message":
+                        # Built by the SHARED serialiser, not by hand: this door
+                        # and the WebSocket arm in state.py are fed the same
+                        # note by `_broadcast()`, and rebuilding the frame here
+                        # is how `meta` (the row's `meta.mid` dedup identity)
+                        # went missing on this transport after #7981 fixed the
+                        # other one (#8045).
+                        #
+                        # `include_metadata` is NOT True unconditionally. This
+                        # queue has no per-app filtering — `_broadcast()` fans
+                        # the raw note to every registered SSE client — so
+                        # `meta` (tool_input, a live oauth_url, approval_id)
+                        # would reach any app token granted this route whatever
+                        # its `slots:*` scope. Same class as GPT #6789, which
+                        # leaked public-repo status onto this endpoint. The WS
+                        # door may pass True because it filters downstream; this
+                        # one must decide here.
                         payload = json.dumps(
-                            {
-                                "slot": note["slot"],
-                                "role": note["role"],
-                                "content": note["content"],
-                                "ts": note.get("ts", ""),
-                            }
+                            chat_message_frame(note, include_metadata=is_dashboard_user)
                         )
                         await resp.write(f"event: chat_message\ndata: {payload}\n\n".encode())
                     else:
@@ -2115,7 +2154,6 @@ async def api_update_channel(request: web.Request) -> web.Response:
     # Same reason as the write above: a config read is disk I/O on a path the
     # operator may have put on a network mount.
     cfg = await asyncio.to_thread(KiroCrewConfig.load)
-    _, artifact_base = _cdn_bases()
     return web.json_response(
         {
             "ok": True,

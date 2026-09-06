@@ -2,7 +2,7 @@
 
 ## Overview
 
-Dev Fleet is a builtin App Store app (`kiro_crew/apps/builtins/dev_fleet/server.py`) for
+Dev Fleet is a builtin App Store app (`kiro_crew/apps/builtins/dev_fleet/`) for
 managing KiroCrew feature worktrees (git worktrees of the main repo) and their isolated
 pod test instances. It runs as a managed app backend SUBPROCESS: an aiohttp server on the
 backend-assigned port, reached only through the gateway proxy. Every proxied request
@@ -23,6 +23,39 @@ Gateway session auth (token/cookie) gates the proxy entrance as with all builtin
 6. **GitHub PR status** — TTL-cached `gh pr list` queries for merge state
 7. **Make Live** — repoint the live gateway at another worktree via a
    live-target pointer file (no service definition is ever mutated)
+
+## Backend component boundaries
+
+`server.py` is the composition facade: it registers the unchanged HTTP routes,
+coordinates startup and shutdown, and owns the process entry point. The implementation
+behind that facade is split by state and lifecycle ownership:
+
+- `runtime.py` owns command security, toolchain resolution, run descriptors, active
+  subprocesses, and shutdown admission.
+- `repository.py` owns `MAIN_REPO`, repository discovery and validation, git/worktree
+  access, and dirty-state inspection.
+- `live.py` owns live-target discovery, gateway restart backends, the Make Live lock and
+  committed-cutover latch, and rollback.
+- `fleet_state.py` owns PR/context/resource caches, fleet projections and tombstones, and
+  provision reattachment state.
+- `worktree_ops.py` owns pod actions, worktree remove/sync/rebase/prune orchestration, and
+  the background task handles.
+- `http_api.py` owns proxy HMAC verification, request/audit adapters, and response-shape
+  translation.
+
+Dependencies run in that direction from HTTP adapters toward the lower-level owners;
+lower-level components do not call back through `server.py`. Cross-component calls use
+the owning module, so mutable locks, registries, caches, and scalar state each have one
+authoritative instance. The facade forwards legacy private attribute reads, writes, and
+deletes to that owner, but tests patch the actual owner rather than treating the facade as
+a dependency-injection namespace.
+
+The split does not change lifecycle ordering. Shutdown first closes admission and
+snapshots active runs under the runtime admission lock, then kills process trees before
+cancelling their workers, and only then cancels the idle refresher/reaper/prune tasks.
+Destructive worktree operations retain the lock order `_wt_lock(name)` ->
+`_MAKE_LIVE_LOCK` -> `_GIT_MUTATION_LOCK`; changing either ordering can strand a build or
+deadlock removal against a live cutover.
 
 ## Main Checkout Discovery
 
@@ -80,9 +113,10 @@ instead of failing catch it and say what the degraded answer is — upstream-rem
 resolution falls back to `origin`, build-pending detection reports nothing pending,
 fallback-remote loading leaves the list empty, sync refuses with its usual
 `{"ok": false}` shape, and the background refresher idles. Bare `MAIN_REPO` loads outside
-the accessor are limited to truthiness guards, enforced for loads within `server.py` by an
-AST ratchet (`test/test_dev_fleet_repo_accessor.py`); a helper split out into a sibling
-module must route through `_repo()` by convention, since the ratchet only sees this file.
+the accessor are limited to truthiness guards. An AST ratchet scans every Dev Fleet backend
+component (`test/test_dev_fleet_repo_accessor.py`) and permits the authoritative load only
+inside `repository._repo()`; helpers in every sibling module must route through that
+accessor.
 
 Every OTHER route that resolves a worktree (`/worktree`, `/disk`, `/prune-candidates`,
 `/prune-run`, the pod routes, `/rebase`, `/make-live`) reaches `_discover_worktrees` too, so
@@ -222,10 +256,23 @@ it as hung clicks again or reloads mid-scan.
 
 Relies on `kiro_crew.pod` subpackage (optional import — degrades gracefully if unavailable):
 
-- `runtime.active_names(cfg)` — systemctl list (blocking, offloaded via `run_in_executor`)
+- `runtime.active_names(cfg)` — one point-in-time systemctl/launchctl listing per fleet build
+  (blocking, offloaded via `run_in_executor`), shared by every worktree row
 - `runtime.derive_port(cfg, name)` — cksum-based port derivation (blocking, offloaded)
-- `runtime.health(port, timeout)` — HTTP probe (blocking, offloaded)
-- `runtime.mint_token(cfg, name, ttl)` — token minting (blocking, offloaded)
+- `runtime.health(cfg, name, port, timeout)` — identity-gated HTTP probe (blocking,
+  offloaded). Takes the pod's NAME, not just its port, because a derived port is
+  routinely held by another pod or by the live gateway: `port_owner` requires the
+  process a `127.0.0.1` connect reaches to be this pod's own `MainPID`, and a
+  responder that is provably somebody else's returns `HEALTH_FOREIGN` (`-2`)
+  instead of its HTTP status. The fleet row treats that as unhealthy, since the
+  frontend's `health >= 200` test already excludes a negative value. There is
+  deliberately no bare-port variant to call — see `instances/run_marker`, which
+  states the rule ("no caller can mistake reachability for identity")
+- `runtime.mint_token(cfg, name, ttl)` — credential minting (blocking, offloaded).
+  Requires POSITIVE ownership proof and refuses when ownership is merely
+  unprovable, unlike `health`, which keeps its reading: this call sends the pod's
+  own `.local_secret`, so failing open would hand a credential to whatever
+  answered
 - `runtime.recent_journal(cfg, name, n)` — journalctl tail (blocking, offloaded)
 - `provision.has_venv(path)` / `provision.has_dist(path)` — filesystem checks (offloaded)
 
@@ -659,6 +706,65 @@ stdlib-only, so the copy needs no package context. Both halves matter: `-I` drop
 the cwd from `sys.path`, and the snapshot means an editable install cannot make
 the tree being synced supply the code doing the verifying.
 
+**The generated runner itself carries `-I` too, and for the same reason.** `python
+-c` puts the inherited cwd at `sys.path[0]`, ahead of the standard library, and
+the cwd a module-style app backend hands down is the gateway's own source root —
+which on the editable install Dev Fleet exists to manage *is* `<checkout>/src`,
+the tree being synced. So the runner's own startup imports (`os`, `shutil`,
+`subprocess`, `json`) resolve against that directory first, and the runner is the
+one process here that is **not** sandbox-wrapped: only the step argvs go through
+`sandboxed_spawn_argv`. Without `-I`, a `shutil.py` dropped in that directory runs
+arbitrary code outside the per-step sandbox. The shadowing module only has to be
+on disk when the runner *starts* — a revision an earlier sync already landed, or
+anything an agent wrote in the checkout between syncs, is enough — so this is not
+a race with the run's own merge. It is set on the interpreter rather than scrubbed
+inside the script so it holds for the process's whole life, including any import
+the runner grows later after a step has merged untrusted content. It costs
+nothing: the script is stdlib-only by design, and the `-E`/`-s` that `-I` implies
+remove env and user-site import sources it never uses. A mask from the sandbox
+could not substitute — an app backend's `extra_hidden_dirs` is silently dropped by
+`wrap_argv`'s nested passthrough (pinned in `test_sandbox_argv.py`), so it would
+read as a control at the call site and enforce nothing.
+
+**The install is skipped when the answer is already on disk.** Most syncs are
+backend-only and change nothing under `website/`, so paying a full scratch install
+to re-derive "is this lockfile installable" on every Pull + Build is cost without
+information. `_install_already_proven` skips it, and only when BOTH hold: `git
+diff --name-only <ref> -- website` is empty, meaning the incoming ref changes no
+path under the frontend half at all, AND `website/node_modules` is populated (not
+merely present — an interrupted `npm ci` leaves an empty directory, which proves
+nothing). Without a tree there is no evidence, so a fresh checkout's first sync
+still probes. Anything the comparison cannot answer — a failing or missing `git`,
+a timeout — probes as well: the unknown case costs an install rather than a
+guarantee.
+
+A populated tree is evidence, not a verified install, and the bound is worth
+stating: a prior frontend sync whose post-merge `npm ci` died partway can leave a
+partial tree beside the merged lockfile, and later backend-only syncs will skip on
+it, since from there on the subtree is unchanged and nothing re-examines it. The
+consequence is the same class as the dead-registry residual — the skip decides only
+whether this sync pays for a rehearsal, so a refusal lands one step later rather
+than never, and the transaction keeps the checkout consistent either way. Issue
+[#7132](https://github.com/kirodotdev/KiroCrew/issues/7132) tracks the stronger
+evidence check that would close it.
+
+The condition is the whole subtree rather than just `package-lock.json` /
+`package.json` / `.npmrc`, and the difference is load-bearing. With those three
+identical but frontend SOURCE changed, a skipped probe lets the merge land, and a
+failing `npm ci` afterwards leaves the checkout with new source and the
+previously-built bundle — the stale-bundle half of the very defect this section
+exists to prevent. Requiring the entire subtree to be unchanged makes that
+unreachable: with no frontend change there is no new bundle owed, so a failed sync
+leaves the frontend byte-for-byte as it was.
+
+What makes the skip safe rather than merely cheap is where a failure lands. Under
+this condition the transaction above restores the tree on any non-zero step, the
+lockfile it matches did not change, and neither did the source the bundle was
+built from. A skipped probe can only leave a state a later `npm ci` fixes, never
+one no revision produced. A skip is reported on the run's `preflight:` detail line
+rather than the generic pass line, so it is visible in the log instead of
+inferable from a missing pause.
+
 **Failure causes reach the dashboard as an exit code, not as text.** The probe
 exits with a reserved code (41-45) and the runner owns two more (46 ambiguous
 tree, 47 restore failed); `npm_preflight.explain_exit` maps each to one
@@ -885,6 +991,38 @@ Disk and loaded launchd definitions must both report `KeepAlive=true` and
 `GRACEFUL_SHUTDOWN_SECS` (10s), leaving the remaining budget for cleanup and
 exit before launchd escalates to SIGKILL. An agent with a legacy contract falls
 back to staged-only Make Live and names `kirocrew service install` as the repair.
+
+## Git environment hardening
+
+Every git invocation from this module — foreground inspection, the unattended
+background fetch, rebase, the sync pull, and any git a build step runs — carries
+`runtime._GIT_ENV_NEUTRALIZERS`, injected as **environment** rather than as
+per-call-site `-c` flags so one chokepoint covers call sites that have not been
+written yet. The environment form has the same precedence as `git -c`, so it
+overrides every config file, including an agent-writable repo-local one.
+
+Two different jobs live in that one dict, and they are worth keeping apart:
+
+- **Config-driven execution.** `GIT_ALLOW_PROTOCOL` / `GIT_PROTOCOL_FROM_USER`
+  make git itself refuse `ext::` and custom remote helpers; the four
+  `GIT_CONFIG_KEY_*` / `VALUE_*` pairs disable `core.fsmonitor` and
+  `core.hooksPath`, reset `credential.helper` to empty, and pin `core.sshCommand`
+  to plain `ssh`. Each of those is a config key a repo can set to name a program
+  git will spawn. (The operator's own *global* credential helpers are re-pinned
+  after the reset — see `_GIT_TRUSTED_HELPERS` — because a global config is
+  operator-owned rather than part of the repo attack surface.)
+- **Which object graph git answers from.** `GIT_NO_REPLACE_OBJECTS=1` is not a
+  config key and is not about code execution. A `refs/replace/<oid>` ref
+  substitutes one object for another in *every* read, so `log`,
+  `rev-list --count`, `merge-base` and `merge --ff-only` all answer about the
+  substitute graph — a history no checked-out commit names. Every git answer this
+  module acts on is a statement about the checkout on disk, so the real graph is
+  the only one that answers the question asked, and "behind by N commits" derived
+  from a grafted walk is simply wrong. `git replace` is a legitimate local
+  operation, so this is a correctness pin first and a tamper pin second. It is
+  therefore an env var in its own right and **not** one of the counted config
+  pairs: `GIT_CONFIG_COUNT` stays at 4. `platform/update_governance.py` and
+  `auto_improvement`'s clone setup pin it for the same reason.
 
 ## Output Redaction
 

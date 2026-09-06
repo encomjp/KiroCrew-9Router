@@ -7,6 +7,14 @@ on:
 permissions:
   contents: read
 
+# Five jobs fire per event, on `edited` as well as `synchronize`, so without a
+# group a push burst leaves every superseded revision's jobs running to
+# completion. Matches the sibling reviewers (codex-review, pr-scope,
+# cross-platform), which all key on the PR number and cancel.
+concurrency:
+  group: code-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   autosde-rules:
     name: Automated Rule Check
@@ -171,7 +179,8 @@ jobs:
           echo "::group::model-selection — no hardcoded model id as a default/fallback"
           # A hardcoded model id fails at runtime for accounts not entitled to it
           # (free-tier gets a subset). Use the "auto" sentinel or
-          # agent.role_models.<role> (see AGENTS.md → Model selection).
+          # agent.role_models.<role> (see
+          # docs/system-specs/common/model-selection.md).
           # model_registry.py IS the id source-of-truth (excluded); the CC-seam
           # fallback (_BACKGROUND_CC_MODEL) and *_FALLBACK_* maps are the one
           # documented exception. tests live outside src/kiro_crew.
@@ -179,7 +188,7 @@ jobs:
                ':(exclude)src/kiro_crew/model_registry.py' \
              | grep -nP "^\+.*(=|\":)\s*[\"'](claude-(opus|sonnet|haiku|fable)|opus-[0-9]|sonnet-[0-9]|haiku-[0-9]|fable-[0-9]|gpt-[0-9])" \
              | grep -vP "_BACKGROUND_CC_MODEL|_FALLBACK_"; then
-            echo "::error::Do not hardcode a model id as a default/fallback. Use \"auto\" or agent.role_models.<role> (see AGENTS.md → Model selection)."
+            echo "::error::Do not hardcode a model id as a default/fallback. Use \"auto\" or agent.role_models.<role> (see docs/system-specs/common/model-selection.md)."
             exit 1
           fi
           echo "::endgroup::"
@@ -265,11 +274,14 @@ jobs:
           fi
 
   # ── Production Dependency Vulnerability Gate ─────────────────────────
-  # The reusable gate audits every lockfile-backed Node project and fails
-  # closed on high/critical production vulnerabilities or audit failures.
-  dep-audit:
-    name: Dependency Audit
-    uses: ./.github/workflows/dependency-vulnerability.yml
+  # NOT run per pull request. The reusable gate (dependency-vulnerability.yml)
+  # audits every lockfile-backed Node project against the npm registry, and a
+  # registry that answers slowly -- which it does for hours at a stretch -- made
+  # it the one red X on otherwise-green PRs, re-run by hand until it passed. A
+  # gate people learn to re-run until green is not a gate. It runs where a
+  # vulnerable dependency would actually ship: release.yml, before any wheel or
+  # desktop build. A PR that adds or bumps a dependency is checked by the
+  # release that would carry it.
 
   # ── Coverage Gate ────────────────────────────────────────────────────
   # MOVED to ci.yml. It now consumes the coverage-backend / coverage-frontend
@@ -406,3 +418,40 @@ jobs:
             exit 1
           fi
           echo "Commit count verified ($COMMIT_COUNT of at most $MAX_COMMITS)."
+
+      # ── Pattern harvest on fix PRs ──────────────────────────────────
+      # Every fix is a chance to retire its whole defect class. Fix/revert
+      # PRs must carry a "Pattern harvest" section stating either a rule
+      # candidate (semgrep / lint / review-prompt / agents-md) or why the
+      # defect is a one-off. Presence-only: content is judged by reviewers,
+      # never by this gate. Feature/docs/chore PRs are exempt.
+      - name: Require Pattern harvest section on fix PRs
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if ! echo "$PR_TITLE" | grep -qiE '^(fix|revert)([(!:]|$)'; then
+            echo "Not a fix/revert PR; Pattern harvest section not required."
+            exit 0
+          fi
+          if ! printf '%s' "$PR_BODY" | grep -qiE '^##+ *Pattern harvest'; then
+            echo "::error::Fix/revert PRs must carry a '## Pattern harvest' section."
+            echo ""
+            echo "  State either a rule candidate or why the defect is a one-off:"
+            echo ""
+            echo "    ## Pattern harvest"
+            echo "    Rule candidate: semgrep"
+            echo "    Pattern: sentinel return value used in boolean context"
+            echo ""
+            echo "  or:"
+            echo ""
+            echo "    ## Pattern harvest"
+            echo "    Not generalizable: typo in a single format string"
+            echo ""
+            exit 1
+          fi
+          if ! printf '%s' "$PR_BODY" | grep -qiE '^ *(Rule candidate|Not generalizable) *:'; then
+            echo "::error::The Pattern harvest section must contain a 'Rule candidate:' or 'Not generalizable:' line."
+            exit 1
+          fi
+          echo "Pattern harvest section present."

@@ -22,18 +22,25 @@ import logging
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
 from kiro_crew import platform_compat
-from kiro_crew.constants import KIROCREW_SPAWNED_ENV, KIROCREW_SPAWNED_VALUE
+from kiro_crew.constants import (
+    KIROCREW_SPAWNED_ENV,
+    KIROCREW_SPAWNED_VALUE,
+    SUBAGENT_TIMEOUT_SECS,
+)
 from kiro_crew.executors import image_executor, maintenance_executor
 from kiro_crew.mcp_caller import (
     CALLER_CAPABILITY_KEY,
     CALLER_META_KEY,
+    TENANT_META_KEY,
     CallerContext,
     build_caller_meta,
+    build_tenant_meta,
 )
 from kiro_crew.mcp_gateway import hazards
 from kiro_crew.mcp_gateway.apps import (
@@ -57,6 +64,7 @@ from kiro_crew.mcp_gateway.image_budget import (
 )
 from kiro_crew.mcp_gateway.pool import READ_BUFFER_LIMIT_BYTES, RESPONSE_SPILL_THRESHOLD_BYTES
 from kiro_crew.mcp_gateway.spill import maybe_spill_response
+from kiro_crew.mcp_gateway.tool_surface import ToolSurface, project_tool_surface
 from kiro_crew.security import redact
 from kiro_crew.sel import SecurityEventLog
 
@@ -64,6 +72,17 @@ if False:  # typing-only import guard
     from kiro_crew.mcp_gateway.pool import PoolKey
 
 logger = logging.getLogger(__name__)
+
+#: Stub-uuid prefix for a gateway-internal ``tools/list`` asked on a backend's
+#: own behalf (see :meth:`Backend.probe_tool_surface`).
+TOOL_SURFACE_STUB_PREFIX = "__tool_surface__"
+
+#: Stub-uuid prefixes that mark a request as the gateway's own rather than a
+#: session's. Neither the MCP Apps render path nor the model-visibility filter
+#: applies to these: they carry no model to protect and no app to render for.
+#: ``str.startswith`` takes the tuple directly, so adding a prefix here is the
+#: whole registration.
+INTERNAL_STUB_PREFIXES: tuple[str, ...] = ("__app_call__", TOOL_SURFACE_STUB_PREFIX)
 
 # --- Per-request latency metrics ----------------------------------------
 #
@@ -115,6 +134,13 @@ async def _emit_call_metric(record: dict[str, Any]) -> None:
 # backend on a loaded host.
 _DEFAULT_INITIALIZE_TIMEOUT_SECS = 10.0
 
+# Budget for the tool-surface probe (see ``Backend.probe_tool_surface``). Same
+# 10s as the app-call listing, and for the same reason: a backend that has just
+# completed its handshake answers ``tools/list`` in milliseconds, so a longer
+# wait only stretches how long a mid-call recovery holds its stub. Overrunning
+# it reads as "could not establish", never as agreement.
+_TOOL_SURFACE_PROBE_TIMEOUT_SECS = 10.0
+
 # Upper bound on a single ``_write_json_line`` drain (writing a forwarded
 # request to a backend's stdin). A backend that has stopped reading its stdin
 # must not hang the forwarding coroutine — and the shared heartbeat sweeper —
@@ -155,8 +181,18 @@ PING_STALE_SECS = 150.0
 
 # Absolute ceiling: recycle regardless of ping freshness. Protects against a
 # pathological case where the tool itself is stuck but the MCP server's read
-# loop still services ping requests. Set to wait_max (1800s) + 5-min margin.
-HARD_WEDGE_CEILING_SECS = 2100.0
+# loop still services ping requests.
+#
+# It has to sit ABOVE the longest LEGITIMATE in-flight request, or it stops
+# being a wedge detector and becomes a deadline: a blocking ``spawn_sub_agents``
+# is in flight for as long as its slowest member runs, so a ceiling at or below
+# the subagent deadline recycles the backend under a caller whose work is
+# healthy, reporting ``backend gone`` while the subagent keeps running detached
+# and its result is stranded. The subagent deadline is therefore the binding
+# term (``wait``'s 1800s max is well under it), plus a 5-minute margin. An
+# operator who raises ``agent.subagent_timeout_secs`` past the default re-opens
+# that gap; the load-time clamp bounds how far.
+HARD_WEDGE_CEILING_SECS = float(SUBAGENT_TIMEOUT_SECS + 300)
 
 # Upper bound on a single stub's pending-delivery inbox. Backend->stub frames
 # are enqueued by the stdout pump without awaiting the stub's socket drain, so
@@ -260,6 +296,11 @@ class _PendingRequest:
     # non-tools/call requests and gateway-internal sentinels.
     session_key: str = ""
     tool_name: str = ""
+    # True when a ``tools/list`` request carried a pagination ``cursor``, so its
+    # response is a CONTINUATION page rather than the session's whole tool set.
+    # Captured from the REQUEST because the response side cannot tell a final
+    # page (no ``nextCursor``) from a complete listing on its own.
+    list_paginated: bool = False
     # The tools/call ``params.arguments`` object, captured so an intercepted
     # app render can forward the ORIGINATING inputs to the app (SEP-1865
     # ``ui/notifications/tool-input``). ``None`` for non-tools/call requests.
@@ -296,20 +337,32 @@ class _PendingRequest:
 
 def _strip_caller_meta(msg: dict[str, Any]) -> dict[str, Any]:
     """Return a shallow copy of ``msg`` with any stub-supplied
-    ``params._meta.kirocrew.caller`` unconditionally removed.
+    ``params._meta.kirocrew.caller`` / ``params._meta.kirocrew.tenant``
+    unconditionally removed.
 
     The gateway is the trust boundary: stubs are untrusted clients and must
     never be able to forge their caller identity by pre-populating
     ``_meta.kirocrew.caller`` in the request. This function is called on
     EVERY forwarded request regardless of method so a malicious stub cannot
     sneak a forged caller block through non-tools/call methods.
+
+    BOTH gateway-owned blocks are stripped here, in ONE place, deliberately: the
+    tenant nonce decides which namespace an unnamed co-tenant's per-tenant state
+    lands in, so a stub allowed to supply its own could choose to land in a
+    PEER's namespace — the same collision #5322 fixed, only chosen instead of
+    accidental. Giving the nonce its own strip function would have added a second
+    site that every future forward path has to remember; both call sites of this
+    one (``forward_from_stub`` and ``_handle_initialize``) already exist.
     """
     out = dict(msg)
     params = out.get("params")
     if not isinstance(params, dict):
         return out
     meta_raw = params.get("_meta")
-    if not isinstance(meta_raw, dict) or CALLER_META_KEY not in meta_raw:
+    if not isinstance(meta_raw, dict):
+        return out
+    forged = [key for key in (CALLER_META_KEY, TENANT_META_KEY) if key in meta_raw]
+    if not forged:
         return out
     # The caller block is a FLAT ``params._meta[CALLER_META_KEY]`` key
     # ("kirocrew.caller") — exactly the shape build_caller_meta writes and
@@ -321,7 +374,8 @@ def _strip_caller_meta(msg: dict[str, Any]) -> dict[str, Any]:
     # request closes that regardless of whether injection happens.)
     params = dict(params)
     meta = dict(meta_raw)
-    del meta[CALLER_META_KEY]
+    for key in forged:
+        del meta[key]
     if meta:
         params["_meta"] = meta
     else:
@@ -497,6 +551,44 @@ def _inject_caller_meta(msg: dict[str, Any], caller: CallerContext) -> dict[str,
     meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
     # Inject the authoritative caller block from the gateway.
     meta.update(build_caller_meta(caller))
+    params["_meta"] = meta
+    out["params"] = params
+    return out
+
+
+def _inject_tenant_meta(msg: dict[str, Any], nonce: str) -> dict[str, Any]:
+    """Return a shallow copy of ``msg`` with ``params._meta.kirocrew.tenant``
+    set to this connection's *nonce*.
+
+    Injected on every request FORWARDED FROM A STUB by an advertising backend,
+    including the ones with no caller — that is the case it exists for. A backend
+    serving a caller the gateway cannot name falls back to a per-PROCESS
+    namespace, which on a pooled backend is one namespace for every unnamed
+    co-tenant (#5322); the nonce splits it per connection.
+
+    Deliberately NOT on the gateway's own synthesized lease frames
+    (``resources/subscribe`` / ``resources/unsubscribe`` replays): those carry the
+    caller because a subscription is held per caller, and no backend keys
+    subscription state by tenant. A backend that ever needs to would have to have
+    the nonce threaded into the lease bookkeeping, which is why this says
+    forwarded-from-a-stub rather than "always".
+
+    It is NOT an identity and must not be read as one: the block carries no
+    session key, so :meth:`CallerContext.from_meta` still finds nothing to parse
+    and every identity resolver keeps returning empty for an unnamed caller.
+
+    Copy discipline mirrors :func:`_inject_caller_meta`; assumes any stub-supplied
+    block was already removed by :func:`_strip_caller_meta`.
+    """
+    out = dict(msg)
+    params = out.get("params")
+    if isinstance(params, dict):
+        params = dict(params)
+    else:
+        params = {}
+    meta_raw = params.get("_meta")
+    meta = dict(meta_raw) if isinstance(meta_raw, dict) else {}
+    meta.update(build_tenant_meta(nonce))
     params["_meta"] = meta
     out["params"] = params
     return out
@@ -700,6 +792,28 @@ class Backend:
     # (see test_declared_only_server_still_intercepted). Keying this map per
     # session would drop the association and break rendering.
     _apps_declared_uris: dict[str, str] = field(default_factory=dict)
+    # The tool set this backend TOLD each stub about, projected by
+    # ``tool_surface`` from that stub's most recent model-facing tools/list
+    # response. A missing entry = nothing was ever served to that stub, which is
+    # NOT an empty tool set: it is the absence of any claim a replacement could
+    # contradict.
+    #
+    # Keyed PER STUB, not per backend. A pool key carries no caller identity, so
+    # one backend legitimately serves several sessions; a single scalar would let
+    # the last listing served to ANY of them stand in for what a particular
+    # session was told. For a server that answers every caller alike the two are
+    # the same value, but the comparison must be about the session being
+    # recovered, not about whichever tenant listed most recently.
+    #
+    # Bounded by the attached-stub set: ``detach_stub`` prunes an entry with the
+    # rest of that stub's per-stub state, which is also why the respawn path
+    # reads the anchor BEFORE it detaches.
+    #
+    # Read only by the respawn adoption path. Deliberately not an
+    # authorization input — see the module docstring of
+    # :mod:`kiro_crew.mcp_gateway.tool_surface` for why a snapshot must never
+    # become one.
+    _served_tool_surfaces: dict[str, ToolSurface] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Serialize concurrent writes to the SHARED backend stdin. Every
@@ -976,6 +1090,11 @@ class Backend:
         # already handled at grant time: a replay grant is honoured only
         # while its stub is still attached.)
         self._rekey_generation.pop(stub_uuid, None)
+        # The tool set this stub was told about goes with it. A respawn reads it
+        # BEFORE detaching for exactly this reason (see ``served_tool_surface``);
+        # keeping it here instead would grow one entry per session this backend
+        # ever served.
+        self._served_tool_surfaces.pop(stub_uuid, None)
         # A departing stub parked as a rider expects no further reply. This
         # prune runs BEFORE the pending scan below: the scan promotes the
         # first parked rider into the departing stub's in-flight subscribe,
@@ -1135,6 +1254,7 @@ class Backend:
         msg: dict[str, Any],
         *,
         caller: Optional[CallerContext] = None,
+        tenant_nonce: str = "",
     ) -> None:
         """Forward one JSON-RPC message from ``stub_uuid`` to the backend.
 
@@ -1151,6 +1271,13 @@ class Backend:
            advertised the capability at initialize time. The block is
            built via :func:`kiro_crew.mcp_caller.build_caller_meta` so
            gateway + backend share exactly one wire format.
+
+        ``tenant_nonce`` is this CONNECTION's namespace separator, injected
+        alongside (3) and independently of it: a caller the gateway cannot name
+        gets no identity block but still gets a nonce, which is what keeps two
+        unnamed co-tenants of one pooled backend out of each other's per-tenant
+        state (#5322). Empty means "no separator available" and leaves the
+        backend on its own per-process fallback.
         """
         if not self.is_alive:
             raise BackendGone(self._dead_reason or "backend is not alive")
@@ -1200,11 +1327,19 @@ class Backend:
                 tool_name = ""
                 tool_arguments = None
                 resource_uri = ""
+                list_paginated = False
                 _params = msg.get("params")
                 if isinstance(_params, dict):
                     _meta = _params.get("_meta")
                     if isinstance(_meta, dict):
                         progress_token = _meta.get("progressToken")
+                    if method == "tools/list":
+                        # A cursor means this response is a CONTINUATION page,
+                        # so on its own it is not the session's whole tool set.
+                        # Captured here because the recording side sees only the
+                        # response, and a final page is indistinguishable from a
+                        # complete listing without knowing what was asked.
+                        list_paginated = _params.get("cursor") is not None
                     if method == "tools/call":
                         _name = _params.get("name")
                         if isinstance(_name, str):
@@ -1224,6 +1359,7 @@ class Backend:
                     tool_name=tool_name,
                     tool_arguments=tool_arguments,
                     resource_uri=resource_uri,
+                    list_paginated=list_paginated,
                     caller=(caller if resource_uri else None),
                 )
             elif method == "notifications/cancelled":
@@ -1255,6 +1391,8 @@ class Backend:
             msg = _strip_caller_meta(msg)
             if self.supports_caller_identity and caller is not None:
                 msg = _inject_caller_meta(msg, caller)
+            if self.supports_caller_identity and tenant_nonce:
+                msg = _inject_tenant_meta(msg, tenant_nonce)
 
         self.touch()
         try:
@@ -1464,6 +1602,134 @@ class Backend:
             raise BackendGone(
                 self._dead_reason or "backend initialize failed on respawn"
             )
+
+    def served_tool_surface(self, stub_uuid: str) -> Optional[ToolSurface]:
+        """The tool set this backend told ``stub_uuid`` about.
+
+        ``None`` when that stub was never served a model-facing ``tools/list``,
+        or was served one this host could not project — in both cases there is
+        no claim a replacement could contradict, which is a different answer
+        from an empty tool set.
+
+        A caller that will also detach the stub must read this FIRST:
+        :meth:`detach_stub` prunes the entry, and a read after it would report
+        "nothing was ever served" for a session that was told plenty.
+        """
+        return self._served_tool_surfaces.get(stub_uuid)
+
+    def carry_served_tool_surface(self, stub_uuid: str, surface: ToolSurface) -> None:
+        """Adopt ``stub_uuid``'s existing tool-set claim onto THIS backend.
+
+        Called by the respawn path once a replacement has been validated and the
+        stub rebound to it. The claim belongs to what the SESSION holds, not to
+        the process that answered it: without carrying it, the anchor dies with
+        the backend it was recorded on, the replacement starts anchor-less, and a
+        SECOND respawn of the same stub has nothing to compare — so the guard
+        would protect only the first process swap in a session's life while the
+        client's frozen tool set is still the one from its original listing.
+
+        Carries what the session was TOLD, not what the replacement published.
+        The two agree on the tools the client holds, but a replacement may
+        legitimately offer more (an addition is not drift), and those extra tools
+        are not in the client's frozen set — so recording them would let a later
+        respawn refuse over a tool no call could name.
+        """
+        self._served_tool_surfaces[stub_uuid] = surface
+
+    async def probe_tool_surface(
+        self,
+        *,
+        caller: Optional[CallerContext] = None,
+        tenant_nonce: str = "",
+        timeout: float = _TOOL_SURFACE_PROBE_TIMEOUT_SECS,
+    ) -> Optional[ToolSurface]:
+        """Ask this backend what it publishes, projected for comparison.
+
+        Returns ``None`` when the answer cannot be projected into a surface —
+        the request failed, timed out, the server answered with a JSON-RPC
+        error, or the listing is not shaped like one
+        :func:`~kiro_crew.mcp_gateway.tool_surface.project_tool_surface` can
+        read. Every one of those is "we could not establish what it publishes",
+        which the caller must not be able to confuse with agreement.
+
+        Runs on its own internal stub so the reply is routed to us and to
+        nobody else, and so the model-visibility filter does not narrow the
+        server's own declaration on the way (see
+        :data:`INTERNAL_STUB_PREFIXES`). *caller* and *tenant_nonce* are carried
+        through so the probe asks in the SAME tenant context the recorded
+        listing was answered in: an identity-scoped server answers about the
+        session whose surface is being compared, and an unnamed caller keeps the
+        connection's ``_meta.kirocrew.tenant`` namespace instead of falling into
+        the per-process one. Asking without either would compare two answers the
+        server gave to different tenants and read the difference as drift.
+
+        Never raises: this is called from an adoption path whose entire purpose
+        is to be the safe one, so a probe that blows up must read as "could not
+        establish" rather than take the recovery down with it.
+        """
+        stub_uuid = f"{TOOL_SURFACE_STUB_PREFIX}{uuid.uuid4().hex[:12]}"
+        frame = {
+            "jsonrpc": "2.0",
+            "id": f"tool-surface-{uuid.uuid4().hex[:8]}",
+            "method": "tools/list",
+            "params": {},
+        }
+        try:
+            inbox = await self.attach_stub(stub_uuid)
+        except Exception:  # pragma: no cover — defensive
+            logger.debug("tool-surface probe could not attach", exc_info=True)
+            return None
+        try:
+            await self.forward_from_stub(
+                stub_uuid, frame, caller=caller, tenant_nonce=tenant_nonce
+            )
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                data = await asyncio.wait_for(inbox.get(), timeout=remaining)
+                try:
+                    msg = json.loads(data.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if not isinstance(msg, dict) or msg.get("id") != frame["id"]:
+                    continue
+                if "result" not in msg:
+                    # A JSON-RPC error answers the id but establishes nothing.
+                    return None
+                if not isinstance(msg["result"], dict):
+                    return None
+                if msg["result"].get("nextCursor") is not None:
+                    # Only the FIRST page. This probe asks without a cursor by
+                    # design — following the chain would make a recovery path
+                    # issue an unbounded request sequence — so a paginated answer
+                    # establishes nothing about the whole tool set. Reads as
+                    # unmeasurable, never as agreement.
+                    logger.info(
+                        "tool-surface probe on pid=%s got a paginated listing; "
+                        "the replacement's tool set cannot be established",
+                        self.pid,
+                    )
+                    return None
+                return project_tool_surface(msg["result"])
+        except (asyncio.TimeoutError, BackendGone, ConnectionError, OSError) as exc:
+            logger.info(
+                "tool-surface probe on pid=%s did not answer: %s", self.pid, exc
+            )
+            return None
+        except Exception:  # pragma: no cover — defensive
+            logger.warning("tool-surface probe raised", exc_info=True)
+            return None
+        finally:
+            # Mirrors the app-call relay's teardown: cancel first so a listing
+            # still in flight is not left running with no consumer, then detach
+            # unconditionally or this backend's refcount never returns to what
+            # it was before the probe.
+            with contextlib.suppress(Exception):
+                await self.cancel_in_flight_for_stub(stub_uuid)
+            with contextlib.suppress(Exception):
+                await self.detach_stub(stub_uuid)
 
     async def _broadcast_backend_gone(self, reason: str) -> None:
         """Send a synthetic JSON-RPC error to every attached stub before
@@ -3024,24 +3290,62 @@ class Backend:
         The tools/list visibility filter runs even when the feature gate is
         OFF — see below for why — so this is not a pure no-op in that state.
         """
-        # App-originated callbacks (the app-call relay forwards a tools/call on
-        # a ``__app_call__*`` stub) must NEVER be re-intercepted: if the called
-        # tool itself declares a ui:// resource, re-spooling would replace the
-        # app's real result with an internal marker string and mint a stray
-        # spool record. The render/spool path is only for MODEL-originated tool
-        # results; app callbacks return verbatim to the requesting app.
+        # Gateway-internal requests must NEVER be re-intercepted:
+        #
+        # * an app-originated callback (the app-call relay forwards a tools/call
+        #   on a ``__app_call__*`` stub) whose tool declares a ui:// resource
+        #   would have its real result replaced by an internal marker string and
+        #   mint a stray spool record. The render/spool path is only for
+        #   MODEL-originated tool results; app callbacks return verbatim to the
+        #   requesting app.
+        # * a tool-surface probe (``__tool_surface__*``) asks for the server's
+        #   OWN declaration so it can be compared with one already served. The
+        #   filter would hide part of that declaration, and its SEL audit would
+        #   record a withhold against a synthetic stub nobody asked for.
         #
         # Checked ahead of the feature gate because it also exempts a listing
         # from the visibility filter, which runs gate-independently.
-        if pending.stub_uuid.startswith("__app_call__"):
+        if pending.stub_uuid.startswith(INTERNAL_STUB_PREFIXES):
             return False
         if pending.method == "tools/list":
             result = msg.get("result")
             if isinstance(result, dict):
+                # What THIS stub is being told its tools are. Projected from the
+                # listing BEFORE the strip below mutates it, so this one call
+                # site does not depend on the strip having run: the projection
+                # applies the SAME model-visibility predicate itself, so it sees
+                # the set the client ends up holding either way, and the
+                # ordering cannot silently change what is recorded.
+                #
+                # An unprojectable listing CLEARS this stub's entry rather than
+                # leaving the previous one: the client just received a listing
+                # this host cannot read, so any earlier readable claim no longer
+                # describes what the session holds, and comparing against it
+                # would be comparing against a superseded answer.
+                #
+                # A PARTIAL listing clears it for the same reason and is the
+                # commoner case: ``tools/list`` is paginated, so one response can
+                # be a page rather than the whole tool set — the request carrying
+                # a ``cursor`` says this is a continuation, and a ``nextCursor``
+                # in the result says more follows. Either way it cannot stand for
+                # what the session holds, and recording it would compare a page
+                # against the probe's first page and refuse a replacement that
+                # never changed. A paginating server therefore keeps no anchor at
+                # all, which is the pre-existing behaviour: no validation, and no
+                # false refusal either.
+                #
+                # Not an authorization input and never served to anybody; see
+                # :mod:`kiro_crew.mcp_gateway.tool_surface`.
+                partial = pending.list_paginated or result.get("nextCursor") is not None
+                projected = None if partial else project_tool_surface(result)
+                if projected is None:
+                    self._served_tool_surfaces.pop(pending.stub_uuid, None)
+                else:
+                    self._served_tool_surfaces[pending.stub_uuid] = projected
                 # SEP-1865 MUST: a tool whose visibility omits "model" is not
                 # the agent's to see. Mutates the response in place before the
                 # caller delivers it. Reachable ONLY for model-facing listings —
-                # the __app_call__ guard above returns first, so an app's
+                # the internal-stub guard above returns first, so an app's
                 # authorization snapshot keeps its app-only tools and the
                 # visibility gate in app_call still sees them.
                 #

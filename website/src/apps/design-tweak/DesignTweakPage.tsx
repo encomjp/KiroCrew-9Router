@@ -17,6 +17,8 @@ import {
   MessageSquare, Archive, Trash2, MoreHorizontal,
 } from 'lucide-react'
 import Clickable from '../../components/Clickable'
+import ErrorNotice from '../../components/ErrorNotice'
+import { FolderBody } from '../../components/FolderBody'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '../../components/ui/dropdown-menu'
@@ -217,33 +219,9 @@ const DOT: Record<string, string> = {
   done: 'var(--ok)',
 }
 
-// Sessions' collapse mechanic: a grid that animates 1fr <-> 0fr, children stay
-// mounted (ChatSidebar.tsx FolderBody).
-function FolderBody({ open, children }: { open: boolean; children?: React.ReactNode }) {
-  return (
-    <div
-      style={{
-        display: 'grid',
-        gridTemplateRows: open ? '1fr' : '0fr',
-        transition: 'grid-template-rows 0.15s ease-out',
-      }}
-    >
-      <div
-        style={{
-          overflow: 'hidden',
-          visibility: open ? 'visible' : 'hidden',
-          padding: open ? '2px' : 0,
-        }}
-        // `inert` is not in the standard React 18 HTMLAttributes typing; add it via
-        // a spread (exempt from excess-property checks) so the closed subtree is
-        // non-interactive exactly as before (inert="" when collapsed).
-        {...(open ? {} : { inert: '' })}
-      >
-        {children}
-      </div>
-    </div>
-  )
-}
+// Sessions' collapse mechanic, shared with the chat sidebar rather than copied:
+// the local copy of this component kept reserving layout height for its closed
+// rows after the sidebar's copy was fixed, which is the whole reason it moved.
 
 interface CommentRowProps {
   req: Request
@@ -523,6 +501,10 @@ export default function DesignTweak() {
   }, [])
   const [mode, setMode] = useState<'preview' | 'edit'>('preview')
   const [status, setStatus] = useState('')
+  // A capture or follow-up the overlay handed up that the backend refused. Kept
+  // apart from `status` (progress prose) so it renders as an error notice, not
+  // as a muted line that fades into the next status update.
+  const [bridgeError, setBridgeError] = useState('')
   const [reqOpen, setReqOpen] = useState<Record<string, boolean>>({})     // requestId -> expanded?
   const [sendingId, setSendingId] = useState('') // request currently being sent
   const iframeRef = useRef<HTMLIFrameElement | null>(null)
@@ -561,6 +543,13 @@ export default function DesignTweak() {
   // Sole consumer is the payload path quoted into the agent prompt.
   const healthQuery = useQuery({ queryKey: DT_KEY.health, queryFn: fetchHealth, retry: false })
   const dataDir = healthQuery.data?.dataDir || ''
+  // The prompt quotes a payload path built from the data home, and the sender
+  // must not close over `dataDir` — the health read settles after the first
+  // render, so a captured copy is the empty string and the agent is handed a
+  // path with no data home in it. A ref is read at send time instead (same
+  // reason as `previewIdRef` below).
+  const dataDirRef = useRef(dataDir)
+  useEffect(() => { dataDirRef.current = dataDir }, [dataDir])
 
   const projects = projectsQuery.data?.projects ?? NO_PROJECTS
   const activeId = projectsQuery.data?.activeId ?? ''
@@ -863,7 +852,7 @@ export default function DesignTweak() {
   // calling `/send` again would only report `already` and dispatch nothing.
   const deliverSealed = useCallback(async (snap: Request, req: Request) => {
     const sealedComments = snap.comments || []
-    const msg = REQUEST_PROMPT(snap, sealedComments, requestPayloadPath(dataDir, req.id))
+    const msg = REQUEST_PROMPT(snap, sealedComments, requestPayloadPath(dataDirRef.current, req.id))
 
     // Route into THIS web app's dedicated session so every request for the
     // app is a turn in the same conversation.
@@ -1100,17 +1089,22 @@ export default function DesignTweak() {
               thread: [{ role: 'user', text: d.payload.comment }],
             })
             setReqOpen((m) => ({ ...m, [out.id as string]: true }))   // reveal the draft
+            setBridgeError('')
             setStatus(i18nT('apps.designTweak.status.added_comment', {
               label: out.label ?? '', n: out.commentCount ?? 0, number: out.number ?? 0,
             }))
             refresh()
           } else {
-            setStatus(i18nT('apps.designTweak.status.capture_failed', {
-              error: out?.error || i18nT('apps.designTweak.status.unknown'),
-            }))
+            const error = out?.error || i18nT('apps.designTweak.status.unknown')
+            setBridgeError(i18nT('apps.designTweak.status.capture_failed', { error }))
+            // Tell the overlay too: without this its composer sits on "Adding to
+            // request…" with the comment stranded, since `created` was its only
+            // exit. On `create_failed` it reopens the composer with the text.
+            postToOverlay({ type: 'create_failed', clientRef: d.clientRef, error })
           }
         } catch (err) {
-          setStatus(i18nT('apps.designTweak.status.capture_failed', { error: errMsg(err) }))
+          setBridgeError(i18nT('apps.designTweak.status.capture_failed', { error: errMsg(err) }))
+          postToOverlay({ type: 'create_failed', clientRef: d.clientRef, error: errMsg(err) })
         }
         return
       }
@@ -1120,7 +1114,12 @@ export default function DesignTweak() {
       if (d.type === 'dispatch' && d.id && d.text) {
         try {
           const origin = commentIndexRef.current[d.id]
-          if (!origin) { setStatus(i18nT('apps.designTweak.status.follow_up_origin_missing')); return }
+          if (!origin) {
+            const error = i18nT('apps.designTweak.status.follow_up_origin_missing')
+            setBridgeError(error)
+            postToOverlay({ type: 'dispatch_failed', id: d.id, text: d.text, error })
+            return
+          }
           const out: SubmitResponse = await submitComment({
             type: 'visual_edit_request',
             comment: d.text,
@@ -1131,17 +1130,22 @@ export default function DesignTweak() {
           })
           if (out?.ok) {
             setReqOpen((m) => ({ ...m, [out.id as string]: true }))
+            setBridgeError('')
             setStatus(i18nT('apps.designTweak.status.follow_up_added', {
               label: out.label ?? '', number: out.number ?? 0,
             }))
             refresh()
           } else {
-            setStatus(i18nT('apps.designTweak.status.follow_up_failed', {
-              error: out?.error || i18nT('apps.designTweak.status.unknown'),
-            }))
+            const error = out?.error || i18nT('apps.designTweak.status.unknown')
+            setBridgeError(i18nT('apps.designTweak.status.follow_up_failed', { error }))
+            // The overlay drew the reply optimistically; this lets it take the
+            // bubble back and restore the text instead of showing a sent reply
+            // that was never persisted.
+            postToOverlay({ type: 'dispatch_failed', id: d.id, text: d.text, error })
           }
         } catch (err) {
-          setStatus(i18nT('apps.designTweak.status.follow_up_failed', { error: errMsg(err) }))
+          setBridgeError(i18nT('apps.designTweak.status.follow_up_failed', { error: errMsg(err) }))
+          postToOverlay({ type: 'dispatch_failed', id: d.id, text: d.text, error: errMsg(err) })
         }
         return
       }
@@ -1704,6 +1708,10 @@ export default function DesignTweak() {
         </div>
 
         {status && <div className="px-5 py-1 text-[11px] text-muted truncate">{status}</div>}
+        {/* No hand-off: the refused comment is sitting restored in the preview
+            overlay's composer (see `create_failed` / `dispatch_failed`), and the
+            navigation would unmount the iframe that holds it. */}
+        <ErrorNotice message={bridgeError} onDismiss={() => setBridgeError('')} className="mx-5 my-1" />
 
         {/* request tree + history (nesting mirrors the Sessions folder view) */}
         <div className="flex-1 min-h-0 flex flex-col">
@@ -1779,8 +1787,17 @@ export default function DesignTweak() {
         </div>
       </div>
 
-      {/* drag handle = the gap between panels */}
+      {/* drag handle = the gap between panels. `separator` is the role a resize
+          strip carries across the dashboard, and it takes a name so a screen
+          reader announces the divider rather than an anonymous gap. It stays
+          OUT of the tab order: the width it adjusts is cosmetic, both panels
+          scroll and stay fully operable at any width, so there is no content or
+          control here that only the pointer can reach. */}
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- pointer-only splitter: `onMouseDown` starts the drag, and a separator with no tab stop has no keyboard operation to mirror it with */}
       <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label={i18nT('apps.designTweak.layout.drag_to_resize')}
         onMouseDown={onDragStart}
         title={i18nT('apps.designTweak.layout.drag_to_resize')}
         className="shrink-0 cursor-col-resize"
@@ -1836,18 +1853,11 @@ export default function DesignTweak() {
                     })}
                   </div>
                 )}
-                {devError && (
-                  <div
-                    className="text-[12px] leading-snug"
-                    style={{
-                      color: 'var(--danger)', background: 'var(--danger-subtle)',
-                      padding: '8px 10px', borderRadius: 8, whiteSpace: 'pre-wrap',
-                    }}
-                    role="alert"
-                  >
-                    {devError}
-                  </div>
-                )}
+                {/* The edit requests are persisted server-side, so the only draft this
+                    page can hold is the dev-server URL field in the rail: the hand-off
+                    is gated on that disclosure being closed. No hand-off while
+                    `devOpen`: `devDraft` is unsaved. */}
+                <ErrorNotice message={devError} askAgent={!devOpen} className="w-full" />
               </div>
             </div>
           )
@@ -1887,6 +1897,7 @@ export default function DesignTweak() {
                   If you need to change this, change WHERE the frame is served from
                   (server.py `_StaticInjectHandler`), not this attribute.
                 */}
+                {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- `onLoad` is a resource event on the frame (the preview finished loading, so seed the overlay), not a gesture, so it has no keyboard equivalent to add */}
                 <iframe
                   ref={iframeRef}
                   src={previewSrc}

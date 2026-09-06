@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Search, BookOpen, Network, FolderSync, HelpCircle, FileText, X, Copy, Settings } from 'lucide-react'
 import { Btn, SearchInput, Badge, EmptyState, ContentSkeleton } from '../../components/ui'
 import Clickable from '../../components/Clickable'
+import Modal from '../../components/Modal'
 import SimpleSelect from '../../components/SimpleSelect'
 import { knowledgeApi } from './api'
 import { useCopy, ITEM_TYPES, STATUSES, DEFAULT_STATUS_FILTER, ONBOARDING, FALLBACK_SUPPORTED_FORMATS, formatSupportedFormats } from './helpers'
@@ -392,8 +393,13 @@ export default function KnowledgePage({ embedded = false }: { embedded?: boolean
         const input = searchRef.current?.querySelector('input')
         input?.focus()
       } else if (e.key === 'Escape') {
-        if (showHelp) { setShowHelp(false); e.preventDefault() }
-        else if (selectedId) { setSelectedId(null); e.preventDefault() }
+        // The help dialog owns Escape while it is open, and it is the shared
+        // Modal that closes it now (bubble-phase window listener, registered
+        // when the dialog opened). This branch only has to keep the PRECEDENCE
+        // the chain below documents: one Escape must not both dismiss the help
+        // and clear the page's selection underneath it.
+        if (showHelp) return
+        if (selectedId) { setSelectedId(null); e.preventDefault() }
         else if (selectedItems.size > 0) { setSelectedItems(new Set()); e.preventDefault() }
       } else if (e.key === 'ArrowRight' && !e.altKey && !e.ctrlKey) {
         // Arrow paging drives the flat search pager only; in source-first mode
@@ -527,28 +533,29 @@ export default function KnowledgePage({ embedded = false }: { embedded?: boolean
       )}
 
       {showHelp && (
-        <Clickable className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50" onClick={e => { if (!e || e.target === e.currentTarget) setShowHelp(false) }}>
-          <div role="dialog" aria-modal="true" aria-labelledby="help-title" className="bg-bg-elevated border border-border rounded-xl p-6 max-w-md w-full mx-4 animate-rise">
-            <div className="flex items-center justify-between mb-3">
-              <h3 id="help-title" className="text-lg font-bold text-text-strong">{ONBOARDING.title}</h3>
-              <button aria-label={i18nT('pages.knowledge.index.close')} onClick={() => setShowHelp(false)} className="text-muted hover:text-text bg-transparent border-none cursor-pointer"><X size={18} /></button>
-            </div>
-            <p className="text-sm text-muted mb-3">{ONBOARDING.description}</p>
-            <ol className="space-y-2">
-              {ONBOARDING.steps(supportedFormatsDisplay).map((s, i) => <li key={i} className="text-[13px] text-text flex gap-2"><span className="text-accent font-bold">{i + 1}.</span>{s}</li>)}
-            </ol>
-            <div className="mt-4 pt-3 border-t border-border">
-              <div className="text-[12px] font-medium text-text-strong mb-1">{i18nT('pages.knowledge.index.keyboard_shortcuts')}</div>
-              <div className="grid grid-cols-2 gap-1 text-[11px] text-muted">
-                <span><kbd className="px-1 bg-bg-elevated border border-border rounded">/</kbd> {i18nT('pages.knowledge.index.focus_search')}</span>
-                <span><kbd className="px-1 bg-bg-elevated border border-border rounded">{i18nT('pages.knowledge.index.esc')}</kbd> {i18nT('pages.knowledge.index.back_clear')}</span>
-                {/* Arrow glyphs are keycap symbols, not prose — no translation. */}
-                <span><kbd className="px-1 bg-bg-elevated border border-border rounded">←</kbd> <kbd className="px-1 bg-bg-elevated border border-border rounded">→</kbd> {i18nT('pages.knowledge.index.prev_next_page')}</span>
-                <span><kbd className="px-1 bg-bg-elevated border border-border rounded">{i18nT('pages.knowledge.index.ctrl_a')}</kbd> {i18nT('pages.knowledge.index.select_all')}</span>
-              </div>
+        // The shared Modal owns the backdrop, Escape dismissal, the focus
+        // trap/restore, the scroll lock and the keyboard isolation this
+        // hand-rolled overlay lacked. `open` is constant because the help panel
+        // is conditionally mounted. The dialog keeps its accessible name from
+        // its own rendered title, which is the same string the removed <h3>
+        // carried, and Modal's header supplies the close button the panel used
+        // to hand-roll.
+        <Modal open onClose={() => setShowHelp(false)} title={ONBOARDING.title} maxWidth={448}>
+          <p className="text-sm text-muted mb-3">{ONBOARDING.description}</p>
+          <ol className="space-y-2">
+            {ONBOARDING.steps(supportedFormatsDisplay).map((s, i) => <li key={i} className="text-[13px] text-text flex gap-2"><span className="text-accent font-bold">{i + 1}.</span>{s}</li>)}
+          </ol>
+          <div className="mt-4 pt-3 border-t border-border">
+            <div className="text-[12px] font-medium text-text-strong mb-1">{i18nT('pages.knowledge.index.keyboard_shortcuts')}</div>
+            <div className="grid grid-cols-2 gap-1 text-[11px] text-muted">
+              <span><kbd className="px-1 bg-bg-elevated border border-border rounded">/</kbd> {i18nT('pages.knowledge.index.focus_search')}</span>
+              <span><kbd className="px-1 bg-bg-elevated border border-border rounded">{i18nT('pages.knowledge.index.esc')}</kbd> {i18nT('pages.knowledge.index.back_clear')}</span>
+              {/* Arrow glyphs are keycap symbols, not prose — no translation. */}
+              <span><kbd className="px-1 bg-bg-elevated border border-border rounded">←</kbd> <kbd className="px-1 bg-bg-elevated border border-border rounded">→</kbd> {i18nT('pages.knowledge.index.prev_next_page')}</span>
+              <span><kbd className="px-1 bg-bg-elevated border border-border rounded">{i18nT('pages.knowledge.index.ctrl_a')}</kbd> {i18nT('pages.knowledge.index.select_all')}</span>
             </div>
           </div>
-        </Clickable>
+        </Modal>
       )}
 
       {/* Tabs — horizontally scrollable on narrow viewports so the active

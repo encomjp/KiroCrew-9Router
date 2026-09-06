@@ -55,10 +55,15 @@ def data_dir() -> Path:
     return root
 
 
+def scratch_path() -> Path:
+    """Configured disposable root without touching the filesystem."""
+    override = os.environ.get("AUTO_IMPROVEMENT_SCRATCH")
+    return Path(override).expanduser() if override else Path.home() / ".autoimprove-scratch"
+
+
 def scratch_dir() -> Path:
     """Disposable clone/worktree root — outside ``data/`` on purpose."""
-    override = os.environ.get("AUTO_IMPROVEMENT_SCRATCH")
-    root = Path(override).expanduser() if override else Path.home() / ".autoimprove-scratch"
+    root = scratch_path()
     root.mkdir(parents=True, exist_ok=True)
     return root
 

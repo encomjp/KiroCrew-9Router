@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { i18nT } from '../i18n/t'
 import type { ReactNode } from 'react'
 import { act, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import type { RootState } from '../store'
@@ -140,6 +141,10 @@ describe('ChatPane send — the response confirms the optimistic bubble', () => 
     store.getState().chat.slotMessages[slot]?.find(m => m.role === 'user')
 
   it('retires the pending-confirmation flags when the server accepts', async () => {
+    ;(api.sendChat as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ ok: true, mid: 'm-server-confirmed' }),
+    })
     const { store } = renderPane('pane-confirm')
     const box = (await screen.findAllByRole('textbox'))[0]
     fireEvent.change(box, { target: { value: 'confirm me' } })
@@ -148,6 +153,7 @@ describe('ChatPane send — the response confirms the optimistic bubble', () => 
     await waitFor(() => expect(userRow(store, 'pane-confirm')?.meta?.optimistic).toBeUndefined())
     // The correlation id stays so a late echo updates this row in place.
     expect(userRow(store, 'pane-confirm')?.meta?.sendId).toMatch(/^s-/)
+    expect(userRow(store, 'pane-confirm')?.meta?.mid).toBe('m-server-confirmed')
   })
 
   it('leaves the bubble pending when the server rejects the send', async () => {
@@ -324,7 +330,7 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     expect((box as HTMLTextAreaElement).value).toBe('')
   })
 
-  it('falls back to the generic string when the transport rejects', async () => {
+  it('states the cause when the transport rejects: the shared connection copy, not a bare "Send failed"', async () => {
     ;(api.sendChat as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('offline'))
     const { store } = renderPane('pane-generic')
     const box = (await screen.findAllByRole('textbox'))[0]
@@ -333,7 +339,7 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
 
     // No response means no server reason, so the connectivity copy is correct here.
     await waitFor(() => expect(errorsIn(store, 'pane-generic')).toHaveLength(1))
-    expect(errorsIn(store, 'pane-generic')[0].content.trim().length).toBeGreaterThan(0)
+    expect(errorsIn(store, 'pane-generic')[0].content).toBe(i18nT('pages.chatPage.send_failed_connection'))
   })
 
   it('reports a REFUSED question-card answer instead of losing it (#4217)', async () => {
@@ -358,6 +364,29 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     await waitFor(() => expect(errorsIn(store, 'pane-ask')).toHaveLength(1))
     expect(errorsIn(store, 'pane-ask')[0].content).toBe('slot is stopping')
     // ...and the answer comes back so it can be sent again.
+    const box = (await screen.findAllByRole('textbox'))[0] as HTMLTextAreaElement
+    await waitFor(() => expect(box.value).toBe('Public only'))
+  })
+
+  it('recovers a cleared question-card answer when its receipt is late', async () => {
+    // The transport normalizes AbortError to response-late. Unlike the normal
+    // composer path, the card has already removed the only visible copy of the
+    // answer, so this caller deliberately restores it for the user to inspect.
+    ;(api.sendChat as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+      new DOMException('The operation was aborted.', 'AbortError'),
+    )
+    const { store } = renderPane('pane-ask-late')
+    act(() => {
+      store.dispatch(setQuestionCard({
+        slot: 'pane-ask-late',
+        card_id: 'delivery-late',
+        questions: [{ question: 'Pick a trust model', options: [{ label: 'Public only' }] }],
+      }))
+    })
+    fireEvent.click(await screen.findByText('Public only'))
+    fireEvent.click(screen.getByText('Submit'))
+
+    await waitFor(() => expect(errorsIn(store, 'pane-ask-late')).toHaveLength(1))
     const box = (await screen.findAllByRole('textbox'))[0] as HTMLTextAreaElement
     await waitFor(() => expect(box.value).toBe('Public only'))
   })
@@ -398,13 +427,13 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     expect((box as HTMLTextAreaElement).value).toBe('')
   })
 
-  it('reports an attachment-only send the backend claims it queued but dropped', async () => {
-    // `chat_handlers` queues `if message:` yet answers `{ok, queued}` either way,
-    // so a file-only send that raced the slot into the busy state is silently
-    // discarded. Nothing else carries the attachment once the composer clears.
+  it('reports an attachment-only send the backend refuses for its empty wire text', async () => {
+    // The server refuses an empty wire text above every dispatch branch, so a
+    // file-only send comes back 400 `message_required`. The pane must surface
+    // that refusal: nothing else carries the attachment once the composer clears.
     ;(api.uploadFiles as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ paths: ['/tmp/report.pdf'] })
     ;(api.sendChat as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
-      ok: true, json: () => Promise.resolve({ ok: true, queued: true }),
+      ok: false, status: 400, json: () => Promise.resolve({ error: 'message is required', code: 'message_required' }),
     })
     const { store, container } = renderPane('pane-dropped')
     const fileInput = container.querySelector('input[type="file"]') as HTMLInputElement
@@ -417,8 +446,8 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     fireEvent.keyDown(box, { key: 'Enter', code: 'Enter' })
 
     await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
-    // Wire text is empty for a file-only send, which is exactly what the backend
-    // guard drops.
+    // Wire text is empty for a file-only send, which is exactly what the server
+    // refuses.
     expect((api.sendChat as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe('')
     await waitFor(() => expect(errorsIn(store, 'pane-dropped')).toHaveLength(1))
   })

@@ -4,6 +4,8 @@ Covers:
 - ``steering_roots`` / ``list_steering_blocking`` discovery of the global
   ``~/.kiro/steering`` and workspace ``<project>/.kiro/steering`` locations
 - ``resolve_steering_file`` traversal, suffix, symlink and containment guards
+- the listing's ``inclusion`` / ``fileMatchPattern`` metadata, and that front
+  matter is excluded from the one-line description
 - ``GET/POST/PUT/DELETE /api/steering`` end-to-end, including the
   restricted-session write block and SEL audit emission
 
@@ -11,6 +13,7 @@ Tests pin $HOME to tmp_path so the real filesystem is never touched.
 """
 from __future__ import annotations
 
+import json
 import os
 import stat
 from pathlib import Path
@@ -23,7 +26,10 @@ from aiohttp.test_utils import TestClient, TestServer
 import kiro_crew.dashboard.handlers.steering as steering_mod
 from kiro_crew.dashboard.handlers._shared import active_project_dir, active_project_state
 from kiro_crew.dashboard.handlers.steering import (
+    _STEERING_META_MAX_CHARS,
     STEERING_FILE_MAX_BYTES,
+    STEERING_INCLUSION_DEFAULT,
+    STEERING_INCLUSION_MODES,
     STEERING_MAX_FILES,
     STEERING_PROJECT_HEADER,
     _project_key,
@@ -117,6 +123,53 @@ class TestListing:
         assert [r["source"] for r in out["roots"]] == ["user", "workspace"]
         assert all(r["exists"] for r in out["roots"])
 
+    def test_a_comment_only_front_matter_block_is_not_the_description(self, fake_home):
+        """A closed fence around nothing but a comment is still a closed fence.
+
+        ``split_frontmatter`` already returns the text AFTER it correctly; the
+        bug was discarding that body for the RAW head whenever no ``key: value``
+        field was found, so the front matter's own ``#`` line was read as the
+        document's first markdown heading — publishing a comment inside the
+        declaration as the description, in place of the real title after it.
+        """
+        _write_steering(
+            fake_home / ".kiro" / "steering", "x.md",
+            "---\n# just a note\n---\n# Title\nBody text.\n",
+        )
+        out = list_steering_blocking(None)
+        by_key = {f["key"]: f for f in out["files"]}
+        assert by_key["user/x.md"]["description"] == "Title"
+
+    def test_a_hardlinked_document_leaks_no_metadata(self, fake_home, tmp_path):
+        """A hardlink defeats the symlink and sensitive-PATH checks above it.
+
+        The entry's own path stays innocently inside the steering root while its
+        inode is somebody else's secret, so the scan's ``is_symlink`` and
+        ``is_sensitive_path`` gates both pass and the file's first line would be
+        published as this document's description. The guarded reader fstat()s the
+        descriptor it opened and refuses ``st_nlink > 1``.
+        """
+        secret = tmp_path / "credentials"
+        secret.write_text("# aws_secret_access_key = SHOULD-NOT-APPEAR\n", encoding="utf-8")
+        root = fake_home / ".kiro" / "steering"
+        _write_steering(root, "innocent.md", "# Innocent\n")
+        link = root / "linked.md"
+        try:
+            os.link(secret, link)
+        except (OSError, NotImplementedError):
+            pytest.skip("filesystem does not support hardlinks")
+        if link.stat().st_nlink < 2:
+            pytest.skip("filesystem did not create a second link")
+
+        out = list_steering_blocking(None)
+        by_key = {f["key"]: f for f in out["files"]}
+        # Still listed — the scan sees a regular .md file — but with no metadata
+        # read out of it.
+        assert by_key["user/linked.md"]["description"] == ""
+        assert "SHOULD-NOT-APPEAR" not in json.dumps(out)
+        # The ordinary neighbour is unaffected.
+        assert by_key["user/innocent.md"]["description"] == "Innocent"
+
     def test_nested_files_and_home_redaction(self, fake_home):
         _write_steering(fake_home / ".kiro" / "steering", "team/style.md")
         out = list_steering_blocking(None)
@@ -152,6 +205,104 @@ class TestListing:
         for i in range(STEERING_MAX_FILES + 5):
             _write_steering(root, f"doc{i:04d}.md")
         assert len(list_steering_blocking(None)["files"]) == STEERING_MAX_FILES
+
+
+class TestInclusionMetadata:
+    """The listing reports each document's declared ``inclusion``.
+
+    Kiro Crew does not ACT on the value — on the live ACP path the load
+    decision is kiro-cli's, which reads the same front matter itself. These
+    pin that the tab shows the author what they declared, and that a
+    declaration never masquerades as the document's summary.
+    """
+
+    def _entry(self, home: Path, body: str) -> dict:
+        _write_steering(home / ".kiro" / "steering", "doc.md", body)
+        return list_steering_blocking(None)["files"][0]
+
+    def test_front_matter_does_not_become_the_description(self, fake_home):
+        """The regression this metadata replaced: the tab summarized a document
+        by its first declaration, so a ``manual`` document was described as the
+        string ``inclusion: manual``."""
+        entry = self._entry(fake_home, "---\ninclusion: manual\n---\n# Payroll rules\nbody\n")
+        assert entry["description"] == "Payroll rules"
+
+    @pytest.mark.parametrize("mode", STEERING_INCLUSION_MODES)
+    def test_each_documented_mode_round_trips(self, fake_home, mode):
+        entry = self._entry(fake_home, f"---\ninclusion: {mode}\n---\n# Doc\n")
+        assert entry["inclusion"] == mode
+        assert entry["inclusion_declared"] == mode
+
+    def test_absent_front_matter_reports_the_default(self, fake_home):
+        entry = self._entry(fake_home, "# Plain doc\nbody\n")
+        assert entry["inclusion"] == STEERING_INCLUSION_DEFAULT
+        # Empty, not the resolved mode: the tab distinguishes "declared
+        # nothing" from "declared something unreadable", and only the second is
+        # worth telling the author about.
+        assert entry["inclusion_declared"] == ""
+        assert entry["description"] == "Plain doc"
+
+    def test_unrecognized_mode_reports_default_plus_raw_spelling(self, fake_home):
+        """A typo resolves to the default — matching what kiro-cli does with a
+        value it does not recognize — but the spelling survives, because it is
+        the only thing that explains the behavior to its author."""
+        entry = self._entry(fake_home, "---\ninclusion: manaul\n---\n# Typo\n")
+        assert entry["inclusion"] == STEERING_INCLUSION_DEFAULT
+        assert entry["inclusion_declared"] == "manaul"
+
+    def test_mode_spelling_is_canonicalized(self, fake_home):
+        entry = self._entry(fake_home, "---\ninclusion: FILEMATCH\n---\n# Doc\n")
+        assert entry["inclusion"] == "fileMatch"
+        assert entry["inclusion_declared"] == "FILEMATCH"
+
+    def test_file_match_pattern_is_reported(self, fake_home):
+        entry = self._entry(
+            fake_home,
+            '---\ninclusion: fileMatch\nfileMatchPattern: "src/**/*.ts"\n---\n# Doc\n',
+        )
+        assert entry["file_match_pattern"] == "src/**/*.ts"
+
+    def test_inclusion_in_body_prose_is_not_front_matter(self, fake_home):
+        """A document explaining the modes must not be read as declaring one."""
+        entry = self._entry(
+            fake_home,
+            "# Guide\nSet inclusion: manual to keep a runbook out of every turn.\n",
+        )
+        assert entry["inclusion"] == STEERING_INCLUSION_DEFAULT
+        assert entry["inclusion_declared"] == ""
+
+    def test_truncated_crlf_front_matter_yields_no_description(self, fake_home):
+        """A CRLF document opens ``---\\r\\n``; missing that opener let the raw
+        head through and re-exposed ``inclusion:`` as the description."""
+        filler = "".join(f"pad{i}: {'x' * 80}\r\n" for i in range(60))
+        entry = self._entry(
+            fake_home, f"---\r\ninclusion: manual\r\n{filler}---\r\n# Title\r\n"
+        )
+        assert entry["description"] == ""
+
+    def test_front_matter_past_the_head_slice_yields_no_description(self, fake_home):
+        """With no closing fence inside the slice there is no body to read, and
+        falling back to the raw head would reinstate the exact bug above."""
+        filler = "".join(f"pad{i}: {'x' * 80}\n" for i in range(60))
+        entry = self._entry(fake_home, f"---\ninclusion: manual\n{filler}---\n# Title\n")
+        assert entry["description"] == ""
+
+    def test_free_text_metadata_is_redacted(self, fake_home):
+        """``inclusion``/``fileMatchPattern`` are author-supplied text on the
+        same never-round-tripped path as the description."""
+        leak = "AKIAIOSFODNN7EXAMPLE1234567890abcdefghij"
+        entry = self._entry(
+            fake_home,
+            f"---\ninclusion: fileMatch\nfileMatchPattern: {leak}\n---\n# Doc\n",
+        )
+        assert "AKIAIOSFODNN7EXAMPLE" not in entry["file_match_pattern"]
+
+    def test_free_text_metadata_is_capped(self, fake_home):
+        entry = self._entry(
+            fake_home,
+            "---\ninclusion: fileMatch\nfileMatchPattern: " + "a" * 500 + "\n---\n# Doc\n",
+        )
+        assert len(entry["file_match_pattern"]) == _STEERING_META_MAX_CHARS
 
 
 # ── Key parsing + resolution guards ──
@@ -206,12 +357,14 @@ class TestResolution:
         (root / "link.md").symlink_to(secret)
         assert resolve_steering_file("user/link.md", None) is None
 
-    def test_symlinked_leaf_inside_base_also_rejected(self, fake_home):
-        """A link that resolves INSIDE the base is still not a steering file.
+    def test_symlinked_leaf_inside_base_rejected_for_write_but_listed(self, fake_home):
+        """A leaf link never resolves for write, but an admissible one lists.
 
         ``.kiro/steering/rules.md -> ../../README.md`` passes a base-containment
         check, so without a leaf-symlink rejection PUT would truncate — and
         DELETE unlink — an unrelated file the user never opened in the tab.
+        The listing DOES show it, read-only: the target is under $HOME, a
+        regular file and not sensitive, so the session loader reads it.
         """
         root = fake_home / ".kiro" / "steering"
         root.mkdir(parents=True, exist_ok=True)
@@ -219,7 +372,10 @@ class TestResolution:
         victim.write_text("# real readme\n", encoding="utf-8")
         (root / "rules.md").symlink_to(victim)
         assert resolve_steering_file("user/rules.md", None) is None
-        assert [f["key"] for f in list_steering_blocking(None)["files"]] == []
+        entries = list_steering_blocking(None)["files"]
+        assert [f["key"] for f in entries] == ["user/rules.md"]
+        assert entries[0]["linked"] is True
+        assert entries[0]["editable"] is False
 
     def test_symlinked_subdir_escaping_base_rejected(self, fake_home, tmp_path):
         root = fake_home / ".kiro" / "steering"
@@ -232,6 +388,192 @@ class TestResolution:
     def test_write_target_need_not_exist(self, fake_home):
         target = resolve_steering_file("user/new/doc.md", None, for_write=True)
         assert target == fake_home / ".kiro" / "steering" / "new" / "doc.md"
+
+
+class TestLinkedEntries:
+    """Leaf symlinks list read-only through the loader's own admission gate.
+
+    ``context._load_steering_resources`` follows a leaf symlink and loads its
+    target whenever that target is under ``$HOME``, a regular file, and not
+    sensitive — so the listing admits exactly the same set
+    (``steering_target_admissible``), read-only, or the tab reports
+    "Steering (0)" for documents that load into every session.
+    """
+
+    @staticmethod
+    def _link(fake_home, rel: str, target: Path) -> Path:
+        root = fake_home / ".kiro" / "steering"
+        root.mkdir(parents=True, exist_ok=True)
+        link = root / rel
+        link.symlink_to(target)
+        return link
+
+    def test_admissible_link_lists_read_only_with_target_meta(self, fake_home):
+        target = fake_home / "dotfiles" / "conventions.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("# Conventions\nrules\n", encoding="utf-8", newline="")
+        self._link(fake_home, "conventions.md", target)
+
+        out = list_steering_blocking(None)
+        by_key = {f["key"]: f for f in out["files"]}
+        entry = by_key["user/conventions.md"]
+        assert entry["linked"] is True
+        assert entry["editable"] is False
+        # The description comes from the TARGET's head, and the resolved
+        # target travels with the entry (home collapsed to ``~``). Display
+        # paths are OS-native, so fold the separator before comparing.
+        assert entry["description"] == "Conventions"
+        assert entry["target"].replace("\\", "/") == "~/dotfiles/conventions.md"
+        assert entry["size"] == target.stat().st_size
+
+    def test_regular_entries_report_editable(self, fake_home):
+        _write_steering(fake_home / ".kiro" / "steering", "plain.md")
+        entry = list_steering_blocking(None)["files"][0]
+        assert entry["linked"] is False
+        assert entry["editable"] is True
+        assert entry["target"] == ""
+
+    def test_link_to_sensitive_target_stays_hidden(self, fake_home):
+        secret = fake_home / ".aws" / "creds.md"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("aws_secret_access_key=nope\n", encoding="utf-8")
+        self._link(fake_home, "innocent.md", secret)
+        out = list_steering_blocking(None)
+        assert [f["key"] for f in out["files"]] == []
+        assert "nope" not in json.dumps(out)
+
+    def test_link_escaping_home_stays_hidden(self, fake_home, tmp_path):
+        outside = tmp_path / "outside.md"
+        outside.write_text("# Outside\n", encoding="utf-8")
+        self._link(fake_home, "outside.md", outside)
+        assert list_steering_blocking(None)["files"] == []
+
+    def test_dangling_link_stays_hidden(self, fake_home):
+        self._link(fake_home, "gone.md", fake_home / "nowhere.md")
+        assert list_steering_blocking(None)["files"] == []
+
+    def test_looping_link_stays_hidden_not_500(self, fake_home):
+        """A self-referential link raises RuntimeError from resolve, not OSError.
+
+        ``Path.resolve(strict=True)`` reports a symlink LOOP as RuntimeError;
+        catching only OSError turned one ``loop.md`` into a 500 for the whole
+        listing and the detail read.
+        """
+        root = fake_home / ".kiro" / "steering"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "loop.md").symlink_to(root / "loop.md")
+        assert list_steering_blocking(None)["files"] == []
+        assert resolve_steering_file("user/loop.md", None, follow_links=True) is None
+
+    def test_workspace_link_inside_steering_root_lists_read_only(self, fake_home, tmp_path):
+        """Workspace latitude stops at the steering root — a link within it lists."""
+        proj = tmp_path / "proj"
+        root = proj / ".kiro" / "steering"
+        target = root / "shared" / "conventions.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("# Project conventions\n", encoding="utf-8", newline="")
+        (root / "conventions.md").symlink_to(target)
+        entries = list_steering_blocking(proj)["files"]
+        by_key = {f["key"]: f for f in entries}
+        entry = by_key["workspace/conventions.md"]
+        assert entry["linked"] is True
+        assert entry["editable"] is False
+        assert entry["description"] == "Project conventions"
+        # The target itself is also a plain listed document.
+        assert by_key["workspace/shared/conventions.md"]["linked"] is False
+
+    def test_workspace_link_to_project_file_outside_root_stays_hidden(self, fake_home, tmp_path):
+        """A repository-committed link must not read project files through steering.
+
+        ``workspace`` has no session loader following links (kiro-cli reads the
+        root itself), so there is no parity to honor — and with the whole
+        project as the base, ``leak.md -> ../../.env`` would serve the
+        project's own credentials verbatim through the steering GET.
+        """
+        proj = tmp_path / "proj"
+        env = proj / ".env"
+        proj.mkdir()
+        env.write_text("SECRET_TOKEN=nope\n", encoding="utf-8")
+        root = proj / ".kiro" / "steering"
+        root.mkdir(parents=True)
+        (root / "leak.md").symlink_to(env)
+        out = list_steering_blocking(proj)
+        assert [f["key"] for f in out["files"]] == []
+        assert "nope" not in json.dumps(out)
+        assert resolve_steering_file("workspace/leak.md", proj, follow_links=True) is None
+
+    def test_workspace_link_escaping_project_stays_hidden(self, fake_home, tmp_path):
+        """A link out of the project entirely (into $HOME) is likewise hidden."""
+        notes = fake_home / ".config" / "notes.md"
+        notes.parent.mkdir(parents=True)
+        notes.write_text("home file a repo link must not reach\n", encoding="utf-8")
+        proj = tmp_path / "proj"
+        root = proj / ".kiro" / "steering"
+        root.mkdir(parents=True)
+        (root / "notes.md").symlink_to(notes)
+        entries = list_steering_blocking(proj)["files"]
+        assert [f["key"] for f in entries] == []
+        assert resolve_steering_file("workspace/notes.md", proj, follow_links=True) is None
+
+    @pytest.mark.asyncio
+    async def test_read_endpoint_serves_workspace_linked_content(self, fake_home, tmp_path):
+        proj = tmp_path / "proj"
+        root = proj / ".kiro" / "steering"
+        target = root / "shared" / "conventions.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("# Project conventions\nbody\n", encoding="utf-8", newline="")
+        (root / "conventions.md").symlink_to(target)
+        async with TestClient(TestServer(_make_app(_state(proj)))) as client:
+            resp = await client.get("/api/steering/workspace/conventions.md")
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["content"] == "# Project conventions\nbody\n"
+
+    def test_resolve_follows_links_only_when_asked(self, fake_home):
+        target = fake_home / "notes.md"
+        target.write_text("# Notes\n", encoding="utf-8")
+        self._link(fake_home, "notes.md", target)
+        assert resolve_steering_file("user/notes.md", None) is None
+        assert (
+            resolve_steering_file("user/notes.md", None, follow_links=True)
+            == target.resolve()
+        )
+
+    def test_resolve_refuses_inadmissible_target_even_following(self, fake_home, tmp_path):
+        outside = tmp_path / "outside.md"
+        outside.write_text("# Outside\n", encoding="utf-8")
+        self._link(fake_home, "outside.md", outside)
+        assert resolve_steering_file("user/outside.md", None, follow_links=True) is None
+
+    @pytest.mark.asyncio
+    async def test_read_endpoint_serves_linked_content(self, fake_home):
+        target = fake_home / "dotfiles" / "conventions.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("# Conventions\nlinked body\n", encoding="utf-8", newline="")
+        self._link(fake_home, "conventions.md", target)
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await client.get("/api/steering/user/conventions.md")
+            assert resp.status == 200
+            data = await resp.json()
+        assert data["content"] == "# Conventions\nlinked body\n"
+
+    @pytest.mark.asyncio
+    async def test_put_and_delete_still_refuse_linked_entries(self, fake_home):
+        """READ/LIST latitude must not leak into the write verbs."""
+        target = fake_home / "dotfiles" / "conventions.md"
+        target.parent.mkdir(parents=True)
+        target.write_text("# Conventions\noriginal\n", encoding="utf-8", newline="")
+        link = self._link(fake_home, "conventions.md", target)
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            put = await client.put(
+                "/api/steering/user/conventions.md", json={"content": "clobbered"}
+            )
+            assert put.status == 404
+            delete = await client.delete("/api/steering/user/conventions.md")
+            assert delete.status == 404
+        # Neither the link nor the target moved.
+        assert link.is_symlink()
+        assert target.read_text(encoding="utf-8") == "# Conventions\noriginal\n"
 
 
 # ── HTTP endpoints ──
@@ -733,6 +1075,68 @@ class TestUpdateDeleteEndpoints:
         assert [p.name for p in root.iterdir()] == ["a.md"]
 
     @pytest.mark.asyncio
+    async def test_update_routes_acl_preservation_through_atomic_write(
+        self, fake_home, monkeypatch
+    ):
+        """The update path must hand atomic_write a source descriptor.
+
+        atomic_write's mode= carries permission BITS only; a named POSIX ACL
+        survives only when the source's xattrs are carried from
+        an OPEN descriptor. Assert the handler opens one and passes it via
+        preserve_access_control_from, so a revert to the bits-only call fails
+        here. The fd must reference the existing file, so its content matches.
+        """
+        import os as _os
+
+        import kiro_crew.atomic_write as aw
+        from kiro_crew.dashboard.handlers import steering as mod
+
+        root = fake_home / ".kiro" / "steering"
+        path = _write_steering(root, "a.md", "original\n")
+
+        captured: dict[str, object] = {}
+        original = mod.atomic_write
+
+        def recording(target, content, **kwargs):
+            captured["kwargs"] = dict(kwargs)
+            src_fd = kwargs.get("preserve_access_control_from")
+            if isinstance(src_fd, int):
+                # The descriptor must point at the file being replaced.
+                captured["source_bytes"] = _os.read(src_fd, 4096)
+            original(target, content, **kwargs)
+
+        monkeypatch.setattr(mod, "atomic_write", recording)
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            assert (
+                await client.put("/api/steering/user/a.md", json={"content": "new"})
+            ).status == 200
+
+        kwargs = captured["kwargs"]
+        # The handler's gate is PIN-FIRST, not xattr-first. When the parent
+        # pins (its own _DIR_FD_SUPPORTED plus the stage-and-rename probe),
+        # open_access_control_source hands back a real descriptor even where
+        # the xattr syscalls are absent — the MODE carry below reads the bits
+        # off that descriptor so they come from the pinned inode (macOS:
+        # openat and no listxattr). Only on the unpinned floor does the xattr
+        # flag decide, and None there (Windows) is deliberate — os.replace
+        # fails while any other handle is open on either path. Asserting
+        # `int` unconditionally would demand the very handle that would break
+        # every save there. Either way the kwarg must be PASSED, so a revert
+        # to the bits-only call still fails here.
+        handler_pins = mod._DIR_FD_SUPPORTED and aw.pinned_parent_replace_supported()
+        assert "preserve_access_control_from" in kwargs
+        if handler_pins or aw.ACCESS_CONTROL_XATTRS_SUPPORTED:
+            assert isinstance(kwargs["preserve_access_control_from"], int)
+            assert captured["source_bytes"] == b"original\n"
+        else:  # pragma: no cover - exercised on Windows CI only
+            assert kwargs["preserve_access_control_from"] is None
+        # Additive to the permission-bit carry, not a replacement.
+        assert kwargs["newline"] == ""
+        assert kwargs["fsync"] is True
+        assert kwargs["mode"] == stat.S_IMODE(path.stat().st_mode)
+        assert path.read_text() == "new"
+
+    @pytest.mark.asyncio
     async def test_delete_removes_file(self, fake_home):
         path = _write_steering(fake_home / ".kiro" / "steering", "a.md")
         async with TestClient(TestServer(_make_app(_state()))) as client:
@@ -743,6 +1147,142 @@ class TestUpdateDeleteEndpoints:
     async def test_delete_unknown_is_404(self, fake_home):
         async with TestClient(TestServer(_make_app(_state()))) as client:
             assert (await client.delete("/api/steering/user/nope.md")).status == 404
+
+
+class TestDeclarationEdit:
+    """``PUT`` may edit the document's declaration, not just its text.
+
+    The front matter is rewritten server-side so the editor never has to splice
+    YAML into its own textarea — a client that got that subtly wrong would
+    corrupt the file whose whole purpose is to be read by the agent.
+    """
+
+    async def _put(self, client, body):
+        return await client.put("/api/steering/user/doc.md", json=body)
+
+    @pytest.mark.asyncio
+    async def test_sets_a_mode_and_preserves_the_body(self, fake_home):
+        root = fake_home / ".kiro" / "steering"
+        _write_steering(root, "doc.md", "# Payroll\n\nrules  \n\ttabbed\n")
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await self._put(
+                client,
+                {"content": "# Payroll\n\nrules  \n\ttabbed\n", "inclusion": "manual"},
+            )
+            data = await resp.json()
+        assert resp.status == 200
+        stored = (root / "doc.md").read_text()
+        assert stored == "---\ninclusion: manual\n---\n# Payroll\n\nrules  \n\ttabbed\n"
+        # The response echoes the rewritten text: an editor still holding the
+        # old body would otherwise re-send it and undo the mode it just set.
+        assert data["content"] == stored
+        assert data["inclusion"] == "manual"
+
+    @pytest.mark.asyncio
+    async def test_empty_value_removes_the_declaration(self, fake_home):
+        root = fake_home / ".kiro" / "steering"
+        _write_steering(root, "doc.md", "---\ninclusion: manual\n---\n# Doc\n")
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await self._put(
+                client, {"content": "---\ninclusion: manual\n---\n# Doc\n", "inclusion": ""}
+            )
+            data = await resp.json()
+        assert resp.status == 200
+        assert (root / "doc.md").read_text() == "# Doc\n"
+        assert data["inclusion"] == STEERING_INCLUSION_DEFAULT
+        assert data["inclusion_declared"] == ""
+
+    @pytest.mark.asyncio
+    async def test_file_match_carries_its_pattern(self, fake_home):
+        root = fake_home / ".kiro" / "steering"
+        _write_steering(root, "doc.md", "# Doc\n")
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await self._put(
+                client,
+                {
+                    "content": "# Doc\n",
+                    "inclusion": "fileMatch",
+                    "file_match_pattern": "src/**/*.ts",
+                },
+            )
+            data = await resp.json()
+        assert resp.status == 200
+        assert data["file_match_pattern"] == "src/**/*.ts"
+        assert "fileMatchPattern" in (root / "doc.md").read_text()
+
+    @pytest.mark.asyncio
+    async def test_file_match_without_a_pattern_is_refused(self, fake_home):
+        """A patternless fileMatch document can never match, so it would be
+        withheld forever with nothing to explain why."""
+        _write_steering(fake_home / ".kiro" / "steering", "doc.md", "# Doc\n")
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await self._put(client, {"content": "# Doc\n", "inclusion": "fileMatch"})
+            data = await resp.json()
+        assert resp.status == 400
+        assert data["code"] == "steering_file_match_needs_pattern"
+
+    @pytest.mark.asyncio
+    async def test_mode_flip_keeps_an_existing_pattern(self, fake_home):
+        """The pattern check reads the RESULT, so flipping the mode back on a
+        document that already carries a pattern is not a rejection."""
+        root = fake_home / ".kiro" / "steering"
+        body = '---\ninclusion: manual\nfileMatchPattern: "src/**/*.ts"\n---\n# Doc\n'
+        _write_steering(root, "doc.md", body)
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await self._put(client, {"content": body, "inclusion": "fileMatch"})
+        assert resp.status == 200
+
+    @pytest.mark.asyncio
+    async def test_unknown_mode_is_refused(self, fake_home):
+        _write_steering(fake_home / ".kiro" / "steering", "doc.md", "# Doc\n")
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await self._put(client, {"content": "# Doc\n", "inclusion": "manaul"})
+            data = await resp.json()
+        assert resp.status == 400
+        assert data["code"] == "steering_unknown_inclusion"
+
+    @pytest.mark.asyncio
+    async def test_mode_spelling_is_canonicalized_on_write(self, fake_home):
+        root = fake_home / ".kiro" / "steering"
+        _write_steering(root, "doc.md", "# Doc\n")
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await self._put(client, {"content": "# Doc\n", "inclusion": "FILEMATCH",
+                                            "file_match_pattern": "*.ts"})
+            data = await resp.json()
+        assert resp.status == 200
+        assert data["inclusion_declared"] == "fileMatch"
+        assert "inclusion: fileMatch" in (root / "doc.md").read_text()
+
+    @pytest.mark.asyncio
+    async def test_a_value_that_cannot_round_trip_is_refused(self, fake_home):
+        """The single-line grammar has no escape sequence, so a value ending in
+        a quote would read back shorter than it went in. Refuse rather than
+        silently truncate the user's text."""
+        _write_steering(fake_home / ".kiro" / "steering", "doc.md", "# Doc\n")
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await self._put(
+                client,
+                {
+                    "content": "# Doc\n",
+                    "inclusion": "fileMatch",
+                    "file_match_pattern": 'ends with a quote"',
+                },
+            )
+            data = await resp.json()
+        assert resp.status == 400
+        assert data["code"] == "steering_field_unrepresentable"
+
+    @pytest.mark.asyncio
+    async def test_content_only_put_leaves_front_matter_alone(self, fake_home):
+        """No declaration field in the request means no rewrite at all — the
+        plain save path stays byte-exact."""
+        root = fake_home / ".kiro" / "steering"
+        body = "---\ninclusion: manual\ncustomKey: kept\n---\n# Doc\n"
+        _write_steering(root, "doc.md", body)
+        async with TestClient(TestServer(_make_app(_state()))) as client:
+            resp = await self._put(client, {"content": body})
+        assert resp.status == 200
+        assert (root / "doc.md").read_text() == body
 
 
 class TestRestrictedSessions:

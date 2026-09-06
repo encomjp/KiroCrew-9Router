@@ -44,12 +44,21 @@ vi.mock('../api/client', async (importOriginal) => {
   }
 })
 
+vi.mock('../apps/file-explorer/api', () => ({
+  fileExplorerApi: {
+    complete: vi.fn().mockResolvedValue({
+      entries: [{ name: 'src', path: '/home/user/src', type: 'dir', size: 0, mtime: 0 }],
+    }),
+  },
+}))
+
 import { api } from '../api/client'
 import TagManagerList from '../components/TagManagerList'
 import ProjectPicker from '../components/ProjectPicker'
 import SearchBar from '../components/SearchBar'
 import BroadcastBar from '../apps/meetings/components/BroadcastBar'
 import { BlockEditor } from '../apps/md-notebook/BlockEditor'
+import PathBar from '../apps/file-explorer/PathBar'
 
 /** Arm the hook's post-composition latch: the WebKit commit-Enter window. */
 function armLatch(el: Element) {
@@ -374,5 +383,83 @@ describe('md-notebook BlockEditor — rule 3 textarea: claim before the Enter→
     const { ta, onCommit } = renderEditor()
     fireEvent.keyDown(ta, { key: 'Enter', ctrlKey: true })
     expect(onCommit).toHaveBeenCalledWith('草稿')
+  })
+
+  // The Tab branch of the same textarea, and the OTHER half of the
+  // boundary-Tab shape: it re-indents the list item by rewriting the whole
+  // value, so an IME cycling its candidate list with Tab replaced the text
+  // still being composed. No focus move to anchor on, which is why the source
+  // ratchet needed a second, act-anchored rule to see it.
+  function renderListEditor() {
+    const onCommit = vi.fn()
+    render(<BlockEditor initial="- item" onCommit={onCommit} onCancel={vi.fn()} />)
+    const ta = screen.getByRole('textbox') as HTMLTextAreaElement
+    return { ta, onCommit }
+  }
+
+  it('does NOT re-indent the list item on the committing Tab in the post-composition window', () => {
+    const { ta } = renderListEditor()
+    armLatch(ta)
+    const defaultNotPrevented = fireEvent.keyDown(ta, { key: 'Tab' })
+    expect(ta.value).toBe('- item')
+    // The decline consumes the key: in this window the browser would otherwise
+    // move focus out of the editor, abandoning the composition.
+    expect(defaultNotPrevented).toBe(false)
+  })
+
+  it('leaves a mid-composition Tab to the IME (native flag set)', () => {
+    const { ta } = renderListEditor()
+    fireEvent.compositionStart(ta)
+    const defaultNotPrevented = fireEvent.keyDown(ta, { key: 'Tab', isComposing: true })
+    expect(ta.value).toBe('- item')
+    expect(defaultNotPrevented).toBe(true)
+  })
+
+  it('re-indents the list item on a plain Tab (positive control)', () => {
+    const { ta } = renderListEditor()
+    fireEvent.keyDown(ta, { key: 'Tab' })
+    expect(ta.value).toBe('\t- item')
+  })
+})
+
+describe('file-explorer PathBar — Tab accepts a suggestion INTO the draft', () => {
+  // The path bar recorded its Tab as a deliberate exemption ("arrow/Tab
+  // navigation stays untouched"), which held only while Tab did nothing to the
+  // text. It accepts the highlighted suggestion into the draft, so with the
+  // latch armed the accept overwrote the composing path.
+  async function openEditor() {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
+    render(
+      <QueryClientProvider client={qc}>
+        <PathBar rootPath="/home/user" gitInfo={null} onChangeRoot={vi.fn()} onNavigate={vi.fn()} />
+      </QueryClientProvider>,
+    )
+    fireEvent.click(screen.getByTitle('Click to edit path'))
+    const input = screen.getByPlaceholderText('/path/to/folder') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '/home/user/s' } })
+    // The suggestion query is debounced, so the row is what proves it arrived.
+    await waitFor(() => expect(screen.getByText('/home/user/src')).toBeInTheDocument())
+    return input
+  }
+
+  it('does NOT replace the draft on the committing Tab in the post-composition window', async () => {
+    const input = await openEditor()
+    armLatch(input)
+    const defaultNotPrevented = fireEvent.keyDown(input, { key: 'Tab' })
+    expect(input.value).toBe('/home/user/s')
+    expect(defaultNotPrevented).toBe(false)
+  })
+
+  it('accepts the highlighted suggestion on a plain Tab (positive control)', async () => {
+    const input = await openEditor()
+    fireEvent.keyDown(input, { key: 'Tab' })
+    expect(input.value).toBe('/home/user/src')
+  })
+
+  it('keeps arrow-key list navigation working while the latch is armed', async () => {
+    const input = await openEditor()
+    armLatch(input)
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    expect(screen.getByRole('option')).toHaveAttribute('aria-selected', 'true')
   })
 })

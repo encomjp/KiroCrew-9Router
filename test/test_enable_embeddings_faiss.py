@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -523,3 +524,112 @@ class TestSetMigratedFailClosed:
             await mem_mod._set_migrated(True)
         data = json.loads(cfg_path.read_text(encoding="utf-8"))
         assert data["memory"]["migrated"] is True
+
+
+class TestPipStderrRedaction:
+    """Regression for issue #7279: pip/ensurepip stderr reached the gateway log
+    unredacted. A private index configured with userinfo credentials leaks the
+    token into pip's stderr on an auth failure; both warning sites must route
+    the decoded stderr through ``redact_and_truncate`` (redact the FULL text
+    first, then bound) so the token never lands in the log."""
+
+    _SECRET = "LEAKY7279TOKEN"
+    _MASK = "[REDACTED: credential]"
+
+    def _auth_failure_stderr(self) -> bytes:
+        return (
+            "ERROR: HTTP error 401 while getting "
+            "https://ci-bot:" + self._SECRET + "@pypi.corp.example/simple/faiss-cpu/\n"
+            "ERROR: Could not install requirement faiss-cpu"
+        ).encode()
+
+    @pytest.mark.asyncio
+    async def test_faiss_install_failure_log_masks_userinfo_credential(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cfg_path = tmp_path / "kirocrew.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        patches, store, proc, mgr = _common_patches(
+            cfg_path, faiss_available=False, proc_rc=1, proc_stderr=self._auth_failure_stderr()
+        )
+
+        with patches["mgr"], patches["model_present"], patches["cfg_load"], \
+             patches["cfg_path"], patches["subprocess"], patches["faiss"], \
+             patches["store"], patches["wrap_argv"], \
+             caplog.at_level(logging.WARNING, logger=_MOD):
+            async with TestClient(TestServer(_make_app())) as c:
+                resp = await c.post("/api/memory/enable-embeddings")
+                assert resp.status == 500
+
+        messages = [r.getMessage() for r in caplog.records if "faiss-cpu install failed" in r.getMessage()]
+        assert messages, "expected the faiss-cpu install-failed warning to be logged"
+        for msg in messages:
+            assert self._SECRET not in msg
+            assert self._MASK in msg
+
+    @pytest.mark.asyncio
+    async def test_ensurepip_failure_log_masks_userinfo_credential(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        proc = _mock_proc(rc=1, stderr=self._auth_failure_stderr())
+        with patch.dict("sys.modules", {"pip": None}), \
+             patch(f"{_MOD}.wrap_argv", side_effect=lambda argv, **kw: (argv, None)), \
+             patch("asyncio.create_subprocess_exec", return_value=proc), \
+             caplog.at_level(logging.WARNING, logger=_MOD):
+            ok, err = await mem_mod._ensure_pip_available()
+
+        assert ok is False
+        messages = [r.getMessage() for r in caplog.records if "ensurepip bootstrap failed" in r.getMessage()]
+        assert messages, "expected the ensurepip bootstrap-failed warning to be logged"
+        for msg in messages:
+            assert self._SECRET not in msg
+            assert self._MASK in msg
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_stderr_does_not_raise(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A pip failure on a non-UTF-8 console (Windows codepage, mangled index
+        # response) must not raise UnicodeDecodeError on the failure path:
+        # decode(errors="replace") keeps the warning best-effort.
+        proc = _mock_proc(rc=1, stderr=b"\xff\xfe broken " + self._auth_failure_stderr())
+        with patch.dict("sys.modules", {"pip": None}), \
+             patch(f"{_MOD}.wrap_argv", side_effect=lambda argv, **kw: (argv, None)), \
+             patch("asyncio.create_subprocess_exec", return_value=proc), \
+             caplog.at_level(logging.WARNING, logger=_MOD):
+            ok, err = await mem_mod._ensure_pip_available()
+
+        assert ok is False
+        assert "ensurepip" in err
+        messages = [r.getMessage() for r in caplog.records if "ensurepip bootstrap failed" in r.getMessage()]
+        assert messages
+        for msg in messages:
+            assert self._SECRET not in msg
+
+    @pytest.mark.asyncio
+    async def test_credential_straddling_log_bound_does_not_leak_fragment(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Redact-before-bound invariant: plant the credential so it straddles
+        # the log bound. The old ``stderr.decode()[:500]`` head slice
+        # would have emitted a raw unredacted prefix of the token; redacting the
+        # full text first means no fragment of the secret can survive.
+        bound = mem_mod._PIP_STDERR_LOG_CHARS
+        prefix = "E" * (bound - len("https://ci-bot:") - 5)  # token crosses the bound
+        stderr = (
+            prefix + "https://ci-bot:" + self._SECRET + "@pypi.corp.example/simple/\n"
+        ).encode()
+        proc = _mock_proc(rc=1, stderr=stderr)
+        with patch.dict("sys.modules", {"pip": None}), \
+             patch(f"{_MOD}.wrap_argv", side_effect=lambda argv, **kw: (argv, None)), \
+             patch("asyncio.create_subprocess_exec", return_value=proc), \
+             caplog.at_level(logging.WARNING, logger=_MOD):
+            ok, _ = await mem_mod._ensure_pip_available()
+
+        assert ok is False
+        messages = [r.getMessage() for r in caplog.records if "ensurepip bootstrap failed" in r.getMessage()]
+        assert messages
+        for msg in messages:
+            # No prefix of the token may appear (the old slice leaked one).
+            for n in range(3, len(self._SECRET) + 1):
+                assert self._SECRET[:n] not in msg

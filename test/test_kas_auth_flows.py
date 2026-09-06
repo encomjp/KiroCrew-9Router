@@ -31,7 +31,7 @@ class _FakeResp:
     async def __aexit__(self, *a):
         return False
 
-    async def json(self):
+    async def json(self, *, content_type: str | None = "application/json"):
         return self._payload
 
     async def text(self):

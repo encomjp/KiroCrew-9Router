@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -1061,3 +1062,418 @@ class TestLifecycleHookTimeout:
         )
         await asyncio.sleep(0)
         assert not lifecycle_mod._DETACHED_HOOK_TASKS
+
+
+class TestGatewayShutdownBackendSweep:
+    """Gateway shutdown must stop the backends it spawned, not just run hooks.
+
+    Spawned backends are gateway children: without an explicit stop they
+    reparent to PID 1 when the gateway exits and keep listening on their ports.
+    """
+
+    @pytest.mark.asyncio
+    async def test_shutdown_stops_spawned_backends_after_hooks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hooks are dispatched FIRST (an app's on_shutdown still has its
+        backend alive), then every gateway-spawned backend is stopped, off the
+        event loop thread."""
+        import kiro_crew.apps.hooks_integration as integration
+
+        order: list[str] = []
+        stop_threads: list[threading.Thread] = []
+
+        class _Dispatcher:
+            async def dispatch_shutdown(self, apps: list[dict[str, Any]]) -> list[str]:
+                order.append("hooks")
+                return []
+
+        def fake_stop(name: str) -> bool:
+            order.append(f"stop:{name}")
+            stop_threads.append(threading.current_thread())
+            return True
+
+        monkeypatch.setattr(integration, "_lifecycle_dispatcher", _Dispatcher())
+        monkeypatch.setattr(integration, "list_apps", lambda: [_make_app_info("app-a")])
+        monkeypatch.setattr(
+            integration, "spawned_backend_names", lambda: ["app-a", "app-b"]
+        )
+        monkeypatch.setattr(integration, "stop_app_backend", fake_stop)
+
+        loop_thread = threading.current_thread()
+        await integration.on_gateway_shutdown()
+
+        # Hooks first; the stops run concurrently, so only membership is
+        # asserted — a total order over them would pin an accident.
+        assert order[0] == "hooks"
+        assert set(order[1:]) == {"stop:app-a", "stop:app-b"}
+        # The stop blocks in the kernel (process-group signal + wait) — it must
+        # run on an executor thread, never on the event loop thread.
+        assert all(t is not loop_thread for t in stop_threads)
+
+    @pytest.mark.asyncio
+    async def test_stop_targets_come_from_the_tracking_table_not_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The sweep is driven by what the gateway actually spawned, so a child
+        whose app was disabled cross-process (metadata-only) is still stopped,
+        and an enabled app with nothing running is never passed to
+        stop_app_backend (whose pidfile erasure would destroy the stale-reap's
+        record of a prior-generation orphan)."""
+        import kiro_crew.apps.hooks_integration as integration
+
+        stopped: list[str] = []
+
+        def fake_stop(name: str) -> bool:
+            stopped.append(name)
+            return True
+
+        # Metadata says "enabled-idle" is enabled; the tracking table says only
+        # "disabled-but-running" has a spawned backend.
+        monkeypatch.setattr(integration, "_lifecycle_dispatcher", None)
+        monkeypatch.setattr(
+            integration, "list_apps", lambda: [_make_app_info("enabled-idle")]
+        )
+        monkeypatch.setattr(
+            integration, "spawned_backend_names", lambda: ["disabled-but-running"]
+        )
+        monkeypatch.setattr(integration, "stop_app_backend", fake_stop)
+
+        await integration.on_gateway_shutdown()
+
+        assert stopped == ["disabled-but-running"]
+
+    def test_spawned_backend_names_excludes_adopted_backends(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Adopted records (proc=None) are externally managed instances whose
+        contract is to SURVIVE gateway exit and be re-adopted on the next
+        start; the shutdown sweep must never signal them."""
+        import kiro_crew.apps.backend as backend
+
+        spawned = backend.AppProcess(app_name="spawned-app", proc=object())  # type: ignore[arg-type]
+        adopted = backend.AppProcess(
+            app_name="adopted-app", proc=None, port=4242, adopted_pids=[123]
+        )
+        monkeypatch.setattr(
+            backend, "_processes", {"spawned-app": spawned, "adopted-app": adopted}
+        )
+
+        assert backend.spawned_backend_names() == ["spawned-app"]
+
+    @pytest.mark.asyncio
+    async def test_one_failing_stop_does_not_skip_the_rest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One app's failing backend stop must not leave the others running."""
+        import kiro_crew.apps.hooks_integration as integration
+
+        stopped: list[str] = []
+
+        def fake_stop(name: str) -> bool:
+            if name == "app-a":
+                raise RuntimeError("stop failed")
+            stopped.append(name)
+            return True
+
+        monkeypatch.setattr(integration, "_lifecycle_dispatcher", None)
+        monkeypatch.setattr(integration, "list_apps", lambda: [])
+        monkeypatch.setattr(
+            integration, "spawned_backend_names", lambda: ["app-a", "app-b"]
+        )
+        monkeypatch.setattr(integration, "stop_app_backend", fake_stop)
+
+        await integration.on_gateway_shutdown()
+
+        assert stopped == ["app-b"]
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_shares_one_deadline_instead_of_stacking_waits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A wedged backend's stop cannot hold the sweep past its shared
+        budget: the sweep returns (logging a warning) so the rest of gateway
+        cleanup still gets its share of the 10s cooperative window, rather
+        than multiplying the per-app SIGTERM grace by the number of apps."""
+        import kiro_crew.apps.hooks_integration as integration
+
+        release = threading.Event()
+
+        def wedged_stop(name: str) -> bool:
+            release.wait(timeout=5.0)
+            return True
+
+        monkeypatch.setattr(integration, "_BACKEND_STOP_BUDGET_SECS", 0.05)
+        monkeypatch.setattr(integration, "_lifecycle_dispatcher", None)
+        monkeypatch.setattr(integration, "list_apps", lambda: [])
+        monkeypatch.setattr(integration, "spawned_backend_names", lambda: ["wedged"])
+        monkeypatch.setattr(integration, "stop_app_backend", wedged_stop)
+
+        try:
+            await asyncio.wait_for(integration.on_gateway_shutdown(), timeout=2.0)
+        finally:
+            # Unblock the executor thread so it does not outlive the test.
+            release.set()
+
+    @pytest.mark.asyncio
+    async def test_sweep_runs_even_when_hook_dispatch_fails_or_is_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hook dispatch awaits third-party on_shutdown hooks; a wedged hook is
+        cancelled by the gateway's shutdown deadline and a broken dispatcher can
+        raise. Neither may skip the backend sweep, or every spawned backend is
+        orphaned — the defect this path exists to fix."""
+        import kiro_crew.apps.hooks_integration as integration
+
+        stopped: list[str] = []
+
+        def fake_stop(name: str) -> bool:
+            stopped.append(name)
+            return True
+
+        class _RaisingDispatcher:
+            async def dispatch_shutdown(self, apps: list[dict[str, Any]]) -> list[str]:
+                raise RuntimeError("dispatcher broke")
+
+        monkeypatch.setattr(integration, "_lifecycle_dispatcher", _RaisingDispatcher())
+        monkeypatch.setattr(integration, "list_apps", lambda: [_make_app_info("app-a")])
+        monkeypatch.setattr(integration, "spawned_backend_names", lambda: ["app-a"])
+        monkeypatch.setattr(integration, "stop_app_backend", fake_stop)
+
+        with pytest.raises(RuntimeError, match="dispatcher broke"):
+            await integration.on_gateway_shutdown()
+        assert stopped == ["app-a"]
+
+        # Cancellation (the shutdown deadline cutting off a hanging hook) also
+        # reaches the sweep on its way out.
+        stopped.clear()
+        hook_started = asyncio.Event()
+
+        class _HangingDispatcher:
+            async def dispatch_shutdown(self, apps: list[dict[str, Any]]) -> list[str]:
+                hook_started.set()
+                await asyncio.Event().wait()  # never returns
+                return []
+
+        monkeypatch.setattr(integration, "_lifecycle_dispatcher", _HangingDispatcher())
+        task = asyncio.ensure_future(integration.on_gateway_shutdown())
+        await asyncio.wait_for(hook_started.wait(), timeout=2.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+        assert stopped == ["app-a"]
+
+    @pytest.mark.asyncio
+    async def test_budget_overrun_does_not_cancel_queued_stops(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The stop futures share the executor with the rest of shutdown, so a
+        stop can still be QUEUED when the budget fires. The timeout must
+        release the sweep without cancelling that queued stop — a cancelled
+        queued future never runs stop_app_backend and its backend is never
+        signalled at all."""
+        import concurrent.futures
+
+        import kiro_crew.apps.hooks_integration as integration
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        release = threading.Event()
+        queued_ran = threading.Event()
+        ran: list[str] = []
+
+        def fake_stop(name: str) -> bool:
+            if name == "a-wedged":
+                release.wait(timeout=5.0)
+            ran.append(name)
+            if name == "b-queued":
+                queued_ran.set()
+            return True
+
+        monkeypatch.setattr(integration, "subprocess_executor", lambda: pool)
+        monkeypatch.setattr(integration, "_BACKEND_STOP_BUDGET_SECS", 0.05)
+        monkeypatch.setattr(integration, "_lifecycle_dispatcher", None)
+        monkeypatch.setattr(integration, "list_apps", lambda: [])
+        monkeypatch.setattr(
+            integration, "spawned_backend_names", lambda: ["a-wedged", "b-queued"]
+        )
+        monkeypatch.setattr(integration, "stop_app_backend", fake_stop)
+
+        try:
+            # The single-worker pool holds "a-wedged" running and "b-queued"
+            # queued when the 0.05s budget fires; the sweep must return anyway.
+            await asyncio.wait_for(integration.on_gateway_shutdown(), timeout=2.0)
+            release.set()
+            assert queued_ran.wait(timeout=2.0), (
+                "the sweep timeout cancelled a queued stop; that backend would "
+                "never be signalled"
+            )
+            assert ran == ["a-wedged", "b-queued"]
+        finally:
+            release.set()
+            pool.shutdown(wait=True)
+
+
+# ---------------------------------------------------------------------------
+# Shutdown resolves the LOADED code, not disk (issue #7880 reconciler teardown)
+# ---------------------------------------------------------------------------
+
+
+class TestShutdownResolvesLoadedCode:
+    @pytest.mark.asyncio
+    async def test_shutdown_prefers_cached_module_over_disk(self, monkeypatch) -> None:
+        """GPT [BLOCKING]: on_shutdown must stop the code that is actually
+        running. A same-path v2 reinstall leaves v2 on disk while v1's task is
+        still live; resolving from disk would run v2's on_shutdown and orphan v1.
+        _invoke(phase='shutdown') resolves the ALREADY-LOADED (cached) callable
+        first, falling back to the disk loader only when nothing is cached."""
+        import sys
+        from types import SimpleNamespace
+
+        import kiro_crew.apps.module_loader as ml
+        from kiro_crew.apps.lifecycle import LifecycleDispatcher
+
+        app_name = "reload-app"
+        hook_path = "backend.hooks:on_shutdown"
+        ran: list[str] = []
+
+        # v1 is the LOADED module: register it in sys.modules under the app's key.
+        v1 = SimpleNamespace(on_shutdown=lambda ctx: ran.append("v1"))
+        key = ml._module_namespace(app_name, "backend.hooks")
+        sys.modules[key] = v1  # type: ignore[assignment]
+
+        dispatcher = LifecycleDispatcher()
+        # The disk loader would return v2 (the replacement) -- it must NOT be used.
+        monkeypatch.setattr(
+            dispatcher, "_resolve_hook", lambda a, h: (lambda ctx: ran.append("v2"))
+        )
+        ctx = SimpleNamespace(health=SimpleNamespace(mark_degraded=lambda *a, **k: None))
+        try:
+            ok = await dispatcher._invoke(app_name, hook_path, ctx, phase="shutdown")
+        finally:
+            sys.modules.pop(key, None)
+
+        assert ok is True
+        assert ran == ["v1"], "shutdown must run the loaded (cached) code, not disk v2"
+
+    @pytest.mark.asyncio
+    async def test_shutdown_falls_back_to_disk_when_nothing_cached(self, monkeypatch) -> None:
+        """When no module is cached (e.g. a builtin, or never imported), shutdown
+        falls back to the normal disk/dotted resolver."""
+        from types import SimpleNamespace
+
+        from kiro_crew.apps.lifecycle import LifecycleDispatcher
+
+        ran: list[str] = []
+        dispatcher = LifecycleDispatcher()
+        monkeypatch.setattr(
+            dispatcher, "_resolve_hook", lambda a, h: (lambda ctx: ran.append("disk"))
+        )
+        ctx = SimpleNamespace(health=SimpleNamespace(mark_degraded=lambda *a, **k: None))
+        ok = await dispatcher._invoke(
+            "uncached-app", "backend.hooks:on_shutdown", ctx, phase="shutdown"
+        )
+        assert ok is True
+        assert ran == ["disk"]
+
+
+class TestCacheShutdownForNeverLoadsOnTheEventLoop:
+    """GPT rounds 8-9 (lifecycle.py shutdown cache): enable-time caching must not
+    BLOCK the event loop (r8 F2) nor re-import a same-module app (r8 F1), and must
+    still RETAIN a separate shutdown module startup never imported (r9). The
+    resolution: resolve an already-loaded module in-memory (no disk, no re-import),
+    and load a genuinely-separate module OFF the loop via asyncio.to_thread."""
+
+    @pytest.mark.asyncio
+    async def test_loaded_module_is_resolved_in_memory_without_reimport(self, monkeypatch):
+        import sys
+        from types import ModuleType
+
+        import kiro_crew.apps.lifecycle as lc
+        import kiro_crew.apps.module_loader as ml
+
+        ml._shutdown_callables.pop("loaded-app", None)
+        key = ml._module_namespace("loaded-app", "backend.hooks")
+        mod = ModuleType(key)
+
+        def _on_shutdown(ctx):
+            return None
+
+        mod.on_shutdown = _on_shutdown
+        sys.modules[key] = mod
+
+        # A same/loaded module must be resolved via sys.modules ONLY: no disk load
+        # (would block the loop) and no re-import (would detach the running state).
+        def _boom(*a, **kw):
+            raise AssertionError("a loaded module must not be disk-loaded / re-imported")
+
+        monkeypatch.setattr(lc, "load_app_module", _boom, raising=False)
+
+        try:
+            disp = lc.LifecycleDispatcher()
+            await disp.cache_shutdown_for(
+                {
+                    "name": "loaded-app",
+                    "manifest": {"backend": {"hooks": {"on_shutdown": "backend.hooks:on_shutdown"}}},
+                }
+            )
+            # Snapshotted from sys.modules (pure getattr), generation-tagged.
+            assert ml.resolve_loaded_callable("loaded-app", "backend.hooks:on_shutdown") is _on_shutdown
+        finally:
+            sys.modules.pop(key, None)
+            ml._shutdown_callables.pop("loaded-app", None)
+
+    @pytest.mark.asyncio
+    async def test_separate_module_is_retained_via_off_loop_load(self, monkeypatch):
+        import kiro_crew.apps.lifecycle as lc
+        import kiro_crew.apps.module_loader as ml
+
+        ml._shutdown_callables.pop("sep-app", None)
+
+        def _sep_shutdown(ctx):
+            return None
+
+        # _resolve_hook does the disk load for a separate module; it MUST be reached
+        # only through asyncio.to_thread (off the event loop), never called inline.
+        offloaded = {"via_thread": False}
+        monkeypatch.setattr(lc.LifecycleDispatcher, "_resolve_hook", lambda self, n, p: _sep_shutdown)
+
+        real_to_thread = asyncio.to_thread
+
+        async def _tracking_to_thread(fn, *a, **kw):
+            offloaded["via_thread"] = True
+            return await real_to_thread(fn, *a, **kw)
+
+        monkeypatch.setattr(lc.asyncio, "to_thread", _tracking_to_thread)
+
+        disp = lc.LifecycleDispatcher()
+        # on_shutdown lives in a module startup never imported -> not in sys.modules,
+        # so it is loaded off-loop and RETAINED (r9: separate modules must be kept).
+        await disp.cache_shutdown_for(
+            {
+                "name": "sep-app",
+                "manifest": {"backend": {"hooks": {"on_shutdown": "backend.never_loaded:on_shutdown"}}},
+            }
+        )
+        assert offloaded["via_thread"] is True, "separate-module load must go off-loop via to_thread"
+        assert ml._shutdown_callables.get("sep-app") == (ml._current_generation("sep-app"), _sep_shutdown)
+        ml._shutdown_callables.pop("sep-app", None)
+
+    @pytest.mark.asyncio
+    async def test_stale_generation_callable_is_not_used(self, monkeypatch):
+        import kiro_crew.apps.module_loader as ml
+
+        ml._shutdown_callables.pop("gen-app", None)
+        ml._app_load_generation.pop("gen-app", None)
+
+        def _v1(ctx):
+            return None
+
+        # Cache a v1 callable at generation 0.
+        ml.cache_shutdown_callable("gen-app", _v1)
+        assert ml.resolve_loaded_callable("gen-app", "backend.hooks:on_shutdown") is _v1
+
+        # A reload (unload bumps the generation) invalidates the stale v1 entry.
+        ml._app_load_generation["gen-app"] = ml._current_generation("gen-app") + 1
+        assert ml.resolve_loaded_callable("gen-app", "backend.hooks:on_shutdown") is None
+        ml._shutdown_callables.pop("gen-app", None)
+        ml._app_load_generation.pop("gen-app", None)

@@ -104,7 +104,7 @@ def mode_stub(tmp_path, monkeypatch):
     launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}"\n')
     launcher.chmod(0o755)
 
-    async def fake_bin() -> str:
+    async def fake_bin(*, environ=None, home=None) -> str:
         return str(launcher)
 
     monkeypatch.setattr(

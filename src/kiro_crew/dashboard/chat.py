@@ -46,6 +46,7 @@ from kiro_crew.dashboard.chat_handlers import (  # noqa: F401
     api_chat_mode,
     api_chat_slot_agent,
     api_chat_slot_approve,
+    api_chat_slot_autocompact,
     api_chat_slot_color,
     api_chat_slot_context,
     api_chat_slot_continue,
@@ -86,7 +87,6 @@ from kiro_crew.dashboard.chat_nav import (  # noqa: F401
 )
 from kiro_crew.dashboard.chat_orchestrator import (  # noqa: F401
     _build_stage_context,
-    _capture_stage_result,
     _previous_result_paths,
     _stage_loop,
     api_chat_plan_action,

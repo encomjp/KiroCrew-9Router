@@ -357,3 +357,187 @@ class TestScratchFilesystemFailures:
         )
         assert code == np.EXIT_TRANSIENT
         assert "timed out" in detail
+
+
+def _tree(root: Path, *, populated: bool = True) -> str:
+    """A checkout whose frontend half has a dependency tree. Returns the repo path."""
+    nm = root / "website" / "node_modules"
+    nm.mkdir(parents=True, exist_ok=True)
+    if populated:
+        (nm / ".package-lock.json").write_bytes(b"{}")
+    return str(root)
+
+
+def _git(*, changed: list[str] | None = None, rc: int = 0, boom: Exception | None = None):
+    """A ``git`` stub for the subtree comparison. ``changed`` is what diff reports."""
+
+    def fake_run(argv, **kw):
+        if boom is not None:
+            raise boom
+        out = "\n".join(changed or []).encode()
+        return subprocess.CompletedProcess(argv, rc, out, b"")
+
+    return fake_run
+
+
+class TestSkipWhenTheFrontendIsUntouched:
+    """The probe pays a real install to be honest; it should pay only when the
+    answer is not already on disk.
+
+    Most syncs are backend-only and change nothing under ``website/``, so
+    re-deriving "is this lockfile installable" costs a full scratch install for
+    an answer the populated tree beside those same files already gives.
+    """
+
+    def test_skips_when_the_frontend_subtree_is_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(np.subprocess, "run", _git(changed=[]))
+        reason = np._install_already_proven("/usr/bin/git", _tree(tmp_path), "origin/main")
+        assert reason and "changes nothing under" in reason
+        assert "website/" in reason
+
+    @pytest.mark.parametrize(
+        "changed,why",
+        [
+            (["website/package-lock.json"], "a new lockfile is a new resolution"),
+            (["website/package.json"], "npm ci verifies the lockfile against package.json"),
+            (["website/.npmrc"], ".npmrc carries settings that change resolution"),
+            (
+                ["website/src/App.tsx"],
+                "changed SOURCE owes a new bundle: with the three resolution inputs "
+                "identical but source changed, a skipped probe lets the merge land and "
+                "a failing npm ci afterwards leaves new source beside the "
+                "previously-built bundle -- the gap that made comparing only the "
+                "resolution files insufficient",
+            ),
+            (["website/index.html"], "any frontend path at all is a frontend change"),
+        ],
+    )
+    def test_probes_when_anything_under_the_frontend_changed(
+        self, tmp_path, monkeypatch, changed, why
+    ):
+        monkeypatch.setattr(np.subprocess, "run", _git(changed=changed))
+        assert (
+            np._install_already_proven("/usr/bin/git", _tree(tmp_path), "origin/main") is None
+        ), why
+
+    def test_probes_when_there_is_no_dependency_tree(self, tmp_path, monkeypatch):
+        """With nothing installed there is no evidence, so a fresh checkout's
+        first sync still probes -- which is when the answer is least known.
+
+        The subtree is reported UNCHANGED here, so the missing tree is the only
+        thing that can make this probe.
+        """
+        monkeypatch.setattr(np.subprocess, "run", _git(changed=[]))
+        (tmp_path / "website").mkdir(parents=True)
+        assert np._install_already_proven("/usr/bin/git", str(tmp_path), "origin/main") is None
+
+    def test_probes_when_the_tree_is_present_but_empty(self, tmp_path, monkeypatch):
+        """An interrupted `npm ci` leaves an empty directory behind, and an empty
+        tree proves nothing about installability."""
+        monkeypatch.setattr(np.subprocess, "run", _git(changed=[]))
+        repo = _tree(tmp_path, populated=False)
+        assert np._install_already_proven("/usr/bin/git", repo, "origin/main") is None
+
+    def test_probes_when_node_modules_is_a_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(np.subprocess, "run", _git(changed=[]))
+        web = tmp_path / "website"
+        web.mkdir(parents=True)
+        (web / "node_modules").write_bytes(b"not a tree")
+        assert np._install_already_proven("/usr/bin/git", str(tmp_path), "origin/main") is None
+
+    @pytest.mark.parametrize(
+        "kwargs,why",
+        [
+            ({"rc": 128}, "a failed comparison establishes nothing"),
+            ({"boom": OSError("no git")}, "a missing git establishes nothing"),
+            ({"boom": subprocess.TimeoutExpired("git", 60)}, "a timeout establishes nothing"),
+        ],
+    )
+    def test_an_unanswerable_comparison_probes(self, tmp_path, monkeypatch, kwargs, why):
+        """The unknown case must cost an install, never a guarantee."""
+        monkeypatch.setattr(np.subprocess, "run", _git(**kwargs))
+        assert (
+            np._install_already_proven("/usr/bin/git", _tree(tmp_path), "origin/main") is None
+        ), why
+
+    def test_the_skip_makes_the_install_not_run_at_all(self, tmp_path, monkeypatch):
+        """The point of the decision is the cost it removes, so pin that no npm
+        process is started -- not merely that the verdict is OK."""
+        repo = _tree(tmp_path)
+
+        def fake_run(argv, **kw):
+            if "ci" in argv:
+                pytest.fail(f"npm must not run when the install is already proven: {argv}")
+            if "diff" in argv:
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+            return subprocess.CompletedProcess(argv, 0, b"{}", b"")
+
+        monkeypatch.setattr(np.subprocess, "run", fake_run)
+        code, detail = np.probe(
+            git="/usr/bin/git", npm="/usr/bin/npm", repo=repo, ref="origin/main"
+        )
+        assert code == np.EXIT_OK
+        assert "skipped the install" in detail
+
+    def test_a_touched_frontend_still_pays_for_the_install(self, tmp_path, monkeypatch):
+        """The saving must not become a hole: when the frontend DID change, the
+        install runs exactly as before."""
+        repo = _tree(tmp_path)
+        ran: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            if "ci" in argv:
+                ran.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, b"added 1 package", b"")
+            if "diff" in argv:
+                return subprocess.CompletedProcess(argv, 0, b"website/package-lock.json\n", b"")
+            return subprocess.CompletedProcess(argv, 0, b"{}", b"")
+
+        monkeypatch.setattr(np.subprocess, "run", fake_run)
+        code, _ = np.probe(git="/usr/bin/git", npm="/usr/bin/npm", repo=repo, ref="origin/main")
+        assert code == np.EXIT_OK
+        assert ran, "a touched frontend must still be probed by a real install"
+
+    def test_the_comparison_is_scoped_to_the_frontend_half(self, tmp_path, monkeypatch):
+        """A backend-only sync must not be disqualified by its own backend diff,
+        so the diff has to be pathspec-limited rather than repo-wide.
+
+        This assertion is also what pins the pathspec WIDE enough, and it carries
+        that alone. The stub returns whatever ``changed`` says regardless of the
+        pathspec, so the source-file row in the parametrized set above would keep
+        passing if the pathspec were narrowed back to the three resolution files
+        -- mutation-checked, and only this test reddened. The pair is what covers
+        the gap: that row pins that a source change in the diff means probe, this
+        one pins that the diff is asked about the whole subtree.
+        """
+        seen: list[list[str]] = []
+
+        def fake_run(argv, **kw):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        monkeypatch.setattr(np.subprocess, "run", fake_run)
+        np._install_already_proven("/usr/bin/git", _tree(tmp_path), "origin/main")
+        assert seen and "--" in seen[0] and seen[0][-1] == np._FRONTEND_SUBDIR, seen
+
+    def test_the_cli_reports_a_skip_rather_than_the_generic_pass_line(self, monkeypatch, capsys):
+        """A skipped safety step must be visible in the run log. Otherwise the
+        only trace is a missing pause, which nobody reads as a decision."""
+        monkeypatch.setattr(np, "probe", lambda **kw: (np.EXIT_OK, "skipped the install: because"))
+        rc = np.main(
+            ["--git", "/usr/bin/git", "--npm", "/usr/bin/npm", "--repo", "/repo", "--ref", "r"]
+        )
+        assert rc == np.EXIT_OK
+        out = capsys.readouterr().out
+        assert "skipped the install: because" in out
+        assert "incoming lockfile is installable" not in out
+
+    def test_the_cli_still_reports_a_real_pass_when_the_install_ran(self, monkeypatch, capsys):
+        monkeypatch.setattr(np, "probe", lambda **kw: (np.EXIT_OK, ""))
+        assert (
+            np.main(
+                ["--git", "/usr/bin/git", "--npm", "/usr/bin/npm", "--repo", "/repo", "--ref", "r"]
+            )
+            == np.EXIT_OK
+        )
+        assert "incoming lockfile is installable" in capsys.readouterr().out

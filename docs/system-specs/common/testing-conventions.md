@@ -32,6 +32,21 @@ async def test_read_message(self, tmp_path):
     ...
 ```
 
+Never poll a synchronous store read from an async test. A plain `sdk.get(...)` /
+`store.read(...)` inside an `async def` test runs ON the event loop, where
+`read_bytes_with_retry` deliberately re-raises the Windows sharing-violation
+`PermissionError` instead of sleeping the loop for its retry budget — so a poll
+that races a concurrent `atomic_write` `os.replace` is a Windows-only flake that
+POSIX shards can never reproduce (#7703). Offload every such read the way the
+production routes do (`job_routes.py`):
+
+```python
+# WRONG: reads on the loop; retry budget is one attempt, and time.sleep stalls the loop
+run = sdk.get(run_id); time.sleep(0.02)
+# RIGHT: the retry applies off-loop, and the loop keeps running
+run = await asyncio.to_thread(sdk.get, run_id); await asyncio.sleep(0.02)
+```
+
 ### Mocking kiro-cli
 Never spawn real `kiro-cli` in tests. Mock the subprocess:
 ```python
@@ -119,7 +134,12 @@ The **rootdir `conftest.py` is the host-mutation floor**: everything in it prote
 developer's machine rather than the correctness of one suite, so it holds for all
 testpaths. It pins `$XDG_CONFIG_HOME` and the launchd paths, traps the spawn
 funnels against service mutation, pins `KIROCREW_HOME` and the import-time `~/.kiro`
-bindings, redirects `tempfile`'s base, and fails the run on residue in the checkout.
+bindings, scrubs the inherited shell-preload and exported-function variables
+`name_grant` refuses on (`BASH_ENV`/`ENV`/`SHELLOPTS`/`BASHOPTS`, `BASH_FUNC_*` keys,
+and the legacy `() {` value spelling — a RHEL-family host inherits `BASH_FUNC_which%%`
+from `which2.sh`, and the refusal outranks every narrower code), redirects
+`tempfile`'s base, and fails the run on residue in the
+checkout.
 
 It also pins the other real host paths a test must not reach: the subagent registry (a
 running gateway sweeps stray entries there as orphans), the 610MB embedding-model
@@ -140,9 +160,10 @@ one scope down:
   multithreaded, which the kernel answers with an EINVAL the probe used to cache as
   "this host has no sandbox backend".
 * `_restore_log_record_factory` puts `logging`'s record factory back. There is one such
-  slot per process, and `log_redaction`'s wrapper deliberately clears `args` and
-  `exc_info` on every record it creates, so leaving it installed reds whatever unrelated
-  test later asserts on either field. `cli._setup_cli_logging` installs it for a
+  slot per process, and `log_redaction`'s wrapper ALWAYS renders and clears
+  `exc_info` (frame locals are unscannable), and clears `args` on any record that
+  is not a clean tuple of exact scalars, so leaving it installed reds whatever
+  unrelated test later asserts on either field. `cli._setup_cli_logging` installs it for a
   long-lived command, so grepping `cli.main()` finds only some of the tests that reach
   it — most call that helper directly, and they are in `test_cli_logging.py`, whose own
   `_pristine_logging` fixture restores handlers and levels but not the factory, which is
@@ -167,7 +188,10 @@ one scope down:
   boundary, so writing back a setup-phase snapshot during teardown would drop the handler
   the teardown phase is capturing through.
 * `_restore_autonudge_singleton` puts `autonudge._INSTANCE` back to whatever the test
-  inherited. `AutoNudgeService.start()` publishes itself there and `stop()` clears it, so
+  inherited. It lives in `test/conftest.py` rather than the rootdir floor, because only
+  the `test/` suites drive the service; it is listed here because its failure shape is
+  the process-global one this section is about.
+  `AutoNudgeService.start()` publishes itself there and `stop()` clears it, so
   a test that starts the service — or drives a dashboard handler that does — leaves a live
   instance holding timer TASKS created on that test's event loop. Every later test in the
   same worker then reaches those tasks through the singleton on a loop that has since
@@ -275,6 +299,13 @@ which testpath asked for the workers.
   across ~10 files that every one of which passes in isolation — which is exactly why
   it reads as "the suite is flaky" instead of as one test missing one line.
 
+- **A child process inherits pytest's CWD, which is the repo root.** A spawn that may
+  create a file therefore writes into the checkout unless it is given
+  `cwd=` under `tmp_path`. Scope the assertion to where the child actually ran, not to
+  where you hoped it wrote: an assertion against `tmp_path` passes vacuously while the
+  file lands in the repo, and neither the test nor the residue check attributes it to
+  this test.
+
 - **A singleton with a background thread beats every filesystem cleanup.** `sel.py` is
   the worked example: `SecurityEventLog` is a process singleton whose writer is a
   *daemon thread*, and `_init_locked` binds its directory **once**, from whatever
@@ -290,6 +321,15 @@ which testpath asked for the workers.
   no individual test (`_isolate_sel_default_dir`, in the rootdir conftest). When you
   add a subsystem with a background worker, ask which directory its thread captured
   and whether anything deletes that directory underneath it.
+
+  One shared directory also means one shared **chain lock**, and that is the wrong
+  tier for a test whose assertion depends on a fail-closed critical SEL write
+  *winning* that lock — on the event-loop thread the acquire is a single non-blocking
+  attempt, so any sibling's writer holding the lock at the wrong moment refuses the
+  audit and fails the test with no code defect anywhere (issue #7029, the issue-radar
+  trust flake). Such tests request `sel_private_root` (rootdir conftest): it rebinds
+  the singleton to a per-test, per-xdist-worker directory built `sync=True` — no
+  background writer at all — so no concurrent writer exists to contend with.
 
 - **When you stub a lifecycle method, SPY and delegate — never replace.** A stub that
   only records the call leaves whatever that method was supposed to stop still running.
@@ -805,11 +845,11 @@ stopping it propagating is the part that is never optional.
 
 ### 5. Absolute time budgets on instrumented runs
 
-Asserting a *duration* when the property under test is algorithmic **complexity**. CI enables
-coverage on one Python version only (`--cov` on 3.12, `--no-cov` on 3.10), and instrumentation
-multiplies the cost of every executed line — so the same un-regressed code measured ~1.7s of CPU
-bare and >5s under coverage, and one shard failed on 3.12 while passing on 3.10 **at the identical
-commit**. The tell is a timing test that splits by Python version rather than by machine load.
+Asserting a *duration* when the property under test is algorithmic **complexity**. Coverage
+instrumentation multiplies the cost of every executed line — so the same un-regressed code
+measured ~1.7s of CPU bare and >5s under coverage, and a shard that runs `--no-cov` passes
+while an instrumented one fails **at the identical commit**. The tell is a timing test whose
+verdict depends on whether coverage was enabled rather than on machine load.
 
 `time.process_time` fixes only the other half: it removes co-tenant scheduling noise, but CPU time
 still includes the instrumentation, so an absolute ceiling stays version-dependent.

@@ -1726,7 +1726,7 @@ Examples:
     pod_parser = cli_help.add_command(sub, "pod")
     pod_sub = pod_parser.add_subparsers(
         dest="pod_action",
-        metavar="{up,down,ls,prune,status,token,url,logs,exec,provision,install}",
+        metavar="{up,down,ls,prune,status,token,url,scenarios,api,logs,exec,provision,install}",
     )
     pod_up = pod_sub.add_parser("up", help="Schedule an isolated pod for a worktree")
     pod_up.add_argument("name", help="Worktree name")
@@ -1737,7 +1737,16 @@ Examples:
         help="Provision (venv + SPA dist) if needed before bringing the pod up",
     )
     pod_up.add_argument("--ttl", default="2h", help="Token TTL (default: 2h)")
-    pod_up.add_argument("--seed", default="", help="Seed config dir (tunnel is forced off)")
+    pod_up.add_argument(
+        "--seed",
+        default="",
+        help=(
+            "Pre-populate the isolated home. A bare NAME is a shipped seed scenario "
+            "and populates the whole home; unknown names are refused with the "
+            "available list. A PATH (a separator or leading ~ or .) contributes only "
+            "its sanitized config.json. Populated homes are never re-seeded."
+        ),
+    )
     pod_up.add_argument(
         "--approval",
         # Literal mirrors kiro_crew.pod.runtime.APPROVAL_MODES, which is the
@@ -1755,10 +1764,9 @@ Examples:
         "--crons",
         action="store_true",
         help=(
-            "Run the pod's cron scheduler. Pods boot with --no-crons by default. A "
-            "pod's HOME starts with no cron definitions (only a sanitized config is "
-            "seeded), so this enables an empty scheduler for testing cron behavior "
-            "inside the pod. Persisted per pod; applies at boot."
+            "Run the pod's cron scheduler. Pods boot with --no-crons by default. "
+            "Without --seed the HOME starts with no cron definitions; a named "
+            "scenario may provide them. Persisted per pod; applies at boot."
         ),
     )
     pod_down = pod_sub.add_parser("down", help="Evict a pod (zero residue)")
@@ -1800,6 +1808,59 @@ Examples:
     pod_token.add_argument("--ttl", default="2h", help="Token TTL (default: 2h)")
     pod_url = pod_sub.add_parser("url", help="Print a pod's base URL")
     pod_url.add_argument("name", help="Worktree name")
+    pod_scenarios = pod_sub.add_parser(
+        "scenarios",
+        help="List the seed scenarios `pod up --seed <scenario>` accepts",
+    )
+    pod_scenarios.add_argument("--json", action="store_true", help="Emit rows as JSON")
+    pod_api = pod_sub.add_parser(
+        "api",
+        help="Call a running pod's HTTP API with its own token",
+        description=(
+            "Make one authenticated request against a running pod and print a "
+            "fixed-key JSON document: {name, method, path, status, ok, body}. "
+            "GET and HEAD are permitted by default; other methods require "
+            "--allow-write."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  kirocrew pod api my-wt GET sessions\n"
+            "  kirocrew pod api my-wt GET /api/health\n"
+            '  kirocrew pod api my-wt POST config --data \'{"key":"agent.model"}\' '
+            "--allow-write\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pod_api.add_argument("name", help="Worktree name")
+    pod_api.add_argument(
+        "method",
+        # No `choices=`: argparse would reject an unrecognised method with its own
+        # usage prose on stderr and exit 2, escaping the fixed-key JSON envelope
+        # this command promises on EVERY exit. `pod.runtime.pod_api` validates the
+        # method against API_METHODS and raises PodError, which the envelope
+        # reports as a status-0 document an agent can parse. `type=str.upper` stays
+        # so a lowercase method still normalises.
+        type=str.upper,
+        metavar="METHOD",
+        help="HTTP method: GET, HEAD, POST, PUT, PATCH or DELETE (case-insensitive)",
+    )
+    pod_api.add_argument(
+        "path",
+        help=(
+            "API path; /api/ is prepended when absent. Existing query parameters "
+            "are preserved, but caller-supplied token parameters are refused."
+        ),
+    )
+    pod_api.add_argument(
+        "--data",
+        default="",
+        help="Request body, sent verbatim as application/json",
+    )
+    pod_api.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="Permit POST, PUT, PATCH, or DELETE (off by default)",
+    )
     pod_logs = pod_sub.add_parser("logs", help="Tail a pod's journal")
     pod_logs.add_argument("name", help="Worktree name")
     pod_logs.add_argument("-n", "--lines", type=int, default=50, help="Lines to tail (default: 50)")
@@ -2246,6 +2307,15 @@ Examples:
     art_save = art_sub.add_parser("save", help="Save a new artifact")
     art_save.add_argument("--name", required=True, help="Human-readable name")
     art_save.add_argument(
+        "--slug",
+        help=(
+            "Explicit slug instead of one derived from --name. A taken or "
+            "malformed slug is REFUSED, never renamed: use 'artifact update "
+            "<slug>' to version one in place. Omit to let a collision resolve "
+            "by suffixing (-2, -3, ...)"
+        ),
+    )
+    art_save.add_argument(
         "--kind",
         choices=["widget", "html", "markdown", "svg", "json", "text", "image"],
         default=None,
@@ -2416,10 +2486,25 @@ Examples:
     app_info = app_sub.add_parser("info", help="Show app details")
     app_info.add_argument("name", help="App name")
     app_dev = app_sub.add_parser(
-        "dev", help="Toggle dev mode (no-store UI serving + live reload on file change)"
+        "dev",
+        help="Toggle dev mode (no-store UI serving + live reload on file change)",
+        # No flag abbreviations: --confirm-out-of-install-root is the
+        # operator's out-of-install attestation and the builtin agent deny
+        # rule matches its LITERAL text, so an accepted abbreviation
+        # (`--confirm`, `--c`) would sail past the rule and let an agent
+        # shell self-supply the attestation. Only the exact flag parses.
+        allow_abbrev=False,
     )
     app_dev.add_argument("name", help="App name")
     app_dev.add_argument("--off", action="store_true", help="Turn dev mode off")
+    app_dev.add_argument(
+        "--confirm-out-of-install-root",
+        action="store_true",
+        help=(
+            "Confirm enabling dev mode on a ui root that resolves outside the "
+            "app's install directory (e.g. a ui/ symlinked to your source tree)"
+        ),
+    )
     app_init = app_sub.add_parser("init", help="Scaffold a new app")
     app_init.add_argument("name", help="App name (kebab-case)")
     app_init.add_argument("--dir", default=".", help="Output directory (default: current)")
@@ -2437,6 +2522,9 @@ Examples:
   kirocrew config get agent.provider    # Get a specific value
   kirocrew config set dashboard.url http://localhost:5476
   kirocrew config edit                  # Open in $EDITOR
+  kirocrew config defaults              # Stored values holding a superseded default
+  kirocrew config defaults --adopt      # Take the current defaults for all of them
+  kirocrew config defaults --keep session.autocompact_pct   # Affirm one as intentional
 
 The dashboard port is set with the KIROCREW_PORT env var, not a config key.
 """,
@@ -2455,6 +2543,26 @@ The dashboard port is set with the KIROCREW_PORT env var, not a config key.
         help="Save to config.local.json (persists across upgrades)",
     )
     cfg_sub.add_parser("edit", help="Open config in $EDITOR")
+    cfg_defaults = cfg_sub.add_parser(
+        "defaults",
+        help="Review stored values that still hold a superseded default",
+    )
+    cfg_defaults.add_argument(
+        "keys",
+        nargs="*",
+        help="Limit to these dotted keys (default: every drifted key)",
+    )
+    _cfg_def_mode = cfg_defaults.add_mutually_exclusive_group()
+    _cfg_def_mode.add_argument(
+        "--adopt",
+        action="store_true",
+        help="Remove the stored keys so the current defaults apply",
+    )
+    _cfg_def_mode.add_argument(
+        "--keep",
+        action="store_true",
+        help="Record the stored values as intentional and stop reporting them",
+    )
 
     # Last registration done: stop argparse from answering an unknown command
     # with the internal mcp-* server names. Must come after every add_parser,

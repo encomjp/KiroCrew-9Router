@@ -7,7 +7,7 @@
  * every other enable failure stays a plain error, and Cancel grants nothing.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 
@@ -41,10 +41,15 @@ vi.mock('../api/client', () => ({
     uninstallPreview: vi.fn().mockResolvedValue({ dependencies: { removable: [], shared: [], userInstalled: [] } }),
     installApp: vi.fn(),
     openApp: vi.fn(),
+    appContributors: vi.fn(() => Promise.resolve({ contributors: [] })),
   },
 }))
 
 vi.mock('../hooks/useTheme', () => ({ useTheme: () => ({ theme: 'dark' }) }))
+
+// happy-dom cannot drive real Radix menus — swap in the repo's stateful mock
+// so the launchpad tile's overflow menu (where Enable now lives) opens.
+vi.mock('@radix-ui/react-dropdown-menu', async () => await import('./__mocks__/@radix-ui/react-dropdown-menu'))
 
 // Render catalog KEYS, not English. The trust-modal strings are authored in the
 // locale catalogs; asserting on their English would make this suite a copy of
@@ -165,11 +170,16 @@ function renderDetailFromGet(name = THIRD_PARTY.name) {
  *
  * The Library page (/apps/library) is the surface that offers it:
  * FeaturedSpotlight/AppListRow only render Enable for a hidden BUILT-IN, so an
- * installed-but-disabled third-party app is enabled from its installed card
- * (or the detail page).
+ * installed-but-disabled third-party app is enabled from its launchpad tile's
+ * overflow menu (the tile caps its action row at two peers — Open plus the
+ * menu — so Enable lives behind the MoreHorizontal trigger).
  */
 async function clickEnable() {
-  const btn = await screen.findByRole('button', { name: /installedAppCard\.enable$/ })
+  const trigger = await screen.findByRole('button', {
+    name: `pages.libraryPage.tile_more_actions ${THIRD_PARTY.displayName}`,
+  })
+  fireEvent.click(trigger)
+  const btn = await screen.findByRole('menuitem', { name: /installedAppCard\.enable$/ })
   fireEvent.click(btn)
   return btn
 }
@@ -199,7 +209,7 @@ beforeEach(() => {
   untrustApp.mockResolvedValue({ apps: [], ineffective: [], allowAll: false })
   // Detail-page load: not installed yet, so the registry entry is the source of
   // truth and the page offers Get rather than Enable/Disable.
-  getApp.mockRejectedValue(new Error('not installed'))
+  getApp.mockRejectedValue(apiError(404, { error: 'not installed' }))
   system.mockResolvedValue({ hostname: 'localhost' })
 })
 
@@ -338,14 +348,19 @@ describe('LibraryPage trust gate', () => {
 
   it('keeps the modal open and reports inline when the retried enable fails', async () => {
     enableApp.mockRejectedValue(TRUST_DENIED())
+    // The rollback probe must not PROVE absence here (a 404 would), so the
+    // grant stands and the copy points at Settings.
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
     renderPage()
     await clickEnable()
     await waitFor(() => expect(modalTitle()).toBeTruthy())
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed LaunchDarkly`))
+    // `toContain`, not `toBe`: the failure renders through the shared ErrorNotice,
+    // whose `role="alert"` node also carries the agent hand-off button's label.
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
     expect(modalTitle()).toBeTruthy()
   })
 
@@ -427,11 +442,14 @@ describe('registry install trust gate', () => {
     installFromRegistryStream.mockResolvedValue(INSTALL_DENIED())
     renderDetailFromGet()
     await waitFor(() => expect(modalTitle()).toBeTruthy())
+    // The page loaded from the registry (the suite's 404 default). From here the
+    // rollback probe must not prove absence, so the grant stands.
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
     expect(modalTitle()).toBeTruthy()
   })
 
@@ -451,25 +469,28 @@ describe('registry install trust gate', () => {
     await waitFor(() => expect(untrustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
     // Nothing was left behind, so the copy must say that rather than sending the
     // user to Settings to remove a grant that is already gone.
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed_generic LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed_generic LaunchDarkly`))
     expect(modalTitle()).toBeTruthy()
   })
 
   it('KEEPS the grant when absence cannot be proven — only a 404 rolls back', async () => {
     // The other half, and the anti-guess rule. Only a 404 proves the name is
     // unoccupied; a network error or a 500 proves nothing, and revoking on that
-    // would switch off an app that exists and works. The suite default rejects
-    // `getApp` with a plain Error (no status), so this is that branch: the grant
-    // stands and the copy points the user at Settings to review it.
+    // would switch off an app that exists and works. The suite default is a 404
+    // (so the detail page loads from the registry — a non-404 rejection is now
+    // a load FAILURE, not "not installed"); the probe is switched to a 500 once
+    // the page is up, so this is that branch: the grant stands and the copy
+    // points the user at Settings to review it.
     installFromRegistryStream.mockResolvedValue(INSTALL_DENIED())
     renderDetailFromGet()
     await waitFor(() => expect(modalTitle()).toBeTruthy())
+    getApp.mockRejectedValue(apiError(500, { error: 'gateway exploded' }, 'gateway exploded'))
 
     fireEvent.click(confirmBtn())
 
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed LaunchDarkly`))
     expect(untrustApp).not.toHaveBeenCalled()
   })
 
@@ -514,8 +535,8 @@ describe('registry install trust gate', () => {
     await waitFor(() => expect(untrustApp).toHaveBeenCalledWith(THIRD_PARTY.name))
     // Nothing was left behind, so the copy says so rather than sending the user to
     // Settings after a grant that is already gone.
-    await waitFor(() => expect(screen.getByRole('alert').textContent)
-      .toBe(`${K}.failed_generic LaunchDarkly`))
+    await waitFor(() => expect(within(screen.getByRole('dialog')).getByRole('alert').textContent)
+      .toContain(`${K}.failed_generic LaunchDarkly`))
   })
 
   it('rolls the grant back when the retried install is ABORTED', async () => {

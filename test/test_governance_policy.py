@@ -233,6 +233,21 @@ class TestCapabilityGate:
         g2 = CapabilityGate.from_dict({}, default_enabled=False)
         assert not g2.enabled
 
+    def test_from_dict_rejects_non_boolean_enabled(self):
+        # bool("false") is True — a stringly-typed disable must not permit.
+        # A present null is not "absent": default-ON scopes must not stay on.
+        for bogus in ("false", "true", 1, 0, ["yes"], None):
+            with pytest.raises(PlatformCompositionError, match="boolean"):
+                CapabilityGate.from_dict({"enabled": bogus}, default_enabled=True)
+
+    def test_known_capability_rejects_non_boolean_enabled(self):
+        # Default-ON siblings (memory_writes, browse, …) used to coerce
+        # enabled: "false" through bool() and stay on.
+        with pytest.raises(PlatformCompositionError, match="boolean"):
+            parse_profile(
+                {"name": "host", "capabilities": {"memory_writes": {"enabled": "false"}}}
+            )
+
     def test_scopes_compose_independently(self):
         a = CapabilityGate(
             enabled=True,
@@ -1727,6 +1742,8 @@ class TestValidateReportsUngovernedCapabilities:
 
     def test_fully_enumerated_block_reports_no_gap(self, capsys):
         body = {scope.split(".", 1)[1]: {"enabled": True} for scope in _capability_scopes()}
+        # agentcore requires a known inner posture when enabled.
+        body["agentcore"] = {"enabled": True, "posture": "workload"}
         out = self._validate(capsys, parse_policy(_policy_body(capabilities=body)))
         assert "UNGOVERNED" not in out
         assert "✅ valid" in out

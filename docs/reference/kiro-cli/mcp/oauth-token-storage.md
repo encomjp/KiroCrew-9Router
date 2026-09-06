@@ -27,8 +27,8 @@ For each remote MCP server with an `https://...` URL, kiro-cli writes
 **two paired files** keyed by SHA-256 of the URL:
 
 ```
-{sha256(server_url)}.token.json          ← the OAuth bearer + refresh token
-{sha256(server_url)}.registration.json   ← the DCR client metadata
+{sha256(origin+path)}.token.json          ← the OAuth bearer + refresh token
+{sha256(origin+path)}.registration.json   ← the DCR client metadata
 ```
 
 Both files use lowercase + dot-suffixed filenames. The hash is computed by
@@ -241,7 +241,7 @@ Pair with a `state.recycle_kiro_sessions()` call so the warm pool reloads
 
 ## Long-term direction
 
-The design doc at `docs/design/mcp-oauth-ownership-problem.md` argues that
+The design doc at `docs/architecture/design-notes/mcp-oauth-ownership.md` argues that
 Kiro Crew should eventually own the OAuth chain end-to-end (token store,
 refresh, sign-out, per-agent identity) once a Kiro SDK exists or we move
 to the Claude Agent SDK. At that point this whole file becomes legacy —

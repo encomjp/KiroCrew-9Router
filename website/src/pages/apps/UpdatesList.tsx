@@ -64,7 +64,7 @@ export default function UpdatesList({
       </div>
       <div className="space-y-2">
         {rows.map(app => {
-          // Icon resolution — the InstalledAppCard chain verbatim, so an app
+          // Icon resolution — the shared installed-app icon chain verbatim, so an app
           // wears the same mark on this worklist as on its Library card: a
           // page icon glyph, else the app's own installed art through the
           // resolver that refuses external hosts, else the name-hashed
@@ -72,7 +72,7 @@ export default function UpdatesList({
           const m = app.manifest
           // `iconPath` FIRST, matching every other surface: the order is only
           // observable for a manifest declaring both, and there it decides which
-          // file the app wears. See InstalledAppCard for the full rationale.
+          // file the app wears. See LaunchpadTile for the full rationale.
           const iconUrl = installedIcon(m?.iconPath, m?.iconUrl, app.name)
           const iconUrlDark = installedIcon(m?.iconPathDark, m?.iconUrlDark, app.name)
           // Disabled while ANY update runs — the batch, this row's own call,

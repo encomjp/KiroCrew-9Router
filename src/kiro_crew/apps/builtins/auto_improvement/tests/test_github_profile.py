@@ -224,6 +224,14 @@ class TestIsolation:
         )
         assert iso.push_disabled() is True
 
+        for key in ("remote.origin.url", "remote.origin.pushurl"):
+            subprocess.run(
+                ["git", "-C", str(clone), "config", "--add", key, "https://example.invalid/x"],
+                check=True,
+                capture_output=True,
+            )
+        assert iso.push_disabled() is False
+
     def test_do_not_pollute_excludes_the_app_data_dir(self, tmp_path: Path) -> None:
         """The app writes its own ledger under the snapshot root during the boot window;
         without the exclude those writes register as a phantom leak."""

@@ -267,18 +267,17 @@ def _xdist_cap_config() -> int:
     Semantics: ``-1`` (default) = auto-compute from available memory;
     ``0`` = disabled, inject nothing (passthrough to xdist's own default);
     ``N > 0`` = fixed cap. Junk values fall back to the default. Reads the
-    same raw ``resource_limits`` block as :func:`security.apply_resource_limits`
-    and ``sandbox._cgroup_limits_from_config``; the import is function-level
-    for the same reason theirs is (no import cycle through the config loader).
+    shared ``resource_limits`` block through ``ResourceLimitsConfig.from_raw``,
+    the single validated parse site every other consumer of that block also
+    goes through; the import is function-level to avoid an import cycle through
+    the config loader.
     """
     try:
-        from kiro_crew.config.loader import _raw_config
+        from kiro_crew.config.loader import ResourceLimitsConfig, _raw_config
 
-        rl = _raw_config().get("resource_limits")
-        if isinstance(rl, dict):
-            v = rl.get("xdist_auto_cap")
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and int(v) >= -1:
-                return int(v)
+        rl = ResourceLimitsConfig.from_raw(_raw_config().get("resource_limits"))
+        if rl.xdist_auto_cap is not None:
+            return rl.xdist_auto_cap
     except Exception:  # pragma: no cover - defensive; config must never break a spawn
         logger.debug("xdist auto cap: config unavailable, using default", exc_info=True)
     return -1

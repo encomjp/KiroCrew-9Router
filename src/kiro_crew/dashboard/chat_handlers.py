@@ -12,6 +12,7 @@ import re
 import tempfile
 import time
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from itertools import islice
@@ -25,18 +26,24 @@ from kiro_crew import members as members_mod
 from kiro_crew import model_registry
 from kiro_crew.acp.client import AcpModelUnavailable
 from kiro_crew.agent_discovery import cached_project_agent_names, warm_project_agent_names
+from kiro_crew.agent_sdk.provider_identity import is_claude_code
 from kiro_crew.config.loader import (
+    AUTOCOMPACT_PCT_MAX,
+    AUTOCOMPACT_PCT_MIN,
     KiroCrewConfig,
     _workspace_name_for_dir,
     config_dir,
     default_project_dir,
+    published_autocompact_pct,
     resolve_agent_bindings,
 )
+from kiro_crew.dashboard import remote_mirror
 from kiro_crew.dashboard.channel_slots import channel_slot_name, note_slot_closed
 from kiro_crew.dashboard.chat_auto_tag import maybe_auto_tag
 from kiro_crew.dashboard.chat_delivery import (
     STEER_REQUEUED,
     STEER_STEERED,
+    normalize_send_id,
     queue_for_next_turn,
     steer_into_running_turn,
 )
@@ -51,6 +58,7 @@ from kiro_crew.dashboard.chat_persistence import (
     COLOR_HEX_RE,
     _attach_variants,
     _rehydrate_slot_title,
+    _validate_autocompact_pct,
     get_reasoning_effort_values,
     save_slot_off_loop,
 )
@@ -62,16 +70,19 @@ from kiro_crew.dashboard.chat_runner import (
     schedule_eager_spawn,
 )
 from kiro_crew.dashboard.chat_summary import generate_session_summary
+from kiro_crew.dashboard.chat_tags import tags_write_lock, validate_folder_tag_ids
 from kiro_crew.dashboard.chat_title import _maybe_auto_title
 from kiro_crew.dashboard.chat_utils import (
     _MANUAL_CONTINUE_MSG,
     _MANUAL_RESUME_MSG,
     SYNTHETIC_RECOVERY_KIND,
+    _broadcast_expired_oauth_banners,
     _build_stream_chunk,
     _collapse_wire_rows,
     _edit_queued_by_id,
     _emit_agent_assignment,
     _history_key_for,
+    _live_child_instance,
     _normalize_model,
     _prepare_messages,
     _redact_for_display,
@@ -80,13 +91,27 @@ from kiro_crew.dashboard.chat_utils import (
     _remove_queued_by_id,
     _sync_dashboard_slots,
     effective_session_key,
+    history_corpus_unreadable,
     slot_history_key,
+    subagents_attached,
+)
+from kiro_crew.dashboard.handlers._shared import read_bounded_json
+from kiro_crew.dashboard.remote_relay import (
+    RemoteTurnError,
+    create_peer_slot,
+    forward_peer_selection,
+    forward_peer_stop,
+    peer_is_connected,
+    redact_peer_text,
+    relay_remote_turn,
+    remote_bound_refusal,
 )
 from kiro_crew.dashboard.state import (
     DashboardState,
     _ChatSlot,
     _mark_permission_resolved,
     _normalize_slot_key,
+    append_and_surface,
     durable_row_count,
     is_stop_event_row,
     is_turn_interrupted,
@@ -95,11 +120,16 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_notice
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
-from kiro_crew.history import carry_provenance, is_incognito_transcript
+from kiro_crew.history import carry_provenance, is_incognito_transcript, transcript_stems
 from kiro_crew.messaging.link import is_channel_session_key
 from kiro_crew.providers.acp import AcpProvider
 from kiro_crew.providers.base import LLMProvider
-from kiro_crew.safety_override import safety_override
+from kiro_crew.safety_override import (
+    approval_mode_permitted,
+    safety_override,
+    yolo_policy_permits,
+)
+from kiro_crew.sandbox import voice_runtime_workspace_conflict
 from kiro_crew.security import (
     is_sensitive_path,
     redact_credentials,
@@ -181,10 +211,10 @@ def _sweep_stale_permissions(slot: "_ChatSlot") -> None:
 async def api_chat(request: web.Request) -> web.StreamResponse:
     """POST /api/chat — send message to a slot, stream response via SSE."""
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     message = body.get("message", "").strip()
     agent = body.get("agent", "")
     slot_name = body.get("slot")
@@ -327,6 +357,13 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 error="app does not own this slot",
             )
             return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # Identity gate for a peer-bound slot, on top of the app-scope 404s above:
+    # those pass every empty-``app`` caller by contract, and a dashboard-link
+    # token is exactly that shape. Sending here would spend the OWNER's tunnel to
+    # run a turn on the owner's connected machine. No-op for a local slot.
+    denied = deny_non_owner_remote_operation(request, slot, "chat_send")
+    if denied is not None:
+        return denied
     # The member-pin refusal sits AFTER the app-ownership 404s (a 409 here
     # for an app would be an existence oracle for slots it may not see) and
     # BEFORE the _human_seen attendance mark, so a denied request leaves the
@@ -431,7 +468,9 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 # fall back to default bindings and falsely equate a
                 # project-agent slot with a request naming the default alias.
                 # Warm the cache off-loop first so the on-loop lookup is a hit.
-                await warm_project_agent_names(slot.project or None)
+                await warm_project_agent_names(
+                    slot.project or None, operation="api_chat", source="dashboard"
+                )
                 _stored = resolve_agent_bindings(_cfg, slot.agent, slot.project or None)
                 _requested = resolve_agent_bindings(_cfg, agent, slot.project or None)
                 # Identity itself lives on ResolvedBindings, next to the field
@@ -542,18 +581,63 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 # was suspended — queueing again would deliver the same text twice.
                 return web.json_response({"ok": True, "queued": True})
             # steer requested but unavailable -> fall through to queue below.
+        # A remote-bound slot has no queue drain, so it must not accept a queue
+        # entry. The drain lives inside ``_run_chat``, and ``relay_remote_turn``
+        # REPLACES ``_run_chat`` for this slot rather than wrapping it, so a
+        # queued message would sit there unexecuted while the API had already
+        # answered `queued: true` — the user is told their send was accepted and
+        # nothing ever runs it.
+        #
+        # Refusing is the honest report of that gap. Draining it locally was tried
+        # and reverted: ``_start_next_queued_turn`` carries no
+        # ``is_remote``/``executor`` branch and dispatches ``_run_chat``, so it ran
+        # the follow-up on THIS machine — the wrong-machine execution the
+        # ``executor == "remote"`` guard exists to prevent, and worse than either
+        # losing the message or refusing it. 409 lets the client re-send once the
+        # relayed turn ends, which is the behaviour the user can actually see.
+        #
+        # ``relay=1`` covers the SAME gap from the PEER's side. When the owner
+        # relays a turn, this handler runs on the peer against the peer's own
+        # slot — an ORDINARY local slot there, so ``slot.is_remote`` is False and
+        # the branch above does not fire. If that peer slot is still busy (e.g. a
+        # prior relayed turn survived the owner's restart and is still running),
+        # the send would fall through to the queue and drain later WITHOUT the
+        # ``relay=1`` mirror, so its answer never reaches the owner — the F2
+        # silent-loss path. Refusing a relayed send while busy makes the owner's
+        # ``_peer_turn_chunks`` raise on the 409 and surface a reconnect prompt
+        # instead. Read raw off the query because ``relay_mode`` is computed later
+        # in this handler, after this busy branch.
+        if slot.is_remote or request.query.get("relay") == "1":
+            return web.json_response(
+                {
+                    "error": "this crew is still running the previous message; send again when it finishes",
+                    "code": "remote_turn_busy",
+                },
+                status=409,
+            )
         # Queue the message - return JSON immediately (no SSE needed).
         # The existing SSE reader will pick up queued messages as _run_chat
         # processes the queue in its finally block. The message is non-empty
         # here (hoisted guard above the busy branch), so `queued: true`
-        # always reports a real enqueue.
-        queue_for_next_turn(
+        # always reports a real enqueue. `queue_id` lets the sender bind its
+        # pre-send composer state to THIS entry (the dashboard's cancel-queued
+        # restore), which no content-based key can do: serialization is not
+        # injective and other tabs can queue colliding content.
+        #
+        # The client's `meta.sendId` rides on the entry too (same gate as the
+        # steer path above: `normalize_send_id` treats anything unusable as
+        # absent). The drain unions entry meta onto the row it writes, so the
+        # queued send's row ends up carrying the same id a dispatched send's row
+        # gets from `slot.append(..., meta=user_meta)` below -- the only way a
+        # sender can prove ITS message landed without matching by text.
+        qid = queue_for_next_turn(
             state,
             slot,
             message,
             directive_user_origin=not bool(request_app),
+            send_id=normalize_send_id(user_meta.get("sendId")) if user_meta else None,
         )
-        return web.json_response({"ok": True, "queued": True})
+        return web.json_response({"ok": True, "queued": True, "queue_id": qid})
 
     # ── Crew Mode dispatch (RFC orchestrator-chat-sessions) ─────────
     # MUST precede the hold-users gate below: crew topics ARE background
@@ -603,9 +687,15 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         # circular import: session_control imports this package's modules at module level.
         from kiro_crew.dashboard.session_control import containment_meta
 
+        # Same entry-meta contract as the busy-slot branch: the client's `sendId`
+        # rides on the queue entry so the drained row carries it.
+        _hold_meta: dict = containment_meta(state, slot)
+        _hold_sid = normalize_send_id(user_meta.get("sendId")) if user_meta else None
+        if _hold_sid:
+            _hold_meta["sendId"] = _hold_sid
         qid = slot.queue_append(
             message,
-            meta=containment_meta(state, slot),
+            meta=_hold_meta,
             directive_user_origin=not bool(request_app),
         )
         _c, _ = redact_exfiltration_urls(message)
@@ -620,15 +710,66 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 "queue_id": qid,
             },
         )
-        return web.json_response({"ok": True, "queued": True})
+        # Same receipt contract as the busy-slot queue branch: `queue_id`
+        # binds the sender's pre-send composer state to this exact entry.
+        return web.json_response({"ok": True, "queued": True, "queue_id": qid})
 
     # WS mode: return JSON immediately, chunks delivered via WebSocket
     ws_mode = request.query.get("ws") == "1"
 
+    # Relay mode: an SSE reader on ANOTHER gateway is running this turn on behalf
+    # of a session in its own local list, and needs the frames a WebSocket client
+    # would get — tool calls, segment boundaries, turn end — which the SSE
+    # transport does not otherwise carry. For the life of this request those
+    # frames are also queued onto the slot's pending rows. Meaningless in WS mode
+    # (a WebSocket client already receives them) and ignored there, so the flag
+    # can never double-deliver to a local client.
+    relay_mode = not ws_mode and request.query.get("relay") == "1"
     slot._has_reader = not ws_mode  # Only block SSE broadcast if HTTP SSE reader
     slot._file_changes = []  # Reset file-change accumulator for the new turn
     # ── Sweep orphaned permissions from prior turns ──
     _sweep_stale_permissions(slot)
+
+    # Refuse a remote-bound send BEFORE it is recorded. Both guards below return
+    # 409 without starting a turn, so they must run ahead of the `slot.append`
+    # that writes the user row: a refusal that appended first would leave a user
+    # row in local history, and the user's retry would append a SECOND one while
+    # only the retry ever reaches the peer — the local and peer transcripts then
+    # diverge (GPT #7693). Every turn-refusing validation (member reserve, app
+    # ownership, agent conflict, busy/steer/queue, crew and orchestrator modes)
+    # has already run above, so a remote slot that reaches here is otherwise
+    # cleared to dispatch.
+    #
+    # `executor == "remote"` with an incomplete binding does NOT fall through to
+    # a local run: that would execute on this machine work the user asked a named
+    # crew to do, the one failure the binding exists to prevent.
+    if slot.executor == "remote" and not slot.is_remote:
+        return web.json_response(
+            {
+                "error": "this session is bound to a remote crew but the binding is incomplete",
+                "code": "remote_binding_incomplete",
+            },
+            status=409,
+        )
+    # Lock a remote session while its tunnel is down. A gateway that just
+    # restarted has not re-established its instance tunnels yet, and dispatching a
+    # turn into a half-open or absent tunnel loses it the same way finding F1
+    # describes — the peer never receives it, or answers into a stream nothing is
+    # reading. ``peer_is_connected`` reads the tunnel state defensively (the
+    # manager is duck-typed and stubbed in tests). The user re-sends once the crew
+    # is back online: the honest, visible refusal rather than a silent drop. Only
+    # a fully-bound remote slot reaches here (the incomplete-binding guard above
+    # already returned), so ``instance_id`` is populated.
+    if slot.is_remote and not peer_is_connected(
+        getattr(state, "instances_manager", None), slot.instance_id
+    ):
+        return web.json_response(
+            {
+                "error": "reconnecting to the crew running this session — send again once it is back online",
+                "code": "remote_not_connected",
+            },
+            status=409,
+        )
 
     # No per-message browse marker: browsing is a capability, not a per-turn
     # gate. The agent drives a browser by running `playwright-cli` shell
@@ -677,7 +818,10 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     # to honour it for widget-origin turns and let the text fall through to a
     # normal, fully-gated _run_chat turn instead. Mode changes and tool
     # approvals live on separate endpoints a widget iframe cannot reach.
-    _widget_origin = bool(user_meta) and user_meta.get("origin") == "widget"
+    # `is not None` (not truthiness): user_meta is normalized to dict-or-None
+    # above, and with the body typed by read_bounded_json, mypy narrows the
+    # Optional only through an explicit None check.
+    _widget_origin = user_meta is not None and user_meta.get("origin") == "widget"
     if (
         getattr(slot, "mode", "") == "orchestrator"
         and message.strip().lower() in ("go", "go all")
@@ -771,10 +915,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                 if t and not t.done():
                     t.cancel()
         stop_msg = "🛑 [SYSTEM] Orchestration stopped by user."
-        slot.append("assistant", stop_msg, "msg msg-a")
-        state.broadcast_ws(
-            "chat_message", {"slot": slot.key, "role": "assistant", "content": stop_msg}
-        )
+        append_and_surface(state, slot, "assistant", stop_msg, "msg msg-a")
         state.broadcast_ws("chat_done", {"slot": slot.key})
         return web.json_response({"ok": True, "stopped": True})
 
@@ -820,19 +961,43 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     except Exception:
         logger.debug("on_user_message observer raised; ignoring", exc_info=True)
 
+    # A slot bound to a peer crew runs its turn THERE. The dispatch branch sits
+    # here, at the single dispatch point, so every validation above applies
+    # identically to a remote-bound session — a remote slot is an ordinary slot
+    # that executes elsewhere, not a second kind of session. The two remote
+    # refusals (incomplete binding, tunnel down) ran earlier, ahead of the user
+    # row append, so a refused send is never recorded locally.
+    #
+    # Attach the mirror BEFORE dispatch, not after the response is prepared: the
+    # turn task can emit its first frames as soon as the event loop yields, and a
+    # mirror armed later would miss them.
+    _relay_owned = remote_mirror.attach(slot.key) if relay_mode else False
+
     # FIX 2: an unattended app-owned turn runs under the background concurrency
     # cap; run_background_turn passes an attended slot straight through, so the
     # interactive path is unchanged (no semaphore is even created).
+    #
+    # The remote arm is a conditional expression INSIDE the dispatch rather than a
+    # coroutine hoisted into a local: `test_chat_turn_timeout_consistency` scans
+    # the text of each `spawn_guarded_turn(...)` body for `_run_chat(`, so hoisting
+    # the call out would take this site — the primary user-typed turn — out of the
+    # static guard that every dispatch carries a CHAT_TURN_TIMEOUT ceiling.
+    # Both arms are wrapped identically: a hung peer must hit the same wall a hung
+    # local turn does.
     task = spawn_guarded_turn(
         state,
         slot,
         state.run_background_turn(
             slot,
-            _run_chat(
-                state,
-                slot,
-                message,
-                _directive_user_origin=not bool(request_app),
+            (
+                relay_remote_turn(state, slot, message)
+                if slot.is_remote
+                else _run_chat(
+                    state,
+                    slot,
+                    message,
+                    _directive_user_origin=not bool(request_app),
+                )
             ),
         ),
     )
@@ -855,7 +1020,19 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
     resp.content_type = "text/event-stream"
     resp.headers["Cache-Control"] = "no-cache"
     resp.headers["X-Accel-Buffering"] = "no"
-    await resp.prepare(request)
+    try:
+        await resp.prepare(request)
+    except BaseException:
+        # `prepare` is the one awaitable between `remote_mirror.attach` above and
+        # the streaming loop's detach `finally` below. A peer that vanished
+        # between dispatch and prepare would raise here and skip that finally,
+        # stranding this slot in the process-global `_MIRRORED` set forever —
+        # every later frame then mirrors onto `slot._pending` with no reader
+        # draining it. Drop mirror ownership on the way out so the leak cannot
+        # happen; the dispatched turn keeps running, exactly as it does when the
+        # reader disconnects mid-stream.
+        remote_mirror.detach(slot.key, _relay_owned)
+        raise
 
     # Declare this reader as the owner of `slot._pending` for as long as it is
     # draining. A turn-end chunk release must not run while an SSE reader still
@@ -870,7 +1047,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
                         await resp.write(b"data: [DONE]\n\n")
                         slot._has_reader = False
                         return resp
-                    chunk = _build_stream_chunk(msg)
+                    chunk = _build_stream_chunk(msg, include_row_meta=relay_mode)
                     await resp.write(f"data: {chunk}\n\n".encode())
                 try:
                     await asyncio.wait_for(slot.event.wait(), timeout=30)
@@ -881,18 +1058,22 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         finally:
             slot.drain()
             slot._has_reader = False
+            remote_mirror.detach(slot.key, _relay_owned)
     return resp
 
 
 async def api_chat_slots(request: web.Request) -> web.Response:
     """GET /api/chat/slots — list all chat slots."""
     state: DashboardState = request.app["state"]
-    # Credential-backed check status is owner-only. Non-owner and app-token
-    # callers receive source links but neither cached status nor provider work.
+    # Credential-backed check status is owner-only for PRIVATE repos. For a
+    # PUBLIC repo the lifecycle is world-visible, so an authenticated
+    # dashboard-user (non-owner) may see it too. App-token callers receive
+    # source links but neither cached status nor provider work.
     from kiro_crew.dashboard.handlers.source_providers import (
         ensure_gitlab_hosts_loaded,
         is_owner_dashboard_request,
         schedule_check_refresh,
+        schedule_visibility_refresh,
     )
 
     # Same warm-up as the WebSocket connect path: slot source-link extraction is
@@ -904,10 +1085,17 @@ async def api_chat_slots(request: web.Request) -> web.Response:
         logger.debug("GitLab allowlist warm-up failed; chips may lag one round", exc_info=True)
 
     include_check_status = is_owner_dashboard_request(request)
-    payloads = state.serialize_slots(include_check_status=include_check_status)
+    is_dashboard_user = bool(request.get("is_dashboard_user"))
+    payloads = state.serialize_slots(
+        include_check_status=include_check_status, dashboard_user=is_dashboard_user
+    )
     if include_check_status:
-        # Issue links carry no check status — skip them so the scheduler never
-        # hands an issue URL to the pull-request-only chip fetch.
+        # Only the OWNER's GET drives provider work. Both the visibility probe
+        # and the status refresh run the operator's `gh`/`glab` credentials, so
+        # a non-owner request must trigger NEITHER (GPT #6789) — it renders the
+        # owner-populated caches read-only via the fail-closed is_repo_public
+        # gate in _project_source_links. Issue links carry no check status, so
+        # skip them (the fetch is pull-request-only).
         urls = [
             link["url"]
             for payload in payloads
@@ -915,6 +1103,7 @@ async def api_chat_slots(request: web.Request) -> web.Response:
             if link.get("kind", "change") == "change"
         ]
         if urls:
+            schedule_visibility_refresh(urls, state.push_slots_update)
             schedule_check_refresh(urls, state.push_slots_update)
     return web.json_response(payloads)
 
@@ -985,12 +1174,23 @@ async def api_chat_slot_source_links(request: web.Request) -> web.Response:
             "GitLab allowlist warm-up failed; expanded chips may lag one round", exc_info=True
         )
 
-    # Cached status only, owner-gated exactly like the list endpoint. No
+    # Cached status only, gated exactly like the list endpoint: owner sees all,
+    # a dashboard-user sees public-repo status, app tokens see none. No
     # schedule_check_refresh here: that pushes a `slots` update, which by
     # definition cannot carry links outside the budget, so the provider work
     # would produce a result this response can never show.
+    #
+    # Deliberately NOT gated on `dashboard.session_card_source_links`: the only
+    # caller is the sidebar's "+N" pill, which exists only while the strip
+    # renders, and the config write pushes fresh slots so the pill goes at once.
+    # An app token that owns the slot could ask directly, but it can already read
+    # the slot's messages -- these URLs are extracted FROM those messages, so
+    # gating here would withhold nothing it does not already have.
     return web.json_response(
-        slot.source_links_payload(include_check_status=is_owner_dashboard_request(request))
+        slot.source_links_payload(
+            include_check_status=is_owner_dashboard_request(request),
+            dashboard_user=bool(request.get("is_dashboard_user")),
+        )
     )
 
 
@@ -1823,6 +2023,7 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
                                     if isinstance(msg.get("meta"), dict)
                                     else None
                                 ),
+                                mint_mid=False,
                             )
                             carry_provenance(slot.messages[-1], msg)
                             _attach_variants(slot, msg)
@@ -1847,22 +2048,120 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
             messages = mem_msgs
         total = len(messages)
         has_more = False
-        # This branch returns the whole corpus, so there is no older page to ask
-        # for. Sent anyway so the field is present on every response shape.
+        # This branch returns the whole UN-ARCHIVED corpus. Rows a size
+        # rotation moved into archive/ are NOT in it — so when such rows
+        # exist, advertise them: `next_before` is their collapsed row count,
+        # i.e. the boundary index (in the paginated corpus, which prepends the
+        # archived head) of this response's first row. The client's next
+        # "load earlier" then pages straight into the archived head instead of
+        # this response permanently retiring the affordance. Collapsed in the
+        # same units the paginated path slices in; a chunk run split by the
+        # rotation cut can make this off by one, which the client's mid-dedupe
+        # absorbs.
+        #
+        # The cursor is exact ONLY while the archived rows are a contiguous
+        # PREFIX of the chained corpus (rotation on the first chain member).
+        # A LATER member's archive is sandwiched between rows this response
+        # already carries: no single cursor can reach it, and paging from the
+        # head count would walk past it forever — those rows would simply be
+        # unreachable, and a fork index computed against the true corpus
+        # would name a different row than the one rendered. That shape is
+        # served from the true chained corpus below instead.
         next_before = 0
+        if state.conversation_log:
+            try:
+                rotated = await asyncio.to_thread(
+                    state.conversation_log.read_rotated_messages_chained,
+                    slot_history_key(slot),
+                )
+            except Exception:
+                # NOT `rotated = []`. An empty list is this handler's encoding of
+                # "this session has no archive", so swallowing the failure into it
+                # skips the whole block below and serves the live-only corpus with
+                # `next_before = 0` and no archive advertised — the same silent
+                # truncation, reached by a different route. The read is the only
+                # thing that knows the difference, so it has to answer here.
+                logger.warning("rotated-archive read failed", exc_info=True)
+                return history_corpus_unreadable()
+            if rotated:
+                rotated_count = len(_collapse_wire_rows(rotated))
+                mid_rotation = False
+                if rotated_count > 0:
+                    try:
+                        mid_rotation = await asyncio.to_thread(
+                            state.conversation_log.chain_mid_rotation,
+                            slot_history_key(slot),
+                        )
+                    except Exception:
+                        # A failed probe leaves `mid_rotation` False, which sends
+                        # the request down the prefix-cursor path -- correct ONLY
+                        # when the rotation is on the first chain member. If it is
+                        # not, that cursor addresses the wrong span and the
+                        # sandwiched archived rows become unreachable, which is
+                        # exactly the defect the mid-rotation branch exists to
+                        # avoid. Not knowing which case this is means not serving.
+                        logger.warning("mid-rotation probe failed", exc_info=True)
+                        return history_corpus_unreadable()
+                if rotated_count > 0 and mid_rotation:
+                    # Serve every row at its true position; no cursor needed.
+                    try:
+                        full_msgs = await asyncio.to_thread(
+                            state.conversation_log.read_messages_chained_full,
+                            slot_history_key(slot),
+                        )
+                        tail_snapshot = _snapshot_slot_window(slot)
+                        full_msgs = await asyncio.to_thread(
+                            _append_unflushed_tail, slot, full_msgs, snapshot=tail_snapshot
+                        )
+                        messages = full_msgs
+                        total = len(messages)
+                    except Exception:
+                        # FAIL CLOSED. This branch runs only when
+                        # `chain_mid_rotation` is true, and that predicate means
+                        # a chain member AFTER the first has archive segments --
+                        # so the archived block is SANDWICHED, not the corpus's
+                        # first `rotated_count` rows. A prefix cursor of
+                        # `rotated_count` therefore addresses the wrong span: the
+                        # page it returns does not advance past the sandwiched
+                        # rows, `has_more` then goes false, and those rows become
+                        # unreachable with no error the reader can see or retry.
+                        #
+                        # The sibling `elif` below uses the same value legitimately
+                        # because it runs when the rotation IS on the first member,
+                        # where `rotated_count` is exactly the boundary.
+                        #
+                        # Same retryable shape the fork handler returns for this
+                        # identical corpus and identical reason.
+                        logger.warning("chained-full mid-rotation read failed", exc_info=True)
+                        return history_corpus_unreadable()
+                elif rotated_count > 0:
+                    has_more = True
+                    next_before = rotated_count
+                    total += rotated_count
     else:
         # Legacy pagination path (retained for programmatic callers).
         # Always reads from chained disk history; no in-memory offset math.
+        # The FULL corpus — size-rotated archive heads included — so paging can
+        # walk past a rotation boundary instead of declaring the transcript
+        # complete at it (the reader's oldest messages live in archive/ after
+        # a big session rotates, and this path is their only way back in).
         history_key = slot_history_key(slot)
         try:
             all_msgs = (
-                await asyncio.to_thread(state.conversation_log.read_messages_chained, history_key)
+                await asyncio.to_thread(
+                    state.conversation_log.read_messages_chained_full, history_key
+                )
                 if state.conversation_log
                 else []
             )
         except Exception:
-            logger.warning("read_messages_chained failed for %s", history_key, exc_info=True)
-            all_msgs = []
+            # NOT `all_msgs = []`. This is the legacy pagination path and the only
+            # way back into a rotated archive, so folding the failure into an empty
+            # corpus answers 200 with the live tail and `has_more` false -- the
+            # reader is told their older history does not exist. See
+            # `history_corpus_unreadable` for why all three sites share one answer.
+            logger.warning("read_messages_chained_full failed for %s", history_key, exc_info=True)
+            return history_corpus_unreadable()
         # Append any un-flushed in-memory tail messages beyond what's on disk.
         # Snapshot on the LOOP, after the disk read: the two reads inside the helper
         # have no await between them, so a synchronous finalization cannot be caught
@@ -1913,13 +2212,13 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     queue_snapshot = [{"id": q["id"], "content": q["content"]} for q in slot._queue]
     context_fields = await _context_snapshot_fields(state, slot)
 
-    def _render() -> str:
+    def _render(live_child: str) -> str:
         # Off-loop on purpose. _prepare_messages applies a regex-heavy
         # redaction battery to the ENTIRE history; on a multi-MB session that
         # blocked the event loop past the loop-stall watchdog's exit budget
         # and hard-exited the gateway. json.dumps of the same payload is a
         # second loop-blocking cost, so it lives in the thread too.
-        prepared = _prepare_messages(messages, running)
+        prepared = _prepare_messages(messages, running, live_child=live_child)
         return json.dumps(
             {
                 "key": key,
@@ -1950,7 +2249,13 @@ async def api_chat_slot_detail(request: web.Request) -> web.Response:
     # reconnect + switchSlot + chat_done all refetch) queue here instead of
     # each burning a worker thread on the same multi-MB redaction pass.
     async with slot._detail_render_lock:
-        body = await asyncio.to_thread(_render)
+        # Resolved INSIDE the lock, immediately before the render: the wait
+        # behind another render can outlive a child, and a verdict sampled
+        # before it would serve the dead child's link one more time. On the
+        # event loop on purpose — the session pool is loop-owned and the probe
+        # is two dict lookups plus a returncode read.
+        live_child = _live_child_instance(state, slot)
+        body = await asyncio.to_thread(_render, live_child)
     return web.Response(text=body, content_type="application/json")
 
 
@@ -1968,11 +2273,20 @@ _CREATABLE_MODES = ("", "orchestrator", "crew", "design-critique")
 async def api_chat_slot_create(request: web.Request) -> web.Response:
     """POST /api/chat/slots — create a new chat slot."""
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     name = body.get("name")
+    if name is not None and not isinstance(name, str):
+        # Coerced HERE, before the peer write below, because `get_or_create_slot`
+        # normalizes the key with string operations: a non-string name reaches it
+        # as an unhandled 500 AFTER `create_peer_slot` has already opened a
+        # session on the crew, leaving that session orphaned over there with no
+        # local slot pointing at it to release it. Every other read of `name` in
+        # this handler already goes through `str(...)`, so this closes the one
+        # path that did not rather than adding a new rule.
+        name = str(name)
     agent = body.get("agent", "")
     model = body.get("model", "")
     # Folder membership at BIRTH. Assigning it afterwards (client PATCH) is
@@ -1985,8 +2299,149 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "folder not found", "code": "folder_not_found"}, status=400
         )
-    folder_project = ""
     existing_slot = state._slots.get(_normalize_slot_key(str(name))) if name else None
+    # Remote execution binding. Three authorization gates run BEFORE the peer is
+    # touched, because `create_peer_slot` is a write on ANOTHER machine spending
+    # the owner's tunnel credential — a request that is going to be refused must
+    # not have already created a session over there.
+    instance_id = str(body.get("instance_id") or "")
+    request_app = request.get("app", "")
+    if instance_id:
+        # (1) Binding a session to a crew is a human act: it comes from the
+        # composer's crew picker, which an app credential has no surface for. So
+        # an app caller is refused outright rather than being allowed to spend
+        # the user's peer credential on an unattended request.
+        #
+        # First of the three deliberately: this refusal is shaped as `not found`
+        # so it cannot be an existence oracle, and the owner gate below answers
+        # 403, which would tell an app caller the route is there. An app
+        # credential fails BOTH gates, so the order decides only which answer it
+        # gets — and the quieter one is the app's.
+        if request_app:
+            sel().log_api_access(
+                caller=request_app,
+                operation="chat_slot_create",
+                outcome="denied",
+                source="app_isolation",
+                resources=f"instance={instance_id}",
+                error="app tokens cannot bind a session to a remote crew",
+            )
+            return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+        # (2) Owner-only, the same bar as `api_instances_capabilities` and the
+        # proxy: the peer write is made with the OWNER's manager-held tunnel
+        # credential, so being authenticated is not enough. A messaging identity
+        # admitted by an allow-list holds a dashboard credential whose subject is
+        # not the owner and whose `app` claim is EMPTY — so the gate above passes
+        # it, and without this one such a caller could spend the owner's
+        # credential to open and run sessions on the owner's crew. Deny-by-default:
+        # a positive owner assertion, not the absence of an app claim.
+        from kiro_crew.dashboard.handlers._shared import _owner_denial_response
+        from kiro_crew.dashboard.handlers.source_providers import (
+            is_owner_dashboard_request,
+        )
+
+        if not is_owner_dashboard_request(request):
+            sel().log_api_access(
+                caller="non-owner",
+                operation="chat_slot_create",
+                outcome="denied",
+                source="owner_only",
+                resources=f"instance={instance_id}",
+                error="non-owner identity rejected",
+            )
+            return _owner_denial_response(
+                request, "binding a session to a remote crew is owner-only"
+            )
+        # (3) A binding is only ever stamped at BIRTH, so `name` addressing an
+        # existing slot is refused whatever that slot is — the create path has no
+        # honest way to convert one.
+        #
+        # An already-bound slot is the obvious half: re-binding it would point a
+        # live session at a second peer session and orphan the first.
+        #
+        # An existing LOCAL slot is the destructive half. Its transcript stays
+        # here while its EXECUTION moves to a peer slot that is empty, so the next
+        # turn runs with none of the conversation the user is looking at — the
+        # context is not deleted, it is silently no longer in play. It is also the
+        # ownership hole: the check further down runs only after the binding has
+        # been stamped, so a caller with no right to that slot would already have
+        # created a peer session and rewritten somebody else's session's executor
+        # before seeing its 404. Deciding here keeps every side effect unreachable.
+        if existing_slot is not None:
+            return web.json_response(
+                {
+                    "error": "that session already exists and cannot be bound to a crew",
+                    "code": "remote_already_bound",
+                },
+                status=409,
+            )
+    # Every remaining validation that can refuse this request runs BEFORE the
+    # peer write, for the reason the binding gates above give: `create_peer_slot`
+    # opens a session on another machine, and a refusal that happens afterwards
+    # leaves that session orphaned there with nothing local pointing at it to
+    # release it. So a `{"instance_id": …, "mode": "bogus"}` request must fail
+    # here, not after it has already cost the user a peer session. These read
+    # only `body`/`name`, so nothing forces them to run later.
+    memory_mode = body.get("memory_mode", "persistent")
+    if memory_mode not in ("persistent", "incognito", "temporary"):
+        return web.json_response({"error": "invalid memory_mode"}, status=400)
+    _mode = body.get("mode", "")
+    if _mode not in _CREATABLE_MODES:
+        return web.json_response({"error": "invalid mode", "code": "invalid_mode"}, status=400)
+    # A crew-bound session runs PLAIN chat only. A non-plain mode (crew,
+    # orchestrator, design-critique) is consumed by an EARLIER dispatch branch in
+    # ``api_chat`` — the orchestrator stage loop, the crew store — not by the
+    # remote arm, which only replaces the plain ``_run_chat`` dispatch. So a
+    # remote slot created with ``mode="crew"`` would run that mode's tools and
+    # filesystem work on THIS machine instead of the crew the user picked (finding
+    # F3). Refused here, alongside the other pre-peer validations above, so a
+    # rejected mode never costs the user an orphaned ``create_peer_slot`` session.
+    if instance_id and _mode:
+        return web.json_response(
+            {
+                "error": "a crew-bound session runs plain chat only; mode-specific work runs on the crew you pick, not here",
+                "code": "remote_mode_unsupported",
+            },
+            status=400,
+        )
+    # Same boundary as the mode-switch endpoint: a slot whose name folds to
+    # nothing but dots has no crew store, so accepting `mode="crew"` here would
+    # hand back a tab that 500s on its first message. Only a CALLER-SUPPLIED name
+    # can be that: an omitted name is generated by `get_or_create_slot` and is
+    # always storable. Checked on the NORMALIZED form, which is the key the store
+    # is built from — the raw body name is not what `CrewStore` ever sees.
+    if _mode == "crew" and name:
+        # Deferred: this module is imported when the dashboard package is, which
+        # the gateway does on its boot path, and crew is a dashboard-only
+        # subsystem. Only a crew request pays for it.
+        from kiro_crew.crew_chat import is_crew_capable_slot_key
+
+        if not is_crew_capable_slot_key(_normalize_slot_key(str(name))):
+            return web.json_response(
+                {
+                    "error": "this session name cannot run crew mode",
+                    "code": "crew_unsupported_slot",
+                },
+                status=400,
+            )
+    # A member-* name is RESERVED for DM threads (born only through the member
+    # thread endpoint); `get_or_create_slot` below rejects it with a ValueError
+    # that becomes a 409. That rejection has to happen BEFORE the peer write, not
+    # after — otherwise a `{"instance_id": …, "name": "member-…"}` create opens a
+    # peer session at `create_peer_slot` and only then 409s locally, orphaning the
+    # peer slot with nothing here to release it (opus #7693). Checked on the
+    # normalized key, the form the slot store is built from.
+    if name and _normalize_slot_key(str(name)).casefold().startswith(
+        members_mod.DM_SLOT_KEY_PREFIX
+    ):
+        return web.json_response(
+            {
+                "error": "member thread slots are created only via the member thread endpoint",
+                "code": "member_slot_reserved",
+            },
+            status=409,
+        )
+    folder_project = ""
     if folder_id and (existing_slot is None or not existing_slot.project):
         folder_snapshot = await state.read_folders(
             lambda folders: [dict(folder) for folder in folders]
@@ -2002,6 +2457,15 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 },
                 status=400,
             )
+    remote_slot_key = ""
+    if instance_id:
+        try:
+            # The picks ride the create rather than following it: a second
+            # round-trip could fail after the peer session existed, leaving a
+            # bound session running a crew the user did not choose.
+            remote_slot_key = await create_peer_slot(state, instance_id, agent=agent, model=model)
+        except RemoteTurnError as exc:
+            return web.json_response({"error": str(exc), "code": "remote_bind_failed"}, status=502)
 
     # Resolve workspace from agent bindings
     workspace = "default"
@@ -2020,7 +2484,14 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # channel-transport writes). Placed BEFORE the normalization below so
     # the stamped alias also gets its workspace resolved by the existing
     # binding path.
-    if cfg is not None and not agent:
+    #
+    # Skipped for a peer-bound create: THIS machine's default names a crew from
+    # this machine's roster, and stamping it would make the shelf advertise an
+    # agent the peer may not have while the peer quietly answers with its own
+    # default. An empty agent is the honest record — the header renders the
+    # peer's default from its capability read, and `create_peer_slot` sends no
+    # agent precisely so the peer keeps that choice.
+    if cfg is not None and not agent and not instance_id:
         agent = cfg.default_agent or ""
     # Normalize an agent nothing will dispatch to the one that WILL answer.
     # Otherwise the name is stored verbatim and resolve_agent_bindings silently
@@ -2029,7 +2500,11 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # agent keeps the slot honest, and a caller that requires a specific binding
     # (an app panel verifying the returned agent) can see the mismatch instead of
     # discovering it turns later.
-    if cfg is not None and agent:
+    # Also skipped for a peer-bound create, and for the workspace's sake as much
+    # as the agent's: `resolve_agent_bindings` answers from THIS machine's
+    # bindings, so a peer agent name would resolve to a local workspace (or to
+    # nothing, logging a false "does not resolve"). The peer resolves its own.
+    if cfg is not None and agent and not instance_id:
         try:
             bindings = resolve_agent_bindings(cfg, agent)
             workspace = _workspace_name_for_dir(cfg, bindings.workspace_dir)
@@ -2050,44 +2525,22 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         except Exception:
             logger.warning("Failed to resolve bindings for slot create", exc_info=True)
 
+    # Whether this request will MINT a genuinely new slot, decided before
+    # get_or_create_slot runs. `name` can address an already-open slot (the
+    # handler is also the rehydrate/reopen path), which returns unchanged — and
+    # folder-tag inheritance must fire ONLY for a fresh chat, never re-stamp
+    # tags onto a session the user is merely re-opening inside the folder.
+    # Computed on the normalized key, which is the key the slot store is built
+    # from; an omitted (or degenerate) name is always a mint.
+    _requested_key = _normalize_slot_key(str(name)) if name else ""
+    is_new_slot = not _requested_key or _requested_key not in state._slots
+
     # Coalesce every push inside into ONE broadcast at exit, so the first frame
     # any client sees already carries the folder, title, artifact binding and
     # project. Otherwise each of those is a separate post-create correction the
     # UI renders as a jump.
     with state.suspend_slots_push():
         try:
-            memory_mode = body.get("memory_mode", "persistent")
-            if memory_mode not in ("persistent", "incognito", "temporary"):
-                return web.json_response({"error": "invalid memory_mode"}, status=400)
-            _mode = body.get("mode", "")
-            if _mode not in _CREATABLE_MODES:
-                return web.json_response(
-                    {"error": "invalid mode", "code": "invalid_mode"}, status=400
-                )
-            # Same boundary as the mode-switch endpoint: a slot whose name folds
-            # to nothing but dots has no crew store, so accepting `mode="crew"`
-            # here would hand back a tab that 500s on its first message. Only a
-            # CALLER-SUPPLIED name can be that: an omitted name is generated by
-            # `get_or_create_slot` and is always storable. Checked on the
-            # NORMALIZED form, which is the key the store is built from — the raw
-            # body name is not what `CrewStore` ever sees.
-            if _mode == "crew" and name:
-                # Deferred: this module is imported when the dashboard package is,
-                # which the gateway does on its boot path, and crew is a
-                # dashboard-only subsystem. Only a crew request pays for it.
-                from kiro_crew.crew_chat import is_crew_capable_slot_key
-            if (
-                _mode == "crew"
-                and name
-                and not is_crew_capable_slot_key(_normalize_slot_key(str(name)))
-            ):
-                return web.json_response(
-                    {
-                        "error": "this session name cannot run crew mode",
-                        "code": "crew_unsupported_slot",
-                    },
-                    status=400,
-                )
             slot = state.get_or_create_slot(
                 name,
                 agent=agent,
@@ -2104,6 +2557,37 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             )
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=409)
+        if remote_slot_key and not is_new_slot:
+            # The name was free when the binding gates ran, but `create_peer_slot`
+            # awaits the peer and a concurrent create took it inside that window,
+            # so `get_or_create_slot` just handed back a session that already
+            # existed. Stamping the binding onto it is exactly the destructive
+            # half those gates exist to prevent: its transcript would stay here
+            # while EXECUTION moved to an empty peer slot, so the next turn runs
+            # with none of the conversation on screen. Refused instead — the peer
+            # session is left to the crew rather than taking over a live local
+            # one, which is the cheaper of the two losses.
+            logger.warning(
+                "Slot %s was created concurrently while binding to %s; refusing to rebind",
+                slot.key,
+                instance_id,
+            )
+            return web.json_response(
+                {
+                    "error": "that session already exists and cannot be bound to a crew",
+                    "code": "remote_already_bound",
+                },
+                status=409,
+            )
+        if remote_slot_key:
+            # Stamped after creation rather than passed through
+            # get_or_create_slot: the binding is not part of a slot's identity
+            # (the key, agent and workspace are), and keeping it out of that
+            # signature means every other creation path — channels, apps, forks,
+            # restore — stays untouched by remote execution.
+            slot.executor = "remote"
+            slot.instance_id = instance_id
+            slot.remote_slot = remote_slot_key
         if slot.is_restricted:
             logger.info("Slot %s created with memory_mode=%s", slot.key, slot.memory_mode)
         # App ownership check (App Kit §5.2), same deny-by-default rule as
@@ -2114,7 +2598,8 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # another app's — or the dashboard's — session. A slot this request just
         # created carries `_app == request_app`, so the new-slot path is
         # unaffected; a dashboard caller (empty app) keeps full access.
-        request_app = request.get("app", "")
+        # `request_app` is read once at the top of the handler, because the remote
+        # binding gate up there needs the same value before the peer is touched.
         if request_app and slot._app != request_app:
             sel().log_api_access(
                 caller=request_app,
@@ -2181,6 +2666,40 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 slot._folder_changed = previous_changed
             else:
                 folder_applied = True
+                if is_new_slot:
+                    # Folder-tag inheritance, creation-only (issue #5419). A brand-new
+                    # chat filed into a folder copies that folder's tags by value onto
+                    # its own tag list — the folder's tags are an organizational
+                    # default for chats started inside it. Follows chat_fork.py's
+                    # copy-by-value style.
+                    #
+                    # Gated on is_new_slot so re-opening an existing session inside
+                    # the folder never re-stamps tags, and confirmed only after
+                    # _unhide_folder reported the folder EXISTS (its read is under the
+                    # store lock, the only race-free place to look it up). Direct
+                    # folder only: no ancestor/subfolder transitivity. Ids are
+                    # re-validated against the live vocabulary and appended only when
+                    # not already present, so a stale id on the folder is dropped
+                    # rather than written onto the slot.
+                    def _read_folder_tags(folders: list[dict[str, Any]]) -> list[str]:
+                        f = next((x for x in folders if x["id"] == folder_id), None)
+                        tags = f.get("tags") if f else None
+                        return list(tags) if isinstance(tags, list) else []
+
+                    # One shared definition of "an inheritable folder tag id"
+                    # (string, in the live vocabulary) — see validate_folder_tag_ids
+                    # for why each guard exists. The READ, the intersection AND the
+                    # apply all sit under tags_write_lock (the invariant every
+                    # consumer follows, matching the channel-filing path): a folder
+                    # PATCH or tag deletion committing after an earlier read would
+                    # otherwise stamp a stale tag set or resurrect a deleted id onto
+                    # the new slot. Lock ordering (tags_write_lock → folder-store
+                    # lock) matches the folder create/PATCH paths.
+                    async with tags_write_lock(state):
+                        inherited = await state.read_folders(_read_folder_tags)
+                        for tid in validate_folder_tag_ids(inherited, state):
+                            if tid not in slot.tags:
+                                slot.tags.append(tid)
         # A slot with no project filed into a project-linked folder inherits
         # from the nearest configured ancestor before its first broadcast. The
         # server owns this fallback because the client folder cache can be
@@ -2193,14 +2712,71 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             cfg_proj = cfg.dashboard.default_project if cfg else ""
             if isinstance(cfg_proj, str) and cfg_proj:
                 resolved = os.path.realpath(os.path.expanduser(cfg_proj))
-                if os.path.isdir(resolved) and not is_sensitive_path(resolved):
-                    cfg_proj = resolved
-                else:
-                    cfg_proj = ""
+                eligible = os.path.isdir(resolved) and not is_sensitive_path(resolved)
+                if eligible:
+                    # #7392 round 3: a configured default that overlaps the
+                    # data home would be refused at spawn anyway — skip it
+                    # here like a sensitive path, falling back to the
+                    # workspace default instead of wedging every new slot.
+                    # Off-loop (round 4): the shared scan primes runtime
+                    # paths (realpath/mkdir) on first use.
+                    eligible = (
+                        await asyncio.to_thread(voice_runtime_workspace_conflict, resolved)
+                    ) is None
+                cfg_proj = resolved if eligible else ""
             else:
                 cfg_proj = ""
             slot.project = cfg_proj or default_project_dir(workspace)
         _sync_dashboard_slots(state)
+        # Persist INSIDE the suspension, ahead of the coalesced broadcast, the
+        # same ordering `session_control.py`'s create span uses ("the whole
+        # allocation-to-persist span runs under `suspend_slots_push`", so "a
+        # slot whose birth write fails is never broadcast at all"). Two paths
+        # mint a slot through this context manager and only this one had the
+        # durable write outside it, which is what made the difference below
+        # reachable:
+        #
+        # `suspend_slots_push`'s `__exit__` flushes the owed push, and on the
+        # coalescing window's LEADING edge that flush broadcasts synchronously
+        # (`state.push_slots_update`). An exception there — a non-serializable
+        # value reaching `json.dumps` is the evidenced shape (#6522, #6532) —
+        # escapes `__exit__`, so with the write out here it skipped a metadata
+        # mutation the request had already acknowledged: this `force=True` save
+        # is the ONLY durable record of a recreate's folder filing or pinned
+        # title (see `_save_slot_to_history`'s message-less merge), and the slot
+        # itself survives in memory, so nothing later reconciles the two. Every
+        # client repairs a dropped FRAME on its next read; none of them repairs
+        # a write that never happened.
+        #
+        # The cost this ordering accepts, named by the comment it replaces: the
+        # suspension is process-wide, so other clients' slot updates coalesce
+        # (they defer — no caller blocks) until this off-loop write completes,
+        # and a contended history lock takes the patient acquire. Accepted for
+        # the same reason the twin accepts it, which awaits a cross-process
+        # metadata write inside its own suspension; this span already suspends
+        # on the workspace-conflict probe above, so it was never await-free.
+        #
+        # A pinned title must persist too (not just a folder move): without the
+        # write, a restart rehydrates the previous title with a refreshable
+        # "auto" origin and the background refresh may rewrite the pin.
+        if folder_id or title or remote_slot_key:
+            # The create/recreate request has been authorized against this
+            # transcript.  Do not let a rebind while the off-loop write waits on
+            # the history lock redirect its newly supplied metadata to another
+            # session.
+            #
+            # No slot retraction on failure, unlike the twin: there the write is
+            # the newborn's only record, so an unpersisted slot would vanish on
+            # restart and retracting is the lesser evil. Here the slot already
+            # has a metadata line and `best_effort` (default) logs the failure
+            # and marks the slot dirty so the periodic flush retries it, which
+            # is the retry the metadata mutation routes rely on.
+            await save_slot_off_loop(
+                state,
+                slot,
+                force=True,
+                expected_history_key=slot_history_key(slot),
+            )
         # Guarantee a frame. get_or_create_slot pushes for a NEW slot, but
         # returns an existing named slot without pushing — and this handler is
         # now the only thing that files a slot (the client sends no follow-up
@@ -2210,21 +2786,14 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # placement. Inside the suspension this only marks a push owed, so the
         # new-slot path still emits exactly ONE coalesced frame.
         state.push_slots_update()
-    # Persist OUTSIDE the suspension. save_slot_off_loop deliberately takes the
-    # patient cross-process history lock, which another holder (a workflow or
-    # cron appending to the same session) can hold for a while — and the
-    # suspension is process-wide, so awaiting it inside would stall every
-    # client's slot updates behind one session's file lock. The in-memory slot
-    # is the source of truth and was already broadcast at block exit; a failed
-    # write re-arms the periodic flush (best_effort).
-    # A pinned title must persist too (not just a folder move): without the
-    # write, a restart rehydrates the previous title with a refreshable "auto"
-    # origin and the background refresh may rewrite the pin.
-    if folder_id or title:
-        await save_slot_off_loop(state, slot, force=True)
     # Speculative session creation: overlap the ACP handshake with the user's
     # think-time before their first message. No-op unless session.eager_spawn.
-    schedule_eager_spawn(state, slot)
+    #
+    # Skipped for a peer-bound slot: the turn will run on the peer, so a local
+    # kiro-cli spawned here would idle until it timed out, having consumed a
+    # process and a model handshake for a session that never uses it.
+    if not slot.is_remote:
+        schedule_eager_spawn(state, slot)
     return web.json_response(state.serialize_slot(slot))
 
 
@@ -2255,6 +2824,209 @@ def _reject_pending_approvals(slot: _ChatSlot) -> None:
                 tool_kind="permission",
                 outcome="rejected_on_stop",
             )
+
+
+def _slot_still_ours(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
+    """Return True iff no OTHER slot object has taken over ``name`` in ``_slots``.
+
+    A close pops the slot, then awaits (task cancel, ``save_slot_off_loop``,
+    ``sessions.remove``). A concurrent same-key recreate (POST /api/chat, or the
+    session_close MCP verb) can mint a REPLACEMENT slot for the same key inside
+    that window, and only THAT is what the destructive teardown steps must yield
+    to. So the discriminator is "a DIFFERENT object owns the key", not "our object
+    owns the key": an absent key is the ORDINARY post-pop state of every close, so
+    ``None`` counts as still ours. Reading it the other way would make the guard
+    fire on every close and skip the teardown it guards.
+
+    Synchronous and purely read-only: no side effects, and it touches neither the
+    loop, the session map, nor history. Callers use it to decide whether the
+    KEY-SCOPED steps (``sessions.remove`` on ``dashboard:{name}``, the failure-arm
+    ``_slots`` restore) would clobber a live replacement, and skip them if so. The
+    archival history write is NOT key-scoped — see
+    :func:`_replacement_shares_transcript`.
+    """
+    current = state._slots.get(name)
+    return current is None or current is slot
+
+
+def _replacement_shares_transcript(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
+    """True iff a DIFFERENT slot now holds ``name`` AND writes ``slot``'s transcript.
+
+    Slot identity is not transcript ownership, and the archival save is scoped to
+    the TRANSCRIPT: it targets ``slot_history_key(slot)``, not ``name``. A slot
+    carrying a ``linked_session_key`` — channel-, cron- or workflow-born — keeps its
+    conversation under that linked key, while a replacement minted by a plain
+    ``get_or_create_slot(name)`` (the shape POST /api/chat and the session_close
+    verb take) is unbound and keeps its own under ``dashboard:{name}``. Same key,
+    two files. So :func:`_slot_still_ours` cannot decide the save: yielding the
+    archive to a replacement that shares nothing leaves the ORIGINAL's transcript
+    with no ``closed`` flag, and an absent flag is exactly what
+    ``channel_slots._close_stands`` reads as "the user never dismissed this" — the
+    reconcile pass then resurfaces the tab the user closed.
+
+    Compared as FILE identity, not as key strings, because the file is what the
+    write touches and the mapping is not injective: ``history._safe_key`` folds
+    ``slack:<ts>`` and the ``slack_<ts>`` filename stem onto one ``.jsonl``, and a
+    Slack thread predating the canonical key still resolves to its bare
+    ``thread_ts`` stem (:func:`~kiro_crew.history.transcript_stems` carries both).
+    The two errors are not symmetric: over-reporting "shared" only declines an
+    archive the next close will make, while under-reporting stamps ``closed`` onto a
+    file a live slot is still writing, which is the whole harm being guarded.
+    """
+    current = state._slots.get(name)
+    if current is None or current is slot:
+        return False
+    return bool(
+        set(transcript_stems(slot_history_key(current)))
+        & set(transcript_stems(slot_history_key(slot)))
+    )
+
+
+def _resettle_restricted_key(state: DashboardState, name: str) -> None:
+    """Re-derive ``dashboard:{name}``'s restricted marker from whoever owns ``name`` NOW.
+
+    ``state._restricted_keys`` is keyed by SESSION KEY, not by slot identity, so the
+    marker describes whatever object holds the key — never the object a close happens
+    to be carrying. Every exit of a teardown therefore owes the one postcondition
+    this function IS: ``dashboard:{name}`` is in the set iff the slot currently at
+    ``name`` is restricted, an absent key counting as unrestricted.
+
+    Two shapes of exit need it, and they need opposite answers. An ordinary close
+    pops the slot for good, so the marker must be DROPPED — otherwise an incognito
+    tab's key stays blocked for every later holder of it. A close that yields the key
+    to a concurrent same-key replacement must re-derive from the REPLACEMENT:
+    ``_is_restricted_session`` tests the key BEFORE it looks at the slot, so an
+    incognito original's leftover marker makes every memory, artifact and mcp-apps
+    call on a PERSISTENT replacement answer 403 for as long as that tab lives.
+
+    Re-derived rather than blindly discarded, because a replacement that is itself
+    restricted has to KEEP the marker: dropping it is the fail-OPEN direction.
+    """
+    key = f"dashboard:{name}"
+    current = state._slots.get(name)
+    if current is not None and current.is_restricted:
+        state._restricted_keys.add(key)
+    else:
+        state._restricted_keys.discard(key)
+
+
+async def _persist_handover_tail(state: DashboardState, name: str, slot: _ChatSlot) -> bool:
+    """Write a handed-over original's still-unsaved rows before its object is dropped.
+
+    A teardown that yields ``name`` to a concurrent same-key recreate stops
+    referencing the original slot: it is out of ``state._slots``, and the periodic
+    flush iterates exactly that map, so nothing retries the write for it. Anything
+    the original held past its last commit — ``messages[_disk_window_len:]``, plus
+    any note the cleanup path is still carrying in ``_deferred_notes`` — would be
+    unreachable and never persist. Those rows belong to the ORIGINAL's own
+    transcript, whether or not the replacement happens to share it, and this frame
+    is the last moment anything can put them there.
+
+    The target is ``slot_history_key(slot)``, never ``_history_key_for(name)``. A
+    slot carrying a ``linked_session_key`` — cron-, channel- or workflow-injected —
+    stores its conversation under that key, and the forced save resolves its own
+    write target the same way and REFUSES the whole write when the caller's
+    ``expected_history_key`` names a different transcript. Authorizing
+    ``dashboard:{name}`` there would make this drain a silent no-op for exactly the
+    slots whose transcript is shared with something outside the dashboard, and would
+    name a row-less file in the report.
+
+    Deliberately NOT ``closed=True``. What this frame is finishing is the close of
+    the ORIGINAL; the KEY is open, because a live replacement holds it, so the
+    durable line has to say so. Stamping ``closed`` on a key someone is still using
+    is the harm the surrounding guard exists to prevent. Open-shaped is not the same
+    as un-closing, though: on a line the replacement published, ``closed`` is that
+    holder's own dismissal, so the save defers it rather than erasing it (see
+    ``ROWS_ONLY_OWNED_META_KEYS``). It is only on a line THIS slot published — where
+    there is no other holder's flag to lose — that the write clears a stale
+    ``closed`` an earlier close of the reused key left behind.
+
+    Non-destructive against the replacement's own rows in both directions. The save
+    re-serializes the ORIGINAL's window over the on-disk window region, and the
+    save's foreign-append scan classifies every on-disk line that window does not
+    represent as another writer's append and carries it through verbatim, so rows a
+    replacement already committed survive.
+
+    ``rows_only``, and that is the whole of what this frame claims. The rows are
+    owed to the transcript; the METADATA line may not be this slot's to move.
+    ``_save_slot_to_history`` is otherwise authoritative for every
+    ``SLOT_OWNED_META_KEYS`` field and REBUILDS the line from whichever slot it is
+    handed, so a default save here would revert a folder, pinned title, tag or pin
+    the replacement had already published (``POST /api/chat/slots`` persists both at
+    birth) — silently undoing an acknowledged edit, and for a tab nobody types in
+    again undoing it for good. ``rows_only`` keeps the on-disk value for each of
+    those — the close flags included — and leaves this write owning only the file's
+    identity and accounting, which it carries forward from disk anyway.
+
+    It rides with the write rather than being a caller's choice because the save
+    scopes the deferral itself, by the line's ``tab_id``: it holds back only fields
+    on a line ANOTHER slot published, and rebuilds normally from a line this slot
+    published or from no line at all. That distinction is what keeps the flag from
+    costing the original its own uncommitted metadata — a rename, re-file, tag or
+    pin is acknowledged the moment it lands in memory and persists on a later
+    flush, and this frame is past the pop, so no flush will ever visit this slot
+    again.
+
+    Returns True when nothing was owed or the write committed, False when rows were
+    owed and did not reach disk. Callers MUST honour it: nothing in the process can
+    reach these rows again, so a caller that discards the answer reports a close
+    that succeeded while the rows became unreachable. The log line names the exact
+    count for the same reason.
+    """
+    try:
+        slot.flush_deferred_notes()
+    except Exception:
+        # The flush puts the unwritten suffix back before raising, so this count is
+        # what is still held — and held notes are in-memory only, so they die with
+        # the popped object.
+        logger.error(
+            "Slot %s: %d held note(s) could not be flushed before the key was handed "
+            "to a concurrent recreate; they are lost with the original slot",
+            name,
+            len(slot._deferred_notes),
+            exc_info=True,
+        )
+    # ``_disk_window_len`` is how much of the current window the last committed save
+    # covered, so the difference is exactly what has never reached disk. ``_dirty``
+    # covers the other shape of unsaved state: an in-place edit to a row already
+    # persisted leaves the length unchanged.
+    unsaved = max(0, len(slot.messages) - slot._disk_window_len)
+    if not unsaved and not slot._dirty:
+        return True
+    history_key = slot_history_key(slot)
+    try:
+        committed = await save_slot_off_loop(
+            state,
+            slot,
+            closed=False,
+            best_effort=False,
+            expected_history_key=history_key,
+            rows_only=True,
+        )
+    except Exception:
+        logger.error(
+            "Slot %s: %d unpersisted row(s) could not be written to %s while handing "
+            "the key to a concurrent recreate; they are lost with the original slot",
+            name,
+            unsaved,
+            history_key,
+            exc_info=True,
+        )
+        return False
+    if not committed:
+        # The save declined without writing: the session was permanently deleted
+        # while this write awaited the lock, or the slot's routing moved off the
+        # transcript this frame authorized. Neither leaves anywhere for these rows
+        # to go, and the object holding them is about to be dropped.
+        logger.warning(
+            "Slot %s: %d unpersisted row(s) were not written to %s while handing the "
+            "key to a concurrent recreate; the save declined the write",
+            name,
+            unsaved,
+            history_key,
+        )
+        return False
+    return True
 
 
 def _unblock_pending_waits(state: DashboardState, slot: _ChatSlot) -> None:
@@ -2288,38 +3060,16 @@ def _subagents_attached_response(
 
     One guard for every endpoint whose action cannot coexist with children —
     dispatching a new turn (continue) interleaves with their writes, and a
-    session teardown (reload) kills the shared runtime they run on. Two copies
-    of this block is how the probes diverge, and this one fails toward
-    discarding a child's work.
+    session teardown (reload) kills the shared runtime they run on.
 
-    Three probes, none optional:
-
-    * `running_agents_for` on the true session key. QUEUED children count too:
-      a spawn that hit the concurrency/stagger gate is deliberately absent
-      from `_agents` (see `SubagentInfo.queued`), yet it WILL start on its own.
-    * IN-FLIGHT RESULT DELIVERY: the last child can finish — emptying both
-      probes — while its `[Subagent completion event]` injection is still
-      landing, and that injection needs both the transcript order and the
-      session it reports to. The runner's own synthesis gate pairs the same
-      conditions at both its call sites (chat_runner).
-    * Fail closed on a None running-probe: that is the probe FAILING, not a
-      slot with no children, and mistaking the two is exactly the hazard this
-      guard exists to prevent. Mirrors the stage gate in chat_orchestrator.
+    The probes themselves live in :func:`chat_utils.subagents_attached`, shared
+    with the deferred consume in ``chat_runner`` that applies a queued
+    conversation discard. That teardown reaches the same runtime without passing
+    through any endpoint, so it must apply the same policy — and two copies of
+    the probe block is how the two would diverge. This wrapper only shapes the
+    refusal.
     """
-    subs = getattr(state, "subagents", None)
-    if subs is None:
-        return None
-    running = subs.running_agents_for(session_key)
-    queued = 0
-    if running is not None:
-        try:
-            queued = subs._queued_depth(session_key)
-        except Exception:
-            # An unreadable queue is unknown children, not zero children.
-            logger.debug("%s: queued-depth probe failed", operation, exc_info=True)
-            queued = 1
-    inflight = getattr(slot, "_subagent_deliveries_inflight", 0)
-    if running is None or running or queued or inflight:
+    if subagents_attached(state, slot, session_key, operation):
         return web.json_response(
             {"error": "sub-agents are running", "code": "slot_subagents_running"},
             status=409,
@@ -2357,9 +3107,135 @@ async def _reset_slot_session(
     completed an LLM round-trip, and such a turn is visible to any caller's
     has_active_turn() fast path — so a decline here implies a turn that started
     microseconds ago, which cannot have posted a card yet.
+
+    A successful reset also drops the slot's MCP session report, for the same
+    reason the pending card goes: it describes the session being torn down.
+    Every caller here changes what the next session will mount (agent, model,
+    workspace) or restarts it outright, so keeping the old report would leave
+    the UI presenting a dead session's server list as the live one's — the
+    stale-evidence failure that report exists to remove.
     """
     _unblock_pending_waits(state, slot)
-    return await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
+    try:
+        reloaded = await state.sessions.reset(session_key, skip_if_busy=skip_if_busy)
+    except BaseException:
+        # Raised or cancelled mid-teardown: the session is in a state this slot
+        # cannot vouch for, so neither is its verdict. Unknown fails open.
+        slot.record_model_withheld(None)
+        raise
+    if reloaded:
+        # The withhold verdict describes the session that advertised the model
+        # list, not the slot, so it goes with the session. Routed through this one
+        # funnel for the reason above: the switch handlers that reset a session
+        # are exactly the ones that can change which models the next session will
+        # advertise (agent, workspace, and the model pick itself), and a verdict
+        # surviving that would label the new session from the old one's
+        # entitlement.
+        #
+        # Gated on the reset having HAPPENED. What decides this is whether the
+        # session the verdict describes still exists: `skip_if_busy` DECLINES
+        # while a turn is in flight, leaving that session -- and therefore its
+        # verdict -- alive and accurate, while a completed teardown ends it. The
+        # membership heuristic the frontend falls back to on `null` is not itself
+        # the defect this carries a verdict to remove; inferring entitlement from
+        # that heuristic WHILE an authoritative answer exists is. Dropping on a
+        # decline would throw the authoritative answer away and re-create exactly
+        # that.
+        slot.record_model_withheld(None)
+        # The MCP session report rides the same gate for the same reason: it
+        # describes the session that was just torn down. Clearing is a courtesy
+        # delta push -- correctness rests on the identity projector in
+        # serialize_slots -- so it only fires when something was recorded.
+        if slot.clear_mcp_report():
+            state.broadcast_ws("mcp_report_update", {"slot": slot.key, "mcp_report": None})
+    # Freshness push for open tabs, OUTSIDE the `reloaded` gate on purpose: the
+    # helper is verdict-driven (it re-resolves the live child and applies the
+    # read gate's own predicate), so after a declined or failed teardown the
+    # still-live child's banners match and nothing is broadcast. See
+    # `_broadcast_expired_oauth_banners` for why no snapshot is needed.
+    _broadcast_expired_oauth_banners(state, slot)
+    return reloaded
+
+
+# Advisory response field for a committed switch whose old-session teardown
+# raised. One literal shared by every switch handler (agent, reasoning effort,
+# model, workspace) so a frontend that ever starts reading it never has to
+# match per-handler spellings.
+_TEARDOWN_INCOMPLETE_WARNING = "old session teardown incomplete"
+
+
+async def _reset_slot_session_or_warn(
+    state: DashboardState,
+    slot: _ChatSlot,
+    session_key: str,
+    *,
+    switch_kind: str,
+) -> bool | None:
+    """:func:`_reset_slot_session` for the commit-before-reset switch handlers.
+
+    Returns the reset verdict, or ``None`` when the teardown RAISED after the
+    session pop. The model and workspace handlers commit the new setting
+    BEFORE this await, and ``SessionManager.reset`` pops the session before
+    its shutdown can fail, so a post-pop raise is a success with a degraded
+    teardown — the committed value is what every replacement session runs.
+    That premise is VERIFIED, not assumed: a raise with the SAME provider
+    instance still registered (a pre-pop failure, e.g. in the pending-wait
+    unblock) is re-raised, because the old session then survives on the old
+    value and a 200 would be a false success. Identity, not presence: a
+    successor session registered by a concurrent send after the pop must not
+    be misclassified as the unpopped old one. Propagating a post-pop raise
+    instead would answer 500 without ever reaching
+    ``state.push_slots_update()``, leaving every
+    connected client rendering the OLD value over a switch that actually
+    happened (the acting tab's ``performSlotSwitch`` also keeps its old store
+    value on a non-2xx). ``None`` tells the caller to record the degraded
+    teardown and answer 200 with :data:`_TEARDOWN_INCOMPLETE_WARNING` after
+    the usual slots push; a caller with a rebind guard
+    (``effective_session_key`` — the model and workspace handlers) must still
+    FALL THROUGH and run it, so a slot rebound during the raising await keeps
+    answering rollback + 409. Shared
+    by all four commit-before-reset switch handlers (agent, reasoning effort,
+    model, workspace) so none of them repeats the try block: each calls twice
+    (first attempt + idle-decline retry). Only the raise path is
+    handled here: a normal ``bool`` verdict passes through untouched, so the
+    decline (``False``) ladders keep their semantics.
+
+    ``skip_if_busy`` is fixed at True: every caller is a switch handler with
+    a decline ladder (agent, reasoning effort, model, workspace), and
+    :func:`_reset_slot_session` must decline a busy session atomically with
+    the pop rather than tear it down mid-turn — the ladder then disambiguates
+    the decline. A caller that wants every raise to propagate keeps using
+    :func:`_reset_slot_session` directly.
+    """
+    # Captured BEFORE the await: the post-raise probe must compare INSTANCE
+    # IDENTITY, not mere presence. A concurrent send can register a SUCCESSOR
+    # session for the same key after the pop and before the old session's
+    # shutdown raises — a bare "is a provider registered?" probe would
+    # misclassify that successor as the unpopped old session and answer 500
+    # for a committed switch (GPT review finding on 295817e70). The successor
+    # cold-started from the slot's CURRENT (committed) bindings, so the
+    # committed-success answer is truthful for it.
+    prior_provider = state.sessions.get_provider(session_key)
+    try:
+        return await _reset_slot_session(state, slot, session_key, skip_if_busy=True)
+    except Exception:
+        if (
+            prior_provider is not None
+            and state.sessions.get_provider(session_key) is prior_provider
+        ):
+            # The SAME instance is still registered: the raise came BEFORE the
+            # session pop (e.g. the pending-wait unblock that
+            # _reset_slot_session runs first), so the old session is still
+            # alive on the old value and a 200 here would be exactly the false
+            # success the switch handlers' decline ladders treat as worse than
+            # any retryable error. Propagate — a pre-pop failure keeps the
+            # pre-#8598 semantics (Opus review finding: the committed-switch
+            # answer is only truthful once the pop has happened).
+            raise
+        logger.exception(
+            "Slot %s %s switch: old session teardown incomplete", slot.key, switch_kind
+        )
+        return None
 
 
 def _resolve_stop_event(slot: _ChatSlot, outcome: str) -> None:
@@ -2586,6 +3462,7 @@ async def stop_slot_turn(
     force: bool = False,
     source: str = "dashboard",
     cancel_key: str = "",
+    escalate: bool = True,
 ) -> dict[str, Any]:
     """Stop the slot's turn: cooperative cancel, hard kill on a second call.
 
@@ -2593,6 +3470,16 @@ async def stop_slot_turn(
     escalates to a hard kill, regardless of *force* — the caller's view of the
     stop state can lag the backend's, so the backend's own ``_stop_state`` is
     what decides.
+
+    *escalate* is how a caller says its second call may not be a second
+    DECISION. It defaults to True because that is true of the Stop button this
+    function was written for: a person pressing again has watched the cooperative
+    stop fail to take. It is not true of an RPC, where a client that timed out
+    re-sends the same request — so ``session_control.stop_target`` passes False
+    for a call it cannot distinguish from a retry, and the repeat falls through to
+    the no-op below instead of discarding the target's queue (issue #5074). It
+    withholds only the ESCALATION: a stop that finds the slot running still stops
+    it either way.
 
     Inserts a ``stop_event`` card into the slot transcript so whoever is
     watching the session sees the stop, and returns the JSON body the route
@@ -2608,13 +3495,36 @@ async def stop_slot_turn(
     name = slot.key
     cancel_key = cancel_key or _cancel_target(slot)
 
+    # A peer-bound slot's turn is not running in this process. The local
+    # escalation machinery below would find nothing to cancel and report a clean
+    # stop while the peer kept generating into the relay, so the stop has to
+    # travel. Deliberately placed before the local path rather than beside it:
+    # there is no local turn to also stop, and running both would insert a second
+    # stop_event card for one press.
+    if slot.is_remote:
+        accepted = await forward_peer_stop(state, slot, force or slot._stop_state == "soft_pending")
+        if not accepted:
+            return {
+                "ok": False,
+                "error": "could not reach the crew running this session to stop it",
+                "code": "remote_stop_unreachable",
+            }
+        # The peer ends its own turn, which reaches us as the relay's [DONE] and
+        # the mirrored chat_done. Nothing local to tear down.
+        return {"ok": True}
+
     # Escalation path: a second stop press while a cooperative cancel is
     # already pending hard-kills. We escalate on ANY second press — not only
     # when the client computed force=true — because the client derives force
     # from the WS-echoed stop_state, which may lag behind the actual state on a
     # slow connection. The backend's own _stop_state is the authoritative
     # "already soft_pending" signal, so a second press always means "kill it".
-    if slot._stop_state == "soft_pending":
+    #
+    # Unless the caller told us this call may not be a second press at all
+    # (*escalate*): a re-sent RPC carries no new intent, and the caller is the
+    # only layer that can know whether its second call was a decision or a
+    # timeout retry. A withheld escalation falls into the no-op branch below.
+    if escalate and slot._stop_state == "soft_pending":
         slot._stop_state = "killing"
         # Survives turn teardown, which resets _stop_state to "idle". Without
         # it a cooperative ack from the first press could still land and label
@@ -2635,6 +3545,10 @@ async def stop_slot_turn(
         # of having a row persisted for a message that never ran.
         for _discarded in slot._pending_steers:
             slot._steer_delivery_ids.pop(_discarded, None)
+            # Lockstep with the line above (see `_ChatSlot._steer_send_ids`): a hard
+            # kill discards the text, so there is no requeued entry left to carry
+            # the client's send id onto.
+            slot._steer_send_ids.pop(_discarded, None)
         slot._pending_steers.clear()
         state.push_slots_update()
         logger.info("Stop (force): hard-killing session for slot %s", name)
@@ -2672,6 +3586,13 @@ async def stop_slot_turn(
             _info = "not running"
         else:
             _info = "stop already in progress"
+        _meta: dict[str, Any] = {"slot": name, "via": source, "reason": _info}
+        if not escalate and slot._stop_state == "soft_pending":
+            # The branch a de-duplicated retry lands on. Recorded so the audit
+            # shows an escalation was WITHHELD rather than never asked for --
+            # #5074's "no record that a retry rather than a decision caused it",
+            # read from the other side: the absorbed retry has to be visible too.
+            _meta["escalation_withheld"] = True
         sel().log_tool_invocation(
             session_key=_history_key_for(name),
             agent=getattr(slot, "agent", "") or "kirocrew",
@@ -2679,9 +3600,15 @@ async def stop_slot_turn(
             tool_name="dashboard_stop",
             tool_kind="command",
             outcome="noop",
-            metadata={"slot": name, "via": source, "reason": _info},
+            metadata=_meta,
         )
-        return {"ok": True, "info": _info}
+        # ``already_stopping`` separates the two facts this branch merges: a
+        # target that was never running has nothing to stop, while one whose
+        # cooperative cancel is still in flight IS stopping. Both answer
+        # ``info``, and a caller that renders them alike tells the second one the
+        # opposite of what happened — which the de-duplicated retry above now
+        # reaches routinely.
+        return {"ok": True, "info": _info, "already_stopping": bool(slot.running)}
 
     # First press: soft stop
     slot._stop_state = "soft_pending"
@@ -2776,6 +3703,12 @@ async def api_chat_slot_stop(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_stop")
     if denied is not None:
         return denied
+    # A peer-bound stop travels over the owner's tunnel and aborts a turn on the
+    # owner's connected machine, so it takes the owner identity check the
+    # app-scope guard above cannot make. No-op for a local slot.
+    denied = deny_non_owner_remote_operation(request, slot, "slot_stop")
+    if denied is not None:
+        return denied
     # Before ANY side effect — the escalation branch inside stop_slot_turn clears
     # the queue and drops pending steers, so a guard placed later would still let
     # a foreign caller mutate the slot. One target, resolved once: the session the
@@ -2851,6 +3784,14 @@ async def api_chat_slot_continue(request: web.Request) -> web.Response:
             ),
         )
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+
+    # A crew-bound slot has no local continue: it queues a synthetic turn that the
+    # runner would dispatch on THIS machine, diverging from the peer. AFTER the
+    # app-ownership 404 above: a foreign app must not be able to tell a remote slot
+    # apart from a missing one, so the anti-enumeration 404 has to win (GPT #7693).
+    refusal = remote_bound_refusal(slot)
+    if refusal is not None:
+        return refusal
 
     async with slot._lock:
         if slot.running:
@@ -3020,15 +3961,10 @@ async def api_chat_slot_end_wait(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_end_wait")
     if denied is not None:
         return denied
-    try:
-        body = await request.json() if request.content_length else {}
-    except Exception:
-        body = {}
-    # `request.json()` happily returns a list or a scalar for well-formed JSON
-    # that simply is not an object, and `.get` on one of those raises past the
-    # except above into a 500. Normalize the shape, not just the parse.
-    if not isinstance(body, dict):
-        body = {}
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     wait_id = str(body.get("wait_id") or "").strip()
     if not wait_id:
         return web.json_response(
@@ -3099,19 +4035,37 @@ async def api_chat_slot_interrupt(request: web.Request) -> web.Response:
 
     # Claim the stop slot synchronously BEFORE the await below: the
     # idempotency guard above is check-then-act, and a concurrent /interrupt
-    # arriving during `await request.json()` would otherwise still see
+    # arriving during the awaited body read below would otherwise still see
     # _stop_state == "idle" and slip past the guard (double stop_turn +
     # double SEL audit for one logical press). /stop is race-safe because it
     # has no await between guard and claim; this makes /interrupt match.
+    prev_auto_run = slot._auto_run
     slot._stop_state = "soft_pending"
     slot._auto_run = False
 
-    # Optionally promote a specific queue item to front
+    # Optionally promote a specific queue item to front. The except is not a
+    # parse guard (read_bounded_json owns that): it rolls the claimed stop
+    # state back when the body read fails in transit, and the refused-body
+    # branch below rolls it back the same way. Both paths also restore
+    # _auto_run: a refused request must not leave orchestrator auto-run
+    # disabled when no interrupt actually happened. The rollback is
+    # conditional on our claim being intact: a concurrent /stop arriving
+    # during the body await may escalate _stop_state (e.g. to "killing"),
+    # and an unconditional reset to "idle" would erase that escalation and
+    # admit another stop while the hard kill is still running.
     try:
-        body = await request.json() if request.content_length else {}
+        body, body_err = await read_bounded_json(request, allow_absent=True)
     except Exception:
-        slot._stop_state = "idle"
+        if slot._stop_state == "soft_pending":
+            slot._stop_state = "idle"
+            slot._auto_run = prev_auto_run
         raise
+    if body_err is not None:
+        if slot._stop_state == "soft_pending":
+            slot._stop_state = "idle"
+            slot._auto_run = prev_auto_run
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     queue_id = body.get("queue_id")
     if queue_id:
         # Wire-side field is `queue_id`; stored items carry `id` (the key
@@ -3228,10 +4182,10 @@ async def api_chat_slot_queue_edit(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_queue_edit")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     content = body.get("content")
     if not isinstance(content, str) or not content.strip():
         return web.json_response({"error": "content must be a non-empty string"}, status=400)
@@ -3273,10 +4227,10 @@ async def api_chat_slot_queue_reorder(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_queue_reorder")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     order = body.get("order")
     if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
         return web.json_response({"error": "order must be a list of queue id strings"}, status=400)
@@ -3363,9 +4317,11 @@ async def _retire_slot_nudge_loop(name: str) -> "NudgeLoop | None":
     either lands first and is removed or runs after the synchronous slot pop.
     Its uncontended acquire does not yield, so the initial retirement also
     cancels a scheduled timer before the fire callback gets another turn.
+    Legacy loops are removed. Structured monitors instead retain their durable
+    outcome and clear their timer, so terminal history remains inspectable.
 
-    The returned loop is the only remaining record of it — the persist-failure
-    path uses it to put the clock back (see :func:`_restore_slot_nudge_loop`).
+    The returned loop lets the persist-failure path put the clock back (see
+    :func:`_restore_slot_nudge_loop`).
 
     A removal that FAILS raises :exc:`_NudgeRetireFailed` rather than logging and
     carrying on. Removal drops the loop from memory first and only then writes
@@ -3414,7 +4370,33 @@ async def _restore_slot_nudge_loop(
     restored at all (it was one tick from terminal), and neither is a paused one
     — reviving that would override an explicit stop.
     """
-    if loop is None or not loop.active:
+    if loop is None:
+        return
+    monitor = getattr(loop, "monitor", None)
+    if monitor is not None:
+        if (
+            not loop.active
+            and monitor.outcome is not None
+            and monitor.outcome.value == "session_close"
+        ):
+            try:
+                from kiro_crew.autonudge import (
+                    get_instance as _autonudge_get,  # circular: autonudge -> dashboard
+                )
+
+                svc = _autonudge_get()
+                if svc is not None:
+                    await svc.restore_monitor_after_failed_session_close(
+                        loop.id,
+                        admission_check=admission_check,
+                    )
+            except Exception:
+                logger.warning(
+                    "structured monitor restore after failed slot close failed",
+                    exc_info=True,
+                )
+        return
+    if not loop.active:
         return
     try:
         from kiro_crew import autonudge  # circular: autonudge -> dashboard.chat -> chat_handlers
@@ -3441,6 +4423,14 @@ async def _restore_slot_nudge_loop(
             max_cycles=cycles_left,
             stop_sentinel_path=loop.stop_sentinel_path,
             max_runtime_secs=runtime_left,
+            # Configuration, so it is replayed WHOLE — unlike the two budgets
+            # above, which are deliberately reduced. Omitting it fails silently:
+            # ``add()`` defaults it to "", the loop keeps running, and only the
+            # transcript rows change — back to the full multi-KB message every
+            # cycle, which is the harm the banner exists to remove. The blank is
+            # then persisted, so one failed close would discard the setting for
+            # good.
+            banner=loop.banner,
             admission_check=admission_check,
         )
     except Exception:
@@ -3483,11 +4473,17 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
     mid-write, a plan between stages, and children still running after their
     parent's turn ended.
 
-    ``has_active_turn`` is the probe the reload route uses for this same teardown,
-    and it inherits that probe's edge: a turn holding the per-session semaphore
-    but not yet having a prompt in flight is not seen. Matching the sibling is
-    deliberate — a second, subtly different notion of "busy" for one teardown is
-    how the two drift apart.
+    The ``has_active_turn()`` check is a best-effort fast path; the
+    authoritative guard is the discard's ``skip_if_busy``, which probes the
+    per-session SEMAPHORE atomically with the session pop (see
+    :meth:`SessionManager.discard_conversation`). The fast path has a known
+    edge — a turn holding the semaphore but not yet having a prompt in flight
+    is invisible to it — and the atomic guard is what closes it, the same
+    contract the sibling reload route rests on, so the two teardowns keep one
+    notion of "busy". Of the refusal paths, only the atomic guard's decline is
+    SEL-recorded (``outcome="denied"``): it is the one refusal that happens
+    after the route has committed to the teardown, while the fast-path 409s
+    are pre-checks and stay unlogged, as they are on the sibling.
 
     The transcript is deliberately left in place, which means the tab still shows
     the earlier messages while the model no longer remembers them. That is the
@@ -3524,15 +4520,16 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
     # however long a slow body takes to arrive. The guards must be the last thing
     # that happens before the teardown.
     #
-    # A malformed or absent body is not an error. This route took no body before,
-    # so refusing one would break every existing caller for a parameter they do
-    # not send.
+    # An absent body is not an error: this route took no body before, so
+    # refusing one would break every existing caller for a parameter they do
+    # not send. A present-but-malformed body IS refused — "sent nothing" and
+    # "sent garbage" are different facts, and only the first can be defaulted.
     replay = True
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-    if isinstance(body, dict) and "replay" in body:
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
+    if "replay" in body:
         replay = bool(body.get("replay"))
 
     # A turn in flight on the SESSION, which ``slot.running`` cannot see: that
@@ -3572,7 +4569,29 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
     if attached is not None:
         return attached
 
-    await state.sessions.discard_conversation(key, replay=replay)
+    # ``skip_if_busy``: the fast paths above cannot see a turn that holds the
+    # per-session semaphore but has not yet put a prompt in flight (an inbound
+    # channel message between the lease and its first stream event). The discard
+    # probes the semaphore atomically with the session pop, so a turn admitted
+    # after the guards above answered False is refused here instead of being
+    # torn down mid-lease.
+    discarded = await state.sessions.discard_conversation(key, replay=replay, skip_if_busy=True)
+    if not discarded:
+        sel().log_api_access(
+            caller=request.get("app", "") or "dashboard",
+            operation="slot_reset_conversation",
+            outcome="denied",
+            resources=f"slot={name} replay={replay}",
+        )
+        return web.json_response(
+            {"error": "a turn is in flight", "code": "turn_in_flight", "slot": name},
+            status=409,
+        )
+    # The fresh conversation will advertise its own model list, so the previous
+    # one's withhold verdict no longer describes this slot. Only on a performed
+    # discard: a refusal above leaves the old conversation (and its verdict) in
+    # place.
+    slot.record_model_withheld(None)
     sel().log_api_access(
         caller=request.get("app", "") or "dashboard",
         operation="slot_reset_conversation",
@@ -3582,45 +4601,68 @@ async def api_chat_slot_reset_conversation(request: web.Request) -> web.Response
     return web.json_response({"slot": name, "reset": True, "replay": replay})
 
 
-async def api_chat_slot_delete(request: web.Request) -> web.Response:
-    """DELETE /api/chat/slots/{slot} — stop and remove a UI slot.
+class SlotCloseError(Exception):
+    """A close that could not complete, carrying the response the tab-✕ path
+    would have rendered.
 
-    Kills the per-tab kiro-cli session and saves history.  The session
-    will be recreated from the warm pool if the tab is resumed later.
+    Extracted alongside :func:`close_slot` so the DELETE endpoint and
+    session-control's ``close_target`` map the SAME three failures the same way.
+    ``code`` is the machine-readable contract; ``message`` is advisory prose;
+    ``status`` is 500 for every close failure (each leaves the tab open and
+    every partial step rolled back — a state the user can see and retry).
     """
-    state: DashboardState = request.app["state"]
-    name = request.match_info["slot"]
-    slot = state._slots.get(name)
-    if not slot:
-        return web.json_response({"error": "not found"}, status=404)
 
-    # App ownership check (App Kit §5.2): app can only delete slots it created.
-    # Unscoped slots (empty _app) cannot be deleted by app tokens.
-    # Dashboard users (empty request_app) can delete anything.
-    request_app = request.get("app", "")
-    if request_app and slot._app != request_app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="slot_delete",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={name}",
-            error="app does not own this slot",
-        )
-        return web.json_response({"error": "not found"}, status=404)
-    if request_app and not slot._app:
-        sel().log_api_access(
-            caller=request_app,
-            operation="slot_delete",
-            outcome="denied",
-            source="app_isolation",
-            resources=f"slot={name}",
-            error="app cannot delete unscoped slots",
-        )
-        # 404 (not 403): a foreign/unscoped slot is indistinguishable from a
-        # missing one — anti-enumeration (CWE-204); true reason logged via SEL.
-        return web.json_response({"error": "not found"}, status=404)
+    def __init__(self, message: str, code: str, status: int = 500) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.status = status
 
+
+async def close_slot(
+    state: DashboardState,
+    slot: "_ChatSlot",
+    name: str,
+    *,
+    pre_pop_check: Callable[[], None] | None = None,
+) -> None:
+    """Close (archive) one live slot the way the tab ✕ does: tombstone it, retire
+    its auto-nudge loop, notify its owning app, persist it as closed, and tear
+    down the per-tab session.
+
+    Non-destructive: the conversation is saved to history (``closed=True``) and
+    recreated from the warm pool if the tab is resumed later — nothing is
+    permanently deleted here.
+
+    Shared by :func:`api_chat_slot_delete` and ``session_control.close_target``
+    so neither can diverge on the ordering invariants that keep a nudge or an
+    app watchdog from resurrecting the very tab being dismissed. The three
+    failure paths raise :class:`SlotCloseError`, leaving the slot open with every
+    partial step rolled back; the caller renders the refusal in its own idiom
+    (an HTTP response, or a ``SessionControlError``). The APP-OWNERSHIP check is
+    deliberately NOT here — it is DELETE-endpoint policy (App Kit isolation for
+    app tokens) and stays in that handler; session control scopes the caller
+    through ``authorize_target`` instead.
+
+    ``pre_pop_check`` runs SYNCHRONOUSLY at the point of no return — immediately
+    before the slot is popped, after the nudge-retirement and app-hook awaits. It
+    exists for a caller (``close_target``) that authorized the target BEFORE this
+    coroutine and must re-assert that authorization against state those awaits
+    could have changed: a target unmirrored/unlinked at admission can gain a
+    channel mirror or link while the AutoNudge lock and the app hook are awaited,
+    and archiving a now-channel-backed session it was never allowed to reach is
+    the boundary the target guards exist to hold. It is SYNCHRONOUS on purpose —
+    an awaited check would put a suspension back between the last retirement and
+    the pop (reopening the retired-loop window) and between the re-authorization
+    and the pop (reopening the mirror window); a synchronous check has neither, so
+    nothing can change between the final authorization and the archival. It must
+    therefore do no blocking I/O (``close_target`` passes ``skip_enabled_check=True``
+    so its ``authorize_target`` never reads config on the loop). It raises
+    :class:`SlotCloseError` to abort; the abort unwinds the teardown so far (the
+    retired nudge loop is restored, an app notification is taken back) and
+    re-raises, exactly like the persist-failure path. The human ✕ path passes
+    ``None`` — the person owns the tab and closes it unconditionally.
+    """
     # Synchronous tombstone, BEFORE any await: a channel-slot reconcile pass
     # whose snapshot predates this close reads these after its last await, so
     # it cannot re-surface the tab this handler is dismissing (see
@@ -3646,10 +4688,7 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
         logger.error("Failed to retire nudge loop for slot %s, close aborted", name)
         _sync_dashboard_slots(state)
         state.push_slots_update()
-        return web.json_response(
-            {"error": "failed to retire nudge loop", "code": "nudge_retire_failed"},
-            status=500,
-        )
+        raise SlotCloseError("failed to retire nudge loop", code="nudge_retire_failed")
     # Remove from the registry only AFTER the loop is retired, because the ORDER
     # is what decides whether a nudge landing in between is harmless or fatal.
     # Retiring takes the AutoNudge lock, so it awaits; a timer expiring inside
@@ -3691,10 +4730,7 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
             logger.error("Slot-close hook for app %r failed on %r, close aborted", slot._app, name)
             _sync_dashboard_slots(state)
             state.push_slots_update()
-            return web.json_response(
-                {"error": "failed to notify the app", "code": "app_close_hook_failed"},
-                status=500,
-            )
+            raise SlotCloseError("failed to notify the app", code="app_close_hook_failed")
         # The app hook awaits external work while the slot is still visible.
         # Re-arbitrate the nudge registry after it returns: an arm that committed
         # during that await must be retired before the synchronous pop below.
@@ -3718,12 +4754,37 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
             logger.error("Late nudge retirement failed for slot %s; close aborted", name)
             _sync_dashboard_slots(state)
             state.push_slots_update()
-            return web.json_response(
-                {"error": "failed to retire nudge loop", "code": "nudge_retire_failed"},
-                status=500,
-            )
+            raise SlotCloseError("failed to retire nudge loop", code="nudge_retire_failed")
         if late_retired_loop is not None:
             retired_loop = late_retired_loop
+    if pre_pop_check is not None:
+        # Point of no return: re-assert authorization that the awaits above could
+        # have staled (nudge retirement takes the AutoNudge lock; the app hook
+        # awaits external work). Called SYNCHRONOUSLY so there is NO suspension
+        # between the last retirement above, this re-check, and the pop below —
+        # nothing can change between the final authorization and the archival, and
+        # the retirement stays adjacent to the removal. A raised SlotCloseError
+        # unwinds the teardown so far — restore the retired nudge loop, take back
+        # an app notification — and re-raises, exactly like a failed persist.
+        try:
+            pre_pop_check()
+        except SlotCloseError:
+            await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)
+            if slot._app:
+                from kiro_crew.apps.teardown import (
+                    notify_slot_close_undone,  # circular: apps.teardown -> apps.bridges
+                )
+
+                if not await notify_slot_close_undone(slot._app, name):
+                    logger.error(
+                        "Could not take back the dismissal for app %r on %r after a "
+                        "pre-pop re-check aborted the close",
+                        slot._app,
+                        name,
+                    )
+            _sync_dashboard_slots(state)
+            state.push_slots_update()
+            raise
     state._slots.pop(name, None)
     # Release any blocking wait before cancelling the task: a question pending on
     # the blocking POST /api/ask-question path holds an MCP worker on an open
@@ -3747,22 +4808,136 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
             await asyncio.wait_for(asyncio.shield(slot.task), timeout=2.0)
         except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
             pass
+    # Post-pop teardown race: across the awaits above (and the app-notify awaits
+    # before the pop) a concurrent same-key recreate — a POST /api/chat or the
+    # session_close MCP verb — can mint a REPLACEMENT slot under `name`. When that
+    # replacement writes the SAME transcript, writing THIS (original) slot as
+    # closed=True would stamp the archive flag on a conversation the replacement is
+    # still using, and the sessions.remove below would tear down the session it now
+    # uses. The original was already popped and its task cancelled, so the close is
+    # effectively complete for it; leave the replacement's slot and session
+    # untouched and report success.
+    #
+    # The gate is TRANSCRIPT sharing, not key ownership, because those are two
+    # different questions and the save answers to the transcript: a linked slot
+    # (channel-, cron- or workflow-born) writes its `linked_session_key`, while an
+    # unbound same-name replacement writes `dashboard:{name}`. Yielding the archive
+    # on that pair would leave the ORIGINAL's transcript with no `closed` flag, and
+    # the channel reconcile reads an absent flag as "never dismissed" and resurfaces
+    # the tab. So a replacement that shares nothing takes nothing: the archive below
+    # runs normally on the original's own file, and only the KEY-SCOPED steps
+    # (`sessions.remove`, the failure-arm restore) still yield to it.
+    #
+    # Yielding the archive is NOT the same as discarding the original's content. Its
+    # own unsaved rows still belong on its own transcript — what must not happen is
+    # the `closed` stamp and the session teardown, not the write.
+    # `_persist_handover_tail` is that distinction made explicit: the same window
+    # this frame was about to save, saved OPEN instead of closed.
+    #
+    # Scope, precisely: this closes the WIDE window — the app-notify awaits before
+    # the pop and the up-to-2.0s task cancel above — and NOT the durable write
+    # itself. `save_slot_off_loop` reaches its commit through the process-wide
+    # default executor, so a recreate can still land between this synchronous
+    # check and the in-lock write. That residual is the one an unguarded close
+    # carries too, and the row it leaves is what a plain sequential
+    # close-then-reopen of a reused key already produces: `closed`/`closed_at` are
+    # slot-owned metadata, so the replacement's next full save drops them, and
+    # `api_chat_slot_resume` compensates a stale flag with an in-lock
+    # compare-and-clear. Closing it AT the commit needs an ownership predicate
+    # evaluated inside `_locked(history_key)` — on the write and on the resume's
+    # read-then-clear both — which is a durable-metadata contract change, not a
+    # loop-side ordering one.
+    if _replacement_shares_transcript(state, name, slot):
+        # Yielding the archive must not silently discard what this slot never got to
+        # disk. The original is out of `_slots` and about to be unreferenced, and
+        # the periodic flush only ever visits `_slots`, so this frame is the last
+        # thing that can persist its tail — as an OPEN-key write, which is the
+        # single difference from the archival save this exit declines.
+        drained = await _persist_handover_tail(state, name, slot)
+        # The key belongs to the replacement now, and so does every KEY-SCOPED
+        # marker sitting on it. Hand the restricted flag over before letting go:
+        # the discard below the save is the only thing that would have cleared the
+        # original's, and this exit skips it. After the drain above, so the marker
+        # is derived from the newest observation of who holds the key.
+        _resettle_restricted_key(state, name)
+        _sync_dashboard_slots(state)
+        state.push_slots_update()
+        if slot._app:
+            # Same decision the failure arm below takes, and it must be as visible:
+            # this is the MORE common hand-over, so a silent one would hide every
+            # ordinary occurrence of an app worker left paused.
+            logger.warning(
+                "Slot %s was recreated while its close was tearing down, so app %r "
+                "keeps the dismissal: the original tab is gone and resuming its "
+                "worker would target the replacement now holding this key",
+                name,
+                slot._app,
+            )
+        if not drained:
+            # The drain was this frame's last chance at those rows, so a close that
+            # reported success here would be reporting durability it does not have —
+            # and unlike the arm below there is nothing to roll back and nothing that
+            # will retry, so the report IS the whole remedy. Same code as the
+            # ordinary save failure: from the caller's side this is one thing, a
+            # close whose history write did not land.
+            raise SlotCloseError("failed to save history", code="history_save_failed")
+        # Otherwise return, do not raise: for the ORIGINAL the close is complete
+        # (popped, task cancelled, tail durable), so every caller — the DELETE
+        # handler and session-control's close_target — must read this as success.
+        return
     try:
         await save_slot_off_loop(state, slot, closed=True, closed_at=closed_at, best_effort=False)
     except Exception:
         # Save failed — restore slot so data isn't lost
         logger.error("Failed to save slot %s to history, restoring", name, exc_info=True)
-        state._slots[name] = slot
+        # ...but only if the key is still free or still ours. A recreate that
+        # landed while save_slot_off_loop was in flight now owns `name`; blindly
+        # writing `state._slots[name] = slot` would clobber that live replacement
+        # with the failed original. Restore only when the slot is genuinely still
+        # ours (or the key is now empty).
+        restored = _slot_still_ours(state, name, slot)
+        if restored:
+            state._slots[name] = slot
+        else:
+            # Not restored means not referenced: the periodic flush that would have
+            # retried this write only visits `_slots`, so without this the failure
+            # arm's own stated invariant — "restores the slot so data isn't lost" —
+            # is not met for the hand-over case. Re-attempt the write as the
+            # open-key save the state actually is, which also clears a failure that
+            # was only lock contention with the recreate instead of treating one as
+            # permanent, and reports the row count when it is not.
+            #
+            # Its answer needs no branch HERE — unlike the pre-save exit above, this
+            # arm already ends in `SlotCloseError`, so a lost tail is reported to the
+            # caller either way. The drain only decides whether the rows survived.
+            await _persist_handover_tail(state, name, slot)
+        # Whichever way that went, the key-scoped restricted marker has to describe
+        # whoever holds `name` when this frame ends — the restored original, or the
+        # replacement that kept the key. This arm never reaches the discard below
+        # the save, so it settles the marker itself.
+        _resettle_restricted_key(state, name)
         # The close did not happen, so the loop retired for it must come back —
         # a restored session with no clock is an abandoned unattended worker.
         await _restore_slot_nudge_loop(retired_loop, lambda: state.get_slot(name) is slot)
-        # ...and the app's record of the dismissal has to come back too. The
-        # notification above already SUCCEEDED, which for a crew means the worker is
-        # durably paused; without this the failed close would still have stopped it,
-        # so the user gets an error AND a silently disabled worker. Unwound in
-        # reverse order of commitment, which is the only arrangement that leaves no
-        # pair of the three stores disagreeing.
-        if slot._app:
+        # ...and the app's record of the dismissal has to come back too — but ONLY
+        # if the tab did. The notification above already SUCCEEDED, which for a crew
+        # means the worker is durably paused; a close that puts the tab back and
+        # leaves the worker stopped hands the user an error AND a silently disabled
+        # worker. Unwound in reverse order of commitment, which is the only
+        # arrangement that leaves no pair of the three stores disagreeing.
+        #
+        # The undo is COUPLED TO THE RESTORE, not to `_app` alone, because with a
+        # replacement on the key there is no tab to put back: the original is
+        # popped, cancelled, and not coming back, so the dismissal DID happen for it
+        # and taking it back would be a lie with teeth. Resuming a crew re-arms an
+        # autonomous worker whose `slot_key` its watchdog resolves straight through
+        # `state.get_slot(...)` with no ownership test — so the auto-approve grant,
+        # and then an unbounded nudge clock, would land on the USER-owned
+        # replacement now sitting on that key. Leaving the pause is the same answer
+        # the pre-save guard above gives from the identical state, and it is a
+        # first-class visible one (a paused_reason row with a resume control), not a
+        # silent stop.
+        if slot._app and restored:
             from kiro_crew.apps.teardown import (
                 notify_slot_close_undone,  # circular: apps.teardown -> apps.bridges
             )
@@ -3774,23 +4949,94 @@ async def api_chat_slot_delete(request: web.Request) -> web.Response:
                     slot._app,
                     name,
                 )
+        elif slot._app:
+            logger.warning(
+                "Slot %s was recreated while its close was persisting, so app %r keeps "
+                "the dismissal: the original tab is gone and resuming its worker would "
+                "target the replacement now holding this key",
+                name,
+                slot._app,
+            )
         _sync_dashboard_slots(state)
         state.push_slots_update()
-        return web.json_response(
-            {"error": "failed to save history", "code": "history_save_failed"}, status=500
-        )
+        raise SlotCloseError("failed to save history", code="history_save_failed")
     else:
-        state._restricted_keys.discard(f"dashboard:{name}")
+        # Through the shared postcondition rather than a bare discard: on the
+        # ordinary close the key is gone and this drops the marker, and a recreate
+        # that landed during the save gets the marker re-derived from ITSELF instead
+        # of inheriting the original's.
+        _resettle_restricted_key(state, name)
         # Durable, so no rollback can retract this frame — a client pruning its
         # per-slot cards on it can never be pruning a slot that comes back.
         state.push_slots_update()
     # The app was already told, and compensated if the persist above failed — see
     # the notify block before the pop and the rollback in the except branch.
-    # Kill the per-tab session to free resources
-    await state.sessions.remove(_history_key_for(name))
+    # Kill the per-tab session to free resources. Re-check identity ONE more
+    # time, and KEY-scoped here rather than transcript-scoped: a recreate can land
+    # between the save above and this remove, and `_history_key_for(name)` is the
+    # session an unbound replacement runs on, so removing it would tear down a live
+    # replacement's session no matter which transcript that replacement writes. Skip
+    # it if the key is no longer ours.
+    if _slot_still_ours(state, name, slot):
+        await state.sessions.remove(_history_key_for(name))
     _sync_dashboard_slots(state)
     state.push_slots_update()
     state.push_refresh("history")
+
+
+async def api_chat_slot_delete(request: web.Request) -> web.Response:
+    """DELETE /api/chat/slots/{slot} — stop and remove a UI slot.
+
+    Kills the per-tab kiro-cli session and saves history.  The session
+    will be recreated from the warm pool if the tab is resumed later.
+
+    The close sequence itself lives in :func:`close_slot`, shared with
+    session-control's ``close_target``; this handler adds only the
+    DELETE-endpoint's App Kit ownership check and maps the outcome to a
+    response.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found"}, status=404)
+
+    # App ownership check (App Kit §5.2): app can only delete slots it created.
+    # Unscoped slots (empty _app) cannot be deleted by app tokens.
+    # Dashboard users (empty request_app) can delete anything.
+    request_app = request.get("app", "")
+    if request_app and slot._app != request_app:
+        sel().log_api_access(
+            caller=request_app,
+            operation="slot_delete",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={name}",
+            error="app does not own this slot",
+        )
+        return web.json_response({"error": "not found"}, status=404)
+    if request_app and not slot._app:
+        sel().log_api_access(
+            caller=request_app,
+            operation="slot_delete",
+            outcome="denied",
+            source="app_isolation",
+            resources=f"slot={name}",
+            error="app cannot delete unscoped slots",
+        )
+        # 404 (not 403): a foreign/unscoped slot is indistinguishable from a
+        # missing one — anti-enumeration (CWE-204); true reason logged via SEL.
+        return web.json_response({"error": "not found"}, status=404)
+
+    try:
+        await close_slot(state, slot, name)
+    except SlotCloseError as exc:
+        # Every failure `close_slot` raises is a server-side 500 (nudge retire /
+        # app hook / history save); a literal status keeps the error-code contract
+        # gate able to verify the `code` statically (a `status=<expr>` would read
+        # as an un-verifiable dynamic-status response). The pre-pop re-check that
+        # raises other statuses is session-control's path, not this handler's.
+        return web.json_response({"error": exc.message, "code": exc.code}, status=500)
     return web.json_response({"ok": True})
 
 
@@ -3801,10 +5047,10 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     Skips the active slot and pinned sessions.
     """
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     max_days = 3
     try:
         max_days = max(1, int(body.get("max_inactive_days", 3)))
@@ -3933,6 +5179,39 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
                 await asyncio.wait_for(asyncio.shield(removed.task), timeout=2.0)
             except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
                 pass
+        # Post-pop teardown race (same as the single-tab close, same gate): across
+        # the cancel await above a concurrent same-key recreate can mint a
+        # REPLACEMENT slot under `name`. When that replacement writes the SAME
+        # transcript, saving THIS (original) slot as closed=True would stamp a
+        # conversation it is still using, and the sessions.remove below would tear
+        # down the session it now uses. Skip the ARCHIVE — the closed stamp, the
+        # session teardown, and the ``archived`` report, which must never claim a
+        # live replacement was archived over — while still persisting the original's
+        # own unsaved rows and held notes onto the transcript the two share.
+        #
+        # A replacement that writes a DIFFERENT transcript (an unbound recreate over
+        # a channel-, cron- or workflow-linked tab) takes none of that: leaving the
+        # linked transcript unarchived is what makes the reconcile pass resurface it,
+        # so the archive below runs on the original's own file and only the
+        # key-scoped steps yield.
+        if _replacement_shares_transcript(state, name, removed):
+            # Same obligation as the single-tab hand-over, and here it also covers
+            # the notes: this exit skips the ``flush_deferred_notes()`` below, and
+            # held notes live nowhere but this popped object. The drain flushes them
+            # into the window and writes the whole tail as an OPEN-key save.
+            drained = await _persist_handover_tail(state, name, removed)
+            # Hand the KEY-SCOPED restricted marker to the replacement on the way
+            # out: this exit skips the discard below the save, which is the only
+            # thing that would otherwise have cleared the original's.
+            _resettle_restricted_key(state, name)
+            if not drained:
+                # This frame was the last reference to those rows, so a pass that
+                # said nothing here would report a clean sweep over a slot whose
+                # tail it dropped. ``failed`` is the honest column: the key is not
+                # in ``archived`` either way, and the two together say "not
+                # archived, and something was lost" rather than "nothing to do".
+                failed.append(name)
+            continue
         try:
             # Order is unchanged and load-bearing: the cancel above, then the
             # flush, then the save. What the guard adds is failure handling, and
@@ -3953,7 +5232,33 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             logger.error(
                 "Cleanup: failed to flush held notes or archive slot %s", name, exc_info=True
             )
-            state._slots[name] = removed
+            # Restore only if the key is still free or still ours: a recreate that
+            # landed while save_slot_off_loop was in flight now owns `name`, and
+            # blindly writing `state._slots[name] = removed` would clobber that
+            # live replacement with the failed original. Skip the restore in that
+            # case; the error-row / dead-task handling below still applies to the
+            # original object we hold.
+            if _slot_still_ours(state, name, removed):
+                state._slots[name] = removed
+            else:
+                # The restore is what this arm's own comment relies on to keep the
+                # flushed notes reachable ("restores the slot with its notes still
+                # held"). Skipping it for a live replacement removes that guarantee,
+                # so drain the tail — flushed notes included — onto the slot's own
+                # transcript instead of dropping the only object holding it.
+                #
+                # Deliberately BEFORE the error row appended below, and that row is
+                # deliberately left in memory on this branch: "the tab was kept" is
+                # false here (the replacement's tab is the one on screen), so
+                # persisting it would put a lie on a transcript a live slot may hold.
+                # The ``failed`` report is what carries the outcome instead — which
+                # is also why the drain's answer needs no branch here, unlike at the
+                # pre-save exit above: this key reaches ``failed`` regardless.
+                await _persist_handover_tail(state, name, removed)
+            # Either way the key-scoped restricted marker must describe whoever holds
+            # `name` now — the restored original, or the replacement that kept it.
+            # This arm never reaches the discard below, so it settles it here.
+            _resettle_restricted_key(state, name)
             # Restoring the slot does not undo the cancel above, and ``running`` is
             # derived from the task, so a cancel that already completed reads False:
             # the tab returns looking idle and dispatchable with that turn's output
@@ -3973,8 +5278,22 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
             failed.append(name)
             continue
         else:
-            state._restricted_keys.discard(f"dashboard:{name}")
-        # Session cleanup is best-effort — history is already written
+            # Through the shared postcondition rather than a bare discard, for the
+            # same reason as the single-tab close: an archive that succeeded onto a
+            # key a recreate has since taken must leave the marker describing the
+            # REPLACEMENT, not the original it just wrote out.
+            _resettle_restricted_key(state, name)
+        # Re-check identity ONE more time, and KEY-scoped here rather than
+        # transcript-scoped: `_history_key_for(name)` is the session an unbound
+        # replacement runs on, so a recreate landing between the save above and here
+        # would have its session torn down. Skip the teardown, and do NOT report the
+        # key archived — ``archived`` names SLOT KEYS, and this one has a live holder
+        # whatever became of the transcript, so listing it would tell the UI a tab on
+        # screen was swept. Move on without touching the replacement's session or its
+        # running task.
+        if not _slot_still_ours(state, name, removed):
+            continue
+        # Session cleanup is best-effort — history is already written.
         try:
             await state.sessions.remove(_history_key_for(name))
         except Exception:
@@ -4009,6 +5328,197 @@ async def api_chat_slots_cleanup(request: web.Request) -> web.Response:
     )
 
 
+async def _apply_remote_pick(
+    request: web.Request,
+    state: "DashboardState",
+    slot: "_ChatSlot",
+    control: str,
+    body: dict[str, Any],
+) -> web.Response:
+    """Forward one header pick to the bound peer, then mirror it on the slot.
+
+    Mirror AFTER the forward, never before: the local field is what the header
+    renders and what the next turn's request reports, so writing it first would
+    leave the user looking at a pick the peer refused.
+
+    ``control`` names both the peer's route and the slot attribute, which is why
+    a single body key carries the value for all four controls.
+
+    Takes the ``request`` purely to authorize: all four pick routes reach the peer
+    through here, so gating inside this function makes a fifth control's guard
+    structural instead of a copied line the next handler can omit.
+    """
+    # Reconfiguring the owner's connected crew is the same credential spend as
+    # sending to it (see ``deny_non_owner_remote_operation``), and it lands BEFORE
+    # anything reaches the tunnel or the local mirror.
+    denied = deny_non_owner_remote_operation(request, slot, f"slot_{control}")
+    if denied is not None:
+        return denied
+    # One pick at a time per slot, across the WHOLE transaction (forward →
+    # mirror → persist). Every pick suspends at the tunnel await, so two
+    # interleaved picks can otherwise land their peer write and their metadata
+    # write in opposite orders, and a restart then restores a value the crew does
+    # not hold — the local record naming one pick while the side that runs the
+    # next turn took the other.
+    #
+    # The lock is ``_remote_pick_lock``, deliberately NOT ``slot._lock``: that
+    # one guards message-window edits, and its own declaration forbids holding it
+    # across a multi-second network await, which is exactly what forwarding to
+    # the peer is. Serialising picks must not stall every window edit behind the
+    # tunnel's round-trip.
+    async with slot._remote_pick_lock:
+        return await _apply_remote_pick_locked(state, slot, control, body)
+
+
+async def _apply_remote_pick_locked(
+    state: "DashboardState", slot: "_ChatSlot", control: str, body: dict[str, Any]
+) -> web.Response:
+    """The body of :func:`_apply_remote_pick`, under its per-slot pick lock.
+
+    Split out rather than wrapping the body in an ``async with``: the transaction
+    has several early returns, and a split makes "the lock covers all of them"
+    checkable at a glance instead of by re-reading every exit.
+    """
+    try:
+        accepted = await forward_peer_selection(state, slot, control, body)
+    except RemoteTurnError as exc:
+        return web.json_response({"error": str(exc), "code": "remote_pick_failed"}, status=502)
+    value = body[control]
+    setattr(slot, control, value)
+    if control == "agent":
+        # The peer resolved this agent against ITS bindings and committed a
+        # workspace for it — the same derivation the local switch does further
+        # down. Mirroring what it reported keeps the header and the next turn's
+        # record naming the workspace the turns actually run in; leaving the
+        # local value alone made this slot claim a workspace the crew had already
+        # moved off. Only a non-empty string is taken, so a peer that omits the
+        # field changes nothing.
+        peer_workspace = accepted.get("workspace")
+        if isinstance(peer_workspace, str) and peer_workspace:
+            # Redacted like every other peer string: this one is both rendered in
+            # the header and PERSISTED to history below, so an unscrubbed
+            # credential here outlives the session.
+            slot.workspace = redact_peer_text(peer_workspace)
+    if control == "model":
+        # Same reason the local path bumps it: an explicit pick has to outrank
+        # the model-fallback restore probe.
+        slot._model_pick_gen += 1
+    # Persist the accepted pick immediately, exactly as the local agent switch
+    # does. The periodic dirty-slot flush would write it eventually (both save
+    # routes rebuild these fields from the slot), but the two ends diverge inside
+    # that window: the PEER committed the value the moment it answered, so a
+    # restart before the flush restores a local field the crew no longer agrees
+    # with — and the crew is the side that runs the next turn. A local-only pick
+    # can only ever disagree with itself, which is why the local model/effort/
+    # workspace routes can leave it to the flush and this one cannot.
+    persisted: dict[str, Any] = {control: value}
+    if control == "agent" and slot.workspace:
+        # The mirrored workspace is as much the peer's committed state as the
+        # agent is, so it goes in the same write — persisting one without the
+        # other would restore the pair inconsistent after a restart.
+        persisted["workspace"] = slot.workspace
+    if state.conversation_log:
+        try:
+            # update_metadata takes a flock and closes fds — blocking-on-loop
+            # prohibited, so it goes to a worker thread (same reasoning as the
+            # local agent switch).
+            await asyncio.to_thread(
+                state.conversation_log.update_metadata,
+                _history_key_for(slot.key),
+                persisted,
+            )
+        except Exception:
+            # The peer COMMITTED this pick the moment it answered, so the local
+            # write is the side that fell behind — re-arm the periodic
+            # dirty-slot flush to retry it, exactly as `save_slot_off_loop`'s
+            # best-effort branch does for the same class of swallowed failure.
+            # Without this a lock timeout or I/O error drops the change for good
+            # and the two ends stay diverged after a restart: the crew runs the
+            # next turn on the value it took while the local record names the old
+            # one. The response stays 2xx because the pick DID apply where the
+            # turns run; reporting failure would roll the header back to a value
+            # the peer no longer holds.
+            slot._dirty = True
+            logger.warning(
+                "Failed to persist remote %s pick for slot %s", control, slot.key, exc_info=True
+            )
+    logger.info("Remote slot %s %s set to %r on %s", slot.key, control, value, slot.instance_id)
+    state.push_slots_update()
+    return web.json_response({"ok": True, control: value, "remote": True})
+
+
+class _CommitToken(str):
+    """A ``str`` whose per-request IDENTITY marks commit ownership.
+
+    ``api_chat_slot_agent`` commits ``slot.agent`` (and the derived
+    ``slot.workspace`` / ``slot.project``) before its awaits and may have to
+    roll those commits back (session rebound, busy decline). Every one of
+    those fields has unlocked writers (openai_compat, members, the in-turn
+    /agent and set_project directives), so the rollback must not fire when
+    one of them wrote during the awaits — including a write of the SAME text,
+    which a value compare-and-set cannot distinguish from this handler's own
+    commit (the in-turn set_project directive can legitimately write the very
+    project this handler derived). A subclass instance compares, hashes,
+    serializes and persists exactly like the plain string, but is a distinct
+    object per commit: ``slot.<field> is <token>`` is therefore a sound
+    "still my write" test with no cooperation needed from the other writers.
+    """
+
+    __slots__ = ()
+
+
+# Serializes slot SWITCH transactions that share one session, keyed by
+# ``effective_session_key``. The per-slot locks the switch handlers take
+# (``slot._lock``, ``slot._model_pick_lock``) are created per ``_ChatSlot``,
+# so two switches arriving through DIFFERENT alias slots that resolve onto
+# ONE session take disjoint locks and neither waits for the other: both
+# commit, both reset the shared session, and the two slots' committed
+# settings can end up disagreeing with each other and with the live
+# provider. Same shape and same reason as ``_autocompact_txn_locks`` below
+# ("channel-linked aliases resolve distinct slot names onto one file"), keyed
+# by the SESSION the switch handlers probe and reset rather than by the
+# transcript.
+#
+# LOCK ORDER — the one place it is written down. ``slot._lock``, then the
+# session lock, then ``slot._model_pick_lock``. Every switch handler acquires
+# them in that order and nothing acquires them in the opposite one, so two
+# aliases contending on one session cannot cycle: a holder of the session lock
+# already holds its own ``slot._lock`` and never waits for another slot's.
+# Unrelated slots resolve to DIFFERENT keys and so take different locks: this
+# serializes aliases of ONE session, never one slot against another session's
+# switch. A WeakValueDictionary so a session's lock is collected once no
+# request holds it.
+#
+# WHY THE SESSION LOCK IS ENTERED SECOND, THROUGH AN ExitStack. Its key is
+# ``effective_session_key(slot)``, and that value is only trustworthy once
+# ``slot._lock`` is held: a channel/cron rebind can land while a request
+# queues, which is why every handler deliberately resolves the key INSIDE its
+# lock (pinned by
+# ``test_binding_that_lands_while_queued_on_the_lock_is_the_one_switched`` --
+# the binding that lands is the one switched). Keying the session lock on any
+# EARLIER read would be unsound in exactly that case: the handler would hold
+# the lock for the PREVIOUS session while probing and resetting the new one,
+# so a concurrent alias switch on the new session would not be serialized
+# against it -- and the handlers' post-await re-checks cannot catch it,
+# because they compare ``effective_session_key(slot) != session_key`` and
+# session_key would already BE the new key. Entering the lock after the
+# in-lock read makes the lock key and the acted-on key THE SAME VALUE BY
+# CONSTRUCTION, so there is no window to guard and no new decision point to
+# get wrong. The ExitStack is what lets a lock be acquired mid-block without
+# nesting the whole remaining transaction one level deeper.
+_slot_switch_session_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _slot_switch_session_lock(session_key: str) -> asyncio.Lock:
+    lock = _slot_switch_session_locks.get(session_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _slot_switch_session_locks[session_key] = lock
+    return lock
+
+
 async def api_chat_slot_agent(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/agent — set agent for a chat slot."""
     state: DashboardState = request.app["state"]
@@ -4019,10 +5529,10 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_agent")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     agent_name = body.get("agent", "")
     if agent_name and not _AGENT_NAME_RE.match(agent_name):
         return web.json_response({"error": "invalid agent name"}, status=400)
@@ -4037,6 +5547,11 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
             {"error": "member thread agent is pinned", "code": "member_thread_agent_pinned"},
             status=409,
         )
+    if slot.is_remote:
+        # A bound session has no local ACP session to reset — the whole
+        # transaction below would resolve a crew on the wrong machine. The pick
+        # travels instead, and the slot is mirrored only after the peer took it.
+        return await _apply_remote_pick(request, state, slot, "agent", {"agent": agent_name})
 
     # The whole resolve -> reset -> commit section runs under the slot's
     # lock: the awaits yield the event loop, and an interleaved second switch
@@ -4047,7 +5562,55 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     # slotSwitch failure-recovery relies on, with no rollback machinery to
     # race against concurrent writers (e.g. the project endpoint, which does
     # not take this lock).
-    async with slot._lock:
+    # Two locks, in the order documented at _slot_switch_session_lock:
+    # slot._lock, then the session lock. An ExitStack because the session
+    # lock's KEY is only known after the in-lock read below, and locking on
+    # any earlier read could leave this holding the wrong session lock.
+    async with contextlib.AsyncExitStack() as _stack:
+        await _stack.enter_async_context(slot._lock)
+        # The session the switch resets — ``effective_session_key``, never
+        # ``_history_key_for`` (see api_chat_slot_model): a channel- or
+        # cron-born slot runs its turns under its linked key, and the
+        # dashboard-prefixed spelling names a session that never existed —
+        # the reset would "succeed" against nothing while the live process
+        # kept the old agent. Resolved INSIDE the lock: the binding can land
+        # while this request waits on it.
+        session_key = effective_session_key(slot)
+        # Now serialize against every OTHER alias slot on this same session.
+        # slot._lock is created per _ChatSlot and so is DISJOINT across
+        # aliases. Keyed on the value resolved just above -- the same one the
+        # probe and reset below use -- so the lock provably guards them even if
+        # a binding landed while this request waited on slot._lock (see
+        # _slot_switch_session_lock).
+        await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+        # App isolation on the SESSION, not just the slot (the cancel routes'
+        # policy): slot ownership does not imply ownership of a linked
+        # channel session, so an app caller may not switch the agent a
+        # channel thread runs on. Denied as an indistinguishable 404.
+        denied = _app_cancel_denied(request, slot, "chat.slot_agent", session_key)
+        if denied is not None:
+            return denied
+        # Never reset under an in-flight turn (the model handler's policy,
+        # and the _cancel_target subtlety): a RUNNING turn owns a captured
+        # identity because ``linked_session_key`` is mutable, so the key
+        # resolved above may not be the turn's — tearing it down would kill
+        # the wrong session (or the streaming turn itself). slot.running is
+        # checked first because it is set at dispatch, BEFORE provider.start()
+        # registers a session, so a cold-starting first turn is invisible to
+        # get_provider but not to slot.running. A 409 is retryable once the
+        # turn completes. Checked BEFORE the commit below, so nothing needs
+        # rolling back.
+        busy_provider = state.sessions.get_provider(session_key)
+        if slot.running or (
+            isinstance(busy_provider, LLMProvider) and busy_provider.has_active_turn()
+        ):
+            return web.json_response(
+                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+            )
+        # Rollback baseline for the session_rebound path below. The commit is
+        # otherwise deliberately not rolled back on a failing reset (see the
+        # teardown_incomplete comment), so this is the ONE case that unwinds.
+        prior_agent = slot.agent
         # Stored verbatim — never rewritten to whatever currently answers. See
         # the same reasoning in api_chat_slot_create.
         new_workspace = slot.workspace
@@ -4066,14 +5629,31 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # flight creates a fresh session from the slot's CURRENT bindings,
         # so the new agent must already be visible or that session
         # cold-starts on the old binding and stays stale after the switch
-        # reports success. Deliberately NO rollback on a failing reset: the
+        # reports success. NO rollback on a POST-POP teardown failure: the
         # reset pops the session from the map before shutting the process
-        # down, so by the time shutdown can fail the old binding's session
-        # no longer exists — every future send cold-starts on the NEW
-        # binding, and a replacement session created by a concurrent send
-        # mid-reset already runs it. Restoring the old label would advertise
-        # a binding nothing runs (and tear against that replacement).
-        slot.agent = agent_name
+        # down, so once the pop has happened the old binding's session no
+        # longer exists — every future send cold-starts on the NEW binding,
+        # and a replacement session created by a concurrent send mid-reset
+        # already runs it. Restoring the old label would advertise a binding
+        # nothing runs (and tear against that replacement). That the pop
+        # happened is VERIFIED, not assumed: the reset below routes through
+        # _reset_slot_session_or_warn, which propagates a pre-pop raise —
+        # and THAT path does roll back (see the except below), because the
+        # probe has proven the opposite premise: the old session survives on
+        # this old binding.
+        slot.agent = _CommitToken(agent_name)
+        # Ownership token for the rollback paths below: the committed value is
+        # a str SUBCLASS instance whose identity only this request holds — it
+        # compares, hashes, serializes and persists exactly like the plain
+        # string, but `slot.agent is <token>` proves no other writer has
+        # touched the field since this commit. Any concurrent write — the
+        # unlocked openai_compat / members / in-turn directive writers
+        # included, and a SAME-VALUE write especially — replaces the object,
+        # so the rollback stands down. A value compare-and-set cannot tell
+        # "still my write" from "their equal write", and rolling back over a
+        # concurrent same-agent dispatch would restore the old agent under a
+        # turn already running the new one.
+        committed_agent = slot.agent
 
         # Resolve workspace from agent bindings. The response value is seeded
         # from the slot's CURRENT workspace, not a "default" literal: if
@@ -4097,7 +5677,9 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 # PREVIOUS agent's project — latent until app agents could dispatch.
                 # Resolve WITH the slot's project scope (warmed off-loop first) so a
                 # project agent counts as resolved rather than falling back.
-                await warm_project_agent_names(slot.project or None)
+                await warm_project_agent_names(
+                    slot.project or None, operation="api_chat_slot_agent", source="dashboard"
+                )
                 bindings = resolve_agent_bindings(cfg, agent_name, slot.project or None)
                 ws_name = _workspace_name_for_dir(cfg, bindings.workspace_dir)
                 new_workspace = ws_name
@@ -4121,35 +5703,174 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
         # cold-starts the replacement session from the slot's CURRENT
         # bindings, so the full new binding TRIPLE must already be visible or
         # the new agent's session starts in the OLD project and its tools run
-        # in the wrong repository. The CAS still protects a concurrent
-        # explicit pick that landed during the resolution awaits above.
+        # in the wrong repository. The write-side CAS still protects a
+        # concurrent explicit pick that landed during the resolution awaits
+        # above; the committed values are identity tokens so the ROLLBACK can
+        # prove ownership — a value compare there would erase a concurrent
+        # same-value write (the in-turn set_project directive can write the
+        # very project this handler derived).
+        committed_workspace: str | None = None
+        committed_project: str | None = None
         if slot.workspace == pre_await_workspace:
-            slot.workspace = new_workspace
+            slot.workspace = _CommitToken(new_workspace)
+            committed_workspace = slot.workspace
         if slot.project == pre_await_project:
-            slot.project = new_project
+            slot.project = _CommitToken(new_project)
+            committed_project = slot.project
 
         # Reset session so the next message uses the new agent.
         logger.info(
             "Slot %s agent switched to %r, resetting session", name, agent_name or "kirocrew"
         )
+
+        def _rollback_switch() -> None:
+            """Unwind this request's commit — only the values still OURS.
+
+            EVERY field is unwound on IDENTITY of its commit token, never
+            value equality: unlocked writers (the in-turn /agent and
+            set_project directives in chat_runner, members, openai_compat)
+            can write the SAME text during this handler's awaits — the
+            in-turn set_project directive can legitimately write the very
+            project this handler derived — and a value compare-and-set would
+            erase that successful concurrent write. Any write replaces the
+            token object, so an identity match proves the field is still
+            this commit's; a field this request never committed (the
+            write-side CAS lost) has a None token and is never touched.
+            """
+            if slot.agent is committed_agent:
+                slot.agent = prior_agent
+            if committed_workspace is not None and slot.workspace is committed_workspace:
+                slot.workspace = pre_await_workspace
+            if committed_project is not None and slot.project is committed_project:
+                slot.project = pre_await_project
+
+        # Last-instant re-probe in a NO-AWAIT window before the teardown (the
+        # model template's rule at its own reset site): the pre-commit check
+        # above is separated from this point by the resolution warm-up await,
+        # so a turn — a channel message on the linked session in particular —
+        # may have started since it ran. Message dispatch does not take
+        # slot._lock, so this fast path plus the atomic skip_if_busy decline
+        # below are what keep the teardown off a streaming turn.
+        recheck = state.sessions.get_provider(session_key)
+        if slot.running or (isinstance(recheck, LLMProvider) and recheck.has_active_turn()):
+            _rollback_switch()
+            return web.json_response(
+                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+            )
+        # Children guard, shared with reload/model: the reset tears down the
+        # runtime attached sub-agents run on, so a parent that is idle but
+        # still has children must refuse rather than discard their work.
+        children_409 = _subagents_attached_response(state, slot, session_key, "slot_agent")
+        if children_409 is not None:
+            _rollback_switch()
+            return children_409
         teardown_incomplete = False
+        reset_ok = True
+        # The switch is COMMITTED already (slot.agent above), so a POST-POP
+        # teardown raise is answered as a success with a degraded-teardown
+        # warning — but only once the helper has verified the raise came
+        # AFTER the session pop. A PRE-POP raise means the old session
+        # survives on the old binding, so the helper propagates it and this
+        # request rolls the commit back and answers 500 instead of a false
+        # success. The helper resets with skip_if_busy=True, which keeps this
+        # handler's decline ladder
+        # below: SessionManager.reset evaluates busyness atomically with the
+        # session pop, so a turn that slipped into the microsecond residue
+        # after the re-check above is declined (reset_ok False) instead of
+        # torn down mid-stream. The helper's None verdict marks the degraded
+        # post-pop teardown; a bool verdict is the reset outcome the ladder
+        # reads.
         try:
-            await _reset_slot_session(state, slot, _history_key_for(name))
+            reset_verdict = await _reset_slot_session_or_warn(
+                state, slot, session_key, switch_kind="agent"
+            )
         except Exception:
-            # The switch is COMMITTED regardless: the reset pops the session
-            # before its shutdown can fail, so the new binding is what every
-            # replacement or future session runs. This is a success with a
-            # degraded teardown, and it must be reported as one — a 500 here
-            # would make the acting tab's performSlotSwitch keep the OLD
-            # store value, corrupting the cycle base and the displayed state
-            # for a switch that actually happened.
+            # The identity probe proved the pop never happened: the old
+            # session is still alive on the old binding, so the committed
+            # values describe a switch that did not take — and the acting tab
+            # keeps its OLD store value on the 500, so leaving them would
+            # split server state from every client. Roll back the commit
+            # (identity-scoped, so a concurrent explicit pick that landed
+            # during the raising await keeps its win) and re-push so clients
+            # and persisted state land on the rolled-back truth, then let the
+            # raise escape as a 500.
+            _rollback_switch()
+            slot._dirty = True
+            state.push_slots_update()
+            raise
+        if reset_verdict is None:
             teardown_incomplete = True
-            logger.exception("Slot %s agent switch: old session teardown incomplete", name)
+        else:
+            reset_ok = reset_verdict
+        if not reset_ok and not teardown_incomplete:
+            # Disambiguate the decline FAIL-CLOSED, the workspace handler's
+            # template: a live provider mid-turn → roll back and 409; a live
+            # IDLE session that declined (its turn ended before this re-read)
+            # is always safe to tear down, so retry once; a second decline
+            # means another turn is genuinely racing. No live provider means
+            # there was nothing to tear down — the next message cold-starts
+            # under the new binding, which is what the reset would arrange.
+            busy_provider = state.sessions.get_provider(session_key)
+            if isinstance(busy_provider, LLMProvider):
+                if busy_provider.has_active_turn():
+                    _rollback_switch()
+                    return web.json_response(
+                        {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                    )
+                # Retry through the same probing helper: a pre-pop raise on
+                # the retry propagates (roll back + 500) exactly as the first
+                # attempt, and a post-pop raise becomes the committed 200 +
+                # warning. Left as a bare _reset_slot_session the retry would
+                # answer a false success on a pre-pop raise, the divergence
+                # the first-attempt guard prevents.
+                try:
+                    reset_verdict = await _reset_slot_session_or_warn(
+                        state, slot, session_key, switch_kind="agent"
+                    )
+                except Exception:
+                    _rollback_switch()
+                    slot._dirty = True
+                    state.push_slots_update()
+                    raise
+                if reset_verdict is None:
+                    teardown_incomplete = True
+                else:
+                    reset_ok = reset_verdict
+                if (
+                    not reset_ok
+                    and not teardown_incomplete
+                    and state.sessions.get_provider(session_key) is not None
+                ):
+                    _rollback_switch()
+                    return web.json_response(
+                        {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                    )
+
+        if effective_session_key(slot) != session_key:
+            # The slot was bound to a different session while the resolution
+            # warm-up or the reset awaited (a cron/workflow slot gets linked
+            # when its first result is injected): the session this request
+            # tore down is no longer the slot's, so the committed binding
+            # would describe a session that never saw the switch. The
+            # teardown itself was harmless (that session was idle and no
+            # longer bound); roll back the commit and answer the same 409 the
+            # model and workspace handlers use. Checked BEFORE the metadata
+            # write below so a rolled-back agent is never persisted for
+            # restart.
+            _rollback_switch()
+            return web.json_response(
+                {"error": "slot session was rebound during the switch", "code": "session_rebound"},
+                status=409,
+            )
 
         # Persist the new agent so the session resumes under the correct
         # agent after a gateway restart. INSIDE the lock: two racing switches
         # otherwise interleave their metadata writes, and a stalled earlier
         # write finishing last would restore the older agent on restart.
+        # Deliberately ``_history_key_for``, NOT ``session_key``: this names
+        # the slot's TRANSCRIPT (the .jsonl the restart scan reads), not the
+        # live session the reset above addressed — the same history-vs-session
+        # split ``_cancel_target`` documents.
         if state.conversation_log:
             try:
                 # update_metadata enters _locked (flock + os.close); those are
@@ -4163,6 +5884,35 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 )
             except Exception:
                 logger.warning("Failed to persist agent for slot %s", name, exc_info=True)
+
+        if effective_session_key(slot) != session_key:
+            # A binding can land during the metadata await too — the rebound
+            # guard above ran BEFORE that await, so it must be re-validated
+            # after the last await inside the lock or a workflow binding
+            # landing there gets a 200 while the linked session keeps the old
+            # agent. Roll back the commit AND the metadata just persisted:
+            # the 409 tells the caller nothing changed, so the transcript
+            # metadata must agree. Restoring ``slot.agent`` (post-rollback)
+            # rather than ``prior_agent`` is deliberate — if a concurrent
+            # writer took ownership during the awaits, its value is the
+            # truthful current one. The metadata is transcript-scoped and
+            # binding-independent, so its restore needs no further re-check.
+            _rollback_switch()
+            if state.conversation_log:
+                try:
+                    await asyncio.to_thread(
+                        state.conversation_log.update_metadata,
+                        _history_key_for(name),
+                        {"agent": str(slot.agent)},
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to restore agent metadata for slot %s", name, exc_info=True
+                    )
+            return web.json_response(
+                {"error": "slot session was rebound during the switch", "code": "session_rebound"},
+                status=409,
+            )
 
         # Snapshot the response's workspace LAST, immediately before leaving
         # the lock: the metadata await above yields the event loop, so a
@@ -4179,7 +5929,7 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
     if teardown_incomplete:
         # Advisory only — the switch itself succeeded and the response
         # carries the committed state the acting tab writes optimistically.
-        resp_body["warning"] = "old session teardown incomplete"
+        resp_body["warning"] = _TEARDOWN_INCOMPLETE_WARNING
     return web.json_response(resp_body)
 
 
@@ -4209,7 +5959,7 @@ def _model_rejected_reason(model_name: str, provider: str | None = None) -> str 
             provider = KiroCrewConfig.load().agent.provider
         except Exception:  # pragma: no cover - config load is resilient
             provider = ""
-    if provider == "claude_code":
+    if is_claude_code(provider):
         return None
     if model_registry.is_canonical_key(model_name):
         return (
@@ -4311,8 +6061,10 @@ async def _try_live_model_switch(
     if provider.has_active_turn():
         # Same hazard api_chat_slot_reasoning_effort documents: awaiting a
         # response mid-turn races the streaming prompt loop on stdout for the
-        # non-multiplexed client. The UI disables the model button while a turn
-        # runs, so this is defensive — take the old reset path.
+        # non-multiplexed client. api_chat_slot_model answers 409 before
+        # reaching here (its check and this call share one no-await window),
+        # so this is defense in depth for any future caller — decline the
+        # live switch rather than race the stream.
         return False
     wire = _wire_model_id(provider, model_name)
     if not wire:
@@ -4368,8 +6120,9 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
     """POST /api/chat/slots/{slot}/model — set model for a chat slot.
 
     Prefers an in-place ``session/set_model`` on the running session and only
-    resets when that is impossible (no ACP provider, a turn in flight, an
-    unrepresentable target, or the live call failing).
+    resets when that is impossible (no ACP provider, an unrepresentable
+    target, or the live call failing). A turn in flight answers 409 instead:
+    the reset fallback would tear down the streaming turn mid-stream.
     """
     state: DashboardState = request.app["state"]
     name = request.match_info["slot"]
@@ -4379,23 +6132,81 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_model")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     model_name = _normalize_model(body.get("model", ""))
     reason = _model_rejected_reason(model_name)
     if reason:
         logger.warning("Slot %s model rejected: %s", name, reason)
         return web.json_response({"error": reason}, status=400)
-    # One pick transaction at a time per slot (verifier finding on 84fc7961):
-    # two picks interleaving at the set_model await can roll back each other's
-    # state no matter how careful the rollback condition is — with two failed
-    # picks out of order, the later one restores the earlier one's already-
-    # refused model. Serialising the whole check → mutate → switch → rollback
-    # span makes each pick atomic; the CAS below stays as a backstop against
-    # any writer outside this lock.
-    async with slot._model_pick_lock:
+    if slot.is_remote:
+        # The picker lists the PEER's models, so the live-switch/reset machinery
+        # below has nothing to act on: the session that would receive
+        # ``session/set_model`` is on the other machine.
+        return await _apply_remote_pick(request, state, slot, "model", {"model": model_name})
+    # Three locks, always in this order (slot._lock, then the session lock,
+    # then _model_pick_lock -- see _slot_switch_session_lock; the bulk handler
+    # nests them the same way and nothing takes them in the opposite order).
+    # An ExitStack because the session lock's KEY is only known after the
+    # in-lock read below:
+    # the session lock — two switches arriving through DIFFERENT alias slots
+    # resolve onto ONE session but take DISJOINT per-slot locks, so without
+    # it neither waits for the other and both reset this same session.
+    #
+    # slot._lock — same serialization as the agent, effort and workspace
+    # switch handlers: the awaits below yield the event loop, and an
+    # interleaved second switch could otherwise observe (or write)
+    # intermediate state — two racing switches would each commit and reset
+    # against the other's half-applied session. Holding it across the
+    # provider RPC mirrors the effort handler holding it across change_effort.
+    #
+    # slot._model_pick_lock — one pick transaction at a time against the
+    # model-fallback machinery (verifier finding on 84fc7961): the fallback
+    # swap and restore probe in chat_runner hold it across their own
+    # set_model awaits, and a pick landing inside that window could be
+    # overwritten by the swap (or roll back the swap's state). Serialising
+    # the whole check → mutate → switch → rollback span makes each pick
+    # atomic; the CAS rollback below stays as a backstop against any writer
+    # outside both locks.
+    #
+    # There is deliberately NO unlocked no-op fast path: a serialized switch
+    # holding the locks commits slot.model before its RPC and rolls it back
+    # on AcpModelUnavailable, so an unlocked equality read could match that
+    # transient value and report "already on X" for a model that is then
+    # rolled back.
+    async with contextlib.AsyncExitStack() as _stack:
+        await _stack.enter_async_context(slot._lock)
+        # The session the switch will probe and, on the reset path, tear
+        # down. ``effective_session_key``, never ``_history_key_for`` (the
+        # reload handler's rule): a channel- or cron-born slot runs its turns
+        # under its linked key, and the dashboard-prefixed spelling names a
+        # session that never existed — the busy probe would see nothing and
+        # the reset would "succeed" against nothing while the live process
+        # kept the old model. Resolved INSIDE the lock, not before it: the
+        # binding can land while this request waits on the lock (a cron or
+        # workflow slot is linked when its first result is injected), and a
+        # key read before the wait would then name the wrong session.
+        session_key = effective_session_key(slot)
+        # Now serialize against every OTHER alias slot on this same session.
+        # slot._lock is created per _ChatSlot and so is DISJOINT across
+        # aliases. Keyed on the value resolved just above -- the same one the
+        # probe and reset below use -- so the lock provably guards them even if
+        # a binding landed while this request waited on slot._lock (see
+        # _slot_switch_session_lock).
+        await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+        await _stack.enter_async_context(slot._model_pick_lock)
+        # App isolation on the SESSION, not just the slot (the cancel
+        # routes' policy): slot ownership does not imply ownership of a
+        # linked channel session, so an app caller may not switch the model
+        # a channel thread runs on. Denied as an indistinguishable 404.
+        denied = _app_cancel_denied(request, slot, "chat.slot_model", session_key)
+        if denied is not None:
+            return denied
+        # Checked INSIDE the locks only: a serialized predecessor targeting the
+        # same model may have committed while this request waited, and acting
+        # again would tear down the session that predecessor just set up.
         if slot.model == model_name and not slot._active_fallback_model:
             # Same-value pick: nothing to switch, but the user's EXPLICIT
             # affirmation of this model must still be recorded — the fallback
@@ -4415,8 +6226,29 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
             # still protects the choice from the restore probe.
             slot._model_pick_gen += 1
             return web.json_response({"ok": True, "model": model_name})
-        session_key = _history_key_for(name)
         provider = state.sessions.get_provider(session_key)
+        if slot.running or (isinstance(provider, LLMProvider) and provider.has_active_turn()):
+            # Never tear down an in-flight turn: _try_live_model_switch
+            # declines a mid-turn live switch, so falling through would take
+            # the reset fallback and kill the streaming turn for any
+            # programmatic caller (the UI disables the picker mid-turn, but
+            # the API has no such guard). Answer busy instead — same policy
+            # as the effort handler's defer-not-reset branch and the bulk
+            # handler's skip_running default. slot.running is checked FIRST
+            # because it is set at dispatch, BEFORE the multi-second
+            # provider.start() registers a session — a cold-starting first
+            # turn is invisible to get_provider but not to slot.running
+            # (api_chat's own busy gate uses the same signal). The refusal
+            # applies to EVERY provider class with an active turn, not only
+            # the ACP one that could have gone live: the reset fallback below
+            # tears down the in-flight turn regardless of provider type, and
+            # a 409 is retryable once the turn completes. isinstance, not a
+            # None check: the base class documents that caller-side guards
+            # defend against test doubles that are not LLMProvider instances,
+            # and the base default is False so no real provider is missed.
+            return web.json_response(
+                {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+            )
         prior_model = slot.model
         prior_pick_gen = slot._model_pick_gen
         slot.model = model_name
@@ -4424,45 +6256,512 @@ async def api_chat_slot_model(request: web.Request) -> web.Response:
         # restore probe never overrides this choice (automatic backfill does NOT
         # bump it).
         slot._model_pick_gen += 1
-        try:
-            went_live = await _try_live_model_switch(name, slot, provider, model_name)
-        except AcpModelUnavailable as exc:
-            # The live session refused the pick as unavailable to this account. Roll
-            # the slot back so the picker keeps showing what is actually running, and
-            # answer 4xx — deliberately NOT the reset fallback below, which would
-            # destroy the conversation and cold-start on a different model while
-            # reporting success. Only the session that owns the advertised list gets
-            # to make this call, so there is no pre-emptive gate here to go stale.
-            # The pick generation rolls back WITH the model: a refused pick changed
-            # nothing, and leaving the bump in place would make the fallback
-            # restore probe read it as an explicit choice and silently abandon
-            # restoring the primary — the session would stay on the fallback with
-            # no card and no probe.
-            #
-            # COMPARE-AND-SWAP, not unconditional (local review finding on
-            # eb3cf067): handlers interleave at the await above, so a NEWER pick
-            # may have landed while this one was in flight. An unconditional
-            # rollback would erase that later pick's model AND its generation,
-            # making the restore probe treat it as nonexistent. Only restore when
-            # the state is still exactly ours (our bump, our model); the check and
-            # both writes are synchronous, so they are atomic on the event loop.
-            # Interleavings compose: a later pick's own rollback restores what IT
-            # observed, unwinding in LIFO order to a consistent state.
+
+        def _rollback_pick() -> None:
+            """Undo this request's commit — model AND pick generation together.
+
+            A refused or declined pick changed nothing, and leaving the bump in
+            place would make the fallback restore probe read it as an explicit
+            choice and silently abandon restoring the primary — the session
+            would stay on the fallback with no card and no probe.
+
+            COMPARE-AND-SWAP, not unconditional (local review finding on
+            eb3cf067): both locks make an interleaved pick impossible, so this
+            is a backstop against any writer outside them. Only restore when
+            the state is still exactly ours (our bump, our model); the check
+            and both writes are synchronous, so they are atomic on the event
+            loop.
+            """
             if slot._model_pick_gen == prior_pick_gen + 1 and slot.model == model_name:
                 slot.model = prior_model
                 slot._model_pick_gen = prior_pick_gen
+
+        def _live_serves_target(candidate: object) -> bool:
+            """True when the live session's BACKEND-RESOLVED model already
+            equals the requested wire id — the truth-based success exception.
+
+            Not identity guessing: dispatch captures slot.model at its call
+            site and registers the session only after provider.start(), so
+            neither identity nor registration time proves anything; the
+            served model does. A True here means slot.model is consistent
+            with what actually runs — the partially-applied live switch
+            (set_model landed, then the effort reapply failed) — so rollback
+            would publish the OLD model over a live session running the NEW
+            one, and a teardown would kill it. Defined once and consumed by
+            BOTH the pre-reset busy re-check and the post-decline
+            disambiguation, so the two spellings cannot diverge.
+            """
+            if not isinstance(candidate, AcpProvider):
+                return False
+            wire = _wire_model_id(candidate, model_name)
+            if not wire:
+                return False
+            if candidate.served_model == wire:
+                return True
+            if wire == "auto":
+                # AcpProvider.served_model collapses the "auto" sentinel to ""
+                # on purpose (the fallback canary must never probe a model the
+                # backend did not resolve), so a landed switch TO Auto is
+                # invisible through it. The session client keeps the raw id —
+                # after set_model("auto") lands the handle prefers that
+                # explicit assignment — so read it unfiltered for this one
+                # value (the same literal _wire_model_id hands out for Auto).
+                # Any other non-match stays False (fail-closed).
+                raw = getattr(candidate.client, "served_model", "")
+                return str(raw or "").strip() == wire
+            return False
+
+        # Set on the reset path when the old session's teardown RAISED after
+        # the pop: the switch is committed, the response carries an advisory
+        # warning (agent-handler precedent via _reset_slot_session_or_warn).
+        teardown_incomplete = False
+        try:
+            went_live = await _try_live_model_switch(name, slot, provider, model_name)
+        except AcpModelUnavailable as exc:
+            # The live session refused the pick as unavailable to this account.
+            # Roll the slot back so the picker keeps showing what is actually
+            # running, and answer 4xx — deliberately NOT the reset fallback
+            # below, which would destroy the conversation and cold-start on a
+            # DIFFERENT model while reporting success. Only the session that
+            # owns the advertised list gets to make this call, so there is no
+            # pre-emptive gate here to go stale. The rollback runs under the
+            # locks, so no serialized successor can observe the transient value.
+            _rollback_pick()
             logger.warning("Slot %s model rejected: %s", name, exc)
             return web.json_response({"error": str(exc), "code": "model_unavailable"}, status=400)
+        if effective_session_key(slot) != session_key:
+            # The slot was bound to a different session while the live switch
+            # awaited its provider RPCs (a cron/workflow slot gets linked when
+            # its first result is injected). Whatever set_model did landed on
+            # a session the slot no longer runs on, and resetting the key this
+            # request resolved would tear down (or "succeed" against) the
+            # wrong session — either way committing would advertise the new
+            # model over a session this handler never touched. Roll back and
+            # answer 409; the retry resolves the current binding.
+            _rollback_pick()
+            return web.json_response(
+                {"error": "slot session was rebound during the switch", "code": "session_rebound"},
+                status=409,
+            )
         if went_live:
             _broadcast_context_reset(state, slot.key, provider)
         else:
+            # LAST-INSTANT busy re-check — the invariant all the review rounds
+            # on this handler converge on: no destructive step may run while a
+            # turn can be live, so idleness must be established within a
+            # NO-AWAIT window immediately before the teardown, and the atomic
+            # skip_if_busy decline covers only that microsecond residue. The
+            # pre-check above is separated from this point by
+            # _try_live_model_switch's provider RPCs (seconds on a slow
+            # backend), so a send may have started — and even posted an
+            # ask_question card — since it ran; _reset_slot_session clears
+            # pending waits BEFORE its atomic decline (its docstring's safety
+            # argument assumes a caller-side busy check microseconds old), so
+            # entering it busy would falsely reject that turn's cards even
+            # though the reset itself declines. Busy here → roll back and
+            # answer the same 409 the pre-check gives.
+            recheck = state.sessions.get_provider(session_key)
+            if slot.running or (isinstance(recheck, LLMProvider) and recheck.has_active_turn()):
+                if _live_serves_target(recheck):
+                    # The turn that slipped in runs on a session that already
+                    # serves the target (set_model landed before the effort
+                    # reapply failed): slot.model is truthful, so report
+                    # success without teardown — rolling back would publish
+                    # the old model while the live turn streams under the new
+                    # one.
+                    logger.warning(
+                        "Slot %s model switch: live session already serves the "
+                        "target; skipping the reset under its in-flight turn",
+                        name,
+                    )
+                    _broadcast_context_reset(state, slot.key, recheck)
+                    state.push_slots_update()
+                    return web.json_response({"ok": True, "model": model_name})
+                _rollback_pick()
+                return web.json_response(
+                    {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                )
+            # Children guard, shared with reload/continue: the reset tears
+            # down the runtime attached sub-agents run on, so a parent that is
+            # idle but still has children (running, queued, or with a
+            # completion event in flight) must refuse rather than discard
+            # their work. Same probe block as api_chat_slot_reload; only the
+            # rollback is added here because this handler committed first.
+            children_409 = _subagents_attached_response(state, slot, session_key, "slot_model")
+            if children_409 is not None:
+                _rollback_pick()
+                return children_409
             logger.info(
                 "Slot %s model switched to %r, resetting session", name, model_name or "auto"
             )
-            await _reset_slot_session(state, slot, session_key)
+            # skip_if_busy: the has_active_turn() 409 above is a best-effort
+            # fast path — message dispatch does not take slot._lock, so a turn
+            # can start between that check and this reset. SessionManager.reset
+            # evaluates busyness atomically with the session pop (the same
+            # authoritative-backstop split api_chat_slot_reload documents), so
+            # a turn that slipped into the window is declined here instead of
+            # torn down mid-stream.
+            reset_ok = await _reset_slot_session_or_warn(
+                state, slot, session_key, switch_kind="model"
+            )
+            if reset_ok is None:
+                # Teardown raised after the session pop: the switch is
+                # COMMITTED (see _reset_slot_session_or_warn), so the answer
+                # is the committed state with an advisory warning — never a
+                # 500 that strands clients on the old value. Deliberately no
+                # _rollback_pick(): rollback is only for the decline/409
+                # paths, where nothing was torn down. NOT an early return:
+                # the rebind guard below must still run (GPT review finding),
+                # so a slot rebound during the raising await answers the same
+                # rollback + 409 as any other rebind.
+                teardown_incomplete = True
+            elif not reset_ok:
+                # Disambiguate the decline FAIL-CLOSED — with one truth-based
+                # exception checked first. Provider identity or registration
+                # time cannot prove which model a live session runs: dispatch
+                # captures slot.model at its call site but registers the
+                # session only after a multi-second provider.start(), so a
+                # session registered after the commit may still carry the old
+                # model. A false 409 is retryable and costs nothing; a false
+                # success strands a live session on the old model under the
+                # new slot.model.
+                busy_provider = state.sessions.get_provider(session_key)
+                live_serves_target = _live_serves_target(busy_provider)
+                if live_serves_target:
+                    # See _live_serves_target: slot.model is consistent with
+                    # what actually runs, so success without teardown is the
+                    # truthful answer; the un-pushed effort override is
+                    # already persisted on the slot and applies on the next
+                    # cold start (same degradation the effort handler's defer
+                    # branch accepts).
+                    logger.warning(
+                        "Slot %s model switch: live session already serves the "
+                        "target; declined reset left it in place (effort "
+                        "override, if any, applies on the next cold start)",
+                        name,
+                    )
+                if not live_serves_target and isinstance(busy_provider, LLMProvider):
+                    if busy_provider.has_active_turn():
+                        # A turn slipped in: roll back the commit and answer
+                        # the same 409 the fast path gives, leaving the turn
+                        # running whichever model it captured.
+                        _rollback_pick()
+                        return web.json_response(
+                            {"error": "a turn is in flight", "code": "turn_in_flight"},
+                            status=409,
+                        )
+                    # A live IDLE session declined the reset (its turn ended
+                    # before this re-read). Reporting success would leave that
+                    # process alive on whatever model it captured. Tearing
+                    # down an idle session is always safe — history lives on
+                    # the slot, not in the process — so retry once
+                    # (api_chat_slot_reload's template for this exact race); a
+                    # second decline means another turn is genuinely racing,
+                    # which is the turn-in-flight case again.
+                    reset_ok = await _reset_slot_session_or_warn(
+                        state, slot, session_key, switch_kind="model"
+                    )
+                    if reset_ok is None:
+                        # Retry teardown raised: same committed-switch answer
+                        # as the first attempt, and same fall-through to the
+                        # rebind guard below.
+                        teardown_incomplete = True
+                    elif not reset_ok:
+                        _rollback_pick()
+                        return web.json_response(
+                            {"error": "a turn is in flight", "code": "turn_in_flight"},
+                            status=409,
+                        )
+                # No live provider: there was no registered session to tear
+                # down — the next message cold-starts under the new model,
+                # which is exactly what the reset would have arranged.
+            if effective_session_key(slot) != session_key:
+                # Same check after the reset await(s) as after the live
+                # switch: the session this request tore down is no longer
+                # the slot's, so the commit would advertise the new model
+                # over a session that never saw the switch. The teardown
+                # itself was harmless (that session was idle and no longer
+                # bound); roll back the commit and let the retry resolve the
+                # current binding.
+                _rollback_pick()
+                return web.json_response(
+                    {
+                        "error": "slot session was rebound during the switch",
+                        "code": "session_rebound",
+                    },
+                    status=409,
+                )
             _broadcast_context_reset(state, slot.key, None)
-        state.push_slots_update()
-        return web.json_response({"ok": True, "model": model_name})
+    state.push_slots_update()
+    model_resp: dict = {"ok": True, "model": model_name}
+    if teardown_incomplete:
+        # Advisory only — the switch itself succeeded and the response
+        # carries the committed state (agent-handler precedent).
+        model_resp["warning"] = _TEARDOWN_INCOMPLETE_WARNING
+    return web.json_response(model_resp)
+
+
+# Per-slot transaction locks for the autocompact endpoint. The write span
+# below contains awaits (body read, forced save), so two concurrent POSTs for
+# one slot can interleave: each captures the other's value as its rollback
+# snapshot, and a failed request's compare-and-swap rollback can then erase a
+# newer request's acknowledged write (value equality cannot identify
+# ownership when both requests carry the same pct). Serializing the whole
+# reauthorize -> pin -> mutate -> persist -> rollback -> live-map span per
+# slot makes the rollback unambiguous: only one request is ever inside the
+# span, so a rollback can only undo its own write. WeakValueDictionary so an
+# idle slot's lock is reclaimed with its last reference. Keyed by the
+# TRANSCRIPT (slot_history_key), not the slot: channel-linked aliases resolve
+# distinct slot names onto one file, and two requests through different alias
+# slots must serialize against each other or the loser's rollback/flush can
+# overwrite the winner's acknowledged durable write. A rebind mid-request is
+# handled by the expected_history_key pin and the post-persist
+# reauthorization, not by the lock key.
+_autocompact_txn_locks: "weakref.WeakValueDictionary[str, asyncio.Lock]" = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _autocompact_txn_lock(history_key: str) -> asyncio.Lock:
+    lock = _autocompact_txn_locks.get(history_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _autocompact_txn_locks[history_key] = lock
+    return lock
+
+
+async def api_chat_slot_autocompact(request: web.Request) -> web.Response:
+    """GET/POST /api/chat/slots/{slot}/autocompact — per-session compact threshold.
+
+    GET returns the slot's override (``pct``, null when it follows the global),
+    the current global (``global_pct``), and the valid range. POST takes
+    ``{"pct": <number|null>}``: a number sets this session's override (rejected
+    outside the documented range, matching the global knob's PATCH validation),
+    null clears it back to the global. The value applies to the live session
+    immediately via the SessionManager override map and persists with the slot
+    metadata, so it survives gateway restarts.
+    """
+    state: DashboardState = request.app["state"]
+    name = request.match_info["slot"]
+    slot = state._slots.get(name)
+    if not slot:
+        return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
+    # Session-aware ownership gate, not the slot-only check: the POST writes the
+    # override keyed by effective_session_key(slot), so a linked app-owned slot
+    # (channel stem) would let an app modify a foreign session's threshold and
+    # metadata. _check_slot_app_ownership authorizes the key the write actually
+    # lands on, same as /context and /note.
+    request_app = request.get("app", "")
+    denied = _check_slot_app_ownership(slot, name, request_app, "slot_autocompact")
+    if denied is not None:
+        return denied
+    if request.method == "GET":
+        return web.json_response(
+            {
+                "pct": slot.autocompact_pct,
+                "global_pct": published_autocompact_pct(),
+                "min": AUTOCOMPACT_PCT_MIN,
+                "max": AUTOCOMPACT_PCT_MAX,
+            }
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object", "code": "invalid_json"}, status=400
+        )
+    if "pct" not in body:
+        return web.json_response(
+            {"error": "pct is required (number or null)", "code": "pct_required"}, status=400
+        )
+    pct = body["pct"]
+    if pct is not None:
+        # bool is an int subclass; True would otherwise read as 1.0 and be
+        # rejected by range, but reject it explicitly for a clear error.
+        if isinstance(pct, bool) or not isinstance(pct, (int, float)):
+            return web.json_response(
+                {"error": "pct must be a number or null", "code": "pct_not_a_number"}, status=400
+            )
+        try:
+            pct = float(pct)
+        except OverflowError:
+            # An int too large for a float; out of range by definition.
+            return web.json_response(
+                {"error": "pct must be a finite number", "code": "pct_not_finite"}, status=400
+            )
+        if pct != pct:  # NaN
+            return web.json_response(
+                {"error": "pct must be a finite number", "code": "pct_not_finite"}, status=400
+            )
+        if not (AUTOCOMPACT_PCT_MIN <= pct <= AUTOCOMPACT_PCT_MAX):
+            return web.json_response(
+                {
+                    "error": (
+                        f"pct must be between {AUTOCOMPACT_PCT_MIN:g} "
+                        f"and {AUTOCOMPACT_PCT_MAX:g}"
+                    ),
+                    "code": "pct_out_of_range",
+                },
+                status=400,
+            )
+    # Persist via the same forced-save mechanism every other slot-metadata
+    # route uses (tags / folders / pin: save_slot_off_loop(force=True) -- the
+    # empty-window merge for message-less slots, the full save otherwise;
+    # both read the slot fields INSIDE the transcript's cross-process lock
+    # and run the delete-won guard, so a permanent delete racing this write
+    # is refused by main's own tested path). A never-saved tab's override
+    # lives only in memory until the tab first persists, exactly like its
+    # model: the empty-window merge lands only into an existing line.
+    #
+    # Transactional shape (mirrors the tag-vocabulary delete): mutate the
+    # slot field, confirm the durable write with best_effort=False, and on
+    # any failure roll the field back and return a coded error -- the
+    # SessionManager override map (the live gate) is only touched after the
+    # persist verdict, so a failed request leaves live behavior unchanged.
+    # Serialize the whole transaction per slot: with awaits inside the write
+    # span, a second concurrent POST would otherwise capture this one's value
+    # as its rollback snapshot, and value-based rollback cannot tell "my
+    # write survived" from "someone else wrote the same number". Under the
+    # lock exactly one request is inside the span, so a rollback can only
+    # undo its own write. The client's per-slot promise chain orders writes
+    # from ONE client; this lock is the cross-client half. Keyed by the
+    # TRANSCRIPT so two alias slots resolving onto one file serialize too.
+    locked_history_key = slot_history_key(slot)
+    async with _autocompact_txn_lock(locked_history_key):
+        stale = _reauthorize_after_await(state, slot, name, request_app, "slot_autocompact")
+        if stale is not None:
+            return stale
+        # Pin the write to the transcript this authorization decision covered:
+        # the persist await below is a rebind window, and the save derives its
+        # target from live routing at write time. expected_history_key makes the
+        # save refuse (False, nothing written) if the routing moved, so the
+        # durable write can never land on a transcript this request was not
+        # authorized against. No await between the reauth above and this read.
+        authorized_history_key = slot_history_key(slot)
+        if authorized_history_key != locked_history_key:
+            # The slot was rebound between the lock-key read and acquisition:
+            # this request holds the OLD transcript's lock while the write
+            # would target the new one, so the serialization guarantee does
+            # not cover it. Same disposition as the mid-persist rebind below.
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
+        prior_pct = slot.autocompact_pct
+        slot.autocompact_pct = pct
+        if state.conversation_log:
+            try:
+                applied = await save_slot_off_loop(
+                    state,
+                    slot,
+                    force=True,
+                    best_effort=False,
+                    expected_history_key=authorized_history_key,
+                )
+            except Exception:
+                # Roll back this request's write and mark dirty so the
+                # periodic flush reconverges the durable record to the live
+                # field (a non-endpoint save may have durably written this
+                # rejected value before the failure).
+                slot.autocompact_pct = prior_pct
+                slot._dirty = True
+                logger.exception("Slot %s autocompact_pct persist failed", name)
+                return web.json_response(
+                    {"error": "could not persist threshold", "code": "persist_failed"}, status=500
+                )
+            if not applied:
+                # The save refused without writing: either the delete-won guard
+                # (session permanently deleted while the save awaited the lock)
+                # or the routing-moved pin (slot rebound to another transcript
+                # mid-request). Do not resurrect, do not write elsewhere, do not
+                # mutate live state.
+                slot.autocompact_pct = prior_pct
+                return web.json_response(
+                    {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+                )
+            # Mirror the COMMITTED value to every live slot whose current
+            # transcript key is the one this write landed on — not just the
+            # requesting slot: channel-linked aliases resolve distinct slot
+            # names onto one file, and a sibling left holding the old value
+            # would persist it back over this acknowledged commit on its next
+            # flush (its ordinary save writes ``autocompact_pct``
+            # unconditionally from its own field). Membership is re-derived
+            # here, NOT assumed: a slot rebound during the persist no longer
+            # writes this file, and mirroring it would apply a live change its
+            # reauthorization is about to deny. Snapshot values() — the event
+            # loop may mutate the dict between iterations. Priors are recorded
+            # so the confirm-save failure paths below can undo the mirror.
+            mirrored: list = []
+            for other in list(state._slots.values()):
+                if other is not slot and slot_history_key(other) == authorized_history_key:
+                    mirrored.append((other, other.autocompact_pct))
+                    other.autocompact_pct = pct
+            # The mirror runs on the event loop AFTER the persist returned, but
+            # a sibling's already-queued flush can acquire the transcript's
+            # file lock in the executor BEFORE the loop resumes here and write
+            # its then-stale field over the acknowledged commit (executor
+            # threads do not wait for the event loop). The mirror above fixes
+            # every live field; this second confirmed save re-orders the
+            # durable record after any such interleaved stale write — the file
+            # lock serializes it behind the sibling's write, and every field it
+            # can read is now the committed value. Same pin, same dispositions.
+            try:
+                confirmed = await save_slot_off_loop(
+                    state,
+                    slot,
+                    force=True,
+                    best_effort=False,
+                    expected_history_key=authorized_history_key,
+                )
+            except Exception:
+                for other, other_prior in mirrored:
+                    if slot_history_key(other) == authorized_history_key:
+                        other.autocompact_pct = other_prior
+                        other._dirty = True
+                slot.autocompact_pct = prior_pct
+                slot._dirty = True
+                logger.exception("Slot %s autocompact_pct confirm-persist failed", name)
+                return web.json_response(
+                    {"error": "could not persist threshold", "code": "persist_failed"}, status=500
+                )
+            if not confirmed:
+                for other, other_prior in mirrored:
+                    if slot_history_key(other) == authorized_history_key:
+                        other.autocompact_pct = other_prior
+                        other._dirty = True
+                slot.autocompact_pct = prior_pct
+                return web.json_response(
+                    {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+                )
+        # INVARIANT for this handler: every write is immediately preceded by an
+        # authorization decision with NO await between them. The persist await is
+        # a rebind window (same mechanism as the body read), so re-decide before
+        # the live override mutation; the slot-field change above rolls back for
+        # a rebound slot, whose successor re-derives its state on restore.
+        stale = _reauthorize_after_await(state, slot, name, request_app, "slot_autocompact")
+        if stale is not None:
+            slot.autocompact_pct = prior_pct
+            return stale
+        # Reauthorization can PASS after a rebind the pin never saw: a rebind
+        # landing after the save's internal routing read leaves the durable
+        # write correctly on the authorized transcript while the slot now
+        # resolves to a different session the caller may also own. Seeding the
+        # live map from effective_session_key(slot) would then apply the
+        # threshold to a session whose transcript never received it. Refuse:
+        # the committed transcript's siblings were mirrored above and its live
+        # override re-seeds on hydration; this slot's successor re-derives.
+        if slot_history_key(slot) != authorized_history_key:
+            slot.autocompact_pct = prior_pct
+            return web.json_response(
+                {"error": "session was deleted or rebound", "code": "session_gone"}, status=409
+            )
+        live_pct = slot.autocompact_pct
+        state.sessions.set_autocompact_pct(effective_session_key(slot), live_pct)
+        logger.info("Slot %s autocompact_pct set to %r", name, live_pct)
+        return web.json_response(
+            {"ok": True, "pct": live_pct, "global_pct": published_autocompact_pct()}
+        )
 
 
 async def api_chat_slots_model(request: web.Request) -> web.Response:
@@ -4470,19 +6769,21 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
 
     Body: {"model": "<name>" | "", "skip_running": bool (default True)}.
     "" selects the provider/auto default. Applies the model to every slot
-    whose model differs, resetting each affected slot's session — a model
-    switch always resets, same as ``api_chat_slot_model``. Slots mid-turn are
-    skipped when ``skip_running`` is true to avoid the model-switch-mid-stream
-    duplicate-content bug; pass ``skip_running: false`` to force
-    every slot. Returns the slot keys that were switched / skipped / unchanged /
+    whose model differs, resetting each affected slot's session. Mid-turn
+    policy deliberately differs from ``api_chat_slot_model``: the single-slot
+    handler prefers a live in-place switch and answers 409 for a slot
+    mid-turn, while this bulk endpoint always resets and skips mid-turn slots
+    when ``skip_running`` is true (the default) — passing ``skip_running:
+    false`` is an explicit opt-in that still tears down in-flight turns.
+    Returns the slot keys that were switched / skipped / unchanged /
     failed; a per-slot reset failure is isolated (that slot is reported in
     ``failed`` and keeps its old model) rather than aborting the whole switch.
     """
     state: DashboardState = request.app["state"]
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     model_name = _normalize_model(body.get("model", ""))
     reason = _model_rejected_reason(model_name)
     if reason:
@@ -4514,33 +6815,139 @@ async def api_chat_slots_model(request: web.Request) -> web.Response:
         # user bypasses the ownership check.
         if not is_dashboard_user and slot._app != request_app:
             continue
-        # Same transaction lock as the single-slot pick (verifier finding on
-        # 9f182b0c): without it, a bulk select of a model that a single-slot
-        # pick is speculatively holding reads equality and reports the slot
-        # unchanged — then the single pick's failure rolls it back, leaving
-        # the bulk response claiming a model the slot does not have.
-        async with slot._model_pick_lock:
+        # Same three locks, same order, as the single-slot pick (slot._lock
+        # outer, _model_pick_lock inner). ALL classification happens inside
+        # them, equality FIRST: a serialized switch commits slot.model before
+        # its provider RPC and rolls it back on failure, so an unlocked
+        # equality read could match that transient value and report a slot
+        # "unchanged" for a model that is then rolled back (verifier finding
+        # on 9f182b0c) — and an unlocked running-check ahead of the equality
+        # check would classify a running slot that already uses the requested
+        # model as skipped_running instead of unchanged. Queuing on the locks
+        # is cheap: turns do not hold slot._lock, so a running slot's lock
+        # only contends with another switch handler.
+        #
+        # The session lock is entered AFTER slot._lock, once the key below is
+        # known (see _slot_switch_session_lock): per-slot locks are disjoint
+        # across aliases, so without it a single-slot switch through another
+        # alias could reset this same session concurrently.
+        async with contextlib.AsyncExitStack() as _stack:
+            await _stack.enter_async_context(slot._lock)
+            # The session this slot's turns run on — effective_session_key,
+            # never _history_key_for (see api_chat_slot_model), resolved
+            # INSIDE the lock so a binding that lands while this iteration
+            # waits on it is what the reset addresses.
+            session_key = effective_session_key(slot)
+            # Now serialize against every OTHER alias slot on this session,
+            # keyed on the value resolved just above (see
+            # _slot_switch_session_lock): per-slot locks are disjoint across
+            # aliases. Entered per iteration and released with the stack, so
+            # two alias slots in ONE bulk request queue in turn rather than
+            # re-entering the same lock.
+            await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+            await _stack.enter_async_context(slot._model_pick_lock)
+            if not is_dashboard_user and session_key != _history_key_for(name):
+                # Slot ownership does not imply ownership of a linked channel
+                # session (the cancel routes' second condition): an app caller
+                # does not get to switch the model a channel thread runs on.
+                # Skipped silently, like every other slot the app does not own.
+                continue
             if slot.model == model_name:
                 unchanged.append(name)
                 continue
             if skip_running and slot.running:
                 skipped_running.append(name)
                 continue
-            # Reset before flipping the model and isolate per-slot failures: if the
-            # reset raises, leave slot.model untouched so the slot is never left on
-            # the new model with stale history (the model/history inconsistency), and a
-            # single failure doesn't abort the whole bulk switch.
+            # Last-instant busy re-check on the EFFECTIVE session, same as the
+            # single-slot handler: slot.running only sees turns dispatched
+            # through this slot's task, and a channel-linked slot's turn runs
+            # under its linked key without setting it. _reset_slot_session
+            # clears pending waits BEFORE its atomic decline (its docstring's
+            # safety argument assumes a caller-side busy check microseconds
+            # old), so entering it against a live linked turn would reject
+            # that turn's cards even though the reset itself declines.
+            live_now = state.sessions.get_provider(session_key)
+            if skip_running and isinstance(live_now, LLMProvider) and live_now.has_active_turn():
+                skipped_running.append(name)
+                continue
+            # Children guard (api_chat_slot_reload's): the reset tears down the
+            # runtime attached sub-agents run on, so a parent with children
+            # running, queued, or mid-delivery is skipped rather than have
+            # their work discarded — regardless of skip_running, which speaks
+            # to the parent's own turn, not to its children.
+            if subagents_attached(state, slot, session_key, "slots_model"):
+                skipped_running.append(name)
+                continue
+            # Reset before flipping the model and isolate per-slot failures: if
+            # the reset raises, leave slot.model untouched so the slot is never
+            # left on the new model with stale history (the model/history
+            # inconsistency), and a single failure doesn't abort the whole bulk
+            # switch. skip_if_busy mirrors skip_running: when the caller asked
+            # to skip running slots, a turn that started AFTER the checks above
+            # (message dispatch does not take slot._lock) is declined at the
+            # authoritative point — SessionManager.reset evaluates busyness
+            # atomically with the session pop — instead of being torn down;
+            # skip_running=false keeps its documented force semantics.
             try:
-                await _reset_slot_session(state, slot, _history_key_for(name))
+                reset_ok = await _reset_slot_session(
+                    state, slot, session_key, skip_if_busy=skip_running
+                )
+                if skip_running and not reset_ok:
+                    if slot.running:
+                        # A first send slipped into the reset await and is still
+                        # inside its multi-second provider.start(): visible to
+                        # slot.running (set at dispatch) but not yet to
+                        # get_provider, so the provider ladder below would read
+                        # "no live provider" and commit over a session that
+                        # captured the OLD model (this handler commits AFTER the
+                        # reset). Classify it as the in-lock pre-check would have.
+                        skipped_running.append(name)
+                        continue
+                    busy_provider = state.sessions.get_provider(session_key)
+                    if isinstance(busy_provider, LLMProvider):
+                        if busy_provider.has_active_turn():
+                            # A turn slipped into the check window: classify it
+                            # the same as the pre-check would have, leaving the
+                            # turn (and the slot's model) untouched.
+                            skipped_running.append(name)
+                            continue
+                        # A live IDLE session declined the reset: the
+                        # slipped-in turn already finished before the re-read.
+                        # This handler commits AFTER the reset, so that session
+                        # is still on the old model — committing over it would
+                        # create the exact model/history inconsistency the
+                        # ordering exists to prevent. Retry once
+                        # (api_chat_slot_reload's template); a second decline
+                        # means another turn is genuinely racing. The retry
+                        # runs INSIDE this try so a teardown that raises keeps
+                        # the per-slot failure isolation: the slot lands in
+                        # failed with its model untouched instead of aborting
+                        # the whole bulk switch with a 500.
+                        reset_ok = await _reset_slot_session(
+                            state, slot, session_key, skip_if_busy=True
+                        )
+                        if not reset_ok:
+                            skipped_running.append(name)
+                            continue
+                    # No live provider: no session to tear down — the next
+                    # message cold-starts under the new model.
             except Exception:
                 logger.error("Bulk model switch: session reset failed for %s", name, exc_info=True)
                 failed.append(name)
                 continue
+            if effective_session_key(slot) != session_key:
+                # The slot was bound to a different session during the reset
+                # await: the session torn down is no longer the slot's, so
+                # committing would advertise the new model over one that
+                # never saw the switch. Nothing to roll back (bulk commits
+                # after the reset); report it as skipped so the caller retries.
+                skipped_running.append(name)
+                continue
             slot.model = model_name
             # Explicit pick (bulk): same generation bump as the single-slot pick.
             slot._model_pick_gen += 1
-        _broadcast_context_reset(state, slot.key, None)
-        switched.append(name)
+            _broadcast_context_reset(state, slot.key, None)
+            switched.append(name)
 
     if switched:
         logger.info(
@@ -4587,10 +6994,10 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_reasoning_effort")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     effort = body.get("reasoning_effort", "")
     valid_efforts = get_reasoning_effort_values()
     if not isinstance(effort, str) or effort not in valid_efforts:
@@ -4600,17 +7007,51 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             },
             status=400,
         )
+    if slot.is_remote:
+        # Validated against the LOCAL level set above, which is safe because a
+        # bound session is version-gated to a peer running this same build — the
+        # levels are an enumeration in the code, not per-machine config. The peer
+        # re-validates regardless; this only keeps an obvious typo off the wire.
+        return await _apply_remote_pick(
+            request, state, slot, "reasoning_effort", {"reasoning_effort": effort}
+        )
     # Same serialization + transactional ordering as the agent switch: the
     # awaits below yield the event loop, so the section runs under the slot's
     # lock, and the slot is mutated only AFTER the switch actually took
     # effect (live update, deferral, or reset) — a failed request provably
     # changed nothing.
-    async with slot._lock:
+    # Two locks, in the order documented at _slot_switch_session_lock:
+    # slot._lock, then the session lock. An ExitStack because the session
+    # lock's KEY is only known after the in-lock read below, and locking on
+    # any earlier read could leave this holding the wrong session lock.
+    async with contextlib.AsyncExitStack() as _stack:
+        await _stack.enter_async_context(slot._lock)
+        # The session the switch will probe and, on the fallback path, reset —
+        # ``effective_session_key``, never ``_history_key_for`` (see
+        # api_chat_slot_model): a channel- or cron-born slot runs its turns
+        # under its linked key, and the dashboard-prefixed spelling names a
+        # session that never existed — the live-effort probe would see
+        # nothing and the reset would "succeed" against nothing while the
+        # live process kept the old effort. Resolved INSIDE the lock: the
+        # binding can land while this request waits on it.
+        session_key = effective_session_key(slot)
+        # Now serialize against every OTHER alias slot on this same session.
+        # slot._lock is created per _ChatSlot and so is DISJOINT across
+        # aliases. Keyed on the value resolved just above -- the same one the
+        # probe and reset below use -- so the lock provably guards them even if
+        # a binding landed while this request waited on slot._lock (see
+        # _slot_switch_session_lock).
+        await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+        # App isolation on the SESSION, not just the slot (the cancel routes'
+        # policy), BEFORE the same-value fast path so the denial is
+        # indistinguishable from a missing slot for every request shape.
+        denied = _app_cancel_denied(request, slot, "chat.slot_reasoning_effort", session_key)
+        if denied is not None:
+            return denied
         if slot.reasoning_effort == effort:
             return web.json_response({"ok": True, "reasoning_effort": effort})
         logger.info("Slot %s reasoning_effort switched to %r", name, effort or "default")
 
-        session_key = _history_key_for(name)
         provider = state.sessions.get_provider(session_key)
         _updated_live = False
         if isinstance(provider, AcpProvider) and provider.supports_effort():
@@ -4649,7 +7090,62 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             _updated_live = True
             logger.info("Slot %s effort persisted (model not effort-capable)", name)
 
+        if effective_session_key(slot) != session_key and _updated_live:
+            # The slot was bound to a different session while change_effort /
+            # clear_effort awaited its provider RPC. The push landed on the
+            # session the slot WAS bound to, and change_effort already
+            # persisted the per-model override + overlay — that cannot be
+            # unwound, so a 409 here would claim a rollback that did not
+            # happen and leave the slot value contradicting the persisted
+            # override. Commit the slot value (it is what the new binding's
+            # next cold start reads) and report the rebind as a warning.
+            slot.reasoning_effort = effort
+            state.push_slots_update()
+            return web.json_response(
+                {
+                    "ok": True,
+                    "reasoning_effort": effort,
+                    "warning": "slot session was rebound during the switch; "
+                    "the new binding applies on its next cold start",
+                }
+            )
+
         if not _updated_live:
+            if effective_session_key(slot) != session_key:
+                # Rebound while a FAILED live push awaited: the reset fallback
+                # below would tear down the wrong session, and nothing is
+                # committed yet on this path, so there is genuinely nothing
+                # to roll back — answer the same 409 the model/workspace
+                # handlers use so the retry resolves the current binding.
+                return web.json_response(
+                    {
+                        "error": "slot session was rebound during the switch",
+                        "code": "session_rebound",
+                    },
+                    status=409,
+                )
+            # Never tear down an in-flight turn (the model handler's policy,
+            # and the _cancel_target subtlety: a RUNNING turn owns a captured
+            # identity, so the key resolved above may not be the turn's).
+            # Re-probed here because the change_effort awaits above yielded
+            # the event loop; slot.running is checked first because a
+            # cold-starting first turn is invisible to get_provider. The
+            # effort-capable live provider's active turn never reaches this —
+            # the defer branch above already returned for it. A 409 is
+            # retryable once the turn completes; nothing is committed yet.
+            recheck = state.sessions.get_provider(session_key)
+            if slot.running or (isinstance(recheck, LLMProvider) and recheck.has_active_turn()):
+                return web.json_response(
+                    {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                )
+            # Children guard, shared with reload/model: the reset tears down
+            # the runtime attached sub-agents run on. Nothing is committed
+            # yet, so a refusal here changes nothing.
+            children_409 = _subagents_attached_response(
+                state, slot, session_key, "slot_reasoning_effort"
+            )
+            if children_409 is not None:
+                return children_409
             # No live session (or live update failed): reset so the next cold
             # start picks up the new effort via the provider factory/overlay.
             # The effort is committed BEFORE the reset: a message send landing
@@ -4660,19 +7156,114 @@ async def api_chat_slot_reasoning_effort(request: web.Request) -> web.Response:
             # value) and is reported as a success with a warning — a 500
             # would make the acting tab keep the OLD store value for a
             # switch that actually happened.
+            prior_effort = slot.reasoning_effort
             slot.reasoning_effort = effort
+            teardown_incomplete = False
+            reset_ok = True
             try:
-                await _reset_slot_session(state, slot, session_key)
-            except Exception:
-                logger.exception(
-                    "Slot %s reasoning_effort switch: old session teardown incomplete", name
+                # A POST-POP teardown raise does NOT undo the switch (the
+                # reset pops the session first, so every replacement runs the
+                # new value) and is answered as a success with a warning —
+                # but only once the helper has verified the raise came AFTER
+                # the session pop. A PRE-POP raise means the old session
+                # survives on the old effort, so the helper propagates it and
+                # this request restores the prior effort and answers 500.
+                # The helper resets with skip_if_busy=True, which keeps this
+                # handler's decline ladder below:
+                # SessionManager.reset evaluates busyness atomically with the
+                # session pop, so a turn that slipped into the residue (or
+                # holds the semaphore before its prompt is in flight, which
+                # has_active_turn cannot see) is declined here instead of torn
+                # down mid-stream. The helper's None verdict marks the
+                # degraded post-pop teardown; a bool verdict is the reset
+                # outcome the ladder reads.
+                reset_verdict = await _reset_slot_session_or_warn(
+                    state, slot, session_key, switch_kind="reasoning_effort"
                 )
+            except Exception:
+                # The identity probe proved the pop never happened: the old
+                # session is still alive on the old effort, so the committed
+                # value describes a switch that did not take and the acting
+                # tab keeps its OLD store value on the 500. Restore the prior
+                # effort (only if this request's write still stands) and
+                # re-push so clients and persisted state land on the truth,
+                # then let the raise escape as a 500.
+                if slot.reasoning_effort == effort:
+                    slot.reasoning_effort = prior_effort
+                slot._dirty = True
+                state.push_slots_update()
+                raise
+            if reset_verdict is None:
+                teardown_incomplete = True
+            else:
+                reset_ok = reset_verdict
+            if not reset_ok and not teardown_incomplete:
+                # Disambiguate the decline FAIL-CLOSED (the workspace
+                # handler's template): live provider mid-turn → roll back and
+                # 409; live IDLE provider → retry once; no live provider →
+                # nothing to tear down, the next message cold-starts under
+                # the new effort.
+                busy_provider = state.sessions.get_provider(session_key)
+                if isinstance(busy_provider, LLMProvider):
+                    if busy_provider.has_active_turn():
+                        slot.reasoning_effort = prior_effort
+                        return web.json_response(
+                            {"error": "a turn is in flight", "code": "turn_in_flight"},
+                            status=409,
+                        )
+                    # Retry through the same probing helper: a pre-pop raise on
+                    # the retry propagates (restore + 500) exactly as the first
+                    # attempt, and a post-pop raise becomes the committed 200 +
+                    # warning below.
+                    try:
+                        reset_verdict = await _reset_slot_session_or_warn(
+                            state,
+                            slot,
+                            session_key,
+                            switch_kind="reasoning_effort",
+                        )
+                    except Exception:
+                        if slot.reasoning_effort == effort:
+                            slot.reasoning_effort = prior_effort
+                        slot._dirty = True
+                        state.push_slots_update()
+                        raise
+                    if reset_verdict is None:
+                        teardown_incomplete = True
+                    else:
+                        reset_ok = reset_verdict
+                    if (
+                        not reset_ok
+                        and not teardown_incomplete
+                        and state.sessions.get_provider(session_key) is not None
+                    ):
+                        slot.reasoning_effort = prior_effort
+                        return web.json_response(
+                            {"error": "a turn is in flight", "code": "turn_in_flight"},
+                            status=409,
+                        )
+            if effective_session_key(slot) != session_key:
+                # Same check after the reset await as after the live push:
+                # the session torn down is no longer the slot's, so the
+                # commit would advertise an effort a session that never saw
+                # the switch does not run. The teardown itself was harmless
+                # (that session was idle and no longer bound); roll back and
+                # let the retry resolve the current binding.
+                slot.reasoning_effort = prior_effort
+                return web.json_response(
+                    {
+                        "error": "slot session was rebound during the switch",
+                        "code": "session_rebound",
+                    },
+                    status=409,
+                )
+            if teardown_incomplete:
                 state.push_slots_update()
                 return web.json_response(
                     {
                         "ok": True,
                         "reasoning_effort": effort,
-                        "warning": "old session teardown incomplete",
+                        "warning": _TEARDOWN_INCOMPLETE_WARNING,
                     }
                 )
         # Live-update and deferral paths commit here (the reset path already
@@ -4781,25 +7372,174 @@ async def api_chat_slot_workspace(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_workspace")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     ws_name = body.get("workspace", "default")
-    # Block workspace change after conversation has started
-    if slot.total_messages > 0:
-        return web.json_response(
-            {
-                "error": "Cannot change workspace after messages have been sent. Open a new session instead."
-            },
-            status=409,
+    if slot.is_remote:
+        # Same guard as the local path, then hand the pick to the peer.
+        # ``slot.project`` is deliberately left alone: it is a path on THIS
+        # machine (file search, @-mentions), and `default_project_dir` would
+        # write a local directory that has nothing to do with the peer's
+        # workspace. The peer resolves its own project from the name. No
+        # local session is reset, so this runs outside slot._lock (the
+        # effort handler's ordering).
+        if slot.total_messages > 0:
+            return web.json_response(
+                {
+                    "error": "Cannot change workspace after messages have been sent. Open a new session instead.",
+                    "code": "conversation_started",
+                },
+                status=409,
+            )
+        return await _apply_remote_pick(request, state, slot, "workspace", {"workspace": ws_name})
+    # Same serialization as the agent switch: the reset await yields the event
+    # loop, so the mutate-then-reset section runs under the slot's lock — an
+    # unlocked write here would interleave with the agent handler's locked
+    # compare-and-set on the same workspace/project fields, and two racing
+    # workspace switches could each reset against the other's half-applied
+    # state. Commit-before-reset ordering per the agent-handler template: a
+    # send landing while the reset await is in flight cold-starts a session
+    # from the slot's CURRENT bindings, so the new pair must already be
+    # visible.
+    # Two locks, in the order documented at _slot_switch_session_lock:
+    # slot._lock, then the session lock. An ExitStack because the session
+    # lock's KEY is only known after the in-lock read below, and locking on
+    # any earlier read could leave this holding the wrong session lock.
+    async with contextlib.AsyncExitStack() as _stack:
+        await _stack.enter_async_context(slot._lock)
+        # The session the reset tears down — effective_session_key, never
+        # _history_key_for (see api_chat_slot_model), resolved INSIDE the lock
+        # so a binding that lands while this request waits on it is what the
+        # reset addresses — with the same session-level app isolation the
+        # model handler applies.
+        session_key = effective_session_key(slot)
+        # Now serialize against every OTHER alias slot on this same session.
+        # slot._lock is created per _ChatSlot and so is DISJOINT across
+        # aliases. Keyed on the value resolved just above -- the same one the
+        # probe and reset below use -- so the lock provably guards them even if
+        # a binding landed while this request waited on slot._lock (see
+        # _slot_switch_session_lock).
+        await _stack.enter_async_context(_slot_switch_session_lock(session_key))
+        denied = _app_cancel_denied(request, slot, "chat.slot_workspace", session_key)
+        if denied is not None:
+            return denied
+        # Block workspace change after conversation has started. Checked
+        # INSIDE the lock: the guard is a check-then-act across an await, so
+        # an unlocked read could pass while a serialized switch this request
+        # waited on was still resetting.
+        if slot.total_messages > 0:
+            return web.json_response(
+                {
+                    "error": "Cannot change workspace after messages have been sent. Open a new session instead.",
+                    "code": "conversation_started",
+                },
+                status=409,
+            )
+        prior_workspace = slot.workspace
+        prior_project = slot.project
+        slot.workspace = ws_name
+        slot.project = default_project_dir(ws_name)
+        logger.info("Slot %s workspace switched to %r, resetting session", name, ws_name)
+        # skip_if_busy: the total_messages guard above is checked before this
+        # await, and message dispatch does not take slot._lock — a first send
+        # can slip into that window. SessionManager.reset evaluates busyness
+        # atomically with the session pop (the authoritative backstop
+        # api_chat_slot_reload documents), so the slipped-in turn is declined
+        # here instead of torn down mid-stream.
+        # Set when the old session's teardown RAISED after the pop: the
+        # switch is committed, the response carries an advisory warning
+        # (agent-handler precedent via _reset_slot_session_or_warn).
+        teardown_incomplete = False
+        reset_ok = await _reset_slot_session_or_warn(
+            state, slot, session_key, switch_kind="workspace"
         )
-    slot.workspace = ws_name
-    slot.project = default_project_dir(ws_name)
-    logger.info("Slot %s workspace switched to %r, resetting session", name, ws_name)
-    await _reset_slot_session(state, slot, _history_key_for(name))
+        if reset_ok is None:
+            # Teardown raised after the session pop: the switch is COMMITTED
+            # (see _reset_slot_session_or_warn), so the answer is the
+            # committed state with an advisory warning — never a 500 that
+            # strands clients on the old bindings. Deliberately no rollback
+            # of slot.workspace/slot.project: rollback is only for the
+            # decline/409 paths, where nothing was torn down. NOT an early
+            # return: the rebind guard below must still run (GPT review
+            # finding), so a slot rebound during the raising await answers
+            # the same rollback + 409 as any other rebind.
+            teardown_incomplete = True
+        elif not reset_ok:
+            # Disambiguate FAIL-CLOSED, same as the model handler: dispatch
+            # captures the slot bindings at its call site but registers the
+            # session only after a multi-second provider.start(), so no
+            # identity or registration-time reasoning can prove which
+            # bindings a live session carries. A false 409 is retryable; a
+            # false success strands a live session on the old bindings.
+            busy_provider = state.sessions.get_provider(session_key)
+            live_serves_target = False
+            if isinstance(busy_provider, AcpProvider) and slot.project:
+                # Truth-based check, mirroring the model handler: when the
+                # live session's actual working directory already equals the
+                # COMMITTED project, the session cold-started on the new
+                # bindings (a first send captured them after the commit) —
+                # rolling back would advertise the old workspace while the
+                # live process runs the new one. Success without teardown is
+                # the truthful answer.
+                live_serves_target = busy_provider.cwd == slot.project
+                if live_serves_target:
+                    logger.info(
+                        "Slot %s workspace switch: live session already runs under %r; "
+                        "declined reset left it in place",
+                        name,
+                        slot.project,
+                    )
+            if not live_serves_target and isinstance(busy_provider, LLMProvider):
+                if busy_provider.has_active_turn():
+                    # Roll back the commit (commit-before-reset means the new
+                    # pair is already visible) and answer the same 409 the
+                    # guard gives.
+                    slot.workspace = prior_workspace
+                    slot.project = prior_project
+                    return web.json_response(
+                        {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                    )
+                # A live IDLE session declined the reset. Tearing down an idle
+                # session is always safe, so retry once
+                # (api_chat_slot_reload's template); a second decline means
+                # another turn is genuinely racing.
+                reset_ok = await _reset_slot_session_or_warn(
+                    state, slot, session_key, switch_kind="workspace"
+                )
+                if reset_ok is None:
+                    # Retry teardown raised: same committed-switch answer as
+                    # the first attempt, and same fall-through to the rebind
+                    # guard below.
+                    teardown_incomplete = True
+                elif not reset_ok:
+                    slot.workspace = prior_workspace
+                    slot.project = prior_project
+                    return web.json_response(
+                        {"error": "a turn is in flight", "code": "turn_in_flight"}, status=409
+                    )
+            # No live provider: no registered session to tear down — the next
+            # message cold-starts under the new bindings.
+        if effective_session_key(slot) != session_key:
+            # The slot was bound to a different session during the reset
+            # await(s): the session torn down is no longer the slot's, so the
+            # committed bindings would describe a session that never saw the
+            # switch. Roll back and answer 409; the retry resolves the
+            # current binding.
+            slot.workspace = prior_workspace
+            slot.project = prior_project
+            return web.json_response(
+                {"error": "slot session was rebound during the switch", "code": "session_rebound"},
+                status=409,
+            )
     state.push_slots_update()
-    return web.json_response({"ok": True, "workspace": ws_name})
+    ws_resp: dict = {"ok": True, "workspace": ws_name}
+    if teardown_incomplete:
+        # Advisory only — the switch itself succeeded and the response
+        # carries the committed state (agent-handler precedent).
+        ws_resp["warning"] = _TEARDOWN_INCOMPLETE_WARNING
+    return web.json_response(ws_resp)
 
 
 async def api_chat_slot_project(request: web.Request) -> web.Response:
@@ -4812,14 +7552,24 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
     denied = _deny_cross_app_slot_access(request, slot, name, "slot_project")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     project = body.get("project", "")
     if not isinstance(project, str):
         return web.json_response({"error": "project must be a string"}, status=400)
     project = project.strip()
+    # Session-level app isolation BEFORE any filesystem probing: the
+    # isdir / sensitive-path / voice-runtime checks below answer differently
+    # for existing vs missing paths, so running them ahead of the denial
+    # would hand an app caller that owns a linked slot an unauthorized
+    # filesystem existence oracle. Best-effort read outside the lock — the
+    # locked re-check below stays authoritative for a binding that moves
+    # while this request waits on the lock.
+    denied = _app_cancel_denied(request, slot, "chat.slot_project", effective_session_key(slot))
+    if denied is not None:
+        return denied
     if project:
         project = os.path.realpath(os.path.expanduser(project))
         if not os.path.isdir(project):
@@ -4833,35 +7583,112 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
                 error="sensitive path",
             )
             return web.json_response({"error": "Access denied"}, status=403)
-    old_project = slot.project
-    slot.project = project
-    logger.info("Slot %s project set to %r", name, project)
-    sel().log_api_access(
-        caller=request.get("user", "dashboard"),
-        operation="chat_slot_project",
-        outcome="allowed",
-        resources=f"slot={name} project={project}",
-    )
-    # Track recent projects
-    if project:
-        try:
-            await asyncio.to_thread(_save_recent_project, project)
-        except Exception:
-            logger.warning("Failed to save recent project", exc_info=True)
-    # Reset the session so the next message cold-starts with the new CWD and
-    # picks up project-level .kiro/steering/**/*.md (mirrors api_chat_slot_agent).
-    # Only on an actual change — avoids a needless cold start on a no-op set.
-    #
-    # Deferred via a flag because this endpoint is reachable over loopback HTTP
-    # from inside the kiro-cli process group (the set_project MCP tool); an
-    # inline reset would killpg() the caller. Consumed in chat_runner.
-    if project != old_project:
-        slot._pending_reset_history_key = _history_key_for(name)
-        # Speculatively re-create the session rooted at the new project so the
-        # cwd change is paid during think-time. The eager task consumes the
-        # deferred reset itself, but only when no turn is running — the
-        # same killpg constraint that deferred the reset applies to it.
-        schedule_eager_spawn(state, slot)
+        # Pre-flight the voice-runtime workspace guard (issue #7392): a
+        # workspace that contains (or sits inside) the Kiro Crew data home is
+        # refused at agent spawn anyway, but only after the session exists and
+        # with a spawn-time stack trace. Reject it here, at the moment of
+        # choice, with the same actionable message. Off-loop: the check primes
+        # the runtime path cache (mkdir/realpath) on first use.
+        conflict = await asyncio.to_thread(voice_runtime_workspace_conflict, project)
+        if conflict is not None:
+            sel().log_api_access(
+                caller=request.get("user", "dashboard"),
+                operation="chat_slot_project",
+                outcome="denied",
+                resources=f"slot={name} project={project}",
+                error="voice runtime overlap",
+            )
+            return web.json_response(
+                {"error": conflict, "code": "workspace_overlaps_data_home"},
+                status=400,
+            )
+    # Same serialization as the agent/model/workspace switch handlers: this is
+    # the one remaining live HTTP mutator of slot.project (the MCP set_project
+    # directive in session_directive_apply also writes it, but from inside the
+    # slot's own running turn, where this lock is not an option), and unlocked
+    # it could interleave with a locked switch's mutate-then-reset section —
+    # the workspace handler's rollback would then erase a project pick that
+    # landed during its reset await. The lock only serializes the write; the
+    # reset stays DEFERRED via the flag (the killpg constraint below), so no
+    # reset is awaited while holding the lock beyond what the other switch
+    # handlers already hold.
+    async with slot._lock:
+        # The session the deferred reset will address — ``effective_session_key``,
+        # never ``_history_key_for`` (see api_chat_slot_model): a channel- or
+        # cron-born slot runs its turns under its linked key, and the
+        # dashboard-prefixed spelling names a session that never existed, so
+        # the deferred reset would "succeed" against nothing while the live
+        # process kept the old CWD. Resolved INSIDE the lock (a binding can
+        # land while this request waits on it), and the flag below carries
+        # THIS key — the one the app gate authorized — so authorization and
+        # action cannot disagree. session_directive_apply's set_project path
+        # already resolves the flag the same way.
+        session_key = effective_session_key(slot)
+        # App isolation on the SESSION, not just the slot (the cancel routes'
+        # policy): slot ownership does not imply ownership of a linked
+        # channel session, so an app caller may not repoint the project a
+        # channel thread runs under. Denied as an indistinguishable 404.
+        denied = _app_cancel_denied(request, slot, "chat.slot_project", session_key)
+        if denied is not None:
+            return denied
+        old_project = slot.project
+        # _CommitToken (identity-gated rollback), the agent handler's pattern:
+        # slot.project has unlocked writers (the in-turn set_project directive
+        # writes this field without the lock, and may legitimately write the
+        # very project this handler sets). A value compare-and-set rollback
+        # cannot tell such a same-text write from this handler's own commit and
+        # would erase it; a per-request identity token can.
+        committed_project = _CommitToken(project)
+        slot.project = committed_project
+        logger.info("Slot %s project set to %r", name, project)
+        sel().log_api_access(
+            caller=request.get("user", "dashboard"),
+            operation="chat_slot_project",
+            outcome="allowed",
+            resources=f"slot={name} project={project}",
+        )
+        # Track recent projects
+        if project:
+            try:
+                await asyncio.to_thread(_save_recent_project, project)
+            except Exception:
+                logger.warning("Failed to save recent project", exc_info=True)
+        # Reset the session so the next message cold-starts with the new CWD and
+        # picks up project-level .kiro/steering/**/*.md (mirrors api_chat_slot_agent).
+        # Only on an actual change — avoids a needless cold start on a no-op set.
+        #
+        # Deferred via a flag because this endpoint is reachable over loopback HTTP
+        # from inside the kiro-cli process group (the set_project MCP tool); an
+        # inline reset would killpg() the caller. Consumed in chat_runner.
+        if project != old_project:
+            if effective_session_key(slot) != session_key:
+                # The slot was bound to a different session while the
+                # recent-project save awaited: arming the flag with the key
+                # this request resolved would have the consumer tear down a
+                # session nobody is on while the slot's ACTUAL session keeps
+                # the old CWD — the exact stale-binding class this handler
+                # was converted to remove. Re-resolving here instead is not
+                # an option either: it would arm a key the app gate above
+                # never authorized. Roll back the commit (identity-gated on
+                # the _CommitToken — the in-turn set_project directive writes
+                # this field without the lock, and a same-value write must not
+                # be mistaken for this handler's own commit) and answer the
+                # same 409 the sibling switch handlers use.
+                if slot.project is committed_project:
+                    slot.project = old_project
+                return web.json_response(
+                    {
+                        "error": "slot session was rebound during the switch",
+                        "code": "session_rebound",
+                    },
+                    status=409,
+                )
+            slot._pending_reset_history_key = session_key
+            # Speculatively re-create the session rooted at the new project so the
+            # cwd change is paid during think-time. The eager task consumes the
+            # deferred reset itself, but only when no turn is running — the
+            # same killpg constraint that deferred the reset applies to it.
+            schedule_eager_spawn(state, slot)
     state.push_slots_update()
     return web.json_response({"ok": True, "project": project})
 
@@ -4928,6 +7755,37 @@ def _deny_cross_app_slot_access(
     return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
 
 
+def deny_non_owner_remote_operation(
+    request: web.Request, slot, operation: str
+) -> web.Response | None:
+    """403 unless the dashboard OWNER is driving this peer-bound slot, else None.
+
+    THE authorization chokepoint for peer-directed work. Every request that
+    spends the owner's tunnel credential — relaying a turn, stopping one, or
+    forwarding a header pick — passes through this one function, so a new
+    peer-directed route is authorized by construction rather than by whoever
+    remembers to copy a guard. ``test_remote_crew_execution`` asserts that
+    property statically against the relay entry points.
+
+    Why the existing guards are not enough. ``_deny_cross_app_slot_access``
+    returns ``None`` for any caller with an empty ``request["app"]`` — that is
+    its whole contract, "dashboard users pass". But ``send_dashboard_link``
+    mints ``generate_token(user_id, …)`` with ``app=""``, so a Slack-allowlisted
+    NON-owner holds exactly that shape: empty app, ``request["user"]`` different
+    from ``owner_id``. Against a local slot that is only the access the link
+    grants by design. Against a peer-bound slot it is the owner's SSH tunnel and
+    the owner's connected machine, which is the harm the create/capabilities
+    gates were added to prevent — so identity, not app scope, has to decide.
+
+    A LOCAL slot is untouched: the early return keeps the link's ordinary reach
+    intact, which is why this is safe to call unconditionally on every one of
+    these routes.
+    """
+    if not slot.is_remote:
+        return None
+    return deny_non_dashboard_caller(request, operation)
+
+
 def deny_non_dashboard_caller(request: web.Request, operation: str) -> web.Response | None:
     """403 unless this is the dashboard OWNER's own request, else None.
 
@@ -4936,9 +7794,11 @@ def deny_non_dashboard_caller(request: web.Request, operation: str) -> web.Respo
     dashboard users, the app name for app tokens), so an ABSENT key means the
     middleware did not run and must refuse rather than fall through.
 
-    An app claim of ``""`` is necessary but NOT sufficient. Both surfaces guarded
-    here act on owner-scoped resources — the card renders in the owner's composer
-    and the worktree allow-list is built from every slot's project — so identity
+    An app claim of ``""`` is necessary but NOT sufficient. Every surface guarded
+    here acts on owner-scoped resources — the card renders in the owner's composer,
+    the worktree allow-list is built from every slot's project, and (via
+    ``deny_non_owner_remote_operation``) a peer-bound slot spends the owner's own
+    tunnel credential on the owner's connected machine — so identity
     is checked with ``is_owner_dashboard_request``, the same predicate the source
     provider mutations use: the caller must match the configured ``owner_id``, or
     be a signed local bootstrap subject when no owner is configured (the
@@ -5001,12 +7861,10 @@ async def api_chat_slot_followup(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    if not isinstance(body, dict):
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     try:
         cleaned = validate_tool_args(body, SUGGEST_FOLLOWUP_SCHEMA)
     except ValidationError as exc:
@@ -5224,6 +8082,7 @@ async def _reconcile_slot_window(state: DashboardState, slot: "_ChatSlot") -> No
                 if isinstance(msg.get("meta"), dict)
                 else None
             ),
+            mint_mid=False,
         )
         carry_provenance(slot.messages[-1], msg)
         _attach_variants(slot, msg)
@@ -5317,7 +8176,9 @@ async def _live_slot_resume_response(
         window = _collapse_wire_rows(existing.messages)
         total = len(window)
         recent = window[-200:] if total > 200 else window
-        prepared = _prepare_messages(recent, existing.running)
+        prepared = _prepare_messages(
+            recent, existing.running, live_child=_live_child_instance(state, existing)
+        )
         # Raw index this window starts at: the frozen on-disk prefix plus the
         # in-memory rows it skipped. has_more is derived from the same number so
         # the flag cannot contradict the cursor -- counting only the in-memory
@@ -5377,10 +8238,10 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             error="app cannot access member slots",
         )
         return web.json_response({"error": "not found", "code": "slot_not_found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+    body, body_err = await read_bounded_json(request, allow_absent=True)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     history_key = body.get("key", name)
 
     # If slot already exists (active session), just return it — no duplicate.
@@ -5783,8 +8644,12 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
         slot.created_at = meta["created_at"]
     # The identity of the transcript this resume read — lets a later save
     # recognize a file recreated by another writer after a permanent delete
-    # (the delete-won guard in ``_save_slot_to_history``).
+    # (the delete-won guard in ``_save_slot_to_history``). The observed bit
+    # records that a hydration READ happened even when the metadata carries
+    # no created_at (legacy files): without it, the guard's evidence gate
+    # treats the slot as never-hydrated and skips the delete-won comparison.
     slot._disk_meta_created_at = str(meta.get("created_at") or "")
+    slot._disk_meta_observed = bool(meta)
     # On a member key the pin came from the BINDING at slot creation above and
     # metadata may not override it (same tamperable file the guard refused to
     # trust). On an ordinary key, mode="member" may not ride in either — the
@@ -5836,6 +8701,14 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
         # so a tampered/legacy JSONL can't seed a malformed sha that later
         # crashes the compare.
         slot.theme_consent_sha = normalize_theme_consent_sha(meta.get("theme_consent_sha"))
+    if meta.get("autocompact_pct") is not None:
+        # Restore the per-session compaction threshold, mirroring the
+        # persistence loaders: without this, a resumed slot's field stays None
+        # and the next save overwrites the persisted override with null, while
+        # the live gate silently falls back to the global.
+        slot.autocompact_pct = _validate_autocompact_pct(meta["autocompact_pct"])
+        if slot.autocompact_pct is not None and state.sessions:
+            state.sessions.set_autocompact_pct(effective_session_key(slot), slot.autocompact_pct)
     # Restore tags + the auto-tag once-flag (mirrors the persistence loaders).
     # Without the flag, resuming a session whose auto-tag the user removed
     # would re-run maybe_auto_tag on the next message and silently re-add it.
@@ -5884,6 +8757,7 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             meta=(
                 _redact_meta_for_role(role, m["meta"]) if isinstance(m.get("meta"), dict) else None
             ),
+            mint_mid=False,
         )
         # See the equivalent call in _rehydrate_slot_from_history: resume loads
         # the window that the next save re-serializes.
@@ -5906,7 +8780,9 @@ async def api_chat_slot_resume(request: web.Request) -> web.Response:
             # `total` is the full on-disk length here, so this already is the
             # raw index the next older page starts from.
             "next_before": total - len(recent),
-            "messages": _prepare_messages(recent, slot.running),
+            "messages": _prepare_messages(
+                recent, slot.running, live_child=_live_child_instance(state, slot)
+            ),
             "queue": [
                 {"id": q["id"], "content": _redact_for_display(q["content"])} for q in slot._queue
             ],
@@ -5934,11 +8810,41 @@ async def api_chat_mode(request: web.Request) -> web.Response:
     denied = deny_non_dashboard_caller(request, "chat_mode")
     if denied is not None:
         return denied
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     mode = body.get("mode", "normal")
+    # Governance gate: the ``approval_modes`` policy scope governs ``yolo`` and
+    # only ``yolo``. Refuse a denied mode here, before any mutation, so it is
+    # blocked regardless of the UI. ``normal`` is the interactive floor, and
+    # ``trust`` / ``trust_reads`` are non-deniable because their live consumption
+    # predicates are not gated -- ``approval_mode_permitted`` short-circuits all
+    # three, and a policy naming one is refused at parse time. Kept as a general
+    # mode check rather than a YOLO special case so that widening the scope needs
+    # no change here; YOLO is additionally guarded at arming in ``safety_override``.
+    #
+    # ``yolo`` reads the PUSHED verdict, which is resolved when a ceiling is installed
+    # and so needs no thread: there is one answer for the ceiling in force, and a
+    # governance-evaluation error resolved to a deny at that install. Every other mode
+    # is non-deniable and short-circuits inside ``approval_mode_permitted`` -- but an
+    # unrecognised ``mode`` string does reach governance, so that branch keeps its
+    # offload.
+    if mode == "yolo":
+        if not yolo_policy_permits():
+            return _deny_approval_mode(
+                caller="dashboard:chat_mode",
+                operation=f"chat_mode:{mode}",
+                mode=mode,
+                resource=str(body.get("slot") or ""),
+            )
+    elif not await asyncio.to_thread(approval_mode_permitted, mode):
+        return _deny_approval_mode(
+            caller="dashboard:chat_mode",
+            operation=f"chat_mode:{mode}",
+            mode=mode,
+            resource=str(body.get("slot") or ""),
+        )
     raw_slot = body.get("slot")
     slot_key = raw_slot or None
 
@@ -5994,6 +8900,17 @@ async def api_chat_mode(request: web.Request) -> web.Response:
     if mode == "yolo":
         result = await asyncio.to_thread(safety_override().activate, "dashboard")
         if not result.active:
+            # Arming can be refused for two reasons and the client needs to tell
+            # them apart: an ``approval_modes`` deny of ``yolo`` is a permanent
+            # policy answer (403, same code the picker already understands),
+            # while anything else is a transient activation failure (503).
+            if not yolo_policy_permits():
+                return _deny_approval_mode(
+                    caller="dashboard:chat_mode",
+                    operation="mode_change:yolo",
+                    mode="yolo",
+                    resource=slot_key or "",
+                )
             return web.json_response(
                 {"ok": False, "error": "safety override activation refused"},
                 status=503,
@@ -6104,63 +9021,81 @@ async def api_chat_mode(request: web.Request) -> web.Response:
 
     # If any slot has a pending approval and mode is trust/yolo, auto-approve it
     if mode in ("trust", "yolo"):
-        for slot in state._slots.values():
-            for aid, fut in list(slot._approval_futures.items()):
+        # A slot-scoped ``trust`` grants auto-approval to ONE session only (the
+        # target slot and any slot sharing its effective key). The pending-approval
+        # sweep MUST honour that scope: sweeping every slot's pending prompt would
+        # clear the approval card in unrelated chats — making them LOOK approved —
+        # while their ``_trust`` flag stays False, so their very next tool call
+        # prompts again. ``yolo`` is process-global and an unscoped ``trust`` (no
+        # slot named = the documented all-slots request) still sweeps everything,
+        # including background and channel approvals. Only a slot-scoped ``trust``
+        # narrows.
+        scoped = mode == "trust" and slot is not None
+        _target_key = effective_session_key(slot) if slot is not None and scoped else None
+        for _slot in state._slots.values():
+            if scoped and effective_session_key(_slot) != _target_key:
+                continue
+            for aid, fut in list(_slot._approval_futures.items()):
                 if not fut.done():
                     fut.set_result("approved")
                     # Persist resolved state into the permission message. The
                     # periodic flush skips non-dirty slots, so the mark must
                     # flag the slot or the write can be lost on restart.
-                    if _mark_permission_resolved(slot.messages, aid, mode):
-                        slot._dirty = True
+                    if _mark_permission_resolved(_slot.messages, aid, mode):
+                        _slot._dirty = True
                     # ``slot`` keys the frame for the slot-scoped WS gate — an
                     # app token cannot receive its own resolution without it.
                     state.broadcast_ws(
                         "approval_resolved",
-                        {"id": aid, "approved": True, "slot": slot.key},
+                        {"id": aid, "approved": True, "slot": _slot.key},
                     )
                     try:
                         sel().log_api_access(
-                            caller=f"dashboard:{slot.key}",
+                            caller=f"dashboard:{_slot.key}",
                             operation=f"tool_approval:bulk_{mode}",
                             outcome="approved",
                             resources=aid,
                         )
                     except Exception:
                         logger.warning("SEL audit failed for bulk approval %s", aid, exc_info=True)
-        # Also auto-approve all pending background approvals (cron/subagent/taskrunner)
-        for aid in list(state._approval_futures):
-            fut = state._approval_futures[aid]
-            if not fut.done():
-                state.resolve_approval(aid, True)
-                try:
-                    sel().log_api_access(
-                        caller="dashboard:background",
-                        operation=f"tool_approval:bulk_{mode}",
-                        outcome="approved",
-                        resources=aid,
-                    )
-                except Exception:
-                    logger.warning("SEL audit failed for bulk approval %s", aid, exc_info=True)
-        # Auto-approve pending channel approvals
-        mgr = getattr(state, "channel_manager", None)
-        if mgr:
-            for ch in mgr._channels.values():
-                for agent in ch.members.values():
-                    fut = agent._approval_future
-                    if fut and not fut.done():
-                        fut.set_result("approved")
-                        try:
-                            sel().log_api_access(
-                                caller=f"channel:{ch.id}:{agent.agent_name}",
-                                operation=f"tool_approval:bulk_{mode}",
-                                outcome="approved",
-                                resources=getattr(fut, "_approval_id", "unknown"),
-                            )
-                        except Exception:
-                            logger.warning(
-                                "SEL audit failed for channel bulk approval", exc_info=True
-                            )
+        # Background (cron/subagent/taskrunner) and channel approvals are NOT
+        # slot-scoped, so a slot-scoped ``trust`` must leave them pending — it
+        # asked for auto-approval on one session and cannot answer for unrelated
+        # background work. Only ``yolo`` and an all-slots ``trust`` sweep them.
+        if not scoped:
+            for aid in list(state._approval_futures):
+                fut = state._approval_futures[aid]
+                if not fut.done():
+                    state.resolve_approval(aid, True)
+                    try:
+                        sel().log_api_access(
+                            caller="dashboard:background",
+                            operation=f"tool_approval:bulk_{mode}",
+                            outcome="approved",
+                            resources=aid,
+                        )
+                    except Exception:
+                        logger.warning("SEL audit failed for bulk approval %s", aid, exc_info=True)
+            # Auto-approve pending channel approvals
+            mgr = getattr(state, "channel_manager", None)
+            if mgr:
+                for ch in mgr._channels.values():
+                    for agent in ch.members.values():
+                        fut = agent._approval_future
+                        if fut and not fut.done():
+                            fut.set_result("approved")
+                            try:
+                                sel().log_api_access(
+                                    caller=f"channel:{ch.id}:{agent.agent_name}",
+                                    operation=f"tool_approval:bulk_{mode}",
+                                    outcome="approved",
+                                    resources=getattr(fut, "_approval_id", "unknown"),
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "SEL audit failed for channel bulk approval",
+                                    exc_info=True,
+                                )
 
     # Propagate trust/yolo to session approval policies so subagents inherit.
     #
@@ -6199,6 +9134,42 @@ def _get_pattern_from_pending(slot: _ChatSlot, request_id: str, field: str) -> s
     return ""
 
 
+def _deny_approval_mode(
+    *,
+    caller: str,
+    operation: str,
+    mode: str,
+    resource: str = "",
+) -> web.Response:
+    """Refuse a policy-denied approval mode, audited, WITHOUT any mutation.
+
+    One helper for every surface that can arm an auto-approve mode, so a refusal
+    always lands in the security event log. A governance refusal that leaves no
+    trace is indistinguishable from the request never having been made, which is
+    exactly the record an operator needs after an attempted escalation. The audit
+    is best-effort: an SEL write failure must not turn a refusal into a grant.
+    """
+    try:
+        sel().log_api_access(
+            caller=caller,
+            operation=operation,
+            outcome="approval_mode_denied_by_policy",
+            resources=resource or mode,
+            error="mode_disabled_by_policy",
+        )
+    except Exception:
+        logger.warning("SEL audit failed for policy-refused approval mode %s", mode, exc_info=True)
+    return web.json_response(
+        {
+            "ok": False,
+            "error": f"approval mode {mode!r} is disabled by your organization's policy",
+            "code": "mode_disabled_by_policy",
+            "mode": mode,
+        },
+        status=403,
+    )
+
+
 def _deny_trust_pattern(name: str, request_id: str, action: str, code: str) -> web.Response:
     """Refuse and audit a command-scoped trust grant without resolving it."""
     try:
@@ -6230,10 +9201,10 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     action = body.get("action", "rejected")
     original_action = action
     request_id = body.get("request_id", "")
@@ -6352,6 +9323,17 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
     elif action == "yolo":
         result = await asyncio.to_thread(safety_override().activate, "dashboard")
         if not result.active:
+            # Same two-reason split as ``api_chat_mode``: an ``approval_modes``
+            # deny of ``yolo`` is a permanent policy answer the client can render
+            # (403 + the code the picker already understands), while anything else
+            # is a transient activation failure worth retrying (503).
+            if not yolo_policy_permits():
+                return _deny_approval_mode(
+                    caller=f"dashboard:{name}",
+                    operation="tool_approval:yolo",
+                    mode="yolo",
+                    resource=request_id,
+                )
             return web.json_response(
                 {"ok": False, "error": "safety override activation refused"},
                 status=503,
@@ -6361,6 +9343,26 @@ async def api_chat_slot_approve(request: web.Request) -> web.Response:
             # linked cron/workflow or channel-surfaced slot runs under its
             # linked_session_key.
             state.sessions.set_approval_policy(effective_session_key(s), "auto")
+        # Reconcile against a policy deny that landed while this was writing.
+        #
+        # This write is the grant's inherited half -- ``admission.parent_trusted``
+        # reads the slot's approval policy directly rather than any flag in
+        # ``safety_override`` -- and it happens OUTSIDE the lock the revocation takes.
+        # So a denying ceiling installed after the arm returned can revoke the grant
+        # and run its ``_on_expired`` cleanup, and this loop then puts the inherited
+        # trust straight back with nothing left to clear it: a subagent spawned under
+        # it is auto-approved, and is not un-spawned by the next event either.
+        #
+        # The two halves are complete together: a write that lands BEFORE the
+        # cleanup is cleared by the cleanup, and one that lands after -- or
+        # interleaved with it -- is cleared here. Standing trust is preserved on the
+        # same rule ``_on_override_expired`` uses, since a Trust press is a separate,
+        # longer-lived decision that no yolo deny expires.
+        if not yolo_policy_permits():
+            for s in state._slots.values():
+                if not (s._trust or s._trust_reads):
+                    state.sessions.set_approval_policy(effective_session_key(s), "")
+            state.push_slots_update()
         action = "approved"
     resolved = action if action in ("approved", "approved_trust_reads") else "rejected"
     if not fut or fut.done():
@@ -6443,10 +9445,10 @@ async def api_chat_slot_color(request: web.Request) -> web.Response:
     slot = state._slots.get(name)
     if not slot:
         return web.json_response({"error": "not found"}, status=404)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
+    body, body_err = await read_bounded_json(request)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
     has_ci = "color_index" in body
     has_ch = "color_hex" in body
     ci = body.get("color_index")
@@ -6869,14 +9871,10 @@ async def api_chat_slot_context(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
 
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON"}, status=400)
-    if not isinstance(body, dict):
-        return web.json_response(
-            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
-        )
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
 
     content = body.get("content", "")
     bad = (
@@ -6996,16 +9994,10 @@ async def api_chat_slot_note(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
 
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "invalid JSON", "code": "invalid_json"}, status=400)
-    # A scalar or array parses cleanly and then makes `.get` raise past the
-    # except above into a 500, so the SHAPE needs its own rejection.
-    if not isinstance(body, dict):
-        return web.json_response(
-            {"error": "body must be a JSON object", "code": "invalid_body"}, status=400
-        )
+    body, body_err = await read_bounded_json(request, max_bytes=None)
+    if body_err is not None:
+        return body_err
+    assert body is not None  # read_bounded_json returns (dict, None) on success
 
     content = body.get("content", "")
     bad = (

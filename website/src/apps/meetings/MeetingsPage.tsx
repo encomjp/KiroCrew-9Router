@@ -20,6 +20,7 @@ import {
 } from 'lucide-react'
 
 import { i18nT } from '../../i18n/t'
+import ErrorNotice from '../../components/ErrorNotice'
 import { fmtDateFields } from '../../i18n/format'
 import Clickable from '../../components/Clickable'
 import {
@@ -154,6 +155,9 @@ function useNotifier(): (message: string, opts?: { type?: 'info' | 'success' | '
   )
 }
 
+/** How often the list re-reads the calendar cache and the meetings on disk. */
+const LIST_REFRESH_MS = 60_000
+
 export default function MeetingsPage() {
   const notify = useNotifier()
   const queryClient = useQueryClient()
@@ -161,8 +165,19 @@ export default function MeetingsPage() {
   const [filter, setFilter] = useState('')
 
   const configQuery = useQuery({ queryKey: ['meetings', 'config'], queryFn: meetingsApi.config })
-  const calendarQuery = useQuery({ queryKey: ['meetings', 'calendar'], queryFn: meetingsApi.calendar })
-  const meetingsQuery = useQuery({ queryKey: ['meetings', 'list'], queryFn: meetingsApi.meetings })
+  // The backend's calendar poller refreshes the cache and pre-creates the meeting
+  // that is about to start while this page sits open, so both lists re-read on a
+  // cadence: without it a pre-created meeting appears only after a remount.
+  const calendarQuery = useQuery({
+    queryKey: ['meetings', 'calendar'],
+    queryFn: meetingsApi.calendar,
+    refetchInterval: LIST_REFRESH_MS,
+  })
+  const meetingsQuery = useQuery({
+    queryKey: ['meetings', 'list'],
+    queryFn: meetingsApi.meetings,
+    refetchInterval: LIST_REFRESH_MS,
+  })
 
   const sync = useMutation({
     mutationFn: meetingsApi.syncCalendar,
@@ -261,6 +276,17 @@ export default function MeetingsPage() {
         }
       />
       <div className="px-4 md:px-6 pb-8 overflow-y-auto flex-1 min-h-0">
+        {/* The toast in `sync.onError` fades; this stays until the next sync or
+            a dismiss, so a failed sync is not mistaken for a quiet one. The list
+            page holds no draft, so the hand-off is offered. */}
+        {sync.isError && (
+          <ErrorNotice
+            message={sync.error.message || i18nT('apps.meetings.list.syncFailed')}
+            askAgent
+            onDismiss={() => sync.reset()}
+            className="mt-4"
+          />
+        )}
         <div className="grid gap-3.5 grid-cols-[repeat(auto-fit,minmax(150px,1fr))] my-6">
           <StatCard
             label={i18nT('apps.meetings.list.statScheduled')}
@@ -387,14 +413,8 @@ export default function MeetingsPage() {
                         </IconButton>
                       )}
                     </Clickable>
-                    {rowDeleteError && (
-                      <div
-                        role="alert"
-                        className="bg-danger/10 border border-danger/20 rounded-md px-3 py-2 text-[13px] text-danger animate-rise"
-                      >
-                        {rowDeleteError}
-                      </div>
-                    )}
+                    {/* Delete acts on a persisted meeting; the list holds no draft. */}
+                    <ErrorNotice message={rowDeleteError} askAgent className="animate-rise" />
                   </div>
                 )
               })}

@@ -31,7 +31,7 @@ export default function InvestigateButton({
     staleTime: 30_000,
   })
   const record = recordQuery.data?.investigation ?? null
-  const { investigate, busy, error, concludedFor } = useInvestigate()
+  const { investigate, busy, error, concludedFor, openOlderSessions } = useInvestigate()
   // Same rule as ReviewButton: a pending or failed lookup must not be read as
   // "no session", or clicking would start a second one and orphan the first.
   const unresolved = !recordQuery.isSuccess
@@ -63,6 +63,7 @@ export default function InvestigateButton({
       onClick={onClick}
       concluded={concludedFor === itemKey(repoRef, issue.number)}
       onStartOver={onStartOver}
+      onOpenOlderSessions={openOlderSessions}
       startHint={
         recordQuery.isError
           ? i18nT('apps.issueRadar.components.investigateButton.could_not_check_for_an_existing_investigation_re')

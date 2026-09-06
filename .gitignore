@@ -124,6 +124,9 @@ test_plan_atomic_writes_subagent_progress.md
 website/electron/backend-dist/
 website/electron/dist/
 website/electron/node_modules
+# Placed by packaging/build-desktop.sh from KIROCREW_MANAGED_INSTALL_MARKER so
+# electron-builder packs it into app.asar; a per-edition build input, not source.
+website/electron/EXTERNALLY-MANAGED
 # Generated launcher icon (created from icon.png when making the desktop shortcut)
 website/electron/KiroCrew.ico
 tui/
@@ -152,7 +155,10 @@ SESSION_SUMMARY.md
 # Internal migration worklog — deliberately untracked (contains pre-scrub notes)
 MOCHI_MIGRATION.md
 website/.vitest-reports/
-.venv-test/
 
-# Runtime/test artifacts
-sqlite_mcp_server.db
+# Skill eval A/B outputs (regenerated per run; not review artifacts)
+evals/*/iteration-*/
+
+# A distribution stamps its build number here at packaging time (see
+# kiro_crew/__init__.py); never committed -- a dev checkout runs the bare core.
+src/kiro_crew/BUILD_VERSION

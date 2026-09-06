@@ -8,6 +8,7 @@ import { createSlot } from '../store/chatSlice'
 import { api, type WebhookTokenEntry } from '../api/client'
 import { useProvider } from '../providers'
 import { useAvailableModels } from '../hooks/useAvailableModels'
+import { FOLDER_COLOR_PALETTE } from '../components/folderColorCatalog'
 import { Btn, SendBtn, Input, Badge, SearchInput, PageHeader, EmptyState } from '../components/ui'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table'
 import {
@@ -17,7 +18,10 @@ import SegmentedControl from '../components/SegmentedControl'
 import InfoTip from '../components/InfoTip'
 import { FOCUSABLE } from '../hooks/useDialogFocusTrap'
 import SimpleSelect from '../components/SimpleSelect'
-import CrewAvatar from '../components/CrewAvatar'
+import CrewAvatar, { ghostTraitsFrom, imageAvatarFrom, type CrewAvatarOverride } from '../components/CrewAvatar'
+import CrewStateAvatar from '../components/CrewStateAvatar'
+import CrewAvatarBuilder from '../components/CrewAvatarBuilder'
+import { expressionsFrom, soundsFrom } from '../lib/crewAvatarState'
 import CrewWakeSection from '../components/CrewWakeSection'
 import CrewWebhookSection from '../components/CrewWebhookSection'
 import CrewEditorRail from '../components/crew/CrewEditorRail'
@@ -28,6 +32,7 @@ import type { CronJob } from '../types'
 import type { KiroCrewAgent } from '../components/AgentSelector'
 import { SourceBadge } from '../components/SourceBadge'
 import { errMessage } from '../utils/thunkError'
+import { EFFORT_LEVELS, effortLabel, modelSupportsEffort } from '../lib/effort'
 
 import { i18nT } from '../i18n/t'
 import ErrorNotice from '../components/ErrorNotice'
@@ -56,8 +61,14 @@ interface AgentUpdatePayload {
   triggers: string
   /** '' = inherit (the kiro template's pin, then the global fallback). */
   model: string
+  /** '' = inherit the global default effort. Otherwise one of the levels the
+   *  backend accepts (low..max); a level is only honoured on a model that
+   *  supports effort at all. */
+  reasoning_effort: string
   /** Default session color (#rrggbb hex) for new sessions. '' = no default. */
   session_color: string
+  /** Pinned ghost face from the avatar builder. `{}` = the name-derived face. */
+  avatar: CrewAvatarOverride | Record<string, never>
 }
 
 /** The stored spelling for "no per-agent pin, inherit the next tier down". The
@@ -75,6 +86,14 @@ type CrewView = 'cards' | 'list'
  *  for both surfaces rather than a second scheme for this one. */
 const VIEW_KEY = 'mc-crews-view'
 
+/** How long a schedule-draft discard confirm stays fully locked while the
+ *  create request is in flight. The lock exists because discarding cannot
+ *  cancel the POST; the unlock exists because a HUNG request (the client
+ *  sets no timeout) must not seal every exit from the modal editor. A
+ *  healthy create settles well under this, so the escape only surfaces for
+ *  genuinely stalled requests. */
+const DISCARD_FORCE_GRACE_MS = 8000
+
 /** Read the remembered layout. Guarded because `localStorage` throws outright
  *  in a partitioned/blocked-storage context rather than returning null. */
 function readStoredView(): CrewView {
@@ -91,6 +110,12 @@ function readStoredView(): CrewView {
  * with my teammates" — the scariest possible reading and the wrong one.
  */
 type SharedKind = 'none' | 'memory' | 'files' | 'both'
+
+/** Text for a failed query: the thrown message, or the value itself when the
+ *  rejection was not an Error. */
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
 
 /* ── Workspace Creation Dialog (a nested Radix layer inside the crew editor) ── */
 
@@ -113,6 +138,9 @@ function WorkspaceForm({
   const [wsDir, setWsDir] = useState('workspace')
   const [dirTouched, setDirTouched] = useState(false)
   const [copyFrom, setCopyFrom] = useState('')
+  // Two states, because they are two different things: `wsHint` is client-side
+  // validation (nothing failed), `wsError` is the outcome of a request that did.
+  const [wsHint, setWsHint] = useState('')
   const [wsError, setWsError] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
@@ -126,9 +154,10 @@ function WorkspaceForm({
   }
 
   const submit = async () => {
+    setWsHint('')
     setWsError('')
     const n = wsName.trim()
-    if (!n) { setWsError(i18nT('pages.kiroCrewAgentsPage.workspace_name_is_required')); return }
+    if (!n) { setWsHint(i18nT('pages.kiroCrewAgentsPage.workspace_name_is_required')); return }
     setSubmitting(true)
     try {
       const body: Record<string, string> = { name: n, dir: wsDir }
@@ -153,7 +182,6 @@ function WorkspaceForm({
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
               {/* Native input associated via htmlFor+id; label-has-for's nesting requirement is a false positive. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="ws-name" className="text-[11px] text-muted uppercase tracking-wider font-medium">{i18nT('pages.kiroCrewAgentsPage.name')}</label>
               <InfoTip text={i18nT('pages.kiroCrewAgentsPage.a_unique_identifier_for_this_workspace_agents_re')} />
             </div>
@@ -162,7 +190,6 @@ function WorkspaceForm({
           <div className="flex flex-col gap-1">
             <div className="flex items-center gap-1">
               {/* Native input associated via htmlFor+id; label-has-for's nesting requirement is a false positive. */}
-              {/* eslint-disable-next-line jsx-a11y/label-has-for */}
               <label htmlFor="ws-dir" className="text-[11px] text-muted uppercase tracking-wider font-medium">{i18nT('pages.kiroCrewAgentsPage.directory')}</label>
               <InfoTip text={i18nT('pages.kiroCrewAgentsPage.subdirectory_inside_kiro_crew_where_this_workspa')} />
             </div>
@@ -181,7 +208,13 @@ function WorkspaceForm({
               aria-label={i18nT('pages.kiroCrewAgentsPage.copy_from_workspace')}
             />
           </div>
-          {wsError && <div className="text-danger text-[13px]">{wsError}</div>}
+          {/* Client-side validation hint (the name never left the browser) —
+              not an error surface, so it stays plain text rather than ErrorNotice. */}
+          {wsHint && <div className="text-danger text-[13px]">{wsHint}</div>}
+          {/* No hand-off: the workspace name / directory / copy-from fields
+              (wsName, wsDir, copyFrom) are unsaved — a failed create is exactly
+              what did not store them. */}
+          <ErrorNotice message={wsError} variant="inline" testId="workspace-create-error" />
         </div>
       </DialogBody>
       <DialogFooter>
@@ -356,6 +389,27 @@ export function ModelField({ options, value, onChange }: {
   )
 }
 
+/** The crew's reasoning-effort pin. Rendered only when the model the crew will
+ *  actually run on supports effort — the same gate the chat picker uses, so a
+ *  crew on Haiku is not offered a control the backend would drop. */
+export function EffortField({ value, onChange }: {
+  value: string; onChange: (v: string) => void
+}) {
+  return (
+    <Field label={i18nT('pages.kiroCrewAgentsPage.reasoning_effort')} hint={i18nT('pages.kiroCrewAgentsPage.reasoning_effort_hint')}>
+      <SimpleSelect
+        options={[...EFFORT_LEVELS]}
+        // '' is the inherit sentinel, labelled as such rather than as a level:
+        // it means "take the global default", which may itself be a level.
+        optionLabels={EFFORT_LEVELS.map(l => (l === '' ? i18nT('pages.kiroCrewAgentsPage.inherited') : effortLabel(l)))}
+        value={value}
+        onChange={onChange}
+        aria-label={i18nT('pages.kiroCrewAgentsPage.edit_reasoning_effort')}
+      />
+    </Field>
+  )
+}
+
 /** The routing-keyword input. Rendered by the create form and by the editor's
  *  routing pane, so it is a component rather than two copies. */
 export function TriggersField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
@@ -387,6 +441,54 @@ export function SessionColorField({ value, onChange }: { value: string; onChange
   }
   return (
     <Field label={i18nT('pages.kiroCrewAgentsPage.session_color')} hint={i18nT('pages.kiroCrewAgentsPage.session_color_hint')}>
+      {/* Quick picks first, exact entry below — the order the session
+       *  right-click menu uses, so the two surfaces read the same way.
+       *
+       *  These are FOLDER_COLOR_PALETTE, the repo's existing fixed-hex identity
+       *  catalog, NOT the sidebar's generated palette. The sidebar's swatches
+       *  are a `color_index` into a palette derived from the theme accent, so
+       *  they re-derive when the theme changes; a crew's `session_color` is a
+       *  stored hex, so a swatch here has to commit exactly the literal it
+       *  shows and must not drift. That is the same job the folder catalog
+       *  already does, and reusing it keeps one visual language across folders,
+       *  tags and crews — as that file's own comment argues — instead of a
+       *  second preset list that would silently diverge from it. Read-only:
+       *  the catalog's KEEP IN SYNC contract with chat_folders.py governs
+       *  changes to its entries, and consuming it adds no such coupling.
+       *
+       *  The active ring is matched by hex, so a custom colour outside the
+       *  catalog correctly rings nothing.
+       *
+       *  No "no color" cell here: Clear already owns that, and two controls for
+       *  one action is worse than one. */}
+      <div className="mb-2 flex flex-wrap items-center gap-1.5">
+        {FOLDER_COLOR_PALETTE.map(({ value: c, label }) => {
+          const active = HEX_RE.test(value) && value.toLowerCase() === c
+          return (
+            <Btn
+              type="button"
+              key={c}
+              aria-label={label()}
+              aria-pressed={active}
+              title={label()}
+              // Btn, not a raw <button>, so the swatches inherit the standard
+              // press and disabled treatment. `p-0` and the sizing below win
+              // over Btn's own padding/radius/border because Btn twMerges
+              // `className` last; the inline background beats its
+              // `bg-transparent` (and its hover background) on specificity, so
+              // the dot keeps its colour in every state.
+              //
+              // `border-text-strong`, not `border-accent`: the accent is itself a
+              // purple in most themes, so an accent ring on the indigo and violet
+              // entries reads as no ring at all. The near-white ring is what
+              // SessionColorSwatches uses, and it separates from every hue here.
+              className={`h-5 w-5 p-0 cursor-pointer rounded-full border-2 transition-transform hover:scale-110 ${active ? 'border-text-strong scale-110' : 'border-border'}`}
+              style={{ background: c }}
+              onClick={() => onChange(c)}
+            />
+          )
+        })}
+      </div>
       <div className="flex items-center gap-2">
         <Input
           type="color"
@@ -472,7 +574,7 @@ function CrewCard({ agent, isDefault, shared, onOpen }: {
       style={agent.session_color ? { borderLeftColor: agent.session_color, borderLeftWidth: '3px' } : undefined}
     >
       <div className="flex items-center gap-3">
-        <CrewAvatar seed={agent.name} size={38} />
+        <CrewAvatar seed={agent.name} avatar={agent.avatar} size={38} />
         {/* Fixed height for the whole header block. Badges are slightly taller
             than plain text, so cards carrying a `default` badge would otherwise
             push their binding grid lower than a card without one, and the row
@@ -566,7 +668,7 @@ function CrewRow({ agent, isDefault, shared, onOpen }: {
     >
       <TableCell>
         <div className="flex items-center gap-2.5 min-w-0">
-          <CrewAvatar seed={agent.name} size={28} />
+          <CrewAvatar seed={agent.name} avatar={agent.avatar} size={28} />
           <div className="min-w-0">
             <div className="flex items-center gap-2 min-w-0">
               <Clickable
@@ -612,30 +714,39 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const provider = useProvider()
   const dispatch = useAppDispatch()
   const navigate = useNavigate()
-  const { data: agentsData, refetch: refetchAgents } = useQuery({
+  const { data: agentsData, refetch: refetchAgents, error: agentsError } = useQuery({
     queryKey: ['kirocrew-agents'],
     queryFn: () => api.kirocrewAgents(),
   })
-  const agents: KiroCrewAgent[] = agentsData?.agents || []
+  // Memoised for the empty case: a bare `|| []` hands out a new array on every
+  // render, which defeats every `useMemo` downstream that keys on the roster
+  // (`sharedTargets`). React Query's structural sharing keeps `agentsData`
+  // identical until the roster actually changes, so this is stable between
+  // fetches that return the same rows.
+  const agents = useMemo<KiroCrewAgent[]>(() => agentsData?.agents || [], [agentsData])
   const defaultAgent = agentsData?.default_agent || ''
 
-  const { data: installedAgents } = useQuery({
+  const { data: installedAgents, error: installedError } = useQuery({
     queryKey: ['agents-installed'],
     queryFn: () => api.agentsInstalled(),
   })
   const kiroAgentOptions = Array.isArray(installedAgents) ? installedAgents.map((x: { name: string }) => x.name).filter(Boolean) : ['kirocrew']
 
-  const { data: workspacesData, refetch: refetchWorkspaces } = useQuery({
+  const { data: workspacesData, refetch: refetchWorkspaces, error: workspacesError } = useQuery({
     queryKey: ['workspaces'],
     queryFn: () => api.workspaces(),
   })
   const workspaceOptions = workspacesData?.workspaces?.map((w: { name: string }) => w.name) || ['default']
 
-  const { data: kirocrewCfg } = useQuery({
+  const { data: kirocrewCfg, error: cfgError } = useQuery({
     queryKey: ['kirocrewConfig'],
     queryFn: () => api.kirocrewConfig(),
   })
   const memoryStoreOptions = kirocrewCfg?.memory_stores ? Object.keys(kirocrewCfg.memory_stores) : ['default']
+  // The three option lists above fall back to a built-in default when their
+  // fetch fails, so without this the editor would offer `default` / `kirocrew`
+  // as though those were the only choices. One notice, first failure wins.
+  const editorOptionsError = installedError ?? workspacesError ?? cfgError
 
   // Model list for the per-agent default. Same query key as every other model
   // picker so the list is fetched once. INHERIT_MODEL leads so "no pin" is the
@@ -649,6 +760,10 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const [filter, setFilter] = useState('')
   const [view, setView] = useState<CrewView>(readStoredView)
   const [error, setError] = useState('')
+  // Client-side validation for the create form ("name is required"). Kept apart
+  // from `error`, which holds the outcome of a request that FAILED: a blank name
+  // never left the browser, so it must not render as a failed operation.
+  const [sheetHint, setSheetHint] = useState('')
   const [sheet, setSheet] = useState<SheetTarget>(null)
   const [name, setName] = useState('')
   // Starts UNSELECTED, not at the built-in 'kirocrew'. Pre-filling the built-in
@@ -663,6 +778,10 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const [triggers, setTriggers] = useState('')
   const [sessionColor, setSessionColor] = useState('')
   const [editModel, setEditModel] = useState(INHERIT_MODEL)
+  const [editEffort, setEditEffort] = useState('')
+  /** Draft avatar override. null = the name-derived face (no override). */
+  const [editAvatar, setEditAvatar] = useState<CrewAvatarOverride | null>(null)
+  const [avatarBuilderOpen, setAvatarBuilderOpen] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
   /** The armed confirm row, scrolled into view when it appears: the danger zone
    *  is the last section, so on a short window the confirm buttons land under
@@ -686,15 +805,33 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
   /** The model a new session on this crew would actually run on, resolved by
    *  the backend so the precedence is not re-derived (and drifted) here. */
-  const { data: resolved } = useQuery({
+  const { data: resolved, error: resolvedError } = useQuery({
     queryKey: ['agent-resolved-model', editing],
     queryFn: () => api.agentResolvedModel(editing),
     enabled: !!editing,
   })
 
+  /** The model an effort level would be applied to: the pending pick when the
+   *  crew pins one, otherwise whatever the inherit chain resolves to. Reading
+   *  the PENDING value is deliberate — the effort control has to appear and
+   *  disappear as the user moves the model select, not one save later.
+   *
+   *  `resolved` describes the SAVED state, so it only answers for a pending
+   *  Inherited when the saved state was Inherited too. Once a stored pin is
+   *  cleared but not yet saved, `resolved.model` is still that pin — reusing it
+   *  would keep offering an effort control on the strength of a model the crew is
+   *  about to stop using, and the level would then be dropped at spawn. Nothing
+   *  here can know what the inherit chain lands on until the write happens, so
+   *  that state reports unresolved and says so. */
+  const modelPinPendingClear = editModel === INHERIT_MODEL && !!editingAgent?.model
+  const effortModel = editModel !== INHERIT_MODEL
+    ? editModel
+    : modelPinPendingClear ? '' : (resolved?.model || '')
+  const effortCapable = modelSupportsEffort(effortModel)
+
   const openCreate = useCallback(() => {
     sheetEpoch.current += 1
-    setError('')
+    setError(''); setSheetHint('')
     setConfirmDelete(false)
     setName(''); setKiroAgent(''); setWorkspace('default'); setMemoryStore('default')
     setTriggers('')
@@ -704,16 +841,65 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
 
   const openEdit = useCallback((a: KiroCrewAgent) => {
     sheetEpoch.current += 1
-    setError('')
+    setError(''); setSheetHint('')
     setConfirmDelete(false)
     setKiroAgent(a.kiro_agent); setWorkspace(a.workspace); setMemoryStore(a.memory_store)
     setTriggers(a.triggers || '')
     setSessionColor(a.session_color || '')
     setEditModel(a.model || INHERIT_MODEL)
+    setEditEffort(a.reasoning_effort || '')
+    // Normalized through the same coercion the renderer applies, so the dirty
+    // check compares like with like (a junk stored value reads as "no
+    // override" everywhere).
+    const storedTraits = ghostTraitsFrom(a.avatar)
+    const storedImage = imageAvatarFrom(a.avatar)
+    // The reaction layer rides on both tiers, and on neither: a record that
+    // pins no face and no picture but carries expressions or sounds is still
+    // an override ("the name-derived face, plus these reactions").
+    const storedExpressions = expressionsFrom(a.avatar)
+    const storedSounds = soundsFrom(a.avatar)
+    const reactions = {
+      ...(storedExpressions ? { expressions: storedExpressions } : {}),
+      ...(storedSounds ? { sounds: storedSounds } : {}),
+    }
+    setEditAvatar(
+      storedTraits
+        ? { kind: 'ghost', traits: storedTraits, ...reactions }
+        : storedImage
+          ? { kind: 'image', v: storedImage.v, ...reactions }
+          : Object.keys(reactions).length
+            ? { kind: 'ghost', ...reactions }
+            : null,
+    )
+    setAvatarBuilderOpen(false)
     setSheet({ mode: 'edit', name: a.name })
-  }, [defaultAgent])
+  }, [])
 
-  const closeSheet = useCallback(() => { sheetEpoch.current += 1; setSheet(null); setError(''); setConfirmDelete(false) }, [])
+  const closeSheet = useCallback(() => { sheetEpoch.current += 1; setSheet(null); setError(''); setSheetHint(''); setConfirmDelete(false) }, [])
+
+  /**
+   * The pending answer to a discard question that is on screen, as a promise
+   * plus its resolver; `null` when nothing is being asked.
+   *
+   * `sheetEpoch` below cannot express a question that has not been answered
+   * yet — it only moves once the sheet actually closes. A save still STAGING a
+   * picture upload therefore waits on this: committing through a live question
+   * would persist exactly the edits the question asks to throw away, and
+   * Discard would then close the editor over a record the server had already
+   * been told to keep. Backing out resolves it `false`, so holding the PUT
+   * never kills the save the user asked for.
+   */
+  const discardAnswer = useRef<{ answered: Promise<boolean>; settle: (discarded: boolean) => void } | null>(null)
+
+  /** Answer a pending discard question, if one is still open. First caller
+   *  wins and clears the ref, so a confirm and the sheet-change reset arriving
+   *  together cannot settle the same question twice. */
+  const settleDiscardAnswer = useCallback((discarded: boolean) => {
+    const pending = discardAnswer.current
+    if (!pending) return
+    discardAnswer.current = null
+    pending.settle(discarded)
+  }, [])
 
   /**
    * Identity of the CURRENT panel opening, bumped on every open and every
@@ -770,31 +956,109 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   })
 
   const create = () => {
-    setError('')
+    setError(''); setSheetHint('')
     const n = name.trim()
-    if (!n) { setError(i18nT('pages.kiroCrewAgentsPage.name_is_required')); return }
+    if (!n) { setSheetHint(i18nT('pages.kiroCrewAgentsPage.name_is_required')); return }
     // Refuse an unset template rather than letting the server apply its
     // 'kirocrew' default: that default is what silently turns a new crew into an
     // alias for the DEFAULT agent (#1684).
-    if (!kiroAgent) { setError(i18nT('pages.kiroCrewAgentsPage.agent_template_is_required')); return }
+    if (!kiroAgent) { setSheetHint(i18nT('pages.kiroCrewAgentsPage.agent_template_is_required')); return }
     createMut.mutate({ name: n, kiro_agent: kiroAgent, workspace, memory_store: memoryStore, triggers, session_color: sessionColor, epoch: sheetEpoch.current })
   }
 
-  const saveEdit = () => {
+  const saveEdit = async () => {
     if (!editing) return
     setError('')
+    // Snapshot the identity of THIS save before the first await: the epoch
+    // moves when the editor closes or reopens, and a save that awaited an
+    // upload must neither write through to a different opening's crew nor
+    // settle (close) a dialog it no longer owns. The FIELD VALUES are
+    // snapshotted here too — what commits is exactly what was on screen when
+    // Save was pressed, and the pane is fenced (disabled) for the upload's
+    // duration so no edit can land mid-save only to be discarded by the
+    // post-save close.
+    const epoch = sheetEpoch.current
+    const name = editing
+    const data = {
+      kiro_agent: kiroAgent,
+      workspace,
+      memory_store: memoryStore,
+      triggers,
+      // INHERIT_MODEL is normalized to '' server-side; send it verbatim so
+      // clearing a pin is a real write rather than a skipped field.
+      model: editModel,
+      // Sent unconditionally for the same reason as `model`: '' is a real
+      // value (clear the pin), so a skipped field would make clearing
+      // impossible.
+      reasoning_effort: editEffort,
+      session_color: sessionColor,
+    }
+    let avatarPayload: CrewAvatarOverride | Record<string, never> = editAvatar ?? {}
+    if (editAvatar?.kind === 'image') {
+      let stagedToken: string | null = null
+      if (editAvatar.pendingData) {
+        // STAGE the picture; nothing live changes until the PUT below
+        // promotes it under the server's config lock — so a failed or
+        // abandoned Save never costs the previously saved picture.
+        setAvatarUploading(true)
+        try {
+          // Decode the data URI directly — fetch(data:) trips the
+          // dashboard's connect-src CSP, which only allows network origins.
+          const comma = editAvatar.pendingData.indexOf(',')
+          const mime = /data:([^;,]+)/.exec(editAvatar.pendingData)?.[1] ?? 'image/png'
+          const bin = atob(editAvatar.pendingData.slice(comma + 1))
+          const bytes = new Uint8Array(bin.length)
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+          const up = await api.uploadCrewAvatar(name, new Blob([bytes], { type: mime }))
+          if (!up.ok || !up.token) {
+            settleFor(epoch, up.error || i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent'))
+            return
+          }
+          stagedToken = up.token
+        } catch (e) {
+          // A thrown error here is transport-level ("Failed to fetch", a
+          // decode failure) — vocabulary the user never saw. The banner gets
+          // the localized failure; the raw message goes to the console.
+          // eslint-disable-next-line no-console -- the only record of WHY a staged upload failed once the banner shows the localized string
+          console.warn('avatar upload failed', e)
+          settleFor(epoch, i18nT('pages.kiroCrewAgentsPage.failed_to_update_agent'))
+          return
+        } finally {
+          setAvatarUploading(false)
+        }
+      }
+      // `promote` + the staging token only when THIS save staged the file —
+      // the token is what stops an overlapping save's staging from being
+      // committed by this one, and a plain {kind:'image'} keeps the current
+      // picture while the server discards any stale staging. The server
+      // stamps the cache-buster `v` at the commit.
+      // Rebuilt rather than spread from the draft (the staging token and
+      // `promote` are wire-only), so the reaction layer must be carried over
+      // by hand — without this, saving a picture silently drops it.
+      const reactions = {
+        ...(editAvatar.expressions ? { expressions: editAvatar.expressions } : {}),
+        ...(editAvatar.sounds ? { sounds: editAvatar.sounds } : {}),
+      }
+      avatarPayload = stagedToken
+        ? { kind: 'image', promote: true, token: stagedToken, ...reactions }
+        : { kind: 'image', ...reactions }
+    }
+    // A discard question raised WHILE this save was staging owns the outcome,
+    // so wait for the answer instead of racing it: a PUT fired mid-question
+    // persists exactly the edits the question is about, and the epoch check
+    // below cannot see an answer that has not arrived yet. Once answered there
+    // is nothing left to wait for — Discard closed the sheet and moved the
+    // epoch, so that check carries the same decision.
+    const pendingDiscard = discardAnswer.current
+    if (pendingDiscard && (await pendingDiscard.answered)) return
+    if (epoch !== sheetEpoch.current) return
     updateMut.mutate({
-      name: editing,
-      epoch: sheetEpoch.current,
+      name,
+      epoch,
       data: {
-        kiro_agent: kiroAgent,
-        workspace,
-        memory_store: memoryStore,
-        triggers,
-        // INHERIT_MODEL is normalized to '' server-side; send it verbatim so
-        // clearing a pin is a real write rather than a skipped field.
-        model: editModel,
-        session_color: sessionColor,
+        ...data,
+        // {} is the wire spelling for "reset to the name-derived face".
+        avatar: avatarPayload,
       },
     })
   }
@@ -878,13 +1142,209 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
   const collidingCrews = [...new Set([...sharingWorkspace, ...sharingMemoryStore])]
 
   const creating = sheet?.mode === 'create'
-  const sheetBusy = createMut.isPending || updateMut.isPending || deleteMut.isPending
+  const [avatarUploading, setAvatarUploading] = useState(false)
+  const sheetBusy =
+    createMut.isPending || updateMut.isPending || deleteMut.isPending || avatarUploading
+
+  /**
+   * The subset of `sheetBusy` that has already COMMITTED something — a write
+   * the server holds and that no answer in the editor can recall.
+   *
+   * `avatarUploading` is deliberately excluded. That leg of saveEdit only
+   * STAGES a picture, and its own epoch check abandons the PUT when the sheet
+   * closes underneath it, so while it stages nothing is committed and every
+   * edit is still genuinely discardable. `requestClose` reads this rather than
+   * `sheetBusy` for that reason: skipping the discard question during staging
+   * would let a dismissal drop the whole save silently.
+   */
+  const committing = updateMut.isPending || deleteMut.isPending
 
   /** Which rail pane the editor body is showing. Reset whenever the editor is
    *  pointed somewhere else, so a crew never opens on the pane the previous one
    *  happened to be left on. */
   const [pane, setPane] = useState<CrewPaneKey>('overview')
-  useEffect(() => { setPane('overview') }, [sheet])
+  const [schedDraft, setSchedDraft] = useState(false)
+  /** True while the schedule draft's create request is in flight. Discarding
+   *  then would unmount the form WITHOUT cancelling the POST, so the schedule
+   *  the user watched being "discarded" persists — the confirm's destructive
+   *  button locks on this for exactly the reason the pane's own toggle does. */
+  const [schedSaving, setSchedSaving] = useState(false)
+  /** Where the schedule-draft discard confirm would go if confirmed: a pane
+   *  key to switch to, 'close' to dismiss the editor, or 'chat' to open a
+   *  chat with this crew. null = no confirm showing. One state drives EVERY
+   *  destruction path so they get the same guard for the same reason -- the
+   *  footer's Save is already disabled for this draft, and a rail click, an
+   *  Escape, or the header's chat jump destroying it silently would make the
+   *  one tracked-dirty pane the one pane whose work a click erases. */
+  const [discardAsk, setDiscardAsk] = useState<CrewPaneKey | 'close' | 'chat' | 'collapse' | null>(null)
+  /** Escape hatch for a hung save: the create POST has no client timeout, so
+   *  a stalled request would otherwise lock EVERY exit from the editor for
+   *  as long as it stalls. After a grace period with the confirm open and
+   *  the save still in flight, the destructive button unlocks — the note
+   *  then says the honest thing: discarding cannot cancel the POST, so the
+   *  schedule may still be created. */
+  const [discardForce, setDiscardForce] = useState(false)
+  useEffect(() => {
+    if (discardAsk === null || !schedSaving) { setDiscardForce(false); return }
+    const t = setTimeout(() => setDiscardForce(true), DISCARD_FORCE_GRACE_MS)
+    return () => clearTimeout(t)
+  }, [discardAsk, schedSaving])
+  /** The section-owned collapse to run if the user confirms discarding via
+   *  the toggle ('collapse' target). A ref, not state: it is a continuation,
+   *  not something the render reads. */
+  const collapseProceed = useRef<(() => void) | null>(null)
+  useEffect(() => { setPane('overview'); setSchedDraft(false); setSchedSaving(false); setDiscardAsk(null) }, [sheet])
+
+  /** Which panes hold an edit not yet saved. Compared against the SAVED crew,
+   *  so a value the user typed and then typed back is not reported as pending.
+   *  Computed ahead of the guards below because they key on it: what the
+   *  dismissal question protects IS this set. */
+  const dirtyPanes = useMemo(() => {
+    const out = new Set<CrewPaneKey>()
+    if (!editingAgent) return out
+    if (kiroAgent !== (editingAgent.kiro_agent || '')) out.add('template')
+    if (workspace !== (editingAgent.workspace || '') || memoryStore !== (editingAgent.memory_store || '')) {
+      out.add('place')
+    }
+    if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add('model')
+    if (editEffort !== (editingAgent.reasoning_effort || '')) out.add('model')
+    if (triggers !== (editingAgent.triggers || '')) out.add('routing')
+    if (sessionColor !== (editingAgent.session_color || '')) out.add('routing')
+    // Both tiers in one comparison: ghost traits normalize through
+    // ghostTraitsFrom (flat record, stable key order) and an image override
+    // through imageAvatarFrom — so a picture pick, replace, or removal is
+    // dirty exactly like a trait edit. pendingData is part of the draft's
+    // identity on purpose: a newly chosen picture IS an unsaved change.
+    const savedNorm = ghostTraitsFrom(editingAgent.avatar) ?? imageAvatarFrom(editingAgent.avatar)
+    const draftNorm =
+      editAvatar?.kind === 'ghost'
+        ? (editAvatar.traits ?? null)
+        : editAvatar?.kind === 'image'
+          ? { v: editAvatar.v, pendingData: editAvatar.pendingData }
+          : null
+    if (JSON.stringify(draftNorm) !== JSON.stringify(savedNorm)) out.add('routing')
+    // Compared separately from the face, and BOTH sides go through the same
+    // coercion — which is what makes the comparison sound rather than merely
+    // convenient. `JSON.stringify` is order-sensitive: the draft's map is in
+    // the order the user touched the states (and, inside one state, the order
+    // they picked eyes vs mouth), while the coercion always emits
+    // working/done/error with eyes before mouth. Comparing the raw draft
+    // against a coerced record would report two identical sets of overrides as
+    // a change, and the rail would show an unsaved dot on a freshly saved crew.
+    const savedReactions = [expressionsFrom(editingAgent.avatar), soundsFrom(editingAgent.avatar)]
+    const draftReactions = [expressionsFrom(editAvatar), soundsFrom(editAvatar)]
+    if (JSON.stringify(draftReactions) !== JSON.stringify(savedReactions)) out.add('routing')
+    // An open inline schedule-create form is pending work too: it gets the
+    // rail's unsaved dot and the note, so closing the editor cannot silently
+    // eat a half-typed schedule the way an untracked surface would.
+    if (schedDraft) out.add('schedules')
+    return out
+  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, editEffort, triggers, sessionColor, schedDraft, editAvatar])
+
+  /** Rail-driven pane changes route through here: leaving the schedules pane
+   *  while a schedule draft is open asks before destroying the typed work
+   *  (the form's state is component-local and unmounts with the pane). The
+   *  other panes' edits live in this component's state and survive a pane
+   *  switch, so only the draft is at stake here. */
+  const requestPane = useCallback((key: CrewPaneKey) => {
+    if (schedDraft && key !== pane) { setDiscardAsk(key); return }
+    setPane(key)
+  }, [schedDraft, pane])
+
+  /**
+   * Editor dismissal (footer Cancel, Escape, overlay click) routes through
+   * here: it asks before throwing away ANY unsaved pane edit, not just a typed
+   * schedule.
+   *
+   * An open schedule draft is tested FIRST. `dirtyPanes` contains 'schedules'
+   * while the draft is open, so that order is what decides which question the
+   * user gets, and the draft's leg is not interchangeable with the generic one:
+   * it locks its destructive button while the draft's create POST is in flight
+   * (discarding cannot cancel the request) and unlocks it after a grace period,
+   * neither of which the generic question needs. It does have to WIDEN what it
+   * claims when other panes are dirty too — see `discardTakesSheet`.
+   *
+   * A COMMITTING write is dismissed with no question at all: the values on
+   * screen are the ones the user just submitted, so nothing there is unsaved,
+   * and the request is not cancellable — offering to discard would promise a
+   * rollback the backend will not honor and the edits would land anyway.
+   * Dismissing mid-write stays allowed; sheetEpoch/settleFor is what makes the
+   * abandoned write land harmlessly on the UI. The create form is not tracked
+   * by `dirtyPanes` (same `!creating` scoping as the footer's unsaved note), so
+   * it closes immediately too.
+   */
+  const requestClose = useCallback(() => {
+    if (schedDraft) { setDiscardAsk('close'); return }
+    if (committing || dirtyPanes.size === 0) { closeSheet(); return }
+    // Published BEFORE the question goes up so a save still staging an upload
+    // sees it and holds its PUT until the answer arrives. Only this leg arms
+    // it: the schedule draft disables Save, so no staging save can be in
+    // flight behind the draft's own question.
+    let settle: (discarded: boolean) => void = () => {}
+    const answered = new Promise<boolean>(resolve => { settle = resolve })
+    discardAnswer.current = { answered, settle }
+    setDiscardAsk('close')
+  }, [schedDraft, committing, dirtyPanes, closeSheet])
+
+  /** The header's "Chat with this crew" routes through here: it creates a
+   *  chat slot, closes the sheet and navigates -- three steps that would
+   *  destroy an open schedule draft as silently as an unguarded Escape. */
+  const requestChat = useCallback(() => {
+    if (schedDraft) { setDiscardAsk('chat'); return }
+    void chatWith(editing)
+  }, [schedDraft, editing]) // eslint-disable-line react-hooks/exhaustive-deps -- chatWith is re-created per render; depping it would make this callback churn for no behavioural gain
+
+  /** The wake section's own cancel toggle asks here before collapsing a
+   *  dirty draft -- the one destruction path the page cannot intercept
+   *  itself (at narrow widths it is a bare icon-only X). */
+  const requestCancelDraft = useCallback((proceed: () => void) => {
+    collapseProceed.current = proceed
+    setDiscardAsk('collapse')
+  }, [])
+
+  const confirmDiscard = useCallback(() => {
+    const target = discardAsk
+    setDiscardAsk(null)
+    // Tell a save that is waiting on this question that its edits are being
+    // thrown away, so it returns instead of committing them.
+    settleDiscardAnswer(true)
+    // The form unmounts with the pane or the sheet; its unmount cleanup is
+    // what clears `schedDraft`, so nothing here resets the flag by hand. The
+    // chat path only destroys on SUCCESS: a failed slot-create keeps the
+    // sheet open (chatWith settles the error and returns), draft intact.
+    if (target === 'close') closeSheet()
+    else if (target === 'chat') void chatWith(editing)
+    else if (target === 'collapse') { collapseProceed.current?.(); collapseProceed.current = null }
+    else if (target) setPane(target)
+  }, [discardAsk, closeSheet, editing, settleDiscardAnswer]) // eslint-disable-line react-hooks/exhaustive-deps -- same chatWith identity note as requestChat
+
+  /** Every exit from the question that is NOT a confirm answers it "keep": the
+   *  Keep-editing button, an Escape on the confirm, and the sheet-change reset
+   *  all land here. A save holding its PUT is released rather than killed —
+   *  the user asked for that save and then chose to stay. */
+  useEffect(() => {
+    if (discardAsk === null) settleDiscardAnswer(false)
+  }, [discardAsk, settleDiscardAnswer])
+
+  /**
+   * Whether the pending question destroys the WHOLE editor while panes OTHER
+   * than the schedule draft are dirty — the case where the draft's narrow
+   * question has to name them.
+   *
+   * 'close' and 'chat' both end in closeSheet, so answering "Discard schedule"
+   * over a dialog that mentioned only the typed schedule is how an
+   * untouched-looking Model or Triggers edit disappears without ever being
+   * asked about. A pane switch and a form collapse keep the sheet, so the
+   * narrow question is the true one there and neither escalates.
+   */
+  const discardTakesSheet =
+    (discardAsk === 'close' || discardAsk === 'chat')
+    && [...dirtyPanes].some(k => k !== 'schedules')
+
+  /** The question stays the NARROW schedule one only while a draft is the
+   *  single thing at stake: with other panes going too it must name them, and
+   *  with no draft open it was never about a schedule. */
+  const askSchedOnly = schedDraft && !discardTakesSheet
 
   /** Pane changes driven from INSIDE a pane (an overview diagram node) rather
    *  than from the rail. The clicked node unmounts with its pane, which would
@@ -942,21 +1402,6 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
    *  comma-separated, blanks ignored, so a trailing comma is not a keyword. */
   const routingWords = triggers.split(',').map(s => s.trim()).filter(Boolean).length
 
-  /** Which panes hold an edit not yet saved. Compared against the SAVED crew,
-   *  so a value the user typed and then typed back is not reported as pending. */
-  const dirtyPanes = useMemo(() => {
-    const out = new Set<CrewPaneKey>()
-    if (!editingAgent) return out
-    if (kiroAgent !== (editingAgent.kiro_agent || '')) out.add('template')
-    if (workspace !== (editingAgent.workspace || '') || memoryStore !== (editingAgent.memory_store || '')) {
-      out.add('place')
-    }
-    if (editModel !== (editingAgent.model || INHERIT_MODEL)) out.add('model')
-    if (triggers !== (editingAgent.triggers || '')) out.add('routing')
-    if (sessionColor !== (editingAgent.session_color || '')) out.add('routing')
-    return out
-  }, [editingAgent, kiroAgent, workspace, memoryStore, editModel, triggers, sessionColor])
-
   const sections = useCrewEditorSections({
     templateLabel: provider.labels.agentTemplateField,
     activeSchedules: wakeJobs.filter(j => j.enabled).length,
@@ -975,6 +1420,25 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
     <>
       {!embedded && <PageHeader title={i18nT('pages.kiroCrewAgentsPage.agents')} subtitle={i18nT('pages.kiroCrewAgentsPage.manage_agent_workspace_memory_store_bindings')} />}
       <div className={`${embedded ? '' : 'px-4 md:px-6'} pb-8 overflow-y-auto flex-1 min-h-0`}>
+        {/* A roster that failed to load must not read as "you have no crews":
+            the empty state below would say exactly that. Hand-off only while the
+            crew sheet is closed — open, its unsaved pane edits (dirtyPanes) would
+            go with the navigation. */}
+        <ErrorNotice
+          className="mb-3.5"
+          title={i18nT('components.agentSelector.roster_load_failed')}
+          message={agentsError ? errorText(agentsError) : null}
+          askAgent={!sheet}
+          testId="crews-roster-load-error"
+        />
+        {/* Same hand-off decision as the roster notice above (dirtyPanes). */}
+        <ErrorNotice
+          className="mb-3.5"
+          title={i18nT('pages.kiroCrewAgentsPage.editor_options_load_failed')}
+          message={editorOptionsError ? errorText(editorOptionsError) : null}
+          askAgent={!sheet}
+          testId="crews-editor-options-load-error"
+        />
         {/* Says out loud what the bindings below cannot: a crew's workspace and
             memory store are shown and editable, but the isolation they imply is
             only partly built — every crew still reads one shared semantic
@@ -1006,9 +1470,14 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               aria-label={i18nT('pages.kiroCrewAgentsPage.new_sessions_use')}
               style={{ width: 190 }}
             />
-            {/* Hand-off is safe here: the select commits immediately on change,
-                so there is no unsaved draft for the navigation to destroy. */}
-            <ErrorNotice message={error} variant="inline" askAgent />
+            {/* `error` is ONE state shared with the crew sheet: settleFor writes
+                the sheet's create / update / delete failures into it too, and
+                those render in the sheet's own footer without a hand-off because
+                dirtyPanes hold unsaved edits. So this copy shows only while the
+                sheet is closed (closeSheet clears the state on the way out) — the
+                only writer then is the select above, which commits immediately on
+                change, so the hand-off has no draft to destroy. */}
+            <ErrorNotice message={sheet ? null : error} variant="inline" askAgent testId="crews-default-agent-error" />
           </div>
         )}
 
@@ -1142,7 +1611,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
         )}
       </div>
 
-      <Dialog open={!!sheet} onOpenChange={next => { if (!next) closeSheet() }}>
+      <Dialog open={!!sheet} onOpenChange={next => { if (!next) requestClose() }}>
         <DialogContent
           /* The rail needs horizontal room; the create form does not have one. */
           maxWidth={creating ? 560 : 790}
@@ -1157,13 +1626,33 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
              and suppressing it would break that. */
         >
           <DialogHeader>
-            {!creating && <CrewAvatar seed={editing} size={28} />}
+            {/* The avatar is itself the entry point to the builder: the
+                first-run review's top finding was that a face setting filed
+                under "Triggers" has no scent — but everyone tries clicking
+                the face. The Triggers-pane row remains as the discoverable
+                text route. */}
+            {!creating && (
+              <button
+                type="button"
+                onClick={() => setAvatarBuilderOpen(true)}
+                // Outside the pane's <fieldset> fence, so it carries the same
+                // busy gate itself: a builder opened mid-save could Apply a newer
+                // draft that the completing save's close then discards.
+                disabled={sheetBusy}
+                className="rounded-md transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-60"
+                aria-label={i18nT('components.avatarBuilder.title')}
+                title={i18nT('components.avatarBuilder.title')}
+                data-testid="header-avatar-button"
+              >
+                <CrewStateAvatar seed={editing} avatar={editAvatar ?? undefined} size={28} onImageError={() => setError(i18nT('components.avatarBuilder.image_load_failed'))} />
+              </button>
+            )}
             <DialogTitle className="font-mono">
               {creating ? i18nT('pages.kiroCrewAgentsPage.create_agent') : editing}
             </DialogTitle>
             {!creating && editingAgent?.source && <SourceBadge source={editingAgent.source} />}
             {!creating && (
-              <Btn className="ml-auto" onClick={() => chatWith(editing)}>
+              <Btn className="ml-auto" onClick={requestChat}>
                 <MessageSquare className="lucide-inline" aria-hidden="true" />
                 {i18nT('pages.kiroCrewAgentsPage.chat_with_this_crew')}
               </Btn>
@@ -1174,6 +1663,18 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               an existing crew has surfaces (schedules, bindings, removal) that a
               new one does not, and a wizard for creation is a separate decision. */}
           <DialogBody className={creating ? undefined : 'flex flex-col overflow-hidden p-0 sm:flex-row'}>
+            {/* The fence that makes the Save-time snapshot honest: while a
+                save is in flight (staged upload, the committing PUT, create
+                or delete), every control in the pane is disabled (fieldset
+                covers form controls, pointer-events the custom widgets), so
+                no edit can land mid-save only to be silently dropped when
+                the post-save close unmounts the pane.
+                display:contents keeps the flex layout unchanged. */}
+            <fieldset
+              disabled={sheetBusy}
+              aria-busy={sheetBusy}
+              className={`contents ${sheetBusy ? '[&>*]:pointer-events-none [&>*]:opacity-60' : ''}`}
+            >
             {creating ? (
               <div className="flex flex-col gap-6">
                 <section className="flex flex-col gap-3">
@@ -1203,7 +1704,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 <CrewEditorRail
                   sections={sections}
                   value={pane}
-                  onChange={setPane}
+                  onChange={requestPane}
                   ariaLabel={i18nT('components.crewEditor.rail_label')}
                   unsavedLabel={i18nT('components.crewEditor.unsaved_changes')}
                   sharedLabel={i18nT('components.crewEditor.tag_shared')}
@@ -1221,7 +1722,21 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 >
                   {pane === 'overview' && (
                     <CrewOverviewPane
-                      hub={<CrewAvatar seed={editing} size={34} />}
+                      // The largest face in the editor opens the builder too, so
+                      // the hub does not teach the opposite lesson from the
+                      // header face (same title, same entry point).
+                      hub={
+                        <button
+                          type="button"
+                          onClick={() => setAvatarBuilderOpen(true)}
+                          className="rounded-full transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring"
+                          aria-label={i18nT('components.avatarBuilder.title')}
+                          title={i18nT('components.avatarBuilder.title')}
+                          data-testid="hub-avatar-button"
+                        >
+                          <CrewAvatar seed={editing} avatar={editAvatar ?? undefined} size={34} />
+                        </button>
+                      }
                       templateLabel={provider.labels.agentTemplateField}
                       template={kiroAgent}
                       workspace={workspace}
@@ -1253,17 +1768,78 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                   {pane === 'model' && (
                     <>
                       <ModelField options={modelOptions} value={editModel} onChange={setEditModel} />
+                      {/* Offered when the model the crew will actually run on
+                          accepts effort — OR when a pin is already stored on a
+                          model that does not, so the only way to clear a
+                          stranded pin is not to first switch the model back. */}
+                      {(effortCapable || !!editEffort) && (
+                        <EffortField value={editEffort} onChange={setEditEffort} />
+                      )}
+                      {!effortCapable && !!editEffort && (
+                        <div className="rounded-md border border-warn-subtle bg-warn-subtle px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                          {/* Two different reasons a stored pin cannot apply, and
+                              they need different sentences: naming a model only
+                              works when there IS one. With nothing resolved,
+                              substituting the "Inherited" label would read as
+                              "Inherited does not take a reasoning effort", which
+                              names no model and states nothing true. */}
+                          {effortModel
+                            ? i18nT('pages.kiroCrewAgentsPage.effort_ignored_on_this_model', { model: effortModel })
+                            : i18nT('pages.kiroCrewAgentsPage.effort_pin_needs_a_model')}
+                        </div>
+                      )}
+                      {/* No hand-off: the crew sheet's unsaved pane edits
+                          (dirtyPanes). Without this a failed resolve just left the
+                          readout below absent, as if the crew had no model. */}
+                      <ErrorNotice
+                        message={resolvedError ? errorText(resolvedError) : null}
+                        testId="crew-resolved-model-error"
+                      />
                       {resolved && (
-                        <div className="rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
-                          <span className="text-text">
-                            {i18nT('pages.kiroCrewAgentsPage.resolves_to', { model: resolved.model || i18nT('pages.kiroCrewAgentsPage.inherited') })}
-                          </span>
-                          {' — '}
-                          {resolved.pinned
-                            ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
-                            : resolved.model
-                              ? i18nT('pages.kiroCrewAgentsPage.inherited_from_the_agent_template')
-                              : i18nT('pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses')}
+                        <div className="flex flex-col gap-1 rounded-md border border-border bg-bg-accent px-3 py-2.5 text-[11.5px] leading-relaxed text-muted">
+                          <div>
+                            <span className="text-text">
+                              {i18nT('pages.kiroCrewAgentsPage.resolves_to', { model: resolved.model || i18nT('pages.kiroCrewAgentsPage.inherited') })}
+                            </span>
+                            {' — '}
+                            {resolved.pinned
+                              ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
+                              : resolved.model
+                                ? i18nT('pages.kiroCrewAgentsPage.inherited_from_the_agent_template')
+                                : i18nT('pages.kiroCrewAgentsPage.no_pin_anywhere_the_backend_chooses')}
+                          </div>
+                          {/* The effort half of the same readout. It answers
+                              "what will this crew think at" in every case,
+                              including the one where no level can apply — an
+                              absent control with no line about it is what makes
+                              the setting look missing rather than unavailable.
+                              Suppressed only for the stranded pin, where the
+                              warning above already says it and says what to do. */}
+                          {(effortCapable || !editEffort) && (
+                            <div>
+                              {effortCapable ? (
+                                <>
+                                  <span className="text-text">
+                                    {i18nT('pages.kiroCrewAgentsPage.effort_resolves_to', {
+                                      effort: resolved.reasoning_effort
+                                        ? effortLabel(resolved.reasoning_effort)
+                                        : i18nT('lib.effort.default'),
+                                    })}
+                                  </span>
+                                  {' — '}
+                                  {resolved.effort_pinned
+                                    ? i18nT('pages.kiroCrewAgentsPage.pinned_on_this_crew')
+                                    : resolved.reasoning_effort
+                                      ? i18nT('pages.kiroCrewAgentsPage.effort_inherited_from_the_global_default')
+                                      : i18nT('pages.kiroCrewAgentsPage.no_effort_pin_the_model_decides')}
+                                </>
+                              ) : effortModel ? (
+                                i18nT('pages.kiroCrewAgentsPage.effort_unavailable_on_this_model', { model: effortModel })
+                              ) : (
+                                i18nT('pages.kiroCrewAgentsPage.effort_needs_a_model')
+                              )}
+                            </div>
+                          )}
                         </div>
                       )}
                     </>
@@ -1287,7 +1863,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                   )}
 
                   {pane === 'schedules' && (
-                    <CrewWakeSection crew={editing} isDefaultCrew={editing === defaultAgent} />
+                    <CrewWakeSection crew={editing} isDefaultCrew={editing === defaultAgent} onDraftChange={setSchedDraft} onSavingChange={setSchedSaving} onRequestCancel={requestCancelDraft} />
                   )}
 
                   {pane === 'webhook' && <CrewWebhookSection crew={editing} />}
@@ -1296,6 +1872,22 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                     <>
                       <TriggersField value={triggers} onChange={setTriggers} />
                       <SessionColorField value={sessionColor} onChange={setSessionColor} />
+                      <Field
+                        label={i18nT('components.avatarBuilder.field_label')}
+                        hint={i18nT('components.avatarBuilder.field_hint')}
+                      >
+                        <div className="flex items-center gap-2.5">
+                          <CrewAvatar seed={editing || ''} avatar={editAvatar ?? undefined} size={36} />
+                          <Btn onClick={() => setAvatarBuilderOpen(true)} data-testid="open-avatar-builder">
+                            {i18nT('components.avatarBuilder.customize')}
+                          </Btn>
+                          {editAvatar && (
+                            <span className="text-[11px] text-muted">
+                              {i18nT('components.avatarBuilder.customized_note')}
+                            </span>
+                          )}
+                        </div>
+                      </Field>
                     </>
                   )}
 
@@ -1331,6 +1923,7 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
                 </div>
               </>
             )}
+            </fieldset>
           </DialogBody>
 
           {/* Save is disabled while nothing is pending. The schedule pause/run
@@ -1338,19 +1931,33 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
               beside them implies those toggles are drafts that Cancel would roll
               back — which it cannot. */}
           <DialogFooter>
-            <ErrorNotice message={error} variant="inline" className="mr-auto" />
-            {!creating && dirtyPanes.size > 0 && !error && (
+            {/* No hand-off: the crew sheet's unsaved pane edits (dirtyPanes) —
+                a failed save is exactly what did not persist them. */}
+            <ErrorNotice message={error} variant="inline" className="mr-auto" testId="crew-sheet-error" />
+            {/* Client-side validation hint — the form never reached the server,
+                so this is plain text, not an error surface. */}
+            {sheetHint && <span className="mr-auto text-[12px] text-danger" data-testid="crew-sheet-hint">{sheetHint}</span>}
+            {!creating && dirtyPanes.size > 0 && !error && !sheetHint && (
               <span className="mr-auto text-[11.5px] text-muted" data-testid="crew-unsaved-note">
-                {i18nT('components.crewEditor.unsaved_changes')}
+                {/* While the open schedule draft is what disables Save, the note
+                    names that reason in visible text — the `title` on the button
+                    is hover-only, which keyboard and touch users never see. */}
+                {schedDraft
+                  ? i18nT('pages.kiroCrewAgentsPage.finish_the_new_schedule_first')
+                  : i18nT('components.crewEditor.unsaved_changes')}
               </span>
             )}
-            <Btn onClick={closeSheet}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
+            <Btn onClick={requestClose}>{i18nT('pages.kiroCrewAgentsPage.cancel')}</Btn>
             {creating ? (
               <SendBtn onClick={create} disabled={sheetBusy}>
                 {createMut.isPending ? i18nT('pages.kiroCrewAgentsPage.creating') : i18nT('pages.kiroCrewAgentsPage.create')}
               </SendBtn>
             ) : (
-              <SendBtn onClick={saveEdit} disabled={sheetBusy || dirtyPanes.size === 0}>{i18nT('pages.kiroCrewAgentsPage.save_changes')}</SendBtn>
+              <SendBtn
+                onClick={saveEdit}
+                disabled={sheetBusy || dirtyPanes.size === 0 || schedDraft}
+                title={schedDraft ? i18nT('pages.kiroCrewAgentsPage.finish_the_new_schedule_first') : undefined}
+              >{i18nT('pages.kiroCrewAgentsPage.save_changes')}</SendBtn>
             )}
           </DialogFooter>
 
@@ -1364,6 +1971,95 @@ export default function KiroCrewAgentsPage({ embedded }: { embedded?: boolean } 
             onCreated={handleWsCreated}
             onClose={() => setWsModalOpen(false)}
           />
+
+          {/* The editor's discard confirm. Same nesting rule and same
+              always-mounted rule as WorkspaceModal above — conditional
+              rendering skips Radix's layer deregistration and leaves the
+              editor believing it is no longer the top layer. Nested INSIDE the
+              editor's DialogContent is also what keeps Escape addressed to this
+              layer alone, so the editor never treats the confirm's own
+              dismissal as a dismissal of itself. The confirm button restates
+              the action; the dismiss restates the alternative, because a bare
+              "Cancel" beside the editor's own footer Cancel would be ambiguous.
+              The `crew-sched-*` test ids predate the generalization and stay
+              stable: one dialog now asks about a typed schedule, about unsaved
+              pane edits, or about both. */}
+          <Dialog open={discardAsk !== null} onOpenChange={next => { if (!next) setDiscardAsk(null) }}>
+            <DialogContent
+              maxWidth={440}
+              className="z-[110]"
+              aria-label={askSchedOnly
+                ? i18nT('pages.kiroCrewAgentsPage.discard_new_schedule')
+                : i18nT('pages.kiroCrewAgentsPage.discard_unsaved_changes')}
+            >
+              <DialogHeader>
+                <DialogTitle>
+                  {askSchedOnly
+                    ? i18nT('pages.kiroCrewAgentsPage.discard_new_schedule')
+                    : i18nT('pages.kiroCrewAgentsPage.discard_unsaved_changes')}
+                </DialogTitle>
+              </DialogHeader>
+              <DialogBody>
+                <p className="m-0 text-sm text-text">
+                  {schedDraft
+                    ? i18nT('pages.kiroCrewAgentsPage.discard_new_schedule_body')
+                    : i18nT('pages.kiroCrewAgentsPage.discard_unsaved_body')}
+                </p>
+                {/* Full contrast, same as the line above: this is the half of
+                    the consequence the narrow question left out, so it must not
+                    read as a footnote to it. */}
+                {schedDraft && discardTakesSheet && (
+                  <p className="mb-0 mt-2 text-sm text-text" data-testid="crew-sched-discard-also-crew">
+                    {i18nT('pages.kiroCrewAgentsPage.discard_also_crew_edits')}
+                  </p>
+                )}
+                {/* The reason Discard is locked, as VISIBLE text: the button's
+                    `title` never reaches keyboard or touch users, and browsers
+                    often suppress titles on disabled controls entirely. */}
+                {schedSaving && (
+                  <p className="mb-0 mt-2 text-[12px] text-muted" data-testid="crew-sched-discard-saving-note">
+                    {discardForce
+                      ? i18nT('pages.kiroCrewAgentsPage.discard_anyway_note')
+                      : i18nT('pages.kiroCrewAgentsPage.discard_locked_while_saving')}
+                  </p>
+                )}
+              </DialogBody>
+              <DialogFooter>
+                <Btn onClick={() => setDiscardAsk(null)} data-testid="crew-sched-discard-keep">
+                  {i18nT('pages.kiroCrewAgentsPage.keep_editing')}
+                </Btn>
+                <Btn
+                  danger
+                  onClick={confirmDiscard}
+                  // While the create request is in flight, discarding would not
+                  // cancel it -- the schedule would persist after the user
+                  // watched it "discarded". Locked until the request settles,
+                  // EXCEPT after the grace period: a hung request must not
+                  // seal every exit from the editor, so the button unlocks
+                  // and the visible note carries the may-still-persist caveat.
+                  disabled={schedSaving && !discardForce}
+                  title={schedSaving ? i18nT('components.jobForm.saving') : undefined}
+                  data-testid="crew-sched-discard-confirm"
+                >
+                  {askSchedOnly
+                    ? i18nT('pages.kiroCrewAgentsPage.discard_schedule_confirm')
+                    : i18nT('pages.kiroCrewAgentsPage.discard_confirm')}
+                </Btn>
+              </DialogFooter>
+            </DialogContent>
+          </Dialog>
+          {/* Same stacked-layer contract as WorkspaceModal: mounted inside the
+              editor's DialogContent, `open`-driven. Save only lands in the
+              editor's draft state — the crew record is written by Save changes. */}
+          {!creating && editing && (
+            <CrewAvatarBuilder
+              open={avatarBuilderOpen}
+              name={editing}
+              value={editAvatar}
+              onCancel={() => setAvatarBuilderOpen(false)}
+              onSave={next => { setEditAvatar(next); setAvatarBuilderOpen(false) }}
+            />
+          )}
         </DialogContent>
       </Dialog>
     </>

@@ -3,6 +3,9 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useTranslation } from 'react-i18next'
 import { Folder, RotateCw, ExternalLink, ChevronDown, ChevronUp, Search, X } from 'lucide-react'
 import DetailPanel from '../../components/DetailPanel'
+import { revealOrOpen, useRevealFailure, useRevealLabel } from '../../components/FilePathMenu'
+import ErrorNotice from '../../components/ErrorNotice'
+import { useBranding } from '../../hooks/useBranding'
 import { useGatewayPlatform } from '../../hooks/useGatewayPlatform'
 import { api } from '../../api/client'
 import { fileIcon, colorForExt } from '../../utils/fileIcons'
@@ -138,6 +141,8 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
   onPathChange?: (p: string) => void
 }) {
   const { t } = useTranslation()
+  // Still read for `atProjectRoot`'s case-sensitivity flag below; the reveal
+  // label it used to spell out now comes from the shared `useRevealLabel`.
   const gatewayPlatform = useGatewayPlatform()
   const [cwd, setCwd] = useState(path)
   const [query, setQuery] = useState('')
@@ -248,12 +253,17 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
   // Name the real application where the gateway HAS one, and fall back to the
   // generic term for Linux and for a platform we could not read. The platform is
   // the GATEWAY's because `/api/reveal` shells out there, and the wording holds for
-  // a directory as well as a file — this button reveals `cwd` itself.
-  const revealLabel = gatewayPlatform === 'darwin'
-    ? t('pages.chat.folderPanel.open_in_finder')
-    : gatewayPlatform === 'windows'
-      ? t('pages.chat.folderPanel.open_in_file_explorer')
-      : t('pages.chat.folderPanel.show_in_file_manager')
+  // a directory as well as a file — this button reveals `cwd` itself. Shared with
+  // every other file-location surface via useRevealLabel.
+  const revealLabel = useRevealLabel()
+  // A failed reveal renders above the search box; askAgent on — the only
+  // editable field is a transient search string, not a durable draft.
+  const reveal = useRevealFailure(cwd)
+  // `/api/reveal` shells out on the gateway, so revealing `cwd` only makes sense
+  // when the browser is on that same machine. A remote/tunneled session would
+  // otherwise get a mis-worded "Path copied" alert; hide the button there, the
+  // same directLocal gate every other file-location surface applies.
+  const { directLocal } = useBranding()
 
   return (
     <DetailPanel
@@ -274,17 +284,24 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
           >
             <RotateCw size={14} className={refreshBusy ? 'animate-spin' : undefined} />
           </button>
-          <button
-            onClick={() => api.revealPath(cwd)}
-            className="flex items-center justify-center w-[26px] h-[26px] rounded-md cursor-pointer transition-colors text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none"
-            title={revealLabel}
-            aria-label={revealLabel}
-          >
-            <ExternalLink size={14} />
-          </button>
+          {directLocal && (
+            <button
+              onClick={() => { void revealOrOpen(cwd, 'reveal', reveal) }}
+              className="flex items-center justify-center w-[26px] h-[26px] rounded-md cursor-pointer transition-colors text-muted hover:text-text hover:bg-bg-hover bg-transparent border-none"
+              title={revealLabel}
+              aria-label={revealLabel}
+            >
+              <ExternalLink size={14} />
+            </button>
+          )}
         </div>
       }
     >
+      {reveal.error && (
+        <div className="mx-2 mt-1.5">
+          <ErrorNotice variant="inline" className="whitespace-normal" message={reveal.error} askAgent onDismiss={reveal.clear} testId="folder-panel-reveal-error" />
+        </div>
+      )}
       <div className="flex items-center gap-1.5 mx-2 mt-1.5 px-2 h-[28px] shrink-0 rounded-md bg-bg border border-border focus-within:border-accent">
         <Search size={12} className="shrink-0 text-muted" />
         <input
@@ -355,8 +372,10 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
               </span>
             </div>
             {isSearchError && (
-              <div className="px-2 py-2 text-[12px] text-danger">
-                {(searchError as Error)?.message || t('pages.chat.folderPanel.search_failed')}
+              // Read failure; the only editable field is the transient search
+              // box, not a durable draft → hand-off on.
+              <div className="px-2 py-2">
+                <ErrorNotice variant="inline" message={(searchError as Error)?.message || t('pages.chat.folderPanel.search_failed')} askAgent />
               </div>
             )}
             {!isSearchError && isSearching && matches.length === 0 && (
@@ -425,8 +444,9 @@ export default function FolderPanel({ path, projectDir, onClose, onFileOpen, onA
             )}
             {isLoading && <div className="px-2 py-2 text-[12px] text-muted">{t('pages.chat.folderPanel.loading')}</div>}
             {isError && (
-              <div className="px-2 py-2 text-[12px] text-danger">
-                {(error as Error)?.message || t('pages.chat.folderPanel.unable_to_list_folder')}
+              // List failure in a side panel with nothing unsaved → hand-off on.
+              <div className="px-2 py-2">
+                <ErrorNotice variant="inline" message={(error as Error)?.message || t('pages.chat.folderPanel.unable_to_list_folder')} askAgent />
               </div>
             )}
             {!isLoading && !isError && isEmpty && (

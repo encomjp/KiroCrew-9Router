@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 # Event kinds — re-exported from the single source of truth
 from kiro_crew.acp.types import (  # noqa: F401
@@ -31,6 +31,47 @@ from kiro_crew.acp.types import AcpEvent as LLMEvent  # noqa: F401
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
+
+
+def resolve_billing_stats(holder: object | None) -> object | None:
+    """The billing stats *holder* declares, else the ``last_prompt_stats`` it carries.
+
+    The single spelling of "read a turn's billing off this object", shared by the
+    accounting path and by every wrapper that forwards it, so a wrapper cannot
+    resolve the capability differently from the reader it feeds.
+
+    The declaration is resolved off the TYPE, not the instance: a class that
+    defines :meth:`LLMProvider.billing_stats` is stating the capability, whereas
+    an object that merely answers an attribute of that name may be a mock whose
+    auto-created child would masquerade as a stats object and shadow the real
+    billing. A holder that declares nothing -- or leaves the ABC default, which
+    answers ``None`` -- falls back to the ``last_prompt_stats`` the ACP runner
+    carries, so a holder found before the capability existed is still read.
+    """
+    if holder is None:
+        return None
+    seam = getattr(type(holder), "billing_stats", None)
+    if callable(seam):
+        declared = seam(holder)
+        if declared is not None:
+            return declared
+    return getattr(holder, "last_prompt_stats", None)
+
+
+@runtime_checkable
+class SessionMcpReport(Protocol):
+    """What a session's MCP registration report offers its consumers.
+
+    Declared at the provider seam rather than imported from ``kiro_crew.acp`` so
+    a dashboard consumer can name the capability without taking an ACP-layer
+    edge. The concrete ``McpSessionReport`` satisfies it structurally.
+    """
+
+    def payload(self) -> dict | None: ...
+
+    def record_event(
+        self, kind: str, server_name: str, error: str = "", *, fanout_no_owner: bool = False
+    ) -> bool: ...
 
 
 class LLMProvider(ABC):
@@ -103,6 +144,17 @@ class LLMProvider(ABC):
         (safe) truth for them."""
         return None
 
+    @property
+    def last_compaction_transient(self) -> bool:
+        """Whether that failure is worth retrying.
+
+        The default is the SAFE value: False means "treat it as permanent", so a
+        provider that reports no verdict gives up the turn exactly as it did
+        before this capability existed, rather than replaying a message against
+        a compaction that cannot succeed.
+        """
+        return False
+
     def context_window_tokens(self) -> int:
         """Return the real served context window in tokens (0 if unknown).
 
@@ -174,6 +226,20 @@ class LLMProvider(ABC):
         return self.is_alive()
 
     @property
+    def process_instance(self) -> str:
+        """Identity of the provider's CURRENT child process instance.
+
+        ``""`` for providers not backed by a child process, and for a
+        process-backed provider whose child is gone. Process-backed providers
+        override this with a per-spawn token so a resource minted by one child
+        (an MCP OAuth authorize link, whose loopback listener and PKCE verifier
+        live in that process) can be recognized as dead once the child is —
+        equality across spawns must be impossible, which is why the ACP session
+        id (reused by resume on a new process) can never serve here.
+        """
+        return ""
+
+    @property
     def exit_code(self) -> int | None:
         """Last child-process exit code, or None if no process or still running."""
         return None
@@ -205,6 +271,36 @@ class LLMProvider(ABC):
         real values. Base returns (None, None) which disables abort push.
         """
         return (None, None)
+
+    def billing_stats(self) -> object | None:
+        """The live per-turn billing stats object, or None when unmetered.
+
+        Declared here so what a turn COST is a stated provider capability, like
+        the context accessors above, instead of an attribute name the accounting
+        path has to guess. Surfaces that dispatch without an ``EVENT_COMPLETE``
+        in hand -- cron, heartbeat, autonudge, workflows, the task runner --
+        recover the turn's spend through ``llm_helpers.provider_last_turn_usage``,
+        which otherwise finds it only by walking the private attributes
+        ``_client`` / ``_handle`` / ``_sess`` / ``provider`` for a
+        ``last_prompt_stats``. A provider that links to its turn-runner under any
+        other name is not found by that walk: the read yields empty usage, the
+        ``usage_has_billing`` gate reads that as "nothing to record", and the
+        spend never reaches the usage store -- absent from the dashboard while
+        the account balance moves, with no error raised anywhere.
+
+        Return the stats OBJECT, not a value. The accounting path compares
+        identity to tell a turn that ran from one whose dispatch failed while a
+        previous, already-recorded turn's stats were still installed, so a
+        provider must install a fresh object as each turn begins (as the ACP
+        runner does) for that comparison to hold.
+
+        The object need only carry the billing: ``to_turn_usage()`` is preferred
+        when it offers one -- that is the single source of truth for every
+        dimension a seam bills on -- and a ``credits`` attribute is read
+        otherwise. Default None means "this backend reports no per-turn
+        billing", so an unmetered provider needs no override.
+        """
+        return None
 
     # ── Turn-control and capability surface (harness-parity H14) ──
     # The session, shutdown-drain, steer, and dashboard layers read these off a
@@ -264,6 +360,23 @@ class LLMProvider(ABC):
         return False
 
     @property
+    def manual_compact_unsupported_backend(self) -> str | None:
+        """Backend id when this provider cannot serve a manual ``/compact``,
+        ``None`` when the command is fine to dispatch.
+
+        The manual entry points gate on this so an unsupported backend gets an
+        immediate, user-visible refusal instead of a prompt whose
+        compaction-status wait strands until ``COMPACT_WAIT_TIMEOUT_SECS``
+        (#7800). Default ``None`` — a provider that has not positively named an
+        unsupported backend passes through, because it handles ``/compact`` on
+        its own terms. Declared here with a safe default rather than probed off
+        the instance (harness-parity H14); the ACP implementations answer from
+        ``ACP_BACKENDS_COMPACT`` membership. Consumers must act only on a
+        non-empty ``str`` value, so a mocked provider's attribute never reads
+        as a refusal."""
+        return None
+
+    @property
     def uses_kiro_identity_store(self) -> bool:
         """True when this provider's child authenticates from kiro-cli's own
         identity store, so an external ``kiro-cli logout`` invalidates a process
@@ -276,10 +389,37 @@ class LLMProvider(ABC):
         layer never has to guess from private attributes."""
         return False
 
+    @property
+    def mcp_config_hot_reload(self) -> bool:
+        """True when this provider's live process reconciles agent-config and
+        ``mcp.json`` edits on its own — only the changed MCP servers restart, the
+        conversation is kept — so the dashboard's MCP sync may leave it running
+        instead of resetting it.
+
+        Default False — the reset is the safe answer, and a harness that has not
+        demonstrated the reconcile must not inherit the skip (harness-parity
+        H6/H14). Declared here rather than probed off the instance; the ACP
+        implementation answers from ``ACP_BACKENDS_MCP_CONFIG_HOT_RELOAD``
+        membership plus the version its process reported at ``initialize``.
+        Consumers must act only on a literal ``True``, so a mocked provider's
+        attribute never reads as a skip."""
+        return False
+
     def available_models(self) -> list[dict[str, str]]:
         """Backend-advertised models (``[{modelId, name, ...}]``) for the model
         picker. Default empty for a provider that advertises none."""
         return []
+
+    def mcp_session_report(self) -> SessionMcpReport | None:
+        """This session's own MCP registration report, or None if it keeps none.
+
+        Declared HERE rather than probed with ``getattr`` at the consumer: a probe
+        answers "no report" for a provider that simply spells the accessor
+        differently, which is indistinguishable from a session that reported
+        nothing — and that silence is the false all-clear the report exists to
+        remove. A provider without one returns None explicitly.
+        """
+        return None
 
     def get_valid_effort_levels(self) -> list[str]:
         """Reasoning-effort levels the provider accepts. Default empty for a

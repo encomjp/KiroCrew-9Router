@@ -53,10 +53,11 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
-from kiro_crew.history import transcript_stem
+from kiro_crew.history import mint_row_mid, transcript_stem
 from kiro_crew.messaging.approval import PendingApprovals, SessionApprovalDecider
 from kiro_crew.messaging.attachments import append_attachment_context
 from kiro_crew.messaging.attachments import cleanup as cleanup_attachments
+from kiro_crew.messaging.commands import compact_unsupported_backend, compact_unsupported_reply
 from kiro_crew.messaging.dispatch import (
     ChannelTurn,
     build_directive_consumer,
@@ -823,8 +824,9 @@ class WebexDispatcher:
 
         Deliberately not a dashboard-session picker: resuming one of those needs
         the durable resume-expectation store and an inbound path that resolves the
-        mirror binding, which is why ``supports_session_resume`` is Discord-only
-        and the capability ledger pins it that way.
+        mirror binding. Webex implements neither and therefore leaves
+        ``supports_session_resume`` false; Discord and Telegram are the shipped
+        transports that currently declare it.
         """
         if self.conv_log is None:
             await self._reply(inbound, "ℹ️ Conversation history is not available.")
@@ -1513,9 +1515,11 @@ class WebexDispatcher:
         """Record the turn to conversation_log (dashboard visibility + restart)."""
         if self.conv_log is None:
             return
-        self.conv_log.append(session_key, "user", user_text, agent=agent)
+        self.conv_log.append(session_key, "user", user_text, agent=agent, mid=mint_row_mid())
         if reply_text:
-            self.conv_log.append(session_key, "assistant", reply_text, agent=agent)
+            self.conv_log.append(
+                session_key, "assistant", reply_text, agent=agent, mid=mint_row_mid()
+            )
         if is_new:
             title = (user_text or "").strip().replace("\n", " ")[:40] or "Webex"
             self.conv_log.set_title(session_key, title)
@@ -1530,6 +1534,14 @@ class WebexDispatcher:
         """
         route = _route_of(inbound)
         pct = self.sessions.check_context_usage(session_key, provider)
+        if pct >= self.cfg.webex.soft_threshold_pct:
+            # Capability gate (#8156): no forced compaction to run and the
+            # soft nudge's /compact advice cannot work — the backend compacts
+            # on its own as context fills.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                logger.debug("Webex: context notice skipped — %s compacts itself", unsupported)
+                return
         if pct >= self.cfg.webex.hard_threshold_pct:
             self._conv.clear_awaiting(route)
             ok, detail = await self._compact_provider(provider)
@@ -1599,6 +1611,14 @@ class WebexDispatcher:
             provider = self.sessions.get_provider(session_key)
             if provider is None:
                 await self._reply(inbound, "ℹ️ There's no conversation to compact yet.")
+                return
+            # Capability gate (#8156, mirroring the dashboard's #7800 gate): a
+            # backend that cannot serve a manual /compact treats the prompt as
+            # ordinary text and never answers, so dispatching would strand the
+            # bounded wait. Informational, never an error.
+            unsupported = compact_unsupported_backend(provider)
+            if unsupported:
+                await self._reply(inbound, compact_unsupported_reply(unsupported))
                 return
             ok, detail = await self._compact_provider(provider)
             await self._reply(

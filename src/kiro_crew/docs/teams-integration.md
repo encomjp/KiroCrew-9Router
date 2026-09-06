@@ -38,14 +38,20 @@ Framework **pushes** activities to a messaging endpoint you host. Kiro Crew:
 
   The gateway itself speaks HTTP, so something must terminate TLS in front of it;
   Teams will not deliver to a non-HTTPS endpoint.
-- The Teams extra installed (for inbound JWT validation):
+- The JWT dependency installed (for inbound token validation), in the
+  environment that runs the gateway:
 
   ```bash
-  pip install "kirocrew[teams]"
+  pip install "PyJWT[crypto]==2.13.0"
   ```
 
-  If the channel is enabled without this extra, Kiro Crew logs an actionable
-  error and skips Teams (the rest of the gateway still starts).
+  This is the whole of the `teams` extra. Installing the dependency directly is
+  the form that works on every layout: Kiro Crew is not published on PyPI, so
+  `pip install "kirocrew[teams]"` cannot resolve, and the direct-URL form below
+  reinstalls Kiro Crew itself rather than just adding the dependency.
+
+  If the channel is enabled without it, Kiro Crew logs an actionable error and
+  skips Teams (the rest of the gateway still starts).
 
  > [!NOTE]
  > The error `invalid-egg-fragment` occurs because modern `pip` (v22+) deprecated and removed support for using `#egg=package_name[extra]` in direct Git URLs.
@@ -226,7 +232,7 @@ None of this disables the security gate: the sensitive-path keystone, the
 enterprise governance ceiling, and the destructive-command deny-list all run ahead
 of auto-approval, so anything denied by policy stays denied.
 
-## Security notes
+## Access control
 
 - The webhook is **exempt from the dashboard cookie gate and from the CSRF origin
   check, for `POST` only**, because it performs its own Bot Framework JWT
@@ -263,7 +269,7 @@ of auto-approval, so anything denied by policy stays denied.
   that resolves into a private, loopback or link-local range is refused — so an
   activity cannot turn the gateway into a proxy for your internal network.
 
-## Limitations (this release)
+## Limits
 
 - 1:1 personal chat only — no team channels, group chats, or @mention handling.
   A reply in a channel would expose tool output to people who are not on your
@@ -297,3 +303,9 @@ of auto-approval, so anything denied by policy stays denied.
   with a channel or user target — its addressing, allow-list and threading are Slack
   concepts — so a Teams-only install should rely on the mirror rather than on that
   tool's own delivery.
+
+## Related docs
+
+- [Channel capabilities](channel-capabilities.md): the ten-channel matrix — streaming, buttons, uploads, reply length, approval timeout
+- [Getting Started](getting-started.md): install, first run, connecting a channel
+- [Configuration](configuration.md): the config file and environment variables

@@ -28,6 +28,7 @@ from aiohttp import web
 
 import kiro_crew.config.loader as loader
 import kiro_crew.dashboard.handlers.messaging as mod
+from kiro_crew.subagent import AGENT_NOT_FOUND_CODE
 
 
 class _Req:
@@ -48,7 +49,10 @@ class _Req:
         self.match_info = match_info or {}
         self.query = query or {}
         self.remote = remote
-        self._extra = extra or {}
+        self._extra = {"app": "", **(extra or {})}
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._extra
 
     async def json(self) -> Any:
         if isinstance(self._body, BaseException):
@@ -100,6 +104,7 @@ def _info(**kw: Any) -> Any:
         "task": "do it",
         "done": False,
         "error": "",
+        "error_code": "",
         "result": "",
         "result_path": "",
         "started": 1_700_000_000.0,
@@ -185,7 +190,30 @@ class TestApiSpawn:
         mgr.spawn.return_value = _info(done=True, error="cwd not allowed")
         resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x"}))
         assert resp.status == 400
-        assert _payload(resp) == {"error": "cwd not allowed", "counted": True}
+        # An un-coded rejection kind reports the generic identifier, so the body
+        # is machine-readable even where the manager mints nothing.
+        assert _payload(resp) == {
+            "error": "cwd not allowed",
+            "code": "spawn_rejected",
+            "counted": True,
+        }
+
+    def test_unknown_agent_rejection_carries_its_own_code(self) -> None:
+        """The one rejection a client acts on differently keeps its own identifier:
+        ``spawn_run`` stops re-posting a name the gateway already refused, and it
+        must not have to parse the prose to know which refusal this was."""
+        mgr = _mgr()
+        mgr.spawn.return_value = _info(
+            done=True,
+            error="agent 'ghost' not found; available: scout",
+            error_code=AGENT_NOT_FOUND_CODE,
+        )
+        resp = _run(mod.api_spawn, _Req(_state(subagents=mgr), {"task": "x", "agent": "ghost"}))
+        assert resp.status == 400
+        body = _payload(resp)
+        assert body["code"] == AGENT_NOT_FOUND_CODE
+        # Prose still travels for the model to read and self-correct from.
+        assert "available: scout" in body["error"]
 
     def test_success_coerces_string_flags_and_bounds_batch_total(self) -> None:
         mgr = _mgr()
@@ -757,6 +785,69 @@ class TestApiSpawnClear:
         resp = _run(mod.api_spawn_clear, _Req(_state(subagents=mgr)))
         assert _payload(resp) == {"ok": True, "cleared": 1}
         assert list(mgr._agents) == ["run"]
+
+
+class TestApiSpawnStopAll:
+    def test_requires_manager(self) -> None:
+        resp = _run(mod.api_spawn_stop_all, _Req(_state(), {"slot": "chat-1"}))
+        assert resp.status == 503
+        assert _payload(resp)["code"] == "subagents_unavailable"
+
+    @pytest.mark.parametrize("body", [_BAD_JSON, None, {}, {"slot": ""}, {"slot": "../other"}])
+    def test_rejects_invalid_slot_input(self, body: Any) -> None:
+        resp = _run(mod.api_spawn_stop_all, _Req(_state(subagents=_mgr()), body))
+        assert resp.status == 400
+
+    def test_requires_an_existing_slot(self) -> None:
+        state = _state(subagents=_mgr())
+        state.get_slot.return_value = None
+        resp = _run(mod.api_spawn_stop_all, _Req(state, {"slot": "missing"}))
+        assert resp.status == 404
+        assert _payload(resp)["code"] == "slot_not_found"
+
+    def test_resolves_server_owned_session_and_stops_running_and_queue(self) -> None:
+        mgr = _mgr(cancel_for_parent=AsyncMock(return_value=(2, 3)))
+        state = _state(subagents=mgr)
+        state.get_slot.return_value = SimpleNamespace(
+            key="chat-1", linked_session_key="slack:123.456"
+        )
+        resp = _run(mod.api_spawn_stop_all, _Req(state, {"slot": "chat-1"}))
+        assert _payload(resp) == {
+            "ok": True,
+            "stopped": 5,
+            "running": 2,
+            "queued": 3,
+        }
+        mgr.cancel_for_parent.assert_awaited_once_with("slack:123.456")
+
+    @pytest.mark.parametrize("slot_app", ["", "caller-app", "other-app"])
+    def test_app_token_cannot_stop_any_slot(self, slot_app: str) -> None:
+        mgr = _mgr(cancel_for_parent=AsyncMock(return_value=(1, 1)))
+        state = _state(subagents=mgr)
+        state.get_slot.return_value = SimpleNamespace(
+            key="chat-1", linked_session_key="foreign:session", _app=slot_app
+        )
+        req = _Req(state, {"slot": "chat-1"}, extra={"app": "caller-app"})
+
+        resp = _run(mod.api_spawn_stop_all, req)
+
+        assert resp.status == 403
+        assert _payload(resp)["code"] == "app_token_forbidden"
+        state.get_slot.assert_not_called()
+        mgr.cancel_for_parent.assert_not_awaited()
+
+    def test_missing_app_claim_is_denied_before_slot_resolution(self) -> None:
+        mgr = _mgr(cancel_for_parent=AsyncMock(return_value=(1, 1)))
+        state = _state(subagents=mgr)
+        req = _Req(state, {"slot": "chat-1"})
+        req._extra.pop("app")
+
+        resp = _run(mod.api_spawn_stop_all, req)
+
+        assert resp.status == 403
+        assert _payload(resp)["code"] == "app_token_forbidden"
+        state.get_slot.assert_not_called()
+        mgr.cancel_for_parent.assert_not_awaited()
 
 
 # ── notifications ──

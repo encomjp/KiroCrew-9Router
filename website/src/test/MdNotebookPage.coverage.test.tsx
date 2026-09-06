@@ -77,6 +77,11 @@ vi.mock('../apps/md-notebook/api', async () => {
   return { ...actual, notesApi: mockApi }
 })
 
+// Load the page during test-module collection, not inside every test's 15-second
+// budget. Under a loaded full-suite worker, the first dynamic import alone could
+// consume that budget before the loading-state assertion ran.
+const MdNotebookPage = (await import('../apps/md-notebook/MdNotebookPage')).default
+
 function vault(over: Partial<Vault> = {}): Vault {
   return {
     id: 'v1',
@@ -117,8 +122,7 @@ const DOC = {
   backlinks: [{ sourcePath: 'folder/Two.md', line: 3, context: 'see [[One]]' }],
 }
 
-async function renderPage() {
-  const { default: MdNotebookPage } = await import('../apps/md-notebook/MdNotebookPage')
+function renderPage() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
   })
@@ -206,11 +210,20 @@ describe('MdNotebookPage', () => {
   // ── boot states ───────────────────────────────────────────────────────────
 
   it('shows a loading line until the vault list arrives', async () => {
-    // Never resolves: the point is the state BEFORE any reply, which the page
-    // reaches by `vaults === null` rather than a separate flag.
-    mockApi.listVaults.mockReturnValue(new Promise(() => {}))
-    await renderPage()
-    expect(await screen.findByText('Loading…')).toBeTruthy()
+    // Hold the reply only until the loading state is observed, then settle it so
+    // this test owns and drains every promise it creates before teardown.
+    let resolveVaults!: (value: { vaults: Vault[]; hasPat: boolean; hasGhAuth: boolean }) => void
+    const pending = new Promise<{ vaults: Vault[]; hasPat: boolean; hasGhAuth: boolean }>((resolve) => {
+      resolveVaults = resolve
+    })
+    mockApi.listVaults.mockReturnValue(pending)
+    renderPage()
+    expect(screen.getByText('Loading…')).toBeTruthy()
+    await act(async () => {
+      resolveVaults({ vaults: [], hasPat: false, hasGhAuth: false })
+      await pending
+    })
+    expect(screen.getByText('Clone a repo')).toBeTruthy()
   })
 
   it('names the backend as unreachable when the vault list fails', async () => {

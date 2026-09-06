@@ -77,6 +77,10 @@ _lock = threading.Lock()
 _proc: subprocess.Popen[bytes] | None = None
 _info: ShowInfo | None = None
 _relay: "_Relay | None" = None
+#: The child's OWN listening port, which is what ownership is proved against.
+#: Distinct from ``_info.port``: on the pinned path that is the operator's port,
+#: served by our in-process relay, so it proves nothing about the child.
+_child_port: int | None = None
 # Why the last start attempt failed, surfaced through ``status()``. With an
 # ephemeral port a failed bind was a near-impossible edge; with a pinned port
 # "already in use" becomes the most likely operator misconfiguration, and a
@@ -89,9 +93,14 @@ def _free_port() -> int:
 
     Binding port 0 lets the kernel pick one that is free right now. This is
     advisory: the socket is closed before the child binds it, so there is a
-    TOCTOU window. A lost race shows up as the child failing its readiness
-    gate, which :func:`ensure_running` reports as a failed start rather than
-    retrying blindly.
+    TOCTOU window in which a local process can take the number instead.
+
+    The window cannot be closed here. Closing it would mean handing the child a
+    socket we already hold, and ``playwright-cli show`` takes a port NUMBER, not
+    an inherited descriptor — so there is no bind-before-release to perform. What
+    contains it is :func:`_port_owner`: the readiness gate proves the responder
+    belongs to the process tree we spawned before adopting it, so losing the race
+    is reported as a failed start instead of adopting the winner.
     """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((LOOPBACK_HOST, 0))
@@ -139,8 +148,10 @@ class _Relay:
     ownership proof: ``bind()`` either succeeds (the port is ours until we
     close it) or raises (occupied). This makes the DETERMINISTIC, operator-named
     port race-free; the child then binds an OS-assigned ephemeral port exactly
-    as on the unpinned path, which keeps that path's advisory window
-    (unpredictable, loopback-local). This relay forwards
+    as on the unpinned path, whose probe-to-bind window is contained a different
+    way -- :func:`_port_owner` proves the responder belongs to the tree we
+    spawned before the readiness gate adopts it, so a squatter that wins the
+    window is refused rather than framed. This relay forwards
     each accepted connection byte-for-byte, which carries HTTP and WebSocket
     traffic alike. Both sockets stay loopback-only.
     """
@@ -306,6 +317,86 @@ def _healthy(port: int) -> bool:
             conn.close()
 
 
+#: Proven: a process in the tree we spawned holds the port.
+_OWNER_CHILD = "child"
+#: Treated as foreign. Either a lookup that ran and could not attribute the
+#: listener to us, or a proven third party -- both mean "not demonstrably ours".
+_OWNER_FOREIGN = "foreign"
+#: The port->PID lookup tool is not installed on this host. Deliberately still
+#: adopted; see :func:`_port_owner` for why this one branch stays fail-open.
+_OWNER_UNPROVEN = "unproven"
+
+
+def _port_owner(port: int, proc: subprocess.Popen[bytes] | None) -> str:
+    """Who holds *port*: our child's tree, foreign, or undecidable on this host.
+
+    :func:`_healthy` answers "is an HTTP server there", which is reachability,
+    not identity. That is the whole gap: ``_free_port`` releases its probe socket
+    before the child binds, so a local process can take the number in between,
+    and a bare health probe then reports the squatter as our server -- after which
+    the panel frames arbitrary content with input forwarding attached.
+
+    **A lookup that RAN but cannot attribute the listener to us is FOREIGN, not
+    undecidable.** The caller only asks after a successful ``127.0.0.1`` probe, so
+    something is listening; if a working lookup cannot show it belongs to our
+    tree, "not ours" is the honest reading. That covers a squatter owned by
+    another user (invisible to our ``lsof``) and a lookup that timed out under
+    load. The cost is a refused start on a loaded host, which is recoverable and
+    reported; adopting an unverified responder is not.
+
+    **The one fail-open branch is the tool being absent**, which is a static
+    property of the host rather than a per-start event. Refusing there would take
+    the panel away from every machine without ``lsof`` -- a certain, permanent
+    regression of a working feature, traded against a race whose winner must
+    already be a local process on a loopback-only dev surface. It is also not
+    attacker-controllable in any threat model that matters: removing
+    ``/usr/bin/lsof`` needs the kind of access that makes this panel the least of
+    the problems. The pod health probe draws the same line for the same reason,
+    and the startup gate logs when it lands here so the operator knows the check
+    did not run.
+    """
+    if proc is None:
+        return _OWNER_FOREIGN
+    if not platform_compat.listening_pid_tool_available():
+        return _OWNER_UNPROVEN
+    listeners = platform_compat.find_port_listeners(port)
+    if not listeners:
+        # The port answered a moment ago, so someone IS listening. A working
+        # lookup that sees nothing means the socket is not visible to us, which
+        # is not evidence of ownership.
+        return _OWNER_FOREIGN
+    owners = platform_compat.loopback_owner_pids(listeners)
+    if not owners:
+        return _OWNER_FOREIGN
+    # The listener is often a DESCENDANT: the CLI spawns Node and helper
+    # processes, which is why _reap signals the whole tree rather than the direct
+    # child. Enumerate the tree we own and accept any member of it.
+    ours = {proc.pid, *platform_compat.process_descendants(proc.pid)}
+    if any(pid in ours for pid in owners):
+        return _OWNER_CHILD
+    return _OWNER_FOREIGN
+
+
+def _recorded_is_live() -> bool:
+    """Whether the recorded child is alive, answering, AND still owns its port.
+
+    One predicate for both the reuse gate in :func:`ensure_running` and
+    :func:`status`, so the two cannot disagree about what "running" means. A
+    divergence would matter: ``status`` is what hands the panel its URL, so a
+    reachability-only ``status`` would report a squatter as running and point the
+    panel at it even while ``ensure_running`` refused to adopt the same server.
+
+    Callers hold :data:`_lock`.
+    """
+    return (
+        _alive(_proc)
+        and _info is not None
+        and _healthy(_info.port)
+        and _child_port is not None
+        and _port_owner(_child_port, _proc) != _OWNER_FOREIGN
+    )
+
+
 def _show_argv(cli: str, port: int) -> list[str]:
     """Argv for the dashboard server.
 
@@ -385,9 +476,12 @@ def ensure_running(port: int | None = None) -> ShowInfo | None:
     pinned port is already taken by something else, or the server did not
     become healthy within the startup budget. ``status()`` carries the reason.
     """
-    global _proc, _info, _relay, _last_reason
+    global _proc, _info, _relay, _last_reason, _child_port
     with _lock:
-        if _alive(_proc) and _info is not None and _healthy(_info.port):
+        # Ownership is re-proved on reuse, not just at startup. A child that is
+        # alive but no longer listening leaves its port free for a squatter, and
+        # without this the next call would hand that squatter back as the panel.
+        if _recorded_is_live():
             return _info
         if _proc is not None:
             _reap(_proc)
@@ -396,6 +490,7 @@ def ensure_running(port: int | None = None) -> ShowInfo | None:
         if _relay is not None:
             _relay.close()
             _relay = None
+        _child_port = None
         _last_reason = None
 
         cli = cli_path()
@@ -440,8 +535,38 @@ def ensure_running(port: int | None = None) -> ShowInfo | None:
                 _last_reason = f"playwright-cli show exited during startup on port {child_port}"
                 return None
             if _healthy(child_port):
+                # Reachability is not identity. Prove the responder is ours
+                # before adopting it; a squatter that won _free_port's window
+                # answers this probe exactly as our child would.
+                owner = _port_owner(child_port, proc)
+                if owner == _OWNER_FOREIGN:
+                    logger.warning(
+                        "another local process holds port %d — refusing to adopt "
+                        "it as the browser view",
+                        child_port,
+                    )
+                    if relay is not None:
+                        relay.close()
+                    _last_reason = (
+                        f"another local process took port {child_port} before the "
+                        f"view server could bind it"
+                    )
+                    _reap(proc)
+                    return None
+                if owner == _OWNER_UNPROVEN:
+                    # Said once per start, not per poll: the operator should know
+                    # the ownership check did not run, since without it this
+                    # adoption rests on reachability alone.
+                    logger.warning(
+                        "cannot verify which process holds port %d (%s is not "
+                        "installed); adopting the browser view on reachability "
+                        "alone",
+                        child_port,
+                        platform_compat.listening_pid_tool(),
+                    )
                 _proc = proc
                 _relay = relay
+                _child_port = child_port
                 _info = ShowInfo(url=f"http://{LOOPBACK_HOST}:{public_port}", port=public_port)
                 return _info
             time.sleep(_POLL_INTERVAL_S)
@@ -467,7 +592,7 @@ def stop() -> None:
     independently-launched ``playwright-cli show`` session, destroying their
     unsaved work.
     """
-    global _proc, _info, _relay, _last_reason
+    global _proc, _info, _relay, _last_reason, _child_port
     with _lock:
         if _proc is not None:
             _reap(_proc)
@@ -476,6 +601,7 @@ def stop() -> None:
         _proc = None
         _info = None
         _relay = None
+        _child_port = None
         _last_reason = None
 
 
@@ -497,7 +623,7 @@ def status() -> dict[str, Any]:
                 "port": None,
                 "reason": "playwright-cli is not installed",
             }
-        if _alive(_proc) and _info is not None and _healthy(_info.port):
+        if _recorded_is_live() and _info is not None:
             return {
                 "status": "running",
                 "url": _info.url,

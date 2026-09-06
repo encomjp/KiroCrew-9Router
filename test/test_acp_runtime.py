@@ -832,6 +832,60 @@ def test_runtime_uses_clients_augmented_kiro_bin_resolver():
     assert runtime_mod._resolve_kiro_bin_for_spawn is client_mod._resolve_kiro_bin_for_spawn
 
 
+@pytest.mark.parametrize("backend", [None, ACP_BACKEND_KAS])
+@pytest.mark.asyncio
+async def test_runtime_missing_kiro_bin_reports_the_directories_it_searched(backend):
+    """The runtime spawn path must DIAGNOSE a missing Kiro CLI, not just name it.
+
+    ``AcpClient._spawn`` already separates "this binary is not installed" from
+    "its install directory is outside the search" by naming every directory it
+    walked (see ``test_spawn_kiro_missing_bin_reports_only_resolver_search_dirs``
+    and ``env.describe_search_path``). The runtime sibling raised a bare
+    ``kiro-cli not found in PATH``, which is both less information and factually
+    wrong: resolution also walks ``%LOCALAPPDATA%\\Kiro-Cli``,
+    ``%ProgramFiles%\\Kiro-Cli`` and the ``KIROCREW_KIRO_BIN`` override, none of
+    which is PATH.
+
+    That gap is what produced #6497. A Windows reporter read "not found in PATH",
+    ran ``where kiro-cli``, got nothing, saw the gateway's OWN ``kirocrew.exe``
+    in the app bundle, and concluded the agent CLI had been renamed and this
+    lookup left stale. It had not been: ``kirocrew`` is Kiro Crew's own console
+    script and ``kiro-cli`` is a separate prerequisite the message never said it
+    was looking for anywhere but PATH.
+
+    Both spawn branches are covered because both resolve the same binary and both
+    have to answer the same question.
+    """
+    import kiro_crew.acp.client as client_mod
+    import kiro_crew.acp.runtime as runtime_mod
+
+    searched = [os.path.join(os.sep, "managed-bin"), os.path.join(os.sep, "path-bin")]
+    unsearched = os.path.join(os.sep, "never-checked")
+    rt = AcpRuntime(work_dir="/tmp")
+    if backend is not None:
+        rt._acp_backend = backend
+
+    async def _no_bin(*, environ=None, home=None):
+        return None
+
+    with (
+        patch.object(runtime_mod, "_resolve_kiro_bin_for_spawn", _no_bin),
+        patch.object(client_mod, "known_kiro_cli_dirs", return_value=searched),
+    ):
+        with pytest.raises(AcpRuntimeError) as raised:
+            await rt._resolve_spawn_argv()
+
+    message = str(raised.value)
+    assert "searched 2 directories" in message
+    assert searched[0] in message
+    assert searched[1] in message
+    assert unsearched not in message
+    # The remedy travels with the diagnosis, the rule env.MCP_PATH_HINT exists
+    # for: a reader who learns the search missed their install needs the one
+    # knob that covers it named here, not only in the source.
+    assert "KIROCREW_KIRO_BIN" in message
+
+
 async def _wait_for_queued(admission: _ColdStartAdmission, expected: int) -> None:
     """Yield to scheduled starters until the coordinator exposes the queue."""
     for _ in range(100):
@@ -1039,7 +1093,7 @@ async def test_runtime_spawn_passes_installed_path_through_exact_wrappers(
         wrapped["spawn_kwargs"] = kwargs
         raise _StopSpawn()
 
-    async def resolve_installed():
+    async def resolve_installed(*, environ=None, home=None):
         return launch_path
 
     monkeypatch.setattr(
@@ -4016,7 +4070,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent):
+        async def _fake_agents(agent, *, member_dispatch=False):
             return [{"id": agent, "prompt": "p", "tools": []}]
 
         monkeypatch.setattr(rt, "_send_and_await", _fake_send)
@@ -4058,7 +4112,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent):
+        async def _fake_agents(agent, *, member_dispatch=False):
             return [{"id": agent, "prompt": "p", "tools": []}]
 
         monkeypatch.setattr(rt, "_send_and_await", _fake_send)
@@ -4091,7 +4145,7 @@ class TestAcpRuntimeLoadSession:
                 return {"modes": {"currentModeId": "kirocrew"}, "models": []}
             return {}
 
-        async def _fake_agents(agent):
+        async def _fake_agents(agent, *, member_dispatch=False):
             calls.append(agent)
             return [{"id": agent, "prompt": "p", "tools": []}]
 
@@ -4654,6 +4708,195 @@ def _metadata_frame(session_id: str) -> JsonRpcMessage:
     )
 
 
+def _mcp_failure_frame(session_id: str, server: str, error: str) -> JsonRpcMessage:
+    return JsonRpcMessage.from_dict(
+        {
+            "method": "_kiro.dev/mcp/server_init_failure",
+            "params": {"sessionId": session_id, "serverName": server, "error": error},
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_init_records_the_session_mcp_report():
+    """Registration frames the drain consumes become this session's report.
+
+    Parity with AcpClient._drain_notifications: without this the frames are
+    consumed and the session has no way to say which servers started.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(_mcp_initialized_frame("sA", "kirocrew-core"))
+    q["sA"].put_nowait(_mcp_failure_frame("sA", "slack-mcp", "spawn ENOENT"))
+    q["sA"].put_nowait(_metadata_frame("sA"))
+
+    await handle.drain_init(duration=0.5, idle_exit=0.05)
+
+    payload = handle.mcp_session_report().payload()
+    assert payload is not None
+    assert payload["ready"] == ["kirocrew-core"]
+    assert payload["failed"] == ["slack-mcp"]
+    assert payload["failures"] == {"slack-mcp": "spawn ENOENT"}
+
+
+@pytest.mark.asyncio
+async def test_drain_init_skips_a_stale_backlog_report():
+    """A pre-switch backlog frame is drained but NOT credited to this report.
+
+    ``stale_report_frames`` names how many already-queued frames are the PRE-switch
+    agent's roster. Recording one would show a server the current agent does not
+    have as mounted here; leaving it out only understates, which the report
+    renders as "no report" rather than "not mounted".
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(_mcp_initialized_frame("sA", "previous-agent-server"))
+
+    await handle.drain_init(
+        duration=0.2, idle_exit=0.01, no_report_ceiling=0.05, stale_report_frames=1
+    )
+
+    assert q["sA"].empty()  # still drained, as the arming docstring promises
+    assert handle.mcp_session_report().payload() is None
+
+
+@pytest.mark.asyncio
+async def test_drain_init_refuses_a_sessionless_frame_on_a_lone_runtime():
+    """A frame naming no session is not this session's, even when unmarked.
+
+    The runtime sets ``fanout_no_owner`` only once MORE THAN ONE queue is
+    registered — right for the idle-stall clock, which may treat a lone session
+    as the sole owner of whatever arrives, but not for a view that publishes
+    server names as "what THIS session mounted". A co-tenant that emits a
+    sessionless frame before registering its own queue would otherwise have its
+    server attributed here.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    frame = _mcp_initialized_frame("sA", "a-co-tenants-server")
+    frame.params.pop("sessionId", None)
+    assert frame.fanout_no_owner is False, "the lone-queue case leaves it clear"
+    q["sA"].put_nowait(frame)
+
+    await handle.drain_init(duration=0.2, idle_exit=0.01, no_report_ceiling=0.05)
+
+    assert handle.mcp_session_report().payload() is None
+
+
+@pytest.mark.asyncio
+async def test_drain_init_credits_the_active_agent_when_the_queue_never_empties():
+    """A refilled queue must not extend the stale backlog past its own depth.
+
+    The original defect: exhaustion was detected by the queue going EMPTY, so an
+    active agent that refilled it before the backlog drained kept the flag set
+    for the rest of the drain and had every one of its reports skipped — a
+    session stuck at "no report" for as long as its servers kept talking.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(_mcp_initialized_frame("sA", "previous-agent-server"))
+
+    async def _refill_before_the_backlog_drains() -> None:
+        # Lands while the drain is awaiting its first get(), so the queue is
+        # already non-empty again when the second iteration begins.
+        await asyncio.sleep(0)
+        q["sA"].put_nowait(_mcp_initialized_frame("sA", "current-agent-server"))
+
+    feeder = asyncio.create_task(_refill_before_the_backlog_drains())
+    try:
+        await handle.drain_init(
+            duration=0.3, idle_exit=0.05, no_report_ceiling=0.5, stale_report_frames=1
+        )
+    finally:
+        await feeder
+
+    payload = handle.mcp_session_report().payload()
+    assert payload is not None, "the active agent's report was swallowed as stale"
+    assert payload["ready"] == ["current-agent-server"]
+
+
+@pytest.mark.asyncio
+async def test_drain_init_credits_a_report_that_landed_before_set_mode_answered():
+    """A count measured at drain time would swallow the active agent's own report.
+
+    The original defect: the pre-switch depth was read inside ``drain_init``,
+    i.e. AFTER set_mode returned. kiro-cli can emit the switched-to agent's
+    registrations before it answers, so those frames were already queued by then
+    and got counted as pre-switch — consumed without being recorded, leaving a
+    false "no report" panel. The caller measures before it sends instead, so a
+    frame that arrives during the request is credited.
+    """
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(_mcp_initialized_frame("sA", "previous-agent-server"))
+
+    # What the caller reads BEFORE sending set_mode: one staged frame.
+    staged = handle.queued_frame_count()
+    assert staged == 1
+    # The switched-to agent registers while set_mode is still in flight.
+    q["sA"].put_nowait(_mcp_initialized_frame("sA", "current-agent-server"))
+
+    await handle.drain_init(
+        duration=0.2, idle_exit=0.01, no_report_ceiling=0.05, stale_report_frames=staged
+    )
+
+    payload = handle.mcp_session_report().payload()
+    assert payload is not None, "the active agent's report was swallowed as pre-switch"
+    assert payload["ready"] == ["current-agent-server"]
+
+
+@pytest.mark.asyncio
+async def test_drain_init_records_a_post_backlog_report_after_a_switch():
+    """After the stale backlog is exhausted, the active agent's own report counts."""
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    q["sA"].put_nowait(_mcp_initialized_frame("sA", "previous-agent-server"))
+
+    async def _after_switch() -> None:
+        await asyncio.sleep(0.05)
+        q["sA"].put_nowait(_mcp_initialized_frame("sA", "current-agent-server"))
+
+    feeder = asyncio.create_task(_after_switch())
+    try:
+        await handle.drain_init(
+            duration=0.3, idle_exit=0.05, no_report_ceiling=0.5, stale_report_frames=1
+        )
+    finally:
+        await feeder
+
+    payload = handle.mcp_session_report().payload()
+    assert payload is not None
+    assert payload["ready"] == ["current-agent-server"]
+
+
+@pytest.mark.asyncio
+async def test_create_session_records_the_wire_roster(monkeypatch):
+    """The report carries the roster session/new actually sent.
+
+    A different fact from the agent spec on disk, which is what the dashboard's
+    other MCP views read.
+    """
+    rt, _, _ = _make_runtime()
+
+    async def _fake_send(method, params, timeout=None):
+        if method == METHOD_SESSION_NEW:
+            return {"sessionId": "sid-roster"}
+        return {}
+
+    monkeypatch.setattr(rt, "_send_and_await", _fake_send)
+    servers = [{"name": "kirocrew-core", "command": "x"}, {"name": "kirocrew-cron"}]
+
+    handle = await rt.create_session(cwd="/w", agent="kirocrew", mcp_servers=servers)
+
+    assert handle.mcp_session_report().configured == ("kirocrew-core", "kirocrew-cron")
+
+
 @pytest.mark.asyncio
 async def test_drain_init_waits_past_idle_window_for_first_mcp_report(monkeypatch):
     """#2627: the idle shortcut is not eligible before the first MCP
@@ -4789,7 +5032,7 @@ async def test_drain_init_ignores_pre_switch_reports_still_waits_for_new_agent(m
 
     feeder = asyncio.create_task(_late_report())
     try:
-        await handle.drain_init(duration=0.2, idle_exit=0.01, ignore_queued_reports=True)
+        await handle.drain_init(duration=0.2, idle_exit=0.01, stale_report_frames=1)
     finally:
         await feeder
     # Without the stale-backlog gate, the staged parent report arms the idle
@@ -5047,13 +5290,36 @@ async def test_send_command_redacts_output(monkeypatch):
 # ── Round-2 parity fixes: auth detection, exception translation, steer ──
 
 
-def test_saw_not_logged_in_detects_auth_failure():
-    """#1: AcpRuntime.saw_not_logged_in scans captured stderr for kiro-cli's
-    'not logged in' signal so a death can be surfaced as AcpAuthRequired."""
-    rt, _, _ = _make_runtime()
-    rt._stderr_lines = ["startup noise", "error: You are not logged in, please log in"]
+@pytest.mark.asyncio
+async def test_saw_not_logged_in_detects_auth_failure():
+    """#1: AcpRuntime.saw_not_logged_in reports kiro-cli's auth-failure signal on
+    stderr so a death can be surfaced as AcpAuthRequired.
+
+    Drives the real ``_drain_stderr`` rather than assigning ``_stderr_lines``
+    directly. The observation is now latched as each line arrives, because the
+    buffer is a 20-line ring and nothing asks about auth until a request has
+    already timed out -- by which point a chatty startup can have evicted the
+    line. ``_drain_stderr`` is the only production writer of that buffer, so
+    driving it is strictly closer to the real path than the previous assignment
+    was; the two assertions below are unchanged in intent.
+    """
+
+    class _Stderr:
+        def __init__(self, lines):
+            self._lines = [f"{ln}\n".encode() for ln in lines]
+
+        async def readline(self):
+            return self._lines.pop(0) if self._lines else b""
+
+    async def _drain(lines):
+        rt, _, proc = _make_runtime()
+        proc.stderr = _Stderr(lines)
+        await rt._drain_stderr()
+        return rt
+
+    rt = await _drain(["startup noise", "error: You are not logged in, please log in"])
     assert rt.saw_not_logged_in() is True
-    rt._stderr_lines = ["ordinary stderr", "mcp server ready"]
+    rt = await _drain(["ordinary stderr", "mcp server ready"])
     assert rt.saw_not_logged_in() is False
 
 
@@ -5881,6 +6147,7 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/fake-agent.sock")
     monkeypatch.setenv("PYTHONPATH", "/gateway/pythonpath")
     monkeypatch.setenv("PYTHONPYCACHEPREFIX", "/gateway/pycache")
+    monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "FAKE-akid")
     monkeypatch.setenv("KIROCREW_UNRELATED_KEEPME", "keep-this-value")
 
@@ -5893,7 +6160,7 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
         captured["env"] = kwargs.get("env")
         raise _StopSpawn()
 
-    async def resolve_kiro_bin():
+    async def resolve_kiro_bin(*, environ=None, home=None):
         return "/fake/kiro"
 
     monkeypatch.setattr(
@@ -5927,6 +6194,7 @@ async def test_runtime_spawn_scrubs_sensitive_env_on_default_auto(monkeypatch):
         "SSH_AUTH_SOCK",
         "PYTHONPATH",
         "PYTHONPYCACHEPREFIX",
+        "PYTHONDONTWRITEBYTECODE",
     ):
         assert key not in env, f"{key} leaked into runtime child env"
     assert env.get("KIROCREW_UNRELATED_KEEPME") == "keep-this-value"
@@ -5953,7 +6221,7 @@ async def test_runtime_spawn_names_its_own_browser_session(monkeypatch):
         captured["env"] = kwargs.get("env")
         raise _StopSpawn()
 
-    async def resolve_kiro_bin():
+    async def resolve_kiro_bin(*, environ=None, home=None):
         return "/fake/kiro"
 
     monkeypatch.setattr(runtime_mod, "_resolve_kiro_bin_for_spawn", resolve_kiro_bin)
@@ -7549,6 +7817,112 @@ async def test_handle_owned_rejections_are_sel_audited():
 
     assert audited, "pre-turn drain reject was not SEL-audited"
     assert audited[0][2] == "stranded_request_pre_turn_drain"
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_drain_counts_discarded_frames_without_logging_content(caplog):
+    """The pre-turn drain destroys leftover frames; it must SAY how many, and
+    nothing else.
+
+    A dropped frame is invisible to every layer above: the abandoned turn's
+    output vanishes with nothing to show it existed, and a turn that loses its
+    terminal this way reaches the dashboard as an empty response with no
+    attributable cause. So the drain reports a COUNT — and only a count. Frame
+    text, tool arguments, tool results and even frame SIZE are all excluded:
+    a size leaks response length, and the kiro-cli data dir this material comes
+    from is fenced precisely because it holds credentials.
+    """
+    import contextlib
+    import logging
+
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    # Three leftover NOTIFICATIONS from a prior abandoned turn. Not permission
+    # requests: those are answered rather than dropped, and must not be counted.
+    for _i, _secret in enumerate(("SECRETALPHA", "SECRETBETA", "SECRETGAMMA")):
+        q["sA"].put_nowait(
+            JsonRpcMessage.from_dict(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "sA",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": _secret},
+                        },
+                    },
+                }
+            )
+        )
+
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.session_handle"):
+        gen = handle.prompt("hi", timeout=0.2)
+        with contextlib.suppress(StopAsyncIteration, asyncio.TimeoutError, Exception):
+            await asyncio.wait_for(gen.__anext__(), timeout=1.0)
+        await gen.aclose()
+
+    _drain_lines = [
+        rec.getMessage() for rec in caplog.records if "pre-turn drain discarded" in rec.getMessage()
+    ]
+    # ONE line per turn, not one per frame: a burst must not flood the log.
+    assert len(_drain_lines) == 1, f"expected one drain warning, got {_drain_lines}"
+    assert "3 leftover frame(s)" in _drain_lines[0]
+    for _secret in ("SECRETALPHA", "SECRETBETA", "SECRETGAMMA"):
+        assert _secret not in _drain_lines[0], f"{_secret!r} leaked into the drain warning"
+
+
+@pytest.mark.asyncio
+async def test_prompt_warns_when_the_stream_ends_without_a_terminal_event(caplog):
+    """A clean exhaustion with no EVENT_COMPLETE is reported; a consumer close is not.
+
+    The dashboard reads a missing terminal as an empty response and cannot tell
+    whether the backend never closed the turn or the consumer walked away. Only
+    the first is a fault, so only the first warns — which is what keeps this line
+    out of the log on every ordinary cancel and every abandoned generator.
+    """
+    import contextlib
+    import logging
+
+    from kiro_crew.acp.types import EVENT_TEXT_CHUNK, AcpEvent
+
+    _MARK = "ended without a terminal completion event"
+
+    # 1. The dispatch loop returns of its own accord having yielded no terminal.
+    rt, _, _ = _make_runtime()
+    q = _register(rt, "sA")
+    handle = AcpSessionHandle("sA", q["sA"], rt)
+    rt.send_request = AsyncMock(return_value=9)
+
+    async def _no_terminal(*a, **kw):
+        yield AcpEvent(kind=EVENT_TEXT_CHUNK, text="partial")
+
+    handle._dispatch_events = _no_terminal  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.session_handle"):
+        async for _ev in handle.prompt("hi", timeout=0.2):
+            pass
+    assert any(_MARK in rec.getMessage() for rec in caplog.records)
+
+    # 2. The SAME stream, abandoned by the consumer after one event. Identical
+    #    absence of a terminal, but the consumer caused it — no warning.
+    caplog.clear()
+    rt2, _, _ = _make_runtime()
+    q2 = _register(rt2, "sB")
+    handle2 = AcpSessionHandle("sB", q2["sB"], rt2)
+    rt2.send_request = AsyncMock(return_value=9)
+    handle2._dispatch_events = _no_terminal  # type: ignore[method-assign]
+    with caplog.at_level(logging.WARNING, logger="kiro_crew.acp.session_handle"):
+        gen = handle2.prompt("hi", timeout=0.2)
+        with contextlib.suppress(StopAsyncIteration):
+            await gen.__anext__()
+        await gen.aclose()
+    assert not any(_MARK in rec.getMessage() for rec in caplog.records), (
+        "a consumer close was reported as a lost terminal — this is the log-spam "
+        "case the guard exists to exclude"
+    )
 
 
 def test_missing_kind_is_not_a_resolved_shell_classification():

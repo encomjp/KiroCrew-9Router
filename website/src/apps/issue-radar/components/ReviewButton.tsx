@@ -34,7 +34,7 @@ export default function ReviewButton({
     staleTime: 30_000,
   })
   const record = recordQuery.data?.investigation ?? null
-  const { reviewPr, busy, error, concludedFor } = useReviewPr()
+  const { reviewPr, busy, error, concludedFor, openOlderSessions } = useReviewPr()
   // A pending or FAILED lookup is indistinguishable from "no record", and acting
   // on that would start a second session and overwrite the existing record's slot
   // link — orphaning the review the user already has. So the button waits for a
@@ -70,6 +70,7 @@ export default function ReviewButton({
       onClick={onClick}
       concluded={concludedFor === itemKey(repoRef, pull.number, 'pull')}
       onStartOver={onStartOver}
+      onOpenOlderSessions={openOlderSessions}
       startHint={
         recordQuery.isError
           ? 'Could not check for an existing review session — retrying on refresh'

@@ -172,9 +172,16 @@ def _runs_json(name: str, runs: list[dict]) -> str:
     )
 
 
+def _lane_log(proc: subprocess.CompletedProcess[str]) -> str:
+    """The step's own diagnostic lane-state line (the only place the arrays are
+    readable from a `gh run view --log`, per #3550)."""
+    return next(
+        line for line in proc.stdout.splitlines() if line.startswith("pr-readiness: lane state")
+    )
+
+
 class Runner:
     """Executes the evaluate step against one stubbed repository state."""
-
     def __init__(self, root: Path) -> None:
         self.fixtures = root / "fixtures"
         bindir = root / "bin"
@@ -243,8 +250,14 @@ class Runner:
         fork: bool = False,
         http_error: str = "",
         existing_status_state: str = "",
+        disposition_ok: str = "",
+        disposition_violations: str = "",
     ):
         env = dict(self.env)
+        if disposition_ok:
+            env["DISPOSITION_OK"] = disposition_ok
+        if disposition_violations:
+            env["DISPOSITION_VIOLATIONS"] = disposition_violations
         if fork:
             env["FORK"] = "true"
         if http_error:
@@ -770,8 +783,12 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
         assert outputs["state"] == "action_required"
         assert outputs["status_state"] == "failure"
         assert outputs["label"] == "readiness: action required"
+        # Four, not three: Fast Gate joined CI, Build and Code Review as a
+        # monitored lane when the cheap blocking gates were split out of ci.yml.
+        # The stub routes every non-ci.yml workflow to green_runs.json, so it is
+        # covered by the same `action_required` fixture as the other two.
         assert outputs["description"] == (
-            "3 workflow(s) awaiting maintainer approval; none has run yet"
+            "4 workflow(s) awaiting maintainer approval; none has run yet"
         )
         assert len(outputs["description"]) <= 140
         summary = (runner.temp / "pr-readiness-summary.md").read_text()
@@ -780,7 +797,9 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
         assert "**Waiting**" in summary
         log_line = self._lane_state(proc)
         assert "failed=[]" in log_line
-        assert "awaiting_approval=[CI Build Code Review]" in log_line
+        # Fast Gate sits between CI and Build in the spec order, matching the
+        # order pr-readiness.yml appends the lanes.
+        assert "awaiting_approval=[CI Fast Gate Build Code Review]" in log_line
 
     def test_real_failure_and_approval_wait_are_reported_separately(self, runner: Runner):
         (runner.fixtures / "ci_runs.json").write_text(
@@ -794,8 +813,10 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
 
         assert proc.returncode == 0, proc.stderr
         assert outputs["status_state"] == "failure"
+        # Three awaiting, not two: ci.yml is the one blocking item here, and
+        # Build, Code Review and Fast Gate are the lanes left waiting.
         assert outputs["description"] == (
-            "1 blocking readiness item(s); 2 awaiting maintainer approval"
+            "1 blocking readiness item(s); 3 awaiting maintainer approval"
         )
         summary = (runner.temp / "pr-readiness-summary.md").read_text()
         assert "**Blocking**" in summary
@@ -832,3 +853,65 @@ class TestAwaitingApprovalIsAttributedToTheMaintainer:
         summary = (runner.temp / "pr-readiness-summary.md").read_text()
         assert "**Awaiting maintainer approval**" in summary
         assert "Evaluation was truncated" in summary
+
+
+class TestDispositionViolationsBlockTheVerdict:
+    """Issue #6658: the disposition rule was mechanical only for a writer
+    running the prepare-pr loop. Readiness publishes the repository's sole
+    required status, so folding the violation list in here is what binds every
+    writer -- including one who never runs that loop."""
+
+    def test_a_violation_turns_an_otherwise_green_revision_red(self, runner: Runner):
+        proc, outputs = runner.evaluate(
+            disposition_ok="true",
+            disposition_violations=(
+                "disposition record claims no span= finding identity "
+                "(comment 900 by alice; target=gpt) while that lane has findings"
+            ),
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["label"] == "readiness: action required"
+        assert outputs["description"] == "1 blocking readiness item(s)"
+        assert "disposition rule:" in _lane_log(proc)
+
+    def test_every_violation_is_counted_separately(self, runner: Runner):
+        proc, outputs = runner.evaluate(
+            disposition_ok="true",
+            disposition_violations="first violation\nsecond violation",
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["description"] == "2 blocking readiness item(s)"
+
+    def test_a_clean_evaluation_leaves_the_verdict_green(self, runner: Runner):
+        # The ordinary case: the gate ran, found nothing, and must contribute
+        # nothing -- not a pending, not a note.
+        proc, outputs = runner.evaluate(disposition_ok="true", disposition_violations="")
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "success"
+        assert outputs["label"] == "readiness: passed"
+
+    def test_an_unreadable_record_set_waits_instead_of_going_red(self, runner: Runner):
+        """A transient comments/permission API failure must never red the
+        required status -- that is issue #2753's class of bug. UNKNOWN is
+        pending, which a later event recomputes."""
+        proc, outputs = runner.evaluate(disposition_ok="false")
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "pending"
+        assert outputs["label"] == "readiness: checking"
+        assert "disposition records could not be read" in _lane_log(proc)
+
+    def test_a_violation_outranks_an_unrelated_pending_lane(self, runner: Runner):
+        """A violation is not something waiting can clear: only the author
+        editing or deleting the comment can, so it must be reported as blocking
+        even while other lanes are still running."""
+        (runner.fixtures / "ci_runs.json").write_text(
+            _run_json("ci.yml", status="in_progress", conclusion="")
+        )
+        proc, outputs = runner.evaluate(
+            disposition_ok="true", disposition_violations="one violation"
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert outputs["status_state"] == "failure"
+        assert outputs["description"] == "1 blocking readiness item(s)"

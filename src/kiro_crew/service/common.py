@@ -254,7 +254,7 @@ def headless_auth_warning(environ: "Mapping[str, str] | None" = None) -> str:
         f"   to {dotenv} (0600) and restart the service:",
         "",
         f"     {remedy}",
-        "     kirocrew service restart",
+        f"     {restart_command_hint()}",
     ]
     if _home_override_is_set(environ):
         lines.append("")
@@ -319,13 +319,9 @@ def service_path(home: str) -> str:
         "/bin",
     ]
     env_path = [p for p in os.environ.get("PATH", "").split(":") if p]
-    seen: set[str] = set()
-    out: list[str] = []
-    for entry in required + env_path:
-        if entry not in seen:
-            seen.add(entry)
-            out.append(entry)
-    return ":".join(out)
+    # dict.fromkeys dedupes on first occurrence and preserves insertion order,
+    # so the required prefixes keep their precedence over the installer's $PATH.
+    return ":".join(dict.fromkeys(required + env_path))
 
 
 class Platform(enum.Enum):

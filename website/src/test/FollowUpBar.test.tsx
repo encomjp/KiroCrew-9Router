@@ -133,7 +133,7 @@ describe('FollowUpBar', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Go' }), { detail: 1 })
       fireEvent.click(screen.getByRole('button', { name: 'Go' }), { detail: 2 })
       fireEvent.dblClick(screen.getByRole('button', { name: 'Go' }))
-      expect(onSend).toHaveBeenCalledWith('Go')
+      expect(onSend).toHaveBeenCalledWith('Go', undefined)
       expect(onSend).toHaveBeenCalledTimes(1)
       expect(onSelect).not.toHaveBeenCalled() // timer cancelled
       act(() => { vi.advanceTimersByTime(250) })
@@ -150,7 +150,7 @@ describe('FollowUpBar', () => {
       fireEvent.dblClick(screen.getByRole('button', { name: 'Go' }))
       expect(onSelect).not.toHaveBeenCalled()
       expect(onSend).toHaveBeenCalledTimes(1)
-      expect(onSend).toHaveBeenCalledWith(undefined)
+      expect(onSend).toHaveBeenCalledWith(undefined, undefined)
     })
 
     it('chip title hints at double-click capability', () => {
@@ -180,7 +180,7 @@ describe('FollowUpBar', () => {
       render(<FollowUpBar options={['Go']} picked={new Set()} onSelect={onSelect} onSend={onSend} />)
       fireEvent.click(screen.getByRole('button', { name: 'Send now: Go' }))
       expect(onSend).toHaveBeenCalledTimes(1)
-      expect(onSend).toHaveBeenCalledWith('Go')
+      expect(onSend).toHaveBeenCalledWith('Go', undefined)
       expect(onSelect).not.toHaveBeenCalled()
     })
 
@@ -189,7 +189,7 @@ describe('FollowUpBar', () => {
       const onSend = vi.fn()
       render(<FollowUpBar options={['Go']} picked={new Set(['Go'])} onSelect={onSelect} onSend={onSend} />)
       fireEvent.click(screen.getByRole('button', { name: 'Send now: Go' }))
-      expect(onSend).toHaveBeenCalledWith(undefined)
+      expect(onSend).toHaveBeenCalledWith(undefined, undefined)
     })
 
     it('clicking the send segment cancels a pending debounced onSelect from the main chip', () => {
@@ -268,9 +268,9 @@ describe('FollowUpBar', () => {
       // The clamp must sit on an unpadded inner element, not on the padded
       // button — otherwise a sliver of the next line shows in the padding.
       const label = chip.querySelector('span')
-      expect(label?.className).toContain('line-clamp-1')
-      expect(label?.className).toContain('break-words')
-      expect(chip.className).not.toContain('line-clamp-1')
+      expect(label?.className).toContain('truncate')
+      expect(label?.className).toContain('block')
+      expect(chip.className).not.toContain('truncate')
     })
 
     it('caps the split-button wrapper too, not just the button', () => {
@@ -359,7 +359,7 @@ describe('FollowUpBar', () => {
       render(<FollowUpBar options={[LONG]} picked={new Set()} onSelect={() => {}} />)
       const chip = screen.getByRole('button', { name: LONG })
       expect(chip.className).toContain('followup-chip')
-      expect(chip.querySelector('span')?.className).toContain('line-clamp-1')
+      expect(chip.querySelector('span')?.className).toContain('truncate')
     })
 
     it('clamps to ONE line so a long label cannot make its chip taller than its neighbours', () => {
@@ -373,7 +373,7 @@ describe('FollowUpBar', () => {
         )
         for (const label of [LONG, 'Ship it']) {
           const span = screen.getByRole('button', { name: label }).querySelector('span')
-          expect(span?.className).toContain('line-clamp-1')
+          expect(span?.className).toContain('truncate')
           expect(span?.className).not.toContain('line-clamp-2')
         }
         unmount()
@@ -527,6 +527,33 @@ describe('FollowUpBar', () => {
       fireEvent.click(screen.getByRole('button', { name: 'Go All' }), { detail: 1 })
       act(() => { vi.advanceTimersByTime(FOLLOWUP_CHIP_DEBOUNCE_MS + 30) })
       expect(onSelect).toHaveBeenCalledWith('Go All', expect.any(Object), 'row-1')
+    })
+
+    it('hands onSend the sourceKey from FIRST click when the row advances mid-double-click', () => {
+      const onSelect = vi.fn()
+      const onSend = vi.fn()
+      const bar = (sourceKey: string) => (
+        <FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} onSend={onSend} sourceKey={sourceKey} />
+      )
+      const { rerender } = render(bar('row-1'))
+      const go = screen.getByRole('button', { name: 'Go' })
+      fireEvent.click(go, { detail: 1 })
+      rerender(bar('row-2'))
+      expect(screen.getByRole('button', { name: 'Go' })).toBe(go)
+      fireEvent.click(go, { detail: 2 })
+      fireEvent.dblClick(go)
+      expect(onSend).toHaveBeenCalledTimes(1)
+      expect(onSend).toHaveBeenCalledWith('Go', 'row-1')
+      expect(onSelect).not.toHaveBeenCalled()
+    })
+
+    it('hands onSend the current sourceKey on a Send-now click with no prior arm', () => {
+      const onSelect = vi.fn()
+      const onSend = vi.fn()
+      render(<FollowUpBar options={PLAN} picked={new Set()} onSelect={onSelect} onSend={onSend} sourceKey="row-1" />)
+      fireEvent.click(screen.getByRole('button', { name: 'Send now: Go' }))
+      expect(onSend).toHaveBeenCalledWith('Go', 'row-1')
+      expect(onSelect).not.toHaveBeenCalled()
     })
   })
 })

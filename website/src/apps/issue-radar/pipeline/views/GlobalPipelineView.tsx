@@ -23,7 +23,12 @@
 import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Activity, AlertTriangle, ChevronLeft, GitBranch, RefreshCw } from 'lucide-react'
-import { autoTriagePipelineFoldApi, isUnsupportedForge, type RepoRef } from '../api'
+import {
+  autoTriagePipelineFoldApi,
+  isQueueMigrationPending,
+  isUnsupportedForge,
+  type RepoRef,
+} from '../api'
 import { repoScopeKey } from '../../lib/links'
 import { Btn, Card, IconButton, PageHeader, EmptyState as UIEmptyState } from '../../../../components/ui'
 import { i18nT } from '../../../../i18n/t'
@@ -47,17 +52,46 @@ const REFRESH_MS = 30_000
  * confident factual claim, and an operator has no way to tell it from the truth.
  * Low frequency, but the failure mode is that the view lies rather than that it
  * breaks.
+ *
+ * One 503 is special and gets its own copy: the backend refuses `_handle_step` /
+ * `_handle_item_sessions` with `queue_migration_pending` when the dispatch queue on
+ * this install has not been sharded per repository yet -- the common state for a
+ * teammate whose cron scripts predate that migration. The generic "Could not load
+ * this data" plus a bare Retry is a trap there: retrying alone can NEVER clear it,
+ * only re-running the pipeline installer can. So when the error carries that code we
+ * name the real reason and the real fix. Retry is KEPT rather than hidden -- it
+ * becomes meaningful the moment the operator runs the installer, and a distinct
+ * label ("Retry after running the installer") stops it implying retrying is itself
+ * the fix. Recognition-only: `isQueueMigrationPending` reads the backend's code, it
+ * does not restate the rule.
  */
-function ErrorPanel({ testId, onRetry }: { testId: string; onRetry: () => void }) {
+function ErrorPanel({
+  testId,
+  onRetry,
+  error,
+}: {
+  testId: string
+  onRetry: () => void
+  error?: unknown
+}) {
+  const migrationPending = isQueueMigrationPending(error)
   return (
-    <Card className="p-4" data-testid={testId}>
+    <Card className="p-4" data-testid={migrationPending ? 'atp-queue-migration-pending' : testId}>
       <div className="flex flex-wrap items-center gap-2">
         <AlertTriangle aria-hidden="true" className="h-4 w-4" style={{ color: 'var(--warn)' }} />
         <p className="text-[12px]" style={{ color: 'var(--text)' }}>
-          {i18nT('apps.autoTriagePipeline.global.load_failed')}
+          {i18nT(
+            migrationPending
+              ? 'apps.autoTriagePipeline.global.queue_migration_pending'
+              : 'apps.autoTriagePipeline.global.load_failed',
+          )}
         </p>
         <Btn onClick={onRetry} className="h-7 px-2 text-[11px]">
-          {i18nT('apps.autoTriagePipeline.global.retry')}
+          {i18nT(
+            migrationPending
+              ? 'apps.autoTriagePipeline.global.queue_migration_retry'
+              : 'apps.autoTriagePipeline.global.retry',
+          )}
         </Btn>
       </div>
     </Card>
@@ -131,7 +165,7 @@ export default function GlobalPipelineView({ repo }: { repo: RepoRef }) {
   const renderSessions = (number: number) => {
     if (item !== number) return null
     if (sessions.isError) {
-      return <ErrorPanel testId="atp-sessions-error" onRetry={() => void sessions.refetch()} />
+      return <ErrorPanel testId="atp-sessions-error" onRetry={() => void sessions.refetch()} error={sessions.error} />
     }
     if (sessions.isLoading) {
       return (
@@ -186,6 +220,11 @@ export default function GlobalPipelineView({ repo }: { repo: RepoRef }) {
               </div>
             </div>
           ) : (
+            // No `error` prop here, deliberately. The migration refusal cannot reach
+            // this level: `fold_pipeline` never reads the queue, and `_handle_overview`
+            // maps every FoldError to code "unreadable", so `queue_migration_pending`
+            // is not a code the overview can return. Passing the error for symmetry
+            // would ship a branch nothing can enter.
             <ErrorPanel testId="atp-overview-error" onRetry={() => void overview.refetch()} />
           )
         ) : overview.data && overview.data.steps.length > 0 ? (
@@ -256,7 +295,7 @@ export default function GlobalPipelineView({ repo }: { repo: RepoRef }) {
               </h2>
             </header>
             {stepItems.isError ? (
-              <ErrorPanel testId="atp-step-error" onRetry={() => void stepItems.refetch()} />
+              <ErrorPanel testId="atp-step-error" onRetry={() => void stepItems.refetch()} error={stepItems.error} />
             ) : stepItems.isLoading ? (
               <Card className="p-3">
                 <p className="text-[12px]" style={{ color: 'var(--text-dim)' }}>

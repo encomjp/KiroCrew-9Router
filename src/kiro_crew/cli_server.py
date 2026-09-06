@@ -317,6 +317,67 @@ def _logout(port: int) -> None:
         sys.exit(1)
 
 
+_SHUTDOWN_RESPONSE_MAX_BYTES = 4096
+
+
+def _request_gateway_shutdown(port: int) -> bool:
+    """Request graceful shutdown through the gateway's self-authenticating API.
+
+    This is the safe fallback when the platform listener lookup is available but
+    returns no pid. The request targets a fixed IPv4 loopback URL and presents
+    the per-generation local secret; the handler independently requires both
+    loopback origin and a constant-time secret match before setting the same
+    shutdown event as SIGTERM.
+
+    A stale secret cannot authorize another gateway generation, and no process
+    identity is guessed or signaled on this path. Any missing credential,
+    refusal, malformed response, or transport failure returns ``False`` so the
+    caller retains the existing no-target diagnostic.
+    """
+    secret = run_marker.read_secret(port)
+    if not secret:
+        return False
+    request = urllib.request.Request(
+        f"http://{_CLI_LOOPBACK}:{port}/api/shutdown",
+        method="POST",
+        headers={"X-Local-Secret": secret, "Content-Type": "application/json"},
+        data=b"{}",
+    )
+    try:
+        with loopback_urlopen(request, timeout=5) as response:
+            if int(response.status) != 200:
+                return False
+            raw = response.read(_SHUTDOWN_RESPONSE_MAX_BYTES + 1)
+            if len(raw) > _SHUTDOWN_RESPONSE_MAX_BYTES:
+                return False
+            payload = json.loads(raw)
+    except (
+        http.client.HTTPException,
+        OSError,
+        RecursionError,
+        UnicodeError,
+        ValueError,
+        urllib.error.URLError,
+    ):
+        return False
+    return bool(isinstance(payload, dict) and payload.get("ok") and payload.get("shutting_down"))
+
+
+def _report_authenticated_shutdown(port: int) -> bool:
+    """Request, audit, and report an authenticated graceful shutdown."""
+    if not _request_gateway_shutdown(port):
+        return False
+    sel().log_api_access(
+        caller="cli",
+        operation="gateway_stop",
+        outcome="allowed",
+        source="cli",
+        resources=f"port={port} via=api reason=listener_lookup_empty",
+    )
+    print(f"✅ Requested graceful shutdown from gateway on port {port}.")
+    return True
+
+
 def _stop(cli_port: int | None = None) -> None:
     """Stop a running KiroCrew gateway.
 
@@ -380,6 +441,8 @@ def _stop(cli_port: int | None = None) -> None:
                     f"port {port}. Install {_tool} and retry."
                 )
             sys.exit(1)
+        if _report_authenticated_shutdown(port):
+            return
         sel().log_api_access(
             caller="cli",
             operation="gateway_stop",
@@ -825,7 +888,12 @@ def _restart(cli_port: int | None = None) -> None:
 
     1. If a systemd/launchd service is active AND the caller did not
        explicitly request a specific port, ask the platform to restart
-       it (``systemctl restart`` / ``launchctl unload + load``).
+       it (``systemctl restart`` / ``launchctl kickstart -k``). When the
+       service manager REFUSES that restart while the unit is still active
+       (system-scope unit, unprivileged caller / polkit denial), fail loudly
+       naming the privileged command the operator must run — never fall
+       through to the listener path, which cannot see a service gateway
+       bound to a unix socket and would misreport the outcome.
     2. Otherwise, SIGTERM the foreground gateway via the existing
        lsof+SIGTERM path used by ``kirocrew stop``, then spawn a
        detached replacement and **verify it is serving** before reporting
@@ -839,17 +907,47 @@ def _restart(cli_port: int | None = None) -> None:
     short-circuiting through it would target the wrong gateway.
     """
     port = resolve_client_port(cli_port)
-    if cli_port is None and service_controller.restart_service():
-        sel().log_api_access(
-            caller="cli",
-            operation="gateway_restart",
-            outcome="allowed",
-            source="cli",
-            resources=f"port={port} via=service",
-        )
-        print("✅ Restarted kirocrew service.")
-        _print_token_url(port)
-        return
+    if cli_port is None:
+        if service_controller.restart_service():
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_restart",
+                outcome="allowed",
+                source="cli",
+                resources=f"port={port} via=service",
+            )
+            print("✅ Restarted kirocrew service.")
+            _print_token_url(port)
+            return
+        if service_controller.is_service_active():
+            # The service manager refused the restart while the unit is active
+            # RIGHT NOW — the system-scope unit needs root/polkit privileges
+            # this process does not have ("Interactive authentication
+            # required"). Falling through to the listener path would be worse
+            # than failing: on a unix-socket deployment nothing listens on TCP,
+            # so the fallback finds nothing to stop, spawns a competitor the
+            # KIROCREW_HOME lock refuses, and the original gateway keeps
+            # running while the command's outcome reads like a restart. Name
+            # the privileged command the operator must run instead. The
+            # active-check runs AFTER the refused restart so a service that
+            # merely stopped in between still falls through below.
+            hint = service_controller.manual_restart_hint()
+            sel().log_api_access(
+                caller="cli",
+                operation="gateway_restart",
+                outcome="denied",
+                source="cli",
+                resources=f"port={port} via=service reason=service_restart_denied",
+            )
+            print(
+                "❌ A kirocrew service is installed and running, but the service "
+                "manager refused to restart it.\n"
+                "   This process lacks the privileges the service's scope "
+                "requires — the gateway was NOT restarted.\n"
+                "   Run the restart yourself:\n"
+                f"       {hint}"
+            )
+            sys.exit(1)
 
     # No service active — bounce the foreground gateway and detach a fresh one.
     # Reuse _stop() for the SIGTERM path so behavior stays in sync if _stop
@@ -878,6 +976,7 @@ def _restart(cli_port: int | None = None) -> None:
     prior_marker_pid = run_marker.read_pid(port)
     listeners = platform_compat.find_listening_pids(port)
     incumbents = [p for p in listeners if _is_kirocrew_process(p)]
+    wait_for_incumbents = False
     if listeners or not platform_compat.listening_pid_tool_available():
         # TOCTOU: the gateway can exit between the check above and _stop()'s own
         # lookup. _stop() raises SystemExit(1) when it finds nothing — for restart
@@ -888,7 +987,24 @@ def _restart(cli_port: int | None = None) -> None:
             _stop(cli_port)
         except SystemExit:
             pass
+        wait_for_incumbents = True
+    elif _report_authenticated_shutdown(port):
+        sel().log_api_access(
+            caller="cli",
+            operation="gateway_restart",
+            outcome="denied",
+            source="cli",
+            resources=f"port={port} reason=shutdown_ack_listener_lookup_blind",
+        )
+        print(
+            f"❌ Gateway accepted graceful shutdown on port {port}, but listener PID "
+            "lookup is unavailable. Not starting a replacement because safe lock "
+            "release cannot be proven.\n   Wait for shutdown to finish, then run: "
+            "kirocrew restart"
+        )
+        sys.exit(1)
 
+    if wait_for_incumbents:
         alive = _wait_for_pids_exit(incumbents, _RESTART_STOP_TIMEOUT)
         if alive:
             # Refuse rather than spawn a replacement that the lock would reject.
@@ -1751,6 +1867,7 @@ async def _run_task(args: argparse.Namespace) -> None:
         episodic_limit=cfg.memory.episodic_max_results,
         embedding_dim=cfg.memory.embedding_dim,
         decay_rates=cfg.memory.decay_rates or None,
+        dedup_threshold=cfg.memory.episodic_dedup_threshold,
     )
     # CALLER CONTRACT (vector_memory.py): async callers offload init() — it is
     # blocking file IO end to end (sqlite connect, migrations, lockdown pass)

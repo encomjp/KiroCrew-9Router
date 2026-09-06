@@ -408,17 +408,30 @@ class TestNonObjectJsonBody:
             mem.api_memory_embedding_model(self._request(payload))
         )
         assert resp.status == 400, f"{payload!r} must be a 400, not a crash"
-        assert b"invalid_json" in resp.body
+        # The shared guard separates "unparseable" from "parsed, wrong shape";
+        # this handler used to answer invalid_json for both.
+        assert b"body_not_object" in resp.body
 
-    def test_the_guard_is_an_isinstance_check_on_dict(self) -> None:
-        """Guard against a refactor that only special-cases lists."""
+    def test_the_guard_runs_before_the_first_field_read(self) -> None:
+        """Guard against a refactor that only special-cases lists.
+
+        The check itself lives in ``_shared.read_bounded_json`` now (issue
+        #5587), so this pins the two properties that made the inline version
+        correct: the handler consults the guard BEFORE its first ``.get()``,
+        and the guard is a general ``isinstance(body, dict)`` test rather than a
+        list-only special case. The parametrized cases above prove the
+        generality behaviorally; this catches a refactor that reorders or drops
+        the call while the parametrized cases still pass for another reason.
+        """
         import inspect
 
+        from kiro_crew.dashboard.handlers._shared import read_bounded_json
         from kiro_crew.dashboard.handlers.memory import api_memory_embedding_model
 
         src = inspect.getsource(api_memory_embedding_model)
-        assert "isinstance(body, dict)" in src
-        assert src.index("isinstance(body, dict)") < src.index('body.get("path"')
+        assert "read_bounded_json(" in src
+        assert src.index("read_bounded_json(") < src.index('body.get("path"')
+        assert "isinstance(body, dict)" in inspect.getsource(read_bounded_json)
 
 
 class TestApplyIsAudited:
